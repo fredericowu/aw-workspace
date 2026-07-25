@@ -6,4 +6,5 @@ psycopg[binary]==3.2.3
 PyJWT==2.12.1
 cryptography==46.0.6
 httpx[http2]==0.28.1
+redis==8.0.1
 pytest==9.0.2
