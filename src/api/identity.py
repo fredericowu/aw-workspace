@@ -1,0 +1,78 @@
+"""Offline verification of the central-identity EdDSA JWT (F2).
+
+No credentials DB here — identity is central (aw-backend, F1b). This module
+only verifies signature + expiry against aw-backend's PUBLIC key, mirroring
+``aw-backend/src/api/identity_guard.py``'s ``decode_identity_jwt`` check but
+without ever touching aw-backend over the network per request:
+
+* ``AW_AUTH_PUBLIC_KEY`` (PEM string) — set directly, no boot-time fetch.
+* Otherwise, fetched once from ``{AW_BACKEND_URL}/api/identity/public-key``
+  on first use and cached in-process for the life of the worker.
+"""
+from __future__ import annotations
+
+import os
+import threading
+
+import httpx
+import jwt as pyjwt
+from fastapi import Header, HTTPException, Request
+
+COOKIE_NAME = "aw_id_jwt"
+JWT_ALGORITHM = "EdDSA"
+
+_public_key_pem: str | None = None
+_lock = threading.Lock()
+
+
+def _fetch_public_key_pem() -> str:
+    backend_url = os.environ.get("AW_BACKEND_URL", "").rstrip("/")
+    if not backend_url:
+        raise RuntimeError(
+            "neither AW_AUTH_PUBLIC_KEY nor AW_BACKEND_URL is set — cannot "
+            "verify identity JWTs"
+        )
+    resp = httpx.get(f"{backend_url}/api/identity/public-key", timeout=10.0)
+    resp.raise_for_status()
+    return resp.text
+
+
+def get_public_key_pem() -> str:
+    """Return the aw-backend Ed25519 public key PEM, caching it in-process."""
+    global _public_key_pem
+    env_key = os.environ.get("AW_AUTH_PUBLIC_KEY")
+    if env_key:
+        return env_key
+    if _public_key_pem is None:
+        with _lock:
+            if _public_key_pem is None:
+                _public_key_pem = _fetch_public_key_pem()
+    return _public_key_pem
+
+
+def decode_identity_jwt(token: str) -> dict | None:
+    """Verify signature + expiry using the PUBLIC key only. No DB lookup —
+    the caller decides what ``sub``/``memberships`` mean for this workspace."""
+    try:
+        return pyjwt.decode(token, get_public_key_pem(), algorithms=[JWT_ALGORITHM])
+    except Exception:
+        return None
+
+
+def _extract_token(request: Request, authorization: str) -> str:
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return request.cookies.get(COOKIE_NAME, "")
+
+
+async def require_identity(request: Request, authorization: str = Header(default="")) -> dict:
+    """FastAPI dependency — returns the verified JWT claims dict or 401s."""
+    token = _extract_token(request, authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    claims = decode_identity_jwt(token)
+    if not claims:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    return claims

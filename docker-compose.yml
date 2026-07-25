@@ -1,0 +1,22 @@
+# aw-workspace — um container por workspace, mesma netns do aw-sandbox
+# (alcança o Postgres compartilhado em 127.0.0.1). AW_WORKSPACE/
+# AW_WORKSPACE_SCHEMA identificam qual schema este processo enxerga.
+services:
+  aw-workspace:
+    build: .
+    container_name: aw-workspace-${AW_WORKSPACE:-demo}
+    restart: unless-stopped
+    network_mode: "container:aw-sandbox"
+    environment:
+      AW_WORKSPACE: "${AW_WORKSPACE:-demo}"
+      AW_WORKSPACE_SCHEMA: "${AW_WORKSPACE_SCHEMA:-workspace_demo}"
+      AW_PORT: "9030"
+      AW_WORKSPACE_WORKERS: "2"
+      AWSERV_DB_URL: "${AWSERV_DB_URL:-postgresql+psycopg://postgres:postgres@127.0.0.1:5432/awserv}"
+      AW_BACKEND_URL: "${AW_BACKEND_URL:-https://api.aw.tekflox.com}"
+      AW_AUTH_PUBLIC_KEY: "${AW_AUTH_PUBLIC_KEY:-}"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9030/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
