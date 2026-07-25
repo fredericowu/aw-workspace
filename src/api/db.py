@@ -28,11 +28,15 @@ _DEFAULT_URL = "postgresql+psycopg://postgres:postgres@127.0.0.1:5432/awserv"
 def get_db_url() -> str:
     """Return the SQLAlchemy URL for the shared Postgres server.
 
-    Accepts ``AWSERV_DB_URL`` with or without the ``+psycopg`` driver
-    suffix — normalises to ``postgresql+psycopg://…`` either way (same
-    convention as aw-backend's ``pg_db.get_db_url``).
+    ``AW_WORKSPACE_DB_URL`` wins over ``AWSERV_DB_URL`` when both are set —
+    the BYOD workspace-host runtime (see aw-remote-host) sets the former to
+    point at the user's own local Postgres, while ``AWSERV_DB_URL`` remains
+    the control-plane convention other callers may still have set in the
+    shared environment. Accepts either var with or without the
+    ``+psycopg`` driver suffix — normalises to ``postgresql+psycopg://…``
+    either way (same convention as aw-backend's ``pg_db.get_db_url``).
     """
-    url = os.environ.get("AWSERV_DB_URL", _DEFAULT_URL)
+    url = os.environ.get("AW_WORKSPACE_DB_URL") or os.environ.get("AWSERV_DB_URL", _DEFAULT_URL)
     if url.startswith("postgresql://"):
         url = "postgresql+psycopg://" + url[len("postgresql://"):]
     return url
