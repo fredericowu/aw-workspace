@@ -79,15 +79,33 @@ def create_all_tables() -> None:
 
     Imports ``src.api.models`` to register the schema-less SQLModel
     classes, then lets ``schema_translate_map`` route ``CREATE TABLE`` to
-    ``AW_WORKSPACE_SCHEMA``. Assumes the schema itself already exists
-    (provisioned by aw-backend's F1 ``provision_schema``) — this never
-    issues ``CREATE SCHEMA``.
+    ``AW_WORKSPACE_SCHEMA``.
+
+    Schema provisioning: in the central multi-tenant model the schema is
+    created ahead of time by aw-backend's F1 ``provision_schema`` (the
+    control-plane owns tenant provisioning). In the BYOD model the
+    workspace's Postgres is the user's own local DB — the cloud
+    control-plane cannot reach it to ``CREATE SCHEMA`` — so the runtime
+    self-provisions its schema. We scope that to BYOD by keying on
+    ``AW_WORKSPACE_DB_URL`` (the var the aw-remote-host bootstrap sets;
+    see ``get_db_url``), which keeps the central invariant intact: with
+    only ``AWSERV_DB_URL`` set, the schema must already exist.
     """
+    from sqlalchemy import text
+
     from src.api import models  # noqa: F401 — side-effect: registers models
 
     engine = get_engine()
+    schema = get_workspace_schema()
+
+    if os.environ.get("AW_WORKSPACE_DB_URL"):
+        # BYOD host — the runtime owns its local DB, so provision the schema.
+        with engine.begin() as conn:
+            conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+        _log.info("db: ensured BYOD schema %s exists", schema)
+
     SQLModel.metadata.create_all(engine, checkfirst=True)
-    _log.info("db: schema %s up to date", get_workspace_schema())
+    _log.info("db: schema %s up to date", schema)
 
 
 def get_session() -> Session:
