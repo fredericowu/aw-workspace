@@ -2,6 +2,9 @@ name: Build + push image
 
 # Manual by default (cost/quota conscious, same policy as other apps) —
 # also fires on push to main when the image-relevant files change.
+#
+# Auto-triggers disabled 2026-07-26 per Frederico (no automatic GHA runs for now).
+# Manual via the Actions tab. Re-enable when ready.
 
 on:
   workflow_dispatch:
@@ -10,12 +13,12 @@ on:
         description: "Extra tag to push alongside :latest and :<sha>"
         type: string
         default: "latest"
-  push:
-    branches: [main]
-    paths:
-      - "Dockerfile"
-      - "src/**"
-      - "requirements.txt"
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - "Dockerfile"
+  #     - "src/**"
+  #     - "requirements.txt"
 
 concurrency:
   group: build-image
