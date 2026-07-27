@@ -9,14 +9,29 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.db import create_all_tables, get_session, get_workspace_schema
-from src.api.identity import require_identity
+from src.api.identity import _extract_token, decode_identity_jwt, require_identity
 from src.api.models import Setting
 
 log = logging.getLogger(__name__)
+
+
+def _spa_origin_regex() -> str:
+    """CORS allow-origin regex for the cloud SPA that talks to this workspace.
+
+    Three-plane split: the SPA is served at ``https://<slug>.workspace.<domain>``
+    and calls this API cross-origin (same apex) at ``api.<slug>.workspace.<domain>``,
+    sending the apex ``aw_id_jwt`` cookie. Restrict to this workspace's own slug
+    when known; fall back to any ``<slug>.workspace`` host in dev."""
+    slug = os.environ.get("AW_WORKSPACE", "")
+    if slug:
+        return rf"^https://{re.escape(slug)}\.workspace\..+$"
+    return r"^https://[^.]+\.workspace\..+$"
 
 
 def create_app() -> FastAPI:
@@ -24,9 +39,31 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="aw-workspace", version="0.1.0")
 
+    # SPA→API is cross-origin (same apex) and credentialed — allow the SPA
+    # origin with credentials so the apex aw_id_jwt cookie is accepted and
+    # preflight (OPTIONS) succeeds. allow_credentials forbids a "*" origin,
+    # hence the per-workspace regex.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=_spa_origin_regex(),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     @app.get("/api/health")
     async def health():
         return {"status": "ok", "workspace": os.environ.get("AW_WORKSPACE", "")}
+
+    @app.get("/api/auth/status")
+    async def auth_status(request: Request, authorization: str = Header(default="")):
+        """Login-gate check for the cloud SPA. Validates the apex aw_id_jwt
+        cookie offline against the cloud JWKS (never 401s — the SPA reads the
+        boolean and renders its login/dashboard accordingly). Minimal stub for
+        Milestone 1; membership/role enforcement is a later card."""
+        token = _extract_token(request, authorization)
+        claims = decode_identity_jwt(token) if token else None
+        return {"authenticated": bool(claims), "mode": "identity"}
 
     @app.get("/api/settings/{key}")
     async def get_setting(key: str, identity: dict = Depends(require_identity)):
