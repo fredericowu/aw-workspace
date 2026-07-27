@@ -10,7 +10,9 @@ Endpoints (all identity-gated):
 - ``POST /api/apps/reconcile``       — converge to the cloud registry on demand
 - ``POST /api/apps/install-my-apps`` — the "Install My Apps" backend flow: read
                                        the user's registry set + converge
-- ``GET  /api/apps/-/contributions`` — declarative frontend contributions
+- ``GET  /api/apps/-/contributions`` — frontend contributions (declarative + code)
+- ``GET  /api/apps/-/catalog``       — marketplace catalog (available apps)
+- ``GET  /api/apps/{slug}/ui/{path}``— serve a component-mode app's ESM bundle
 
 The cloud registry (aw-backend ``app_installs``) is the source of truth (ADR
 Decision 5). ``install`` writes there and hot-loads; the reconciler reads there
@@ -24,9 +26,10 @@ import logging
 import os
 
 from fastapi import Body, Depends, FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from src.api.identity import require_identity
+from src.apps.catalog import get_catalog
 from src.apps.manifest import ManifestError, load_manifest
 from src.apps.reconciler import AppSpec, Reconciler
 from src.apps.runtime import AppRuntime
@@ -47,14 +50,24 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
 
     @app.get("/api/apps")
     async def list_apps(identity: dict = Depends(require_identity)):
+        """Installed apps for the SPA's Apps view — includes what the UI needs
+        to render each row: icon, whether a config gear applies (``has_config``
+        + ``config_schema``), and the frontend contribution mode (Decision 3b)."""
         return [
             {
                 "slug": a.manifest.id,
                 "name": a.manifest.name,
+                "description": a.manifest.description,
                 "version": a.manifest.version,
                 "tier": a.manifest.tier,
+                "icon": a.manifest.icon,
                 "permissions": a.granted_permissions,
+                "signed": a.signed,
                 "routes": bool(a.mount),
+                "has_config": a.manifest.has_config,
+                "config_schema": a.manifest.config_schema,
+                "settings_panels": a.manifest.settings_panels,
+                "frontend": a.manifest.frontend,
             }
             for a in (runtime.get(s) for s in runtime.loaded_slugs())
             if a is not None
@@ -126,6 +139,32 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
     @app.get("/api/apps/-/contributions")
     async def contributions(identity: dict = Depends(require_identity)):
         return runtime.contributions()
+
+    @app.get("/api/apps/-/catalog")
+    async def catalog(identity: dict = Depends(require_identity),
+                      refresh: bool = False):
+        """The marketplace catalog (available apps) for the Marketplace panel."""
+        return get_catalog(force=refresh)
+
+    @app.get("/api/apps/{slug}/ui/{path:path}")
+    async def app_ui_bundle(slug: str, path: str,
+                            identity: dict = Depends(require_identity)):
+        """Serve a component-mode app's prebuilt ESM bundle (Decision 3b).
+
+        The SPA dynamic-``import()``s the hashed URL announced in
+        ``contributions().frontend[].bundle_url``. Files are read from the app's
+        own package under ``ui/dist/`` — path-traversal-guarded and scoped to
+        the loaded app.
+        """
+        loaded = runtime.get(slug)
+        if loaded is None:
+            return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
+        ui_root = os.path.realpath(os.path.join(loaded.package_dir, "ui", "dist"))
+        target = os.path.realpath(os.path.join(ui_root, path))
+        if not target.startswith(ui_root + os.sep) or not os.path.isfile(target):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        media = "text/javascript" if target.endswith(".js") else "application/octet-stream"
+        return FileResponse(target, media_type=media)
 
     return runtime
 

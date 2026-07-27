@@ -88,6 +88,7 @@ class LoadedApp:
     package_dir: str
     granted_permissions: list[str]
     config: dict[str, Any] = field(default_factory=dict)
+    signed: bool = False
     mount: Mount | None = None
     drainable: _DrainableApp | None = None
     module_prefix: str = ""
@@ -130,15 +131,47 @@ class AppRuntime:
         return self._apps.get(slug)
 
     def contributions(self) -> dict[str, Any]:
-        """Declarative frontend contributions for ``GET /api/apps/-/contributions``."""
+        """Frontend contributions for ``GET /api/apps/-/contributions``.
+
+        Declarative (windows/nav/settings) fill slots as data; the ``frontend``
+        block (Decision 3b) tells the SPA plugin runtime which apps ship a
+        real ESM bundle (``component``/``iframe`` mode) and what slots they
+        register into. The SPA re-fetches this on a ``contributions-changed``
+        event and mounts/unmounts accordingly.
+        """
         windows: list[dict[str, Any]] = []
         nav: list[dict[str, Any]] = []
+        settings: list[dict[str, Any]] = []
+        frontend: list[dict[str, Any]] = []
         for app in self._apps.values():
+            slug = app.manifest.id
             for win in app.manifest.windows:
-                windows.append({"app": app.manifest.id, **win})
+                windows.append({"app": slug, **win})
             for entry in app.manifest.nav:
-                nav.append({"app": app.manifest.id, **entry})
-        return {"windows": windows, "nav": nav}
+                nav.append({"app": slug, **entry})
+            for panel in app.manifest.settings_panels:
+                settings.append({"app": slug, **panel})
+            fe = app.manifest.frontend
+            if fe:
+                bundle = fe.get("bundle")
+                frontend.append({
+                    "app": slug,
+                    "mode": fe.get("mode", "iframe"),
+                    # Content-hashed URL busts the SPA module cache on upgrade.
+                    "bundle_url": (
+                        f"/api/apps/{slug}/ui/{os.path.basename(str(bundle))}"
+                        if bundle else None
+                    ),
+                    "components": fe.get("components", []),
+                    "slot_extensions": fe.get("slot_extensions", []),
+                    "slots": fe.get("slots", []),
+                    # Trust gate inputs (Decision 3b/4): component mode is only
+                    # honored for a signed app that was granted ui:code.
+                    "signed": app.signed,
+                    "granted_permissions": app.granted_permissions,
+                })
+        return {"windows": windows, "nav": nav, "settings": settings,
+                "frontend": frontend}
 
     # ---- load / unload --------------------------------------------------
 
@@ -172,7 +205,8 @@ class AppRuntime:
         )
         loaded = LoadedApp(
             manifest=manifest, plugin=plugin, ctx=ctx, package_dir=package_dir,
-            granted_permissions=granted, config=cfg, module_prefix=module_prefix,
+            granted_permissions=granted, config=cfg, signed=signed,
+            module_prefix=module_prefix,
         )
 
         # _mount (called from within activate via ctx.routes.register) attaches

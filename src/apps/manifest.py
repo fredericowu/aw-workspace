@@ -58,6 +58,29 @@ class Manifest:
     def nav(self) -> list[dict[str, Any]]:
         return list(self.contributes.get("nav", []))
 
+    @property
+    def settings_panels(self) -> list[dict[str, Any]]:
+        return list(self.contributes.get("settings_panels", []))
+
+    @property
+    def frontend(self) -> dict[str, Any]:
+        """First-class frontend code plugin (ADR Decision 3b), or ``{}``."""
+        fe = self.contributes.get("frontend")
+        return dict(fe) if isinstance(fe, dict) else {}
+
+    @property
+    def icon(self) -> str:
+        """Icon hint — first nav entry's icon, or the top-level ``icon`` field."""
+        for entry in self.nav:
+            if entry.get("icon"):
+                return str(entry["icon"])
+        return str(self.raw.get("icon", ""))
+
+    @property
+    def has_config(self) -> bool:
+        """True when the app exposes a settings/config surface the gear opens."""
+        return bool(self.settings_panels or self.config_schema.get("properties"))
+
 
 def validate_manifest(data: dict[str, Any]) -> Manifest:
     """Validate a parsed manifest dict against the v1 schema; return a Manifest.
