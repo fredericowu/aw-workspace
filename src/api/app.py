@@ -43,8 +43,9 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Reload locally-installed apps into the running process on startup.
-        await reconcile_on_boot(app.state.app_runtime)
+        # Converge the running app set to the cloud registry on startup — a
+        # fresh/recreated workspace auto-reinstalls the user's apps (F3).
+        await reconcile_on_boot(app)
         yield
 
     app = FastAPI(title="aw-workspace", version="0.1.0", lifespan=lifespan)

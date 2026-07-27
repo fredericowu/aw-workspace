@@ -37,6 +37,11 @@ class AppInstall(SQLModel, table=True):
     slug: str = Field(primary_key=True)
     version: str
     package_dir: str
+    # Where the reconciler (re)fetches the package (F3). ``repo`` None means the
+    # app was installed straight from an on-disk ``package_dir`` (e.g. the bundled
+    # PoC) with no git source to re-clone.
+    repo: Optional[str] = Field(default=None)
+    ref: str = Field(default="HEAD")
     granted_permissions: list[str] = Field(default_factory=list, sa_column=Column(JSONB))
     config: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB))
     enabled: bool = True

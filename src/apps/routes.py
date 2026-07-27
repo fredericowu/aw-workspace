@@ -1,16 +1,22 @@
-"""``/api/apps`` management surface + boot reconcile (F1).
+"""``/api/apps`` management surface + registry-driven reconcile (F1 + F3).
 
 Endpoints (all identity-gated):
 
 - ``GET  /api/apps``                 — list loaded apps
-- ``POST /api/apps/install``         — hot-install from a package dir (no restart)
-- ``DELETE /api/apps/{slug}``        — hot-uninstall (drain + revert journal)
+- ``POST /api/apps/install``         — hot-install (fetch repo | on-disk dir),
+                                       writing the cloud registry (F3)
+- ``DELETE /api/apps/{slug}``        — hot-uninstall (drain + revert journal +
+                                       remove repo + drop registry rows)
+- ``POST /api/apps/reconcile``       — converge to the cloud registry on demand
+- ``POST /api/apps/install-my-apps`` — the "Install My Apps" backend flow: read
+                                       the user's registry set + converge
 - ``GET  /api/apps/-/contributions`` — declarative frontend contributions
 
-The install persists an ``AppInstall`` row so ``reconcile_on_boot`` reloads the
-app when the workspace process restarts (ADR Decision 5, minimal). ``-`` is used
-as the reserved control slug so it can never collide with an app slug (slugs
-must start with a letter — see ``manifest.SLUG_RE``).
+The cloud registry (aw-backend ``app_installs``) is the source of truth (ADR
+Decision 5). ``install`` writes there and hot-loads; the reconciler reads there
+and converges — so a recreated workspace auto-reinstalls the user's apps. ``-``
+is the reserved control slug (slugs must start with a letter — see
+``manifest.SLUG_RE``) so it can never collide with an app slug.
 """
 from __future__ import annotations
 
@@ -21,50 +27,23 @@ from fastapi import Body, Depends, FastAPI
 from fastapi.responses import JSONResponse
 
 from src.api.identity import require_identity
-from src.apps.capabilities import filter_grants
 from src.apps.manifest import ManifestError, load_manifest
+from src.apps.reconciler import AppSpec, Reconciler
 from src.apps.runtime import AppRuntime
 
 log = logging.getLogger(__name__)
 
 
-def _persist_install(slug, version, package_dir, granted, config) -> None:
-    from src.api.db import get_session
-    from src.api.models import AppInstall
-
-    with get_session() as session:
-        row = session.get(AppInstall, slug)
-        if row is None:
-            row = AppInstall(slug=slug, version=version, package_dir=package_dir,
-                             granted_permissions=granted, config=config, enabled=True)
-        else:
-            row.version = version
-            row.package_dir = package_dir
-            row.granted_permissions = granted
-            row.config = config
-            row.enabled = True
-        session.add(row)
-        session.commit()
-
-
-def _forget_install(slug: str) -> None:
-    from src.api.db import get_session
-    from src.api.models import AppInstall
-
-    with get_session() as session:
-        row = session.get(AppInstall, slug)
-        if row is not None:
-            session.delete(row)
-            session.commit()
-
-
 def register_apps_routes(app: FastAPI) -> AppRuntime:
     """Wire the plugin runtime + management routes onto ``app``.
 
-    Returns the :class:`AppRuntime` (stored on ``app.state.app_runtime`` too).
+    Returns the :class:`AppRuntime` (stored on ``app.state.app_runtime`` too);
+    the :class:`Reconciler` is stored on ``app.state.app_reconciler``.
     """
     runtime = AppRuntime(app)
+    reconciler = Reconciler(runtime)
     app.state.app_runtime = runtime
+    app.state.app_reconciler = reconciler
 
     @app.get("/api/apps")
     async def list_apps(identity: dict = Depends(require_identity)):
@@ -83,51 +62,66 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
 
     @app.post("/api/apps/install")
     async def install_app(data: dict = Body(...), identity: dict = Depends(require_identity)):
+        """Install an app either from a git ``repo`` (fetched + pinned to ``ref``)
+        or from an on-disk ``package_dir`` (the bundled PoC / a dev sideload).
+        Hot-loads with no restart and records the cloud registry row."""
+        repo = data.get("repo")
         package_dir = data.get("package_dir") or data.get("source")
-        if not package_dir:
-            return JSONResponse({"error": "package_dir is required"}, status_code=400)
-        package_dir = os.path.abspath(package_dir)
+        if not repo and not package_dir:
+            return JSONResponse({"error": "repo or package_dir is required"}, status_code=400)
+
+        app_id = data.get("app_id") or data.get("slug") or ""
+        if package_dir and not repo:
+            package_dir = os.path.abspath(package_dir)
+            try:
+                manifest = load_manifest(package_dir)
+            except ManifestError as e:
+                return JSONResponse({"error": f"invalid manifest: {e}"}, status_code=400)
+            app_id = manifest.id
+
+        if app_id and runtime.is_loaded(app_id):
+            return JSONResponse({"error": f"{app_id} already installed"}, status_code=409)
+
+        spec = AppSpec(
+            app_id=app_id,
+            version=data.get("version", "") or "",
+            repo=repo,
+            ref=data.get("ref") or "HEAD",
+            granted_permissions=data.get("granted_permissions") or [],
+            config=data.get("config") or {},
+            signed=bool(data.get("signed", False)),
+            package_dir=package_dir if not repo else None,
+        )
+        write_cloud = bool(data.get("persist", True))
         try:
-            manifest = load_manifest(package_dir)
+            summary = await reconciler.install(spec, write_cloud=write_cloud)
         except ManifestError as e:
             return JSONResponse({"error": f"invalid manifest: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001 — surface the failure to the caller
+            log.exception("apps: install failed for %s", app_id or repo)
+            return JSONResponse({"error": f"install failed: {e}"}, status_code=500)
 
-        if runtime.is_loaded(manifest.id):
-            return JSONResponse({"error": f"{manifest.id} already installed"}, status_code=409)
-
-        # grant-on-install (ADR Decision 4): the interactive consent UI is
-        # deferred; here the requested set defaults to the manifest's, and
-        # high-risk caps are stripped for an unsigned (side-loaded) app.
-        requested = data.get("granted_permissions", manifest.permissions)
-        signed = bool(data.get("signed", False))
-        granted, refused = filter_grants(requested, signed=signed)
-        config = data.get("config", {})
-        try:
-            await runtime.load(package_dir, granted_permissions=granted,
-                               config=config, signed=signed)
-        except Exception as e:  # noqa: BLE001 — surface the load failure to the caller
-            log.exception("apps: install failed for %s", manifest.id)
-            return JSONResponse({"error": f"load failed: {e}"}, status_code=500)
-
-        if data.get("persist", True):
-            try:
-                _persist_install(manifest.id, manifest.version, package_dir, granted, config)
-            except Exception:
-                log.exception("apps: could not persist install of %s", manifest.id)
-
-        return {"slug": manifest.id, "version": manifest.version, "installed": True,
-                "granted_permissions": granted, "refused_permissions": refused}
+        return {"installed": True, **summary}
 
     @app.delete("/api/apps/{slug}")
     async def uninstall_app(slug: str, identity: dict = Depends(require_identity)):
         if not runtime.is_loaded(slug):
             return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
-        await runtime.unload(slug)
-        try:
-            _forget_install(slug)
-        except Exception:
-            log.exception("apps: could not forget install of %s", slug)
-        return {"slug": slug, "uninstalled": True}
+        summary = await reconciler.uninstall(slug)
+        return summary
+
+    @app.post("/api/apps/reconcile")
+    async def reconcile_now(identity: dict = Depends(require_identity)):
+        """Converge the running app set to the cloud registry on demand."""
+        return await reconciler.reconcile()
+
+    @app.post("/api/apps/install-my-apps")
+    async def install_my_apps(identity: dict = Depends(require_identity)):
+        """"Install My Apps" backend flow: read the user's registry set for this
+        workspace and converge the runtime to it (install missing / remove
+        extra). The frontend button (deferred) calls this. Returns the desired
+        set plus what changed."""
+        return await reconciler.reconcile()
 
     @app.get("/api/apps/-/contributions")
     async def contributions(identity: dict = Depends(require_identity)):
@@ -136,29 +130,17 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
     return runtime
 
 
-async def reconcile_on_boot(runtime: AppRuntime) -> None:
-    """Load every enabled ``AppInstall`` row (ADR Decision 5 — minimal).
+async def reconcile_on_boot(app: FastAPI) -> None:
+    """Reconcile to the cloud registry on startup (ADR Decision 5).
 
-    Best-effort: a failed app is logged and skipped, never blocking boot.
+    This is what makes a recreated/fresh workspace auto-reinstall the user's
+    apps: an empty loaded-set + a populated registry → the reconciler fetches +
+    hot-loads each app. Falls back to the local mirror when the cloud isn't
+    configured/reachable. Best-effort — never blocks boot.
     """
-    from src.api.db import get_session
-    from src.api.models import AppInstall
-    from sqlmodel import select
-
+    reconciler: Reconciler = app.state.app_reconciler
     try:
-        with get_session() as session:
-            rows = list(session.exec(select(AppInstall).where(AppInstall.enabled == True)))  # noqa: E712
+        result = await reconciler.reconcile()
+        log.info("apps: boot reconcile — %s", result)
     except Exception:
-        log.exception("apps: boot reconcile could not read app_installs")
-        return
-
-    for row in rows:
-        if runtime.is_loaded(row.slug):
-            continue
-        try:
-            await runtime.load(row.package_dir,
-                               granted_permissions=row.granted_permissions,
-                               config=row.config)
-            log.info("apps: reloaded %s v%s on boot", row.slug, row.version)
-        except Exception:
-            log.exception("apps: failed to reload %s on boot", row.slug)
+        log.exception("apps: boot reconcile failed")
