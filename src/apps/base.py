@@ -68,71 +68,133 @@ class RoutesFacade(_Facade):
 
 
 class CommandsFacade(_Facade):
-    """``ctx.commands`` — install commands/CLIs onto the persistent bin dir.
+    """``ctx.commands`` — install commands / system CLIs into the workspace.
 
-    Gated by ``commands:install``. F2 enforces the grant and journals the
-    ``command:install`` action (so uninstall can remove it); the actual write to
-    ``~/.aw-workspace/bin`` is F4.
+    Gated by ``commands:install``. Every install is journaled so uninstall
+    reverses it (ADR Decision 7). Two surfaces (F4):
+
+    * :meth:`install` — a ``<slug>-*`` command **shim** onto the persistent bin
+      dir (``~/.aw-workspace/bin``, on PATH, survives restart); revert removes it.
+    * :meth:`install_system_cli` — run the app's installer script to install a
+      real system CLI (``git``/``gh``/``vim``/…) INTO the workspace. The scripts
+      are idempotent (safe to re-run on every reconcile pass); ``uninstall``
+      names the app's revert script, journaled once, run on uninstall.
     """
+
+    def __init__(self, ctx: "AppContext") -> None:
+        super().__init__(ctx)
+        self._revert_recorded = False
 
     def install(self, name: str, exec_path: str) -> dict[str, Any]:
         self._ctx._enforce("commands:install")
         prefix = f"{self._ctx.app_id}-"
         if not name.startswith(prefix):
             raise ValueError(f"command name {name!r} must be namespaced under {prefix!r}")
+        shim_path = self._ctx._runtime.commands.install_shim(
+            name, self._ctx.package_dir, exec_path)
         self._ctx._runtime.journal.record(
-            self._ctx.app_id, "command:install", name, {"exec": exec_path})
-        return {"command": name, "installed": True}
+            self._ctx.app_id, "command:install", name,
+            {"exec": exec_path, "bin_path": shim_path})
+        return {"command": name, "installed": True, "bin_path": shim_path}
+
+    def install_system_cli(self, name: str, installer: str,
+                           uninstall: str | None = None) -> dict[str, Any]:
+        self._ctx._enforce("commands:install")
+        output = self._ctx._runtime.commands.run_installer(
+            self._ctx.package_dir, installer)
+        self._ctx._runtime.journal.record(
+            self._ctx.app_id, "system_cli:install", name, {"installer": installer})
+        # The app's revert script is app-level (one uninstall.sh reverses every
+        # CLI); journal it once so reverse replay runs it a single time.
+        if uninstall and not self._revert_recorded:
+            self._ctx._runtime.journal.record(
+                self._ctx.app_id, "system_cli:revert-hook", uninstall, {})
+            self._revert_recorded = True
+        return {"cli": name, "installed": True, "output": output}
 
 
 class SecretsFacade(_Facade):
     """``ctx.secrets`` — read/write the app's own secrets.
 
-    Gated by ``secrets:own``. F2 enforces the grant; the zero-knowledge store
-    resolution is F4, so the granted bodies journal the intent and return a
-    placeholder rather than a real value.
+    Gated by ``secrets:own``. Backed by the workspace-side encrypted secret
+    store (F4); the zero-knowledge store plugs in behind this same contract
+    later (separate deferred card). Writes are journaled; uninstall purges the
+    app's whole secret namespace.
     """
 
-    def read(self, key: str) -> None:
+    def read(self, key: str) -> str | None:
         self._ctx._enforce("secrets:own")
-        return None  # F4: resolve the reference against the zero-knowledge store
+        return self._ctx._runtime.secret_store.get(self._ctx.app_id, key)
 
     def write(self, key: str, value: str) -> dict[str, Any]:
         self._ctx._enforce("secrets:own")
+        self._ctx._runtime.secret_store.put(self._ctx.app_id, key, value)
         self._ctx._runtime.journal.record(
             self._ctx.app_id, "secret:write", key, {})
         return {"key": key, "written": True}
+
+    def delete(self, key: str) -> dict[str, Any]:
+        self._ctx._enforce("secrets:own")
+        removed = self._ctx._runtime.secret_store.delete(self._ctx.app_id, key)
+        return {"key": key, "deleted": removed}
+
+    def keys(self) -> list[str]:
+        self._ctx._enforce("secrets:own")
+        return self._ctx._runtime.secret_store.keys(self._ctx.app_id)
 
 
 class DbFacade(_Facade):
     """``ctx.db`` — create/use app-owned workspace tables.
 
-    Gated by ``db:own-tables``. F2 enforces the grant + the ``app__<slug>__``
-    table-name prefix and journals ``db:table``; the bound engine is F4.
+    Gated by ``db:own-tables``. Enforces the ``app__<slug>__`` prefix (ADR
+    Decision 8) and creates tables in this workspace's own schema (F2 isolation).
+    Each create journals ``db:table`` so uninstall drops it (F4).
     """
 
     def table(self, name: str) -> str:
         self._ctx._enforce("db:own-tables")
-        prefix = f"app__{self._ctx.app_id}__"
-        if not name.startswith(prefix):
-            raise ValueError(f"table name {name!r} must be prefixed with {prefix!r}")
+        from src.apps.db_tables import _validate
+        return _validate(self._ctx.app_id, name)
+
+    def create(self, name: str, columns_sql: str) -> str:
+        self._ctx._enforce("db:own-tables")
+        self._ctx._runtime.db_tables.create(self._ctx.app_id, name, columns_sql)
         self._ctx._runtime.journal.record(self._ctx.app_id, "db:table", name, {})
         return name
 
+    def execute(self, name: str, sql: str, params: dict[str, Any] | None = None):
+        self._ctx._enforce("db:own-tables")
+        return self._ctx._runtime.db_tables.execute(
+            self._ctx.app_id, name, sql, params)
+
 
 class ServicesFacade(_Facade):
-    """``ctx.services`` — register a start/stop background service.
+    """``ctx.services`` — register + control a start/stop background service.
 
-    Gated by ``service:manage``. F2 enforces the grant + journals; the actual
-    service supervisor is F4.
+    Gated by ``service:manage``. Registration journals ``service:register`` so
+    uninstall stops + drops it (F4 supervisor).
     """
 
     def register(self, service_id: str, start: str, autostart: bool = False) -> dict[str, Any]:
         self._ctx._enforce("service:manage")
+        self._ctx._runtime.services.register(
+            self._ctx.app_id, service_id, start, self._ctx.package_dir, autostart)
         self._ctx._runtime.journal.record(
             self._ctx.app_id, "service:register", service_id,
             {"start": start, "autostart": autostart})
         return {"service": service_id, "registered": True}
+
+    def start(self, service_id: str) -> dict[str, Any]:
+        self._ctx._enforce("service:manage")
+        return self._ctx._runtime.services.start(self._ctx.app_id, service_id)
+
+    def stop(self, service_id: str) -> dict[str, Any]:
+        self._ctx._enforce("service:manage")
+        return self._ctx._runtime.services.stop(self._ctx.app_id, service_id)
+
+    def status(self, service_id: str) -> dict[str, Any]:
+        self._ctx._enforce("service:manage")
+        return self._ctx._runtime.services.status(self._ctx.app_id, service_id)
 
 
 # capability -> (attribute name, facade class). One facade per single-capability

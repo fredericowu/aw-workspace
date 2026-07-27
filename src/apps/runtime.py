@@ -26,10 +26,15 @@ from fastapi import FastAPI
 from starlette.routing import Mount
 from starlette.types import Receive, Scope, Send
 
+import types
+
 from src.apps.base import AppContext, Plugin
 from src.apps.capabilities import filter_grants
+from src.apps.commands import CommandInstaller
 from src.apps.journal import ActionJournal
 from src.apps.manifest import Manifest, load_manifest
+from src.apps.secret_store import SecretStore
+from src.apps.services import ServiceSupervisor
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +104,19 @@ class AppRuntime:
         self._apps: dict[str, LoadedApp] = {}
         self._lock = asyncio.Lock()
         self._loading: LoadedApp | None = None  # set during activate() for _mount
+        # F4 effect backends the capability facades route through.
+        self.commands = CommandInstaller()
+        self.services = ServiceSupervisor()
+        self.secret_store = SecretStore()
+        self._db_tables: Any = None  # lazy — only apps granted db:own-tables need it
+
+    @property
+    def db_tables(self) -> Any:
+        """Lazily built so a pure-unit runtime never imports the PG engine layer."""
+        if self._db_tables is None:
+            from src.apps.db_tables import DbTables
+            self._db_tables = DbTables()
+        return self._db_tables
 
     # ---- introspection --------------------------------------------------
 
@@ -217,14 +235,41 @@ class AppRuntime:
         except Exception:
             log.exception("apps: deactivate() failed for %s", slug)
 
-        # 4. Replay the journal in reverse (F1: route mounts, already unmounted
-        #    above — this is the audit-complete + residue-free step) and unimport.
+        # 4. Replay the journal in reverse — actually REVERT each side effect
+        #    (F4): remove command shims, run the app's CLI revert script, drop
+        #    app-owned tables, stop registered services. One failing revert must
+        #    not block the rest; the route Mount was already removed above.
         for entry in self.journal.reverse_for(slug):
-            log.debug("apps: reverting %s %s for %s", entry.kind, entry.target, slug)
+            try:
+                self._revert_entry(entry, loaded)
+            except Exception:
+                log.exception("apps: revert of %s %s failed for %s",
+                              entry.kind, entry.target, slug)
+        # Purge the app's secret namespace unconditionally (no residue even if a
+        # secret was written in a prior process whose in-memory journal is gone).
+        try:
+            self.secret_store.purge(slug)
+        except Exception:
+            log.exception("apps: purging secrets for %s failed", slug)
+
         self.journal.clear_app(slug)
         self._unimport(loaded.module_prefix)
         del self._apps[slug]
         log.info("apps: unloaded %s", slug)
+
+    def _revert_entry(self, entry: Any, loaded: LoadedApp) -> None:
+        """Reverse a single journaled side effect (uninstall replay, F4)."""
+        kind = entry.kind
+        if kind == "command:install":
+            self.commands.remove_shim(entry.payload.get("bin_path", ""))
+        elif kind == "system_cli:revert-hook":
+            self.commands.run_revert(loaded.package_dir, entry.target)
+        elif kind == "db:table":
+            self.db_tables.drop(loaded.manifest.id, entry.target)
+        elif kind == "service:register":
+            self.services.stop_all_for(loaded.manifest.id)
+        # route:mount (already unmounted), system_cli:install (audit-only),
+        # secret:write (namespace purged above), capability:denied → no-op.
 
     # ---- facade callback (from RoutesFacade.register) -------------------
 
@@ -249,24 +294,37 @@ class AppRuntime:
     # ---- import isolation ----------------------------------------------
 
     def _import_plugin(self, manifest: Manifest, package_dir: str) -> tuple[Plugin, str]:
-        """Load the entrypoint under a synthetic ``aw_apps.<slug>`` namespace."""
+        """Load the entrypoint under a synthetic ``aw_apps.<slug>`` namespace.
+
+        The per-app namespace package is rooted at ``package_dir`` (its
+        ``__path__``), so a **flat** entrypoint (``plugin:AppPlugin``) and a
+        **packaged** one (``git_app.plugin:GitAppPlugin`` with intra-package
+        relative imports like ``from . import installer``) both resolve — and
+        neither pollutes the global module namespace (everything lives under
+        ``aw_apps.<slug>.*``, dropped wholesale on unload). No two apps collide
+        even if both ship a ``plugin.py``.
+        """
         module_path, _, class_name = manifest.entrypoint.partition(":")
-        rel = module_path.replace(".", os.sep) + ".py"
-        file_path = os.path.join(package_dir, rel)
-        if not os.path.isfile(file_path):
-            raise ManifestFileMissing(f"entrypoint module not found: {rel}")
+        if not module_path or not class_name:
+            raise RuntimeError(
+                f"entrypoint {manifest.entrypoint!r} must be \"module:ClassName\"")
 
         module_prefix = f"aw_apps.{manifest.id}"
+        # umbrella namespace package (shared, path-less) …
+        if "aw_apps" not in sys.modules:
+            umbrella = types.ModuleType("aw_apps")
+            umbrella.__path__ = []  # namespace package
+            sys.modules["aw_apps"] = umbrella
+        # … and the per-app package rooted at this app's dir.
+        base_pkg = types.ModuleType(module_prefix)
+        base_pkg.__path__ = [package_dir]  # type: ignore[attr-defined]
+        sys.modules[module_prefix] = base_pkg
+
         mod_name = f"{module_prefix}.{module_path}"
-        spec = importlib.util.spec_from_file_location(mod_name, file_path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"cannot build import spec for {file_path}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[mod_name] = module
         try:
-            spec.loader.exec_module(module)
+            module = importlib.import_module(mod_name)
         except Exception:
-            sys.modules.pop(mod_name, None)
+            self._unimport(module_prefix)
             raise
 
         cls = getattr(module, class_name, None)
@@ -275,6 +333,7 @@ class AppRuntime:
         # any class exposing a callable ``activate`` rather than requiring a
         # subclass. Subclassing ``src.apps.base.Plugin`` stays a convenience.
         if cls is None or not isinstance(cls, type) or not callable(getattr(cls, "activate", None)):
+            self._unimport(module_prefix)
             raise RuntimeError(
                 f"entrypoint {manifest.entrypoint!r} must be a class with an "
                 f"async activate(ctx) method"

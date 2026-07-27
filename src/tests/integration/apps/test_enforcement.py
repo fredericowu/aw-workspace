@@ -8,6 +8,7 @@ capability (``ui:code``) is stripped from an unsigned app's effective grant.
 from __future__ import annotations
 
 import asyncio
+import os
 import textwrap
 
 import httpx
@@ -114,7 +115,8 @@ def test_granted_route_works_but_ungranted_facades_denied_and_journaled(tmp_path
     _async(run())
 
 
-def test_granted_facade_action_is_allowed_and_journaled(tmp_path):
+def test_granted_facade_action_is_allowed_and_journaled(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
     plugin = """
         class AppPlugin:
             async def activate(self, ctx):
@@ -123,13 +125,24 @@ def test_granted_facade_action_is_allowed_and_journaled(tmp_path):
                 return None
     """
     pkg = _write_app(tmp_path, "cmdapp", plugin, ["commands:install"])
+    # a real exec target for the shim to wrap (F4 install_shim resolves it)
+    bindir = tmp_path / "cmdapp" / "bin"
+    bindir.mkdir()
+    (bindir / "do").write_text("#!/usr/bin/env bash\necho hi\n")
 
     async def run():
+        from src.apps import paths
+
         rt = AppRuntime(FastAPI(), journal=ActionJournal())
         await rt.load(pkg, granted_permissions=["commands:install"])
         kinds = [(e.kind, e.target) for e in rt.journal.entries_for("cmdapp")]
         assert ("command:install", "cmdapp-do") in kinds
+        # the shim was really written onto the persistent bin dir …
+        shim = os.path.join(paths.bin_dir(), "cmdapp-do")
+        assert os.path.isfile(shim)
         await rt.unload("cmdapp")
+        # … and uninstall reverted it (journal reverse replay)
+        assert not os.path.exists(shim)
 
     _async(run())
 
