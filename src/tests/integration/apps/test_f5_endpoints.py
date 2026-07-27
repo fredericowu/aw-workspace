@@ -64,22 +64,23 @@ def test_catalog_serves_marketplace_apps_json(monkeypatch):
             {"id": "essentials", "name": "Essentials", "has_config": False, "repo": "tekflox/aw-app-essentials", "ref": "master"},
         ],
     }
-    monkeypatch.setattr(catalog_mod, "_fetch_apps_json", lambda timeout=15.0: payload)
+    monkeypatch.setattr(catalog_mod, "_fetch_source", lambda source, timeout=15.0: payload["apps"])
 
     app, _rt, client = _client()
     body = client.get("/api/apps/-/catalog").json()
     assert [a["id"] for a in body["apps"]] == ["git", "essentials"]
-    assert body["source"] == catalog_mod.MARKETPLACE_REPO
+    assert body["sources"] == [f"{catalog_mod.MARKETPLACE_REPO}@{catalog_mod.MARKETPLACE_REF}"]
     catalog_mod.clear_cache()
 
 
-def test_catalog_degrades_to_empty_on_cold_failure(monkeypatch):
+def test_catalog_degrades_to_empty_on_cold_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
     catalog_mod.clear_cache()
 
-    def boom(timeout=15.0):
+    def boom(source, timeout=15.0):
         raise RuntimeError("git host unreachable")
 
-    monkeypatch.setattr(catalog_mod, "_fetch_apps_json", boom)
+    monkeypatch.setattr(catalog_mod, "_fetch_source", boom)
     app, _rt, client = _client()
     body = client.get("/api/apps/-/catalog").json()
     assert body["apps"] == []
