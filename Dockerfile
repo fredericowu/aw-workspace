@@ -2,8 +2,9 @@
 # Sem CLIs de agente, sem docker socket, sem build de frontend.
 FROM python:3.12-slim
 
+# procps → `ps`, used by the terminal /procs + /kill endpoints (process badge).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl build-essential libpq-dev \
+        curl build-essential libpq-dev procps \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
