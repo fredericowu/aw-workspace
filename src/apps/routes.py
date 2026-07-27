@@ -3,8 +3,12 @@
 Endpoints (all identity-gated):
 
 - ``GET  /api/apps``                 — list loaded apps
-- ``POST /api/apps/install``         — hot-install (fetch repo | on-disk dir),
-                                       writing the cloud registry (F3)
+- ``POST /api/apps/install``         — kick off a hot-install (fetch repo |
+                                       on-disk dir) in the BACKGROUND and
+                                       return immediately (202, status
+                                       "installing") — see install_jobs.py
+- ``GET  /api/apps/{slug}/install-status`` — poll a background install's
+                                       progress (installing/installed/failed)
 - ``DELETE /api/apps/{slug}``        — hot-uninstall (drain + revert journal +
                                        remove repo + drop registry rows)
 - ``POST /api/apps/reconcile``       — converge to the cloud registry on demand
@@ -22,6 +26,7 @@ is the reserved control slug (slugs must start with a letter — see
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -30,6 +35,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from src.api.identity import require_identity
 from src.apps.catalog import get_catalog
+from src.apps.install_jobs import InstallJobs
 from src.apps.manifest import ManifestError, load_manifest
 from src.apps.reconciler import AppSpec, Reconciler
 from src.apps.runtime import AppRuntime
@@ -45,8 +51,10 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
     """
     runtime = AppRuntime(app)
     reconciler = Reconciler(runtime)
+    jobs = InstallJobs()
     app.state.app_runtime = runtime
     app.state.app_reconciler = reconciler
+    app.state.app_install_jobs = jobs
 
     @app.get("/api/apps")
     async def list_apps(identity: dict = Depends(require_identity)):
@@ -75,9 +83,14 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
 
     @app.post("/api/apps/install")
     async def install_app(data: dict = Body(...), identity: dict = Depends(require_identity)):
-        """Install an app either from a git ``repo`` (fetched + pinned to ``ref``)
-        or from an on-disk ``package_dir`` (the bundled PoC / a dev sideload).
-        Hot-loads with no restart and records the cloud registry row."""
+        """Kick off an install from a git ``repo`` (fetched + pinned to ``ref``)
+        or an on-disk ``package_dir`` (the bundled PoC / a dev sideload) in the
+        BACKGROUND and return immediately (202, status "installing") — the
+        fetch + system-CLI ``apt install`` can take 30-60s, long enough for the
+        BYOD tunnel to drop a held-open request before the response lands
+        ("Failed to fetch" despite the install succeeding). Poll
+        ``GET /api/apps/{slug}/install-status`` for progress; it ends
+        "installed" or "failed" (+ error)."""
         repo = data.get("repo")
         package_dir = data.get("package_dir") or data.get("source")
         if not repo and not package_dir:
@@ -92,8 +105,15 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 return JSONResponse({"error": f"invalid manifest: {e}"}, status_code=400)
             app_id = manifest.id
 
-        if app_id and runtime.is_loaded(app_id):
+        if not app_id:
+            return JSONResponse(
+                {"error": "app_id is required for a repo install"}, status_code=400)
+        if runtime.is_loaded(app_id):
             return JSONResponse({"error": f"{app_id} already installed"}, status_code=409)
+        if jobs.is_installing(app_id):
+            # already in flight (double-click, retried "Failed to fetch") — don't
+            # start a second install, just report the job already running.
+            return JSONResponse({"app_id": app_id, "status": "installing"}, status_code=202)
 
         spec = AppSpec(
             app_id=app_id,
@@ -106,15 +126,31 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             package_dir=package_dir if not repo else None,
         )
         write_cloud = bool(data.get("persist", True))
-        try:
-            summary = await reconciler.install(spec, write_cloud=write_cloud)
-        except ManifestError as e:
-            return JSONResponse({"error": f"invalid manifest: {e}"}, status_code=400)
-        except Exception as e:  # noqa: BLE001 — surface the failure to the caller
-            log.exception("apps: install failed for %s", app_id or repo)
-            return JSONResponse({"error": f"install failed: {e}"}, status_code=500)
+        job = jobs.start(app_id)
 
-        return {"installed": True, **summary}
+        async def _run_install() -> None:
+            try:
+                summary = await reconciler.install(spec, write_cloud=write_cloud)
+                jobs.mark_installed(app_id, summary)
+            except ManifestError as e:
+                log.warning("apps: install failed for %s: %s", app_id, e)
+                jobs.mark_failed(app_id, f"invalid manifest: {e}")
+            except Exception as e:  # noqa: BLE001 — surfaced via the status endpoint
+                log.exception("apps: install failed for %s", app_id)
+                jobs.mark_failed(app_id, f"install failed: {e}")
+
+        job.task = asyncio.create_task(_run_install())
+        return JSONResponse({"app_id": app_id, "status": "installing"}, status_code=202)
+
+    @app.get("/api/apps/{slug}/install-status")
+    async def install_status(slug: str, identity: dict = Depends(require_identity)):
+        """Poll the progress of a background install kicked off above."""
+        job = jobs.get(slug)
+        if job is not None:
+            return job.as_dict()
+        if runtime.is_loaded(slug):
+            return {"app_id": slug, "status": "installed", "error": None, "summary": None}
+        return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
 
     @app.delete("/api/apps/{slug}")
     async def uninstall_app(slug: str, identity: dict = Depends(require_identity)):
