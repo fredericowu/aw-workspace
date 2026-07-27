@@ -16,7 +16,7 @@ import threading
 
 import httpx
 import jwt as pyjwt
-from fastapi import Header, HTTPException, Request
+from fastapi import Header, HTTPException, Request, WebSocket
 
 COOKIE_NAME = "aw_id_jwt"
 JWT_ALGORITHM = "EdDSA"
@@ -76,3 +76,19 @@ async def require_identity(request: Request, authorization: str = Header(default
         raise HTTPException(status_code=401, detail="unauthorized")
 
     return claims
+
+
+def authorize_ws(websocket: WebSocket) -> dict | None:
+    """Verify the identity JWT for a WebSocket handshake, returning claims or None.
+
+    A browser cannot set custom headers on a WebSocket, so the token is taken
+    from (in order): the ``?token=`` query param (short-lived, explicit), then
+    the apex ``aw_id_jwt`` cookie (sent automatically to ``api.<ws>.workspace``
+    since the cookie lives on the shared apex domain). Returns the verified
+    claims dict, or ``None`` if no valid token is present — the caller closes
+    the socket. Never raises.
+    """
+    token = websocket.query_params.get("token") or websocket.cookies.get(COOKIE_NAME, "")
+    if not token:
+        return None
+    return decode_identity_jwt(token)

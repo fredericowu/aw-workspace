@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.db import create_all_tables, get_session, get_workspace_schema
 from src.api.identity import _extract_token, decode_identity_jwt, require_identity
 from src.api.models import Setting
+from src.api.terminal import register_terminal_routes
 
 log = logging.getLogger(__name__)
 
@@ -82,5 +83,10 @@ def create_app() -> FastAPI:
             session.add(row)
             session.commit()
         return {"key": key, "value": value, "schema": get_workspace_schema()}
+
+    # Terminal feature (strangler migration #1): PTY shells on this BYOD host.
+    # In-memory session state → must run single-worker (see AW_WORKSPACE_WORKERS
+    # in the Dockerfile/compose and MIGRATION.md).
+    register_terminal_routes(app)
 
     return app

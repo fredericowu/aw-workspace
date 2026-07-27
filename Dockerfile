@@ -13,8 +13,11 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY . /app
 
+# Single worker: the terminal feature keeps PTY sessions in-process memory, so
+# create/WS must land on the same worker. A single-user data-plane doesn't need
+# more. Revisit if a stateless multi-worker backing store is added (MIGRATION.md).
 ENV AW_PORT=9030 \
-    AW_WORKSPACE_WORKERS=2 \
+    AW_WORKSPACE_WORKERS=1 \
     PYTHONPATH=/app \
     PYTHONUNBUFFERED=1
 

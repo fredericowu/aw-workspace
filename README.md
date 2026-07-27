@@ -26,8 +26,20 @@ workspace, isolado por schema Postgres).
    isolado do translate map. Tabelas de runtime (apps/app_configs/runs) são
    escopo do F5.
 
-Runtime completo (apps/terminal/presentation/gateway/redis) é **F5** — fora
-de escopo aqui.
+Runtime completo (apps/presentation/gateway/redis) é **F5** — fora de escopo
+aqui.
+
+## Migração strangler-fig (rotas portadas do monólito)
+
+O runtime cresce **portando rotas do monólito `agentic-workspace` uma a uma**,
+mantendo o contrato de API/WS idêntico pra o SPA (`repos/aw-frontend`) não mudar.
+Receita repetível + mapa "rota → plano" em **[`MIGRATION.md`](./MIGRATION.md)**.
+
+- **#1 Terminal** — `/api/terminals*` (CRUD) + `/ws/terminal/*` (PTY) rodam
+  **nesta máquina** (o shell é spawnado no host BYOD). Ver `src/api/terminal.py`
+  e `src/api/terminal_manager.py`. Sessão em memória → processo single-worker
+  (`AW_WORKSPACE_WORKERS=1`). `/api/v2/agent-sessions` existe mas vem vazio (a
+  imagem slim ainda não traz CLIs de agente).
 
 ## Rodando local
 
