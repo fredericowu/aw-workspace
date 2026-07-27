@@ -13,27 +13,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.apps.capabilities import is_valid_capability
+
 # slug rule (ADR Decision 8): the namespace key for routes/tables/commands/...
 SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{1,40}$")
 # semver-ish: MAJOR.MINOR.PATCH with optional pre-release/build
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 
 TIERS = {"inprocess", "container"}
-
-# Capability strings the consent UI knows about (ADR Decision 4). Two are
-# parameterised prefixes rather than exact matches.
-_EXACT_PERMISSIONS = {
-    "routes:register",
-    "db:own-tables",
-    "commands:install",
-    "service:manage",
-    "containers:manage",
-    "net:outbound",
-    "fs:workspace-data",
-    "secrets:own",
-    "ui:code",
-}
-_PREFIX_PERMISSIONS = ("config:extend:", "ui:slots:")
 
 
 class ManifestError(ValueError):
@@ -70,12 +57,6 @@ class Manifest:
     @property
     def nav(self) -> list[dict[str, Any]]:
         return list(self.contributes.get("nav", []))
-
-
-def _require_permission(perm: str) -> bool:
-    if perm in _EXACT_PERMISSIONS:
-        return True
-    return any(perm.startswith(p) and len(perm) > len(p) for p in _PREFIX_PERMISSIONS)
 
 
 def validate_manifest(data: dict[str, Any]) -> Manifest:
@@ -120,7 +101,7 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
     if not isinstance(permissions, list) or not all(isinstance(p, str) for p in permissions):
         raise ManifestError("permissions must be a list of strings")
     for perm in permissions:
-        if not _require_permission(perm):
+        if not is_valid_capability(perm):
             raise ManifestError(f"unknown permission {perm!r}")
 
     contributes = data.get("contributes", {})

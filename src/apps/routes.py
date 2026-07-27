@@ -21,6 +21,7 @@ from fastapi import Body, Depends, FastAPI
 from fastapi.responses import JSONResponse
 
 from src.api.identity import require_identity
+from src.apps.capabilities import filter_grants
 from src.apps.manifest import ManifestError, load_manifest
 from src.apps.runtime import AppRuntime
 
@@ -94,10 +95,16 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         if runtime.is_loaded(manifest.id):
             return JSONResponse({"error": f"{manifest.id} already installed"}, status_code=409)
 
-        granted = data.get("granted_permissions", manifest.permissions)
+        # grant-on-install (ADR Decision 4): the interactive consent UI is
+        # deferred; here the requested set defaults to the manifest's, and
+        # high-risk caps are stripped for an unsigned (side-loaded) app.
+        requested = data.get("granted_permissions", manifest.permissions)
+        signed = bool(data.get("signed", False))
+        granted, refused = filter_grants(requested, signed=signed)
         config = data.get("config", {})
         try:
-            await runtime.load(package_dir, granted_permissions=granted, config=config)
+            await runtime.load(package_dir, granted_permissions=granted,
+                               config=config, signed=signed)
         except Exception as e:  # noqa: BLE001 — surface the load failure to the caller
             log.exception("apps: install failed for %s", manifest.id)
             return JSONResponse({"error": f"load failed: {e}"}, status_code=500)
@@ -108,7 +115,8 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             except Exception:
                 log.exception("apps: could not persist install of %s", manifest.id)
 
-        return {"slug": manifest.id, "version": manifest.version, "installed": True}
+        return {"slug": manifest.id, "version": manifest.version, "installed": True,
+                "granted_permissions": granted, "refused_permissions": refused}
 
     @app.delete("/api/apps/{slug}")
     async def uninstall_app(slug: str, identity: dict = Depends(require_identity)):

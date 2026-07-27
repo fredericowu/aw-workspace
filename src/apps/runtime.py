@@ -27,6 +27,7 @@ from starlette.routing import Mount
 from starlette.types import Receive, Scope, Send
 
 from src.apps.base import AppContext, Plugin
+from src.apps.capabilities import filter_grants
 from src.apps.journal import ActionJournal
 from src.apps.manifest import Manifest, load_manifest
 
@@ -124,8 +125,15 @@ class AppRuntime:
     # ---- load / unload --------------------------------------------------
 
     async def load(self, package_dir: str, granted_permissions: list[str] | None = None,
-                   config: dict[str, Any] | None = None) -> Manifest:
-        """Validate, import, and activate an app from its package dir (hot)."""
+                   config: dict[str, Any] | None = None, signed: bool = False) -> Manifest:
+        """Validate, import, and activate an app from its package dir (hot).
+
+        ``signed`` reflects whether the package is trusted (marketplace-signed).
+        High-risk capabilities are stripped from the effective grant for an
+        unsigned app (ADR Decision 4) — defence in depth on top of the same
+        filter the cloud registry applies, so the runtime never hands out a
+        high-risk facade to a side-loaded app even if the registry row lists it.
+        """
         manifest = load_manifest(package_dir)
         if manifest.tier != "inprocess":
             raise ValueError(f"F1 runtime only loads tier=inprocess (got {manifest.tier!r})")
@@ -133,7 +141,10 @@ class AppRuntime:
         if slug in self._apps:
             raise ValueError(f"app {slug!r} is already loaded")
 
-        granted = granted_permissions if granted_permissions is not None else list(manifest.permissions)
+        requested = granted_permissions if granted_permissions is not None else list(manifest.permissions)
+        granted, refused = filter_grants(requested, signed=signed)
+        if refused:
+            log.warning("apps: refused high-risk caps %s for unsigned app %s", refused, slug)
         cfg = config or {}
 
         plugin, module_prefix = self._import_plugin(manifest, package_dir)
@@ -153,6 +164,12 @@ class AppRuntime:
             await plugin.activate(ctx)
         except Exception:
             self._loading = None
+            # residue-free failed load: drop any Mount recorded before the
+            # failure, forget journal entries (incl. capability:denied), unimport
+            if loaded.mount is not None and loaded.mount in self.host.router.routes:
+                self.host.router.routes.remove(loaded.mount)
+                self._invalidate_openapi()
+            self.journal.clear_app(slug)
             self._unimport(module_prefix)
             raise
         self._loading = None
