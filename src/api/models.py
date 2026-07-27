@@ -22,3 +22,21 @@ class Setting(SQLModel, table=True):
 
     key: str = Field(primary_key=True)
     value: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB))
+
+
+class AppInstall(SQLModel, table=True):
+    """A locally-installed decoupled app (F1 minimal registry).
+
+    The cloud (aw-backend ``app_installs``) is the source of truth for the
+    reconciler (F3); F1 persists the install here too so the workspace can
+    reload its apps on boot without a round-trip. One row per installed app.
+    """
+
+    __tablename__ = "app_installs"  # type: ignore[assignment]
+
+    slug: str = Field(primary_key=True)
+    version: str
+    package_dir: str
+    granted_permissions: list[str] = Field(default_factory=list, sa_column=Column(JSONB))
+    config: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB))
+    enabled: bool = True

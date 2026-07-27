@@ -1,0 +1,29 @@
+{
+  "title": "Hello App",
+  "layout": "single",
+  "regions": [
+    {
+      "id": "body",
+      "widgets": [
+        {
+          "type": "markdown",
+          "value": "# Hello 👋\nThis window body was rendered from a declarative spec shipped by a hot-installed app — no frontend code was loaded into the SPA."
+        },
+        {
+          "type": "button",
+          "label": "Ping backend",
+          "action": { "call": "GET /api/apps/hello/" }
+        },
+        {
+          "type": "list",
+          "title": "What this proves",
+          "items": [
+            "Backend route mounted at /api/apps/hello with no workspace restart",
+            "Declarative window body rendered by the generic AppWindow",
+            "Uninstall removes both, leaving no residue"
+          ]
+        }
+      ]
+    }
+  ]
+}

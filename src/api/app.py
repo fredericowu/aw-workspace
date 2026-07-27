@@ -11,6 +11,8 @@ import logging
 import os
 import re
 
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -18,6 +20,7 @@ from src.api.db import create_all_tables, get_session, get_workspace_schema
 from src.api.identity import _extract_token, decode_identity_jwt, require_identity
 from src.api.models import Setting
 from src.api.terminal import register_terminal_routes
+from src.apps.routes import reconcile_on_boot, register_apps_routes
 
 log = logging.getLogger(__name__)
 
@@ -38,7 +41,13 @@ def _spa_origin_regex() -> str:
 def create_app() -> FastAPI:
     create_all_tables()
 
-    app = FastAPI(title="aw-workspace", version="0.1.0")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Reload locally-installed apps into the running process on startup.
+        await reconcile_on_boot(app.state.app_runtime)
+        yield
+
+    app = FastAPI(title="aw-workspace", version="0.1.0", lifespan=lifespan)
 
     # SPA→API is cross-origin (same apex) and credentialed — allow the SPA
     # origin with credentials so the apex aw_id_jwt cookie is accepted and
@@ -88,5 +97,10 @@ def create_app() -> FastAPI:
     # In-memory session state → must run single-worker (see AW_WORKSPACE_WORKERS
     # in the Dockerfile/compose and MIGRATION.md).
     register_terminal_routes(app)
+
+    # Decoupled-apps framework (F1): plugin runtime + /api/apps management.
+    # Tier-1 apps hot-load into THIS process — no restart. Installed apps are
+    # reloaded from the local registry on startup.
+    register_apps_routes(app)
 
     return app
