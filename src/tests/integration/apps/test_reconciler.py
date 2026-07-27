@@ -1,8 +1,11 @@
 """Reconciler tests (F3 acceptance core) — desired-vs-actual convergence.
 
 Uses a fresh ``AppRuntime`` on a bare FastAPI host, an in-memory fake cloud
-registry + local mirror (so no PG/network), and the REAL git fetch against a
-``file://`` repo. Proves:
+registry + local mirror (so no PG/network), and a fake ``fetch`` (a plain
+directory copy) injected into the ``Reconciler`` in place of the real HTTP
+tarball fetch (``src/apps/fetch.py``) — the reconciler's own convergence
+logic is what's under test here, not the fetch transport (see
+``test_fetch.py`` for tarball-download/extraction coverage). Proves:
 
 * install → repo fetched, plugin hot-loaded (route answers), registry rows written;
 * workspace recreation (fresh runtime, empty loaded-set, registry populated) →
@@ -13,7 +16,7 @@ registry + local mirror (so no PG/network), and the REAL git fetch against a
 from __future__ import annotations
 
 import asyncio
-import subprocess
+import shutil
 import sys
 import textwrap
 
@@ -21,6 +24,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from src.apps import fetch as fetch_mod
 from src.apps.reconciler import AppSpec, Reconciler
 from src.apps.runtime import AppRuntime
 
@@ -29,17 +33,19 @@ def _async(coro):
     return asyncio.run(coro)
 
 
-def _git(cwd, *args):
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
-                   env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
-                        "HOME": str(cwd)})
+def _fake_fetch(repo: str, ref: str = "HEAD", *, slug: str, token=None, dest=None) -> str:
+    """Stand-in for the real tarball fetch: ``repo`` is a source dir on disk."""
+    dest = dest or fetch_mod.package_dir_for(slug)
+    if dest != repo:
+        if shutil.os.path.exists(dest):  # noqa: SIM108 - mirrors fetch.py's swap
+            shutil.rmtree(dest)
+        shutil.copytree(repo, dest)
+    return dest
 
 
 def _make_app_repo(tmp_path, slug="widget"):
     src = tmp_path / f"src_{slug}"
     src.mkdir()
-    _git(src, "init", "-q", "-b", "main")
     (src / "aw-app.json").write_text(textwrap.dedent(f"""
     {{
       "manifest_version": 1,
@@ -64,9 +70,7 @@ def _make_app_repo(tmp_path, slug="widget"):
             async def deactivate(self):
                 return None
     """))
-    _git(src, "add", "-A")
-    _git(src, "commit", "-qm", "v1")
-    return f"file://{src}"
+    return str(src)
 
 
 class FakeCloud:
@@ -118,7 +122,7 @@ def _reconciler(tmp_path, monkeypatch, cloud):
     monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path / "apps"))
     host = FastAPI()
     rt = AppRuntime(host)
-    rc = Reconciler(rt, cloud=cloud, local=FakeMirror())
+    rc = Reconciler(rt, cloud=cloud, local=FakeMirror(), fetch=_fake_fetch)
     return host, rt, rc
 
 
