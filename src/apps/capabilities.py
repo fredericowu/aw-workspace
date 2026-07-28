@@ -32,6 +32,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "net:outbound":      {"risk": "low",  "desc": "make outbound HTTP from Tier-1 code"},
     "fs:workspace-data": {"risk": "low",  "desc": "read/write under the app's own data dir"},
     "secrets:own":       {"risk": "low",  "desc": "request the app's own secrets"},
+    "notifications:send": {"risk": "low", "desc": "fire a notification via the workspace notification engine"},
     "containers:manage": {"risk": "high", "desc": "run/manage sidecar containers"},
     "ui:code":           {"risk": "high", "desc": "load the app's JS bundle into the SPA context"},
 }

@@ -20,6 +20,7 @@ Which plane owns which route family. Update this table with every migration.
 | **`/api/terminals*`, `/ws/terminal/*`** | **aw-workspace** | migration #1 — PTY shells run on the BYOD host |
 | `/api/v2/agent-sessions*` | **aw-workspace** | present but empty (no agent CLIs on the slim image yet) |
 | `/ws/status` | **aw-workspace** | slim subset — terminal list push only, for now |
+| **`/api/notify*`, `/ws/notifications`** | **aw-workspace** | notification engine — also reachable from Tier-1 apps via `ctx.notify` (`notifications:send`) |
 | `/api/tasks*`, `/api/plans*`, agent execution, `/api/files*` | monolith (not yet migrated) | future strangler steps |
 
 The rest of the dashboard's routes are still served by the monolith on the

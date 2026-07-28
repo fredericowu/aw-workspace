@@ -24,6 +24,29 @@ class Setting(SQLModel, table=True):
     value: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB))
 
 
+class Notification(SQLModel, table=True):
+    """Persistent notification queue — one row per notification event.
+
+    Strangler-fig port of the monolith's ``src/api/db_models.py::Notification``
+    (identical columns) — see ``src/api/notifications.py`` / ``notification_db.py``.
+    """
+
+    __tablename__ = "notifications"  # type: ignore[assignment]
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    message: str
+    level: str = Field(default="info")
+    title: str = Field(default="")
+    source: str = Field(default="")
+    url: str = Field(default="")
+    external_id: str = Field(default="")
+    external_status: str = Field(default="")
+    status: str = Field(default="new")
+    created_at: Optional[float] = Field(default=None)
+    delivered_at: Optional[float] = Field(default=None)
+    read_at: Optional[float] = Field(default=None)
+
+
 class AppInstall(SQLModel, table=True):
     """A locally-installed decoupled app (F1 minimal registry).
 

@@ -168,6 +168,25 @@ class DbFacade(_Facade):
             self._ctx.app_id, name, sql, params)
 
 
+class NotificationsFacade(_Facade):
+    """``ctx.notify`` — fire a notification through the workspace notification engine.
+
+    Gated by ``notifications:send``. Routes into the same ``NotificationManager``
+    singleton ``/api/notify`` and ``/ws/notifications`` use (``src.api.notifications``,
+    stashed on ``app.state.notification_mgr``), so an app-fired notification shows
+    up in the SPA's notification panel exactly like an external ``POST /api/notify``.
+    """
+
+    def __call__(self, message: str, level: str = "info", title: str = "",
+                 url: str = "", **kwargs: Any) -> dict[str, Any] | None:
+        self._ctx._enforce("notifications:send")
+        mgr = self._ctx._runtime.host.state.notification_mgr
+        return mgr.add_notification(
+            message=message, level=level, title=title,
+            source=self._ctx.app_id, url=url, **kwargs,
+        )
+
+
 class ServicesFacade(_Facade):
     """``ctx.services`` — register + control a start/stop background service.
 
@@ -206,6 +225,7 @@ _FACADES: dict[str, tuple[str, type[_Facade]]] = {
     "secrets:own":      ("secrets", SecretsFacade),
     "db:own-tables":    ("db", DbFacade),
     "service:manage":   ("services", ServicesFacade),
+    "notifications:send": ("notify", NotificationsFacade),
 }
 
 
@@ -275,6 +295,10 @@ class AppContext:
     @property
     def services(self) -> ServicesFacade:
         return self._get_facade("services", "service:manage")  # type: ignore[return-value]
+
+    @property
+    def notify(self) -> NotificationsFacade:
+        return self._get_facade("notify", "notifications:send")  # type: ignore[return-value]
 
     def on_deactivate(self, hook: Callable[[], Awaitable[None] | None]) -> None:
         """Register a callback run on unload (e.g. cancel a long-poll/WS)."""

@@ -7,6 +7,7 @@ proves the two F2 primitives wire together: a schema-isolated engine
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -19,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.db import create_all_tables, get_session, get_workspace_schema
 from src.api.identity import _extract_token, decode_identity_jwt, require_identity
 from src.api.models import Setting
+from src.api.notifications import register_notification_routes
 from src.api.terminal import register_terminal_routes
 from src.apps.routes import reconcile_on_boot, register_apps_routes
 
@@ -43,6 +45,9 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # In-process broadcast needs the running loop to schedule sends from
+        # sync callers (e.g. the apps facade) — see NotificationManager.set_loop.
+        app.state.notification_mgr.set_loop(asyncio.get_running_loop())
         # Converge the running app set to the cloud registry on startup — a
         # fresh/recreated workspace auto-reinstalls the user's apps (F3).
         await reconcile_on_boot(app)
@@ -98,6 +103,12 @@ def create_app() -> FastAPI:
     # In-memory session state → must run single-worker (see AW_WORKSPACE_WORKERS
     # in the Dockerfile/compose and MIGRATION.md).
     register_terminal_routes(app)
+
+    # Notification engine (strangler migration): POST /api/notify + WS
+    # /ws/notifications, backed by this workspace's own Postgres schema. Any
+    # Tier-1 app can also fire through it via AppContext.notifications
+    # (src/apps/base.py), which reaches the same manager off app.state.
+    register_notification_routes(app)
 
     # Decoupled-apps framework (F1): plugin runtime + /api/apps management.
     # Tier-1 apps hot-load into THIS process — no restart. Installed apps are

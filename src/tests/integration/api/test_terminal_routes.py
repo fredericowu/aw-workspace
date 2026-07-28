@@ -41,11 +41,15 @@ def ctx(monkeypatch):
     monkeypatch.setenv("AW_WORKSPACE_SCHEMA", "workspace_test")
     monkeypatch.setenv("AW_AUTH_PUBLIC_KEY", pub)
 
-    import src.api.db as db
-    monkeypatch.setattr(db, "create_all_tables", lambda: None)
-
     from starlette.testclient import TestClient
+    import src.api.app as app_module
     from src.api.app import create_app
+
+    # Patch the name as bound into src.api.app (`from src.api.db import
+    # create_all_tables`), not src.api.db itself — src.api.app may already be
+    # imported (and its own reference already resolved) by an earlier test in
+    # the same session, in which case patching src.api.db has no effect here.
+    monkeypatch.setattr(app_module, "create_all_tables", lambda: None)
 
     token = pyjwt.encode(
         {"sub": "u1", "exp": int(time.time()) + 3600}, priv, algorithm="EdDSA"
