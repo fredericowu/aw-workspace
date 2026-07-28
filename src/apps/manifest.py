@@ -25,8 +25,12 @@ TIERS = {"inprocess", "container"}
 # Marketplace metadata (F6b): optional, defaulted at validation time so
 # existing manifests keep working unchanged.
 DEFAULT_PUBLISHER = "TekFlox"
+# Only CPU is a traffic-light level (green/amber/red in the UI). Memory and
+# disk are FREE-FORM estimates of *server* usage — a size string like "~200 MB"
+# / "1 GB", or "-" for something that doesn't stay resident (e.g. the git app
+# just installs a CLI; nothing runs in memory). See manifest schema notes.
 RESOURCE_LEVELS = {"low", "medium", "high"}
-DEFAULT_RESOURCE_ESTIMATE = {"cpu": "low", "memory": "low", "disk": "low"}
+DEFAULT_RESOURCE_ESTIMATE = {"cpu": "low", "memory": "-", "disk": "-"}
 
 
 class ManifestError(ValueError):
@@ -196,11 +200,19 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
     if not isinstance(resource_estimate_in, dict):
         raise ManifestError("resource_estimate must be an object")
     resource_estimate = {**DEFAULT_RESOURCE_ESTIMATE, **resource_estimate_in}
-    for key in ("cpu", "memory", "disk"):
-        if resource_estimate.get(key) not in RESOURCE_LEVELS:
+    # CPU is a traffic-light level; memory/disk are free-form size estimates
+    # (or "-"). Normalize memory/disk to a string so the UI can render them raw.
+    if resource_estimate.get("cpu") not in RESOURCE_LEVELS:
+        raise ManifestError(
+            f"resource_estimate.cpu must be one of {sorted(RESOURCE_LEVELS)} "
+            f"(got {resource_estimate.get('cpu')!r})"
+        )
+    for key in ("memory", "disk"):
+        val = resource_estimate.get(key)
+        if not isinstance(val, str) or not val.strip():
             raise ManifestError(
-                f"resource_estimate.{key} must be one of {sorted(RESOURCE_LEVELS)} "
-                f"(got {resource_estimate.get(key)!r})"
+                f"resource_estimate.{key} must be a non-empty string "
+                f'(a size estimate like "~200 MB" or "-"; got {val!r})'
             )
 
     return Manifest(

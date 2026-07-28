@@ -182,7 +182,7 @@ def test_catalog_entry_enriched_with_publisher_resource_estimate_and_what_you_ge
     result = catalog_mod.get_catalog(force=True)
     app = result["apps"][0]
     assert app["publisher"] == "TekFlox"
-    assert app["resource_estimate"] == {"cpu": "low", "memory": "low", "disk": "low"}
+    assert app["resource_estimate"] == {"cpu": "low", "memory": "-", "disk": "-"}
     assert app["what_you_get"] == {
         "mcp_tools": [], "ui_screens": ["Git & GitHub CLI", "Git"], "commands": ["git", "gh"],
     }

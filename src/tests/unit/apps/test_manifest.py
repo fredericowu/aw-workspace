@@ -109,19 +109,26 @@ def test_bad_publisher_rejected():
         validate_manifest(_m(publisher=""))
 
 
-def test_resource_estimate_defaults_to_low():
+def test_resource_estimate_defaults_cpu_low_mem_disk_dash():
+    # CPU is a traffic-light level; memory/disk default to "-" (not resident).
     m = validate_manifest(VALID)
-    assert m.resource_estimate == {"cpu": "low", "memory": "low", "disk": "low"}
+    assert m.resource_estimate == {"cpu": "low", "memory": "-", "disk": "-"}
 
 
 def test_resource_estimate_partial_override_fills_defaults():
-    m = validate_manifest(_m(resource_estimate={"memory": "high"}))
-    assert m.resource_estimate == {"cpu": "low", "memory": "high", "disk": "low"}
+    m = validate_manifest(_m(resource_estimate={"cpu": "medium", "memory": "~450 MB"}))
+    assert m.resource_estimate == {"cpu": "medium", "memory": "~450 MB", "disk": "-"}
 
 
-@pytest.mark.parametrize("bad", [{"cpu": "extreme", "memory": "low", "disk": "low"}, {"cpu": 1, "memory": "low", "disk": "low"}])
-def test_bad_resource_estimate_level_rejected(bad):
-    with pytest.raises(ManifestError, match="resource_estimate"):
+@pytest.mark.parametrize("bad", [{"cpu": "extreme"}, {"cpu": 1}])
+def test_bad_resource_estimate_cpu_level_rejected(bad):
+    with pytest.raises(ManifestError, match="resource_estimate.cpu"):
+        validate_manifest(_m(resource_estimate=bad))
+
+
+@pytest.mark.parametrize("bad", [{"memory": ""}, {"disk": 512}, {"memory": None}])
+def test_bad_resource_estimate_mem_disk_must_be_nonempty_string(bad):
+    with pytest.raises(ManifestError, match="resource_estimate.(memory|disk)"):
         validate_manifest(_m(resource_estimate=bad))
 
 
