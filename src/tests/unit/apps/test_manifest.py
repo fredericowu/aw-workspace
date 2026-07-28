@@ -90,8 +90,23 @@ def test_window_id_must_be_namespaced():
 
 def test_container_tier_needs_no_entrypoint():
     m = validate_manifest(_m(tier="container", runtime={"image": "ghcr.io/x", "port": 8080},
-                             permissions=[], contributes={}))
+                             permissions=["containers:manage"], contributes={}))
     assert m.tier == "container"
+
+
+def test_container_tier_requires_image_port_and_permission():
+    # missing image
+    with pytest.raises(ManifestError):
+        validate_manifest(_m(tier="container", runtime={"port": 8080},
+                             permissions=["containers:manage"], contributes={}))
+    # missing/invalid port
+    with pytest.raises(ManifestError):
+        validate_manifest(_m(tier="container", runtime={"image": "ghcr.io/x"},
+                             permissions=["containers:manage"], contributes={}))
+    # missing containers:manage
+    with pytest.raises(ManifestError):
+        validate_manifest(_m(tier="container", runtime={"image": "ghcr.io/x", "port": 8080},
+                             permissions=[], contributes={}))
 
 
 def test_publisher_defaults_to_tekflox():

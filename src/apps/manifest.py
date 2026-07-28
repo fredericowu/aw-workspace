@@ -164,6 +164,11 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
         raise ManifestError("inprocess apps require runtime.entrypoint (\"module:Class\")")
     if tier == "inprocess" and ":" not in str(runtime.get("entrypoint", "")):
         raise ManifestError("runtime.entrypoint must be \"module:ClassName\"")
+    if tier == "container":
+        if not str(runtime.get("image", "")).strip():
+            raise ManifestError("container apps require runtime.image")
+        if not isinstance(runtime.get("port"), int) or runtime.get("port") <= 0:
+            raise ManifestError("container apps require a positive integer runtime.port")
 
     permissions = data.get("permissions", [])
     if not isinstance(permissions, list) or not all(isinstance(p, str) for p in permissions):
@@ -171,6 +176,8 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
     for perm in permissions:
         if not is_valid_capability(perm):
             raise ManifestError(f"unknown permission {perm!r}")
+    if tier == "container" and "containers:manage" not in permissions:
+        raise ManifestError("container apps require the 'containers:manage' permission")
 
     contributes = data.get("contributes", {})
     if not isinstance(contributes, dict):

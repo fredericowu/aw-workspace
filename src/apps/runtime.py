@@ -32,8 +32,10 @@ import types
 from src.apps.base import AppContext, Plugin
 from src.apps.capabilities import filter_grants
 from src.apps.commands import CommandInstaller
+from src.apps.containers import ContainerError, ContainerSupervisor
 from src.apps.journal import ActionJournal
 from src.apps.manifest import Manifest, load_manifest
+from src.apps.proxy import ContainerReverseProxy
 from src.apps.secret_store import SecretStore
 from src.apps.services import ServiceSupervisor
 from src.apps.watchdog import WatchdogSupervisor
@@ -187,6 +189,21 @@ class _DrainableApp:
             return False
 
 
+class _ContainerPlugin(Plugin):
+    """No-op plugin standing in for a Tier-2 (container) app.
+
+    A container app runs its backend in the container, not in-process — there is
+    no Python entrypoint to activate. This keeps the ``LoadedApp`` shape uniform
+    (drain hooks / deactivate() are safe no-ops) so unload works unchanged.
+    """
+
+    async def activate(self, ctx: "AppContext") -> None:  # pragma: no cover
+        return None
+
+    async def deactivate(self) -> None:
+        return None
+
+
 @dataclass
 class LoadedApp:
     manifest: Manifest
@@ -219,6 +236,7 @@ class AppRuntime:
         # F4 effect backends the capability facades route through.
         self.commands = CommandInstaller()
         self.services = ServiceSupervisor()
+        self.containers = ContainerSupervisor()
         self.watchdog = WatchdogSupervisor()
         self.secret_store = SecretStore()
         self._db_tables: Any = None  # lazy — only apps granted db:own-tables need it
@@ -325,11 +343,14 @@ class AppRuntime:
         high-risk facade to a side-loaded app even if the registry row lists it.
         """
         manifest = load_manifest(package_dir)
-        if manifest.tier != "inprocess":
-            raise ValueError(f"F1 runtime only loads tier=inprocess (got {manifest.tier!r})")
         slug = manifest.id
         if slug in self._apps:
             raise ValueError(f"app {slug!r} is already loaded")
+        if manifest.tier == "container":
+            return await self._load_container(
+                manifest, package_dir, granted_permissions, config or {}, signed)
+        if manifest.tier != "inprocess":
+            raise ValueError(f"runtime only loads tier=inprocess|container (got {manifest.tier!r})")
 
         requested = granted_permissions if granted_permissions is not None else list(manifest.permissions)
         granted, refused = filter_grants(requested, signed=signed)
@@ -448,6 +469,8 @@ class AppRuntime:
             self.db_tables.drop(loaded.manifest.id, entry.target)
         elif kind == "service:register":
             self.services.stop_all_for(loaded.manifest.id)
+        elif kind == "container:register":
+            self.containers.stop_all_for(loaded.manifest.id)
         elif kind == "watchdog:register":
             # Idempotent with the explicit cancel_all_for in unload() above.
             self.watchdog.cancel_all_for(loaded.manifest.id)
@@ -463,8 +486,17 @@ class AppRuntime:
             raise RuntimeError("routes.register() may only be called during activate()")
         if loaded.mount is not None:
             raise RuntimeError(f"app {app_id!r} already mounted a sub-app")
+        self._attach_mount(loaded, subapp)
 
-        drainable = _DrainableApp(subapp)
+    def _attach_mount(self, loaded: LoadedApp, asgi_app: Any) -> None:
+        """Mount an ASGI app (Tier-1 sub-app or Tier-2 reverse proxy) hot.
+
+        Wraps it in the drain tracker + :class:`IdentityGuard` and journals the
+        ``route:mount`` so unload removes it. Shared by the Tier-1 routes facade
+        (:meth:`_mount`) and the Tier-2 container path (:meth:`_load_container`).
+        """
+        app_id = loaded.manifest.id
+        drainable = _DrainableApp(asgi_app)
         # IdentityGuard sits OUTSIDE the drain tracker so a rejected (401/4401)
         # request is never counted as in-flight against unload's drain.
         guarded = IdentityGuard(drainable) if self.guard_identity else drainable
@@ -476,6 +508,72 @@ class AppRuntime:
         loaded.drainable = drainable
         self.journal.record(app_id, "route:mount", f"/api/apps/{app_id}",
                             {"version": loaded.manifest.version})
+
+    # ---- Tier-2 (container) load ---------------------------------------
+
+    async def _load_container(self, manifest: Manifest, package_dir: str,
+                              granted_permissions: list[str] | None,
+                              config: dict[str, Any], signed: bool) -> Manifest:
+        """Load a ``tier: container`` app (Phase 6): spawn the image, reverse-proxy it.
+
+        No Python entrypoint runs; the runtime brings up the container via the
+        :class:`ContainerSupervisor` and mounts a :class:`ContainerReverseProxy`
+        at ``/api/apps/<slug>`` behind the same IdentityGuard as Tier-1. Enforces
+        ``containers:manage`` (high-risk → the grant filter strips it from an
+        unsigned app, so Tier-2 needs a signed/marketplace app).
+        """
+        slug = manifest.id
+        requested = granted_permissions if granted_permissions is not None else list(manifest.permissions)
+        granted, refused = filter_grants(requested, signed=signed)
+        if refused:
+            log.warning("apps: refused high-risk caps %s for unsigned app %s", refused, slug)
+        if "containers:manage" not in granted:
+            raise PermissionError(
+                f"app {slug!r} tier=container requires the 'containers:manage' "
+                f"capability (high-risk — signed/marketplace apps only)")
+        if not self.containers.available:
+            raise ContainerError(
+                f"Tier-2 unavailable: no container engine socket configured "
+                f"(AW_CONTAINER_SOCKET) — cannot load {slug!r}")
+
+        rt = manifest.runtime
+        image = str(rt.get("image", ""))
+        port = rt.get("port")
+        resources = rt.get("resources") or {}
+        run_flags = rt.get("run_flags_needed") or rt.get("run_flags") or []
+
+        ctx = AppContext(
+            runtime=self, app_id=slug, version=manifest.version,
+            granted_permissions=granted, config=config, package_dir=package_dir,
+        )
+        loaded = LoadedApp(
+            manifest=manifest, plugin=_ContainerPlugin(), ctx=ctx,
+            package_dir=package_dir, granted_permissions=granted, config=config,
+            signed=signed, module_prefix="",
+        )
+
+        self.containers.register(
+            slug, image, port, run_flags=run_flags, resources=resources)
+        self.journal.record(slug, "container:register", image,
+                            {"port": port, "run_flags": run_flags, "resources": resources})
+        try:
+            self.containers.start(slug)
+            proxy = ContainerReverseProxy(self.containers.base_url(slug))
+            self._attach_mount(loaded, proxy)
+        except Exception:
+            # residue-free failed load: drop the Mount + stop the container +
+            # forget journal entries for this app.
+            if loaded.mount is not None and loaded.mount in self.host.router.routes:
+                self.host.router.routes.remove(loaded.mount)
+            self.containers.stop_all_for(slug)
+            self.journal.clear_app(slug)
+            raise
+
+        self._apps[slug] = loaded
+        self._invalidate_openapi()
+        log.info("apps: loaded container app %s v%s (image=%s)",
+                 slug, manifest.version, image)
+        return manifest
 
     # ---- import isolation ----------------------------------------------
 

@@ -236,6 +236,45 @@ class ServicesFacade(_Facade):
         return self._ctx._runtime.services.status(self._ctx.app_id, service_id)
 
 
+class ContainersFacade(_Facade):
+    """``ctx.containers`` — run + control a Tier-2 sidecar container.
+
+    Gated by ``containers:manage`` (high-risk → signed apps only). Registration
+    journals ``container:register`` so uninstall stops + removes it (Phase 6
+    supervisor). Mirrors :class:`ServicesFacade` but backed by the container
+    engine socket instead of a subprocess.
+    """
+
+    def register(self, image: str, port: int, run_flags: list[str] | None = None,
+                 resources: dict[str, Any] | None = None,
+                 env: dict[str, str] | None = None,
+                 autostart: bool = False) -> dict[str, Any]:
+        self._ctx._enforce("containers:manage")
+        self._ctx._runtime.containers.register(
+            self._ctx.app_id, image, port, run_flags=run_flags,
+            resources=resources, env=env, autostart=autostart)
+        self._ctx._runtime.journal.record(
+            self._ctx.app_id, "container:register", image,
+            {"port": port, "run_flags": run_flags or [], "resources": resources or {}})
+        return {"container": f"aw-app-{self._ctx.app_id}", "registered": True}
+
+    def start(self) -> dict[str, Any]:
+        self._ctx._enforce("containers:manage")
+        return self._ctx._runtime.containers.start(self._ctx.app_id)
+
+    def stop(self) -> dict[str, Any]:
+        self._ctx._enforce("containers:manage")
+        return self._ctx._runtime.containers.stop(self._ctx.app_id)
+
+    def status(self) -> dict[str, Any]:
+        self._ctx._enforce("containers:manage")
+        return self._ctx._runtime.containers.status(self._ctx.app_id)
+
+    def stop_all_for(self) -> None:
+        self._ctx._enforce("containers:manage")
+        self._ctx._runtime.containers.stop_all_for(self._ctx.app_id)
+
+
 # capability -> (attribute name, facade class). One facade per single-capability
 # contribution surface. Parameterised caps (config:extend:*, ui:slots:*) and the
 # cross-app extension registry are F7 and not exposed as facades here.
@@ -247,6 +286,7 @@ _FACADES: dict[str, tuple[str, type[_Facade]]] = {
     "service:manage":   ("services", ServicesFacade),
     "watchdog:tasks":   ("watchdog", WatchdogFacade),
     "notifications:send": ("notify", NotificationsFacade),
+    "containers:manage": ("containers", ContainersFacade),
 }
 
 
@@ -324,6 +364,10 @@ class AppContext:
     @property
     def notify(self) -> NotificationsFacade:
         return self._get_facade("notify", "notifications:send")  # type: ignore[return-value]
+
+    @property
+    def containers(self) -> ContainersFacade:
+        return self._get_facade("containers", "containers:manage")  # type: ignore[return-value]
 
     def on_deactivate(self, hook: Callable[[], Awaitable[None] | None]) -> None:
         """Register a callback run on unload (e.g. cancel a long-poll/WS)."""
