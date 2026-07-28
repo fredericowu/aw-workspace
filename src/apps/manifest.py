@@ -22,6 +22,12 @@ SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 
 TIERS = {"inprocess", "container"}
 
+# Marketplace metadata (F6b): optional, defaulted at validation time so
+# existing manifests keep working unchanged.
+DEFAULT_PUBLISHER = "TekFlox"
+RESOURCE_LEVELS = {"low", "medium", "high"}
+DEFAULT_RESOURCE_ESTIMATE = {"cpu": "low", "memory": "low", "disk": "low"}
+
 
 class ManifestError(ValueError):
     """Raised when an ``aw-app.json`` fails v1 validation."""
@@ -43,6 +49,8 @@ class Manifest:
     config_schema: dict[str, Any] = field(default_factory=dict)
     dependencies: dict[str, Any] = field(default_factory=dict)
     migrations: dict[str, Any] = field(default_factory=dict)
+    publisher: str = DEFAULT_PUBLISHER
+    resource_estimate: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_RESOURCE_ESTIMATE))
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -80,6 +88,39 @@ class Manifest:
     def has_config(self) -> bool:
         """True when the app exposes a settings/config surface the gear opens."""
         return bool(self.settings_panels or self.config_schema.get("properties"))
+
+    @property
+    def what_you_get(self) -> dict[str, list[str]]:
+        """Marketplace detail-view summary — MCP tools / UI screens / runnable
+        commands, derived from ``contributes`` (empty where nothing is declared)."""
+        mcp_tools: list[str] = []
+        for tool in self.contributes.get("mcp", {}).get("provides", []):
+            if isinstance(tool, dict) and tool.get("name"):
+                mcp_tools.append(str(tool["name"]))
+            elif isinstance(tool, str) and tool:
+                mcp_tools.append(tool)
+
+        ui_screens: list[str] = []
+        for win in self.windows:
+            label = win.get("title") or win.get("id")
+            if label and label not in ui_screens:
+                ui_screens.append(str(label))
+        for entry in self.nav:
+            label = entry.get("label")
+            if label and label not in ui_screens:
+                ui_screens.append(str(label))
+
+        commands: list[str] = []
+        for cli in self.contributes.get("system_clis", []):
+            if isinstance(cli, dict) and cli.get("name"):
+                commands.append(str(cli["name"]))
+        for cmd in self.contributes.get("commands", []):
+            if isinstance(cmd, dict) and cmd.get("name"):
+                commands.append(str(cmd["name"]))
+            elif isinstance(cmd, str) and cmd:
+                commands.append(cmd)
+
+        return {"mcp_tools": mcp_tools, "ui_screens": ui_screens, "commands": commands}
 
 
 def validate_manifest(data: dict[str, Any]) -> Manifest:
@@ -147,6 +188,21 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
     if not isinstance(config_schema, dict):
         raise ManifestError("config_schema must be an object")
 
+    publisher = data.get("publisher", DEFAULT_PUBLISHER)
+    if not isinstance(publisher, str) or not publisher.strip():
+        raise ManifestError("publisher must be a non-empty string")
+
+    resource_estimate_in = data.get("resource_estimate", {})
+    if not isinstance(resource_estimate_in, dict):
+        raise ManifestError("resource_estimate must be an object")
+    resource_estimate = {**DEFAULT_RESOURCE_ESTIMATE, **resource_estimate_in}
+    for key in ("cpu", "memory", "disk"):
+        if resource_estimate.get(key) not in RESOURCE_LEVELS:
+            raise ManifestError(
+                f"resource_estimate.{key} must be one of {sorted(RESOURCE_LEVELS)} "
+                f"(got {resource_estimate.get(key)!r})"
+            )
+
     return Manifest(
         id=slug,
         name=name,
@@ -160,6 +216,8 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
         config_schema=config_schema,
         dependencies=data.get("dependencies", {}) or {},
         migrations=data.get("migrations", {}) or {},
+        publisher=publisher,
+        resource_estimate=resource_estimate,
         raw=data,
     )
 

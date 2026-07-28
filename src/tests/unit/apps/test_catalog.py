@@ -155,6 +155,53 @@ def test_token_sent_as_bearer_header_when_configured(monkeypatch):
     assert seen_headers[0]["Authorization"] == "Bearer secret-token"
 
 
+def test_catalog_entry_enriched_with_publisher_resource_estimate_and_what_you_get(monkeypatch):
+    manifest_payload = {
+        "manifest_version": 1,
+        "id": "git",
+        "name": "Git",
+        "version": "0.1.0",
+        "tier": "inprocess",
+        "runtime": {"entrypoint": "git_app.plugin:GitAppPlugin"},
+        "permissions": [],
+        "contributes": {
+            "windows": [{"id": "git.main", "title": "Git & GitHub CLI"}],
+            "nav": [{"id": "git.nav", "label": "Git", "opens": "git.main"}],
+            "system_clis": [{"name": "git", "installer": "x.sh"}, {"name": "gh", "installer": "y.sh"}],
+        },
+    }
+
+    def fake_get(url, headers=None, timeout=None):
+        if url.endswith("apps.json"):
+            return _resp({"apps": [{"id": "git", "name": "Git", "repo": "tekflox/aw-app-git", "ref": "main"}]})
+        assert url == "https://raw.githubusercontent.com/tekflox/aw-app-git/main/aw-app.json"
+        return _resp(manifest_payload)
+
+    monkeypatch.setattr(catalog_mod.httpx, "get", fake_get)
+
+    result = catalog_mod.get_catalog(force=True)
+    app = result["apps"][0]
+    assert app["publisher"] == "TekFlox"
+    assert app["resource_estimate"] == {"cpu": "low", "memory": "low", "disk": "low"}
+    assert app["what_you_get"] == {
+        "mcp_tools": [], "ui_screens": ["Git & GitHub CLI", "Git"], "commands": ["git", "gh"],
+    }
+
+
+def test_catalog_entry_manifest_fetch_failure_leaves_entry_unenriched(monkeypatch):
+    def fake_get(url, headers=None, timeout=None):
+        if url.endswith("apps.json"):
+            return _resp({"apps": [{"id": "git", "name": "Git", "repo": "tekflox/aw-app-git", "ref": "main"}]})
+        raise httpx.ConnectError("down", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(catalog_mod.httpx, "get", fake_get)
+
+    result = catalog_mod.get_catalog(force=True)
+    app = result["apps"][0]
+    assert "publisher" not in app
+    assert "what_you_get" not in app
+
+
 def test_ttl_cache_avoids_refetch_until_forced(monkeypatch):
     calls = {"n": 0}
 

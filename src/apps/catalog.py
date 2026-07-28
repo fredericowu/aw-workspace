@@ -52,6 +52,7 @@ from typing import Any
 
 import httpx
 
+from src.apps.manifest import ManifestError, validate_manifest
 from src.apps.paths import workspace_home
 
 log = logging.getLogger(__name__)
@@ -110,6 +111,49 @@ def _fetch_source(source: str, timeout: float = 15.0) -> list[dict[str, Any]]:
     return data["apps"]
 
 
+def _manifest_raw_url(repo: str, ref: str) -> str:
+    return f"https://raw.githubusercontent.com/{repo}/{ref or 'master'}/aw-app.json"
+
+
+def _fetch_app_manifest(repo: str, ref: str, timeout: float = 10.0) -> dict[str, Any] | None:
+    """Best-effort raw GET of an app's own ``aw-app.json`` (public repo, no auth)."""
+    url = _manifest_raw_url(repo, ref)
+    headers = {}
+    token = _git_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        resp = httpx.get(url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        return json.loads(resp.text)
+    except Exception as e:  # noqa: BLE001 — one bad manifest shouldn't break the catalog
+        log.warning("apps: catalog manifest fetch failed for %s@%s: %s", repo, ref, e)
+        return None
+
+
+def _enrich_with_manifest(app: dict[str, Any]) -> dict[str, Any]:
+    """Add ``publisher`` / ``resource_estimate`` / ``what_you_get`` to a catalog
+    entry, derived from the app's own ``aw-app.json`` (best-effort — the entry
+    is returned unchanged if the manifest can't be fetched or fails validation)."""
+    repo = app.get("repo")
+    if not repo:
+        return app
+    data = _fetch_app_manifest(repo, app.get("ref") or "master")
+    if data is None:
+        return app
+    try:
+        manifest = validate_manifest(data)
+    except ManifestError as e:
+        log.warning("apps: catalog manifest invalid for %s: %s", repo, e)
+        return app
+    return {
+        **app,
+        "publisher": app.get("publisher") or manifest.publisher,
+        "resource_estimate": app.get("resource_estimate") or manifest.resource_estimate,
+        "what_you_get": manifest.what_you_get,
+    }
+
+
 def _merge_sources(sources: list[str]) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     """Fetch + merge every source. Returns (merged_apps, ok_sources, failed_sources)."""
     merged: list[dict[str, Any]] = []
@@ -129,7 +173,7 @@ def _merge_sources(sources: list[str]) -> tuple[list[dict[str, Any]], list[str],
             if not app_id or app_id in seen:
                 continue
             seen.add(app_id)
-            merged.append({**app, "_source": source})
+            merged.append(_enrich_with_manifest({**app, "_source": source}))
     return merged, ok, failed
 
 

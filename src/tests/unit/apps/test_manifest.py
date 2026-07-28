@@ -92,3 +92,53 @@ def test_container_tier_needs_no_entrypoint():
     m = validate_manifest(_m(tier="container", runtime={"image": "ghcr.io/x", "port": 8080},
                              permissions=[], contributes={}))
     assert m.tier == "container"
+
+
+def test_publisher_defaults_to_tekflox():
+    m = validate_manifest(VALID)
+    assert m.publisher == "TekFlox"
+
+
+def test_publisher_can_be_overridden():
+    m = validate_manifest(_m(publisher="Acme"))
+    assert m.publisher == "Acme"
+
+
+def test_bad_publisher_rejected():
+    with pytest.raises(ManifestError, match="publisher"):
+        validate_manifest(_m(publisher=""))
+
+
+def test_resource_estimate_defaults_to_low():
+    m = validate_manifest(VALID)
+    assert m.resource_estimate == {"cpu": "low", "memory": "low", "disk": "low"}
+
+
+def test_resource_estimate_partial_override_fills_defaults():
+    m = validate_manifest(_m(resource_estimate={"memory": "high"}))
+    assert m.resource_estimate == {"cpu": "low", "memory": "high", "disk": "low"}
+
+
+@pytest.mark.parametrize("bad", [{"cpu": "extreme", "memory": "low", "disk": "low"}, {"cpu": 1, "memory": "low", "disk": "low"}])
+def test_bad_resource_estimate_level_rejected(bad):
+    with pytest.raises(ManifestError, match="resource_estimate"):
+        validate_manifest(_m(resource_estimate=bad))
+
+
+def test_what_you_get_derives_ui_screens_and_commands():
+    m = validate_manifest(_m(contributes={
+        "windows": [{"id": "notes.main", "title": "Notes"}],
+        "nav": [{"id": "notes.nav", "label": "Notes", "opens": "notes.main"}],
+        "system_clis": [{"name": "git", "installer": "install.sh"}],
+        "mcp": {"provides": [{"name": "notes_search"}, "notes_create"]},
+    }, permissions=[]))
+    assert m.what_you_get == {
+        "mcp_tools": ["notes_search", "notes_create"],
+        "ui_screens": ["Notes"],
+        "commands": ["git"],
+    }
+
+
+def test_what_you_get_empty_when_nothing_declared():
+    m = validate_manifest(_m(contributes={}, permissions=[]))
+    assert m.what_you_get == {"mcp_tools": [], "ui_screens": [], "commands": []}
