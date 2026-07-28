@@ -7,6 +7,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl build-essential libpq-dev procps \
     && rm -rf /var/lib/apt/lists/*
 
+# `aw` user (UID/GID 1001, standard Ubuntu first-user convention) — created so
+# a non-root option EXISTS, not used by default. The container still runs as
+# root (no `USER aw` here); which apps opt into running as this user is a
+# future per-app `run_as`-style manifest field, not implemented yet.
+# Frederico decision 2026-07-28.
+RUN groupadd -g 1001 aw && useradd -u 1001 -g 1001 -m -s /bin/bash aw
+
 # Mirror the monolith convention: the workspace repo lives at
 # /opt/agentic-workspace (not /app). On a BYOD host this same path is
 # bind-mounted from a host dir (~/agentic-workspace) so it's visible/editable
