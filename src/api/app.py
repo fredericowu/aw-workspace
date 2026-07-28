@@ -111,12 +111,6 @@ def create_app() -> FastAPI:
     # (src/apps/base.py), which reaches the same manager off app.state.
     register_notification_routes(app)
 
-    # DevCtl relay: WS /ws/devctl (the SPA's force-enabled devctlClient.js
-    # connects here, authenticated by aw_id_jwt) + POST /api/devctl/eval so an
-    # in-workspace caller (the agent) can run JS in the user's own live tab.
-    from src.api.devctl_relay import register_devctl_relay
-    register_devctl_relay(app)
-
     # Decoupled-apps framework (F1): plugin runtime + /api/apps management.
     # Tier-1 apps hot-load into THIS process — no restart. Installed apps are
     # reloaded from the local registry on startup.

@@ -26,6 +26,7 @@ from __future__ import annotations
 # risk: "low" | "high". high-risk caps require a signed/marketplace app.
 CATALOG: dict[str, dict[str, str]] = {
     "routes:register":   {"risk": "low",  "desc": "mount /api/apps/<id>/* routes"},
+    "routes:local":      {"risk": "low",  "desc": "declared local_paths bypass identity auth for in-workspace localhost callers"},
     "db:own-tables":     {"risk": "low",  "desc": "create/use app-owned workspace tables"},
     "commands:install":  {"risk": "low",  "desc": "install commands/CLIs that survive restart"},
     "service:manage":    {"risk": "low",  "desc": "register a start/stop background service"},

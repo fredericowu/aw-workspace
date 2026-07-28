@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import FastAPI
-from starlette.routing import Mount
+from starlette.routing import Mount, get_route_path
 from starlette.types import Receive, Scope, Send
 
 import types
@@ -96,6 +96,23 @@ def _default_verify_ws(scope: Scope) -> dict | None:
     return decode_identity_jwt(token) if token else None
 
 
+def _local_paths_for(loaded: "LoadedApp") -> list[str]:
+    """Mount-relative ``local_paths`` an app is allowed to bypass auth on.
+
+    Only honored when the app was actually granted ``routes:local`` (declaring
+    it in the manifest is not enough — an unsigned/side-loaded app could still
+    have it stripped by :func:`src.apps.capabilities.filter_grants`, though
+    it's low-risk so that's not the common case).
+    """
+    if "routes:local" not in loaded.granted_permissions:
+        return []
+    paths: list[str] = []
+    for route in loaded.manifest.contributes.get("routes", []) or []:
+        if isinstance(route, dict):
+            paths.extend(str(p) for p in route.get("local_paths", []) or [])
+    return paths
+
+
 class IdentityGuard:
     """ASGI wrapper enforcing the central identity JWT on an app's sub-app.
 
@@ -110,24 +127,63 @@ class IdentityGuard:
       the app accepts (mirrors ``src/api/terminal.py``); app never invoked.
 
     v1: **all** app routes are guarded — no ``public:`` escape hatch (webhooks
-    are a later manifest extension). Verifiers are injectable for tests.
+    are a later manifest extension), EXCEPT the ``routes:local`` bypass below.
+    Verifiers are injectable for tests.
+
+    ``local_paths`` (ADR "Apps Own Their Front + Back Routes" Decision 2): a
+    mount-relative path (e.g. ``/eval``) that skips the JWT check when the
+    caller's ``scope.client.host`` is a loopback address — the escape hatch
+    for agent-driven endpoints called from inside the workspace with no
+    cookie/bearer token. Only populated when the app was granted
+    ``routes:local`` (:meth:`AppRuntime._attach_mount`).
+
+    On a successful identity verification, the decoded claims are stashed at
+    ``scope["aw_identity"]`` so app WS/HTTP handlers can read who's calling
+    (``websocket.scope.get("aw_identity")``) — a local-bypass request has no
+    claims, so it's simply absent.
     """
 
-    def __init__(self, app: Any, verify_http=None, verify_ws=None) -> None:
+    _LOCAL_HOSTS = ("127.0.0.1", "::1")
+
+    def __init__(self, app: Any, verify_http=None, verify_ws=None,
+                 local_paths: "list[str] | None" = None) -> None:
         self.app = app
         self._verify_http = verify_http or _default_verify_http
         self._verify_ws = verify_ws or _default_verify_ws
+        self._local_paths = frozenset(local_paths or [])
+
+    def _local_bypass(self, scope: Scope) -> bool:
+        if not self._local_paths:
+            return False
+        client = scope.get("client")
+        host = client[0] if client else None
+        if host not in self._LOCAL_HOSTS:
+            return False
+        # scope["path"] is the FULL path — Mount only adjusts root_path, not
+        # path (starlette.routing.Mount.matches) — so the mount-relative
+        # remainder has to be derived the same way starlette itself does.
+        return get_route_path(scope) in self._local_paths
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         stype = scope["type"]
         if stype == "http":
-            if self._verify_http(scope) is None:
+            if self._local_bypass(scope):
+                await self.app(scope, receive, send)
+                return
+            claims = self._verify_http(scope)
+            if claims is None:
                 await self._send_401(send)
                 return
+            scope["aw_identity"] = claims
         elif stype == "websocket":
-            if self._verify_ws(scope) is None:
+            if self._local_bypass(scope):
+                await self.app(scope, receive, send)
+                return
+            claims = self._verify_ws(scope)
+            if claims is None:
                 await self._reject_ws(receive, send)
                 return
+            scope["aw_identity"] = claims
         await self.app(scope, receive, send)
 
     @staticmethod
@@ -550,7 +606,8 @@ class AppRuntime:
         drainable = _DrainableApp(asgi_app)
         # IdentityGuard sits OUTSIDE the drain tracker so a rejected (401/4401)
         # request is never counted as in-flight against unload's drain.
-        guarded = IdentityGuard(drainable) if self.guard_identity else drainable
+        guarded = (IdentityGuard(drainable, local_paths=_local_paths_for(loaded))
+                   if self.guard_identity else drainable)
         mount = Mount(f"/api/apps/{app_id}", app=guarded)
         # Mutation happens on the event loop (single process) — the list append
         # is atomic w.r.t. request matching; no free-threading hazard.

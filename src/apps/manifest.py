@@ -194,6 +194,19 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
         if not isinstance(runtime.get("port"), int) or runtime.get("port") <= 0:
             raise ManifestError("container apps require a positive integer runtime.port")
 
+    # Dual-mode standalone block (ADR "Apps Own Their Front + Back Routes"
+    # Decision 4) — optional, but if present must have the right shape.
+    standalone = runtime.get("standalone")
+    if standalone is not None:
+        if not isinstance(standalone, dict):
+            raise ManifestError("runtime.standalone must be an object")
+        module = standalone.get("module")
+        if not isinstance(module, str) or not module.strip():
+            raise ManifestError("runtime.standalone.module must be a non-empty string")
+        port = standalone.get("default_port")
+        if not isinstance(port, int) or isinstance(port, bool) or port <= 0:
+            raise ManifestError("runtime.standalone.default_port must be a positive integer")
+
     permissions = data.get("permissions", [])
     if not isinstance(permissions, list) or not all(isinstance(p, str) for p in permissions):
         raise ManifestError("permissions must be a list of strings")
@@ -210,6 +223,19 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
     # Any app that mounts routes must declare the capability (ADR Decision 4).
     if contributes.get("routes") and "routes:register" not in permissions:
         raise ManifestError("contributes.routes requires the 'routes:register' permission")
+
+    # local_paths (agent-driven localhost bypass) requires 'routes:local'
+    # (ADR "Apps Own Their Front + Back Routes" Decision 2).
+    routes = contributes.get("routes", [])
+    if not isinstance(routes, list):
+        raise ManifestError("contributes.routes must be a list")
+    has_local_paths = any(
+        isinstance(r, dict) and r.get("local_paths") for r in routes
+    )
+    if has_local_paths and "routes:local" not in permissions:
+        raise ManifestError(
+            "contributes.routes[].local_paths requires the 'routes:local' permission"
+        )
 
     for win in contributes.get("windows", []):
         if not isinstance(win, dict) or not win.get("id"):
