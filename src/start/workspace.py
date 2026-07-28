@@ -8,7 +8,25 @@ worker process builds its own app/engine — same pattern as aw-backend's
 import os
 
 
+def _put_app_bin_dir_on_path():
+    """Prepend the F4 app-shim dir (paths.bin_dir()) to PATH.
+
+    paths.py/base.py/commands.py all claim shims there are "on PATH", but
+    nothing ever actually put it on PATH — set it once, process-wide, before
+    uvicorn starts so it's inherited by every subprocess this process spawns
+    (terminal PTYs, apt installs, ...).
+    """
+    from src.apps.paths import bin_dir
+
+    d = bin_dir()
+    path = os.environ.get("PATH", "")
+    if d not in path.split(os.pathsep):
+        os.environ["PATH"] = f"{d}{os.pathsep}{path}" if path else d
+
+
 def main():
+    _put_app_bin_dir_on_path()
+
     port = int(os.environ.get("AW_PORT", "9030"))
     workers = int(os.environ.get("AW_WORKSPACE_WORKERS", "1"))
     workspace = os.environ.get("AW_WORKSPACE", "")
