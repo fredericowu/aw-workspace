@@ -29,6 +29,7 @@ from starlette.types import Receive, Scope, Send
 
 import types
 
+from src.apps import paths
 from src.apps.base import AppContext, Plugin
 from src.apps.capabilities import filter_grants
 from src.apps.commands import CommandInstaller
@@ -38,6 +39,7 @@ from src.apps.manifest import Manifest, load_manifest
 from src.apps.proxy import ContainerReverseProxy
 from src.apps.secret_store import SecretStore
 from src.apps.services import ServiceSupervisor
+from src.apps.skills import SkillError, SkillsRegistry
 from src.apps.watchdog import WatchdogSupervisor
 
 log = logging.getLogger(__name__)
@@ -239,6 +241,7 @@ class AppRuntime:
         self.containers = ContainerSupervisor()
         self.watchdog = WatchdogSupervisor()
         self.secret_store = SecretStore()
+        self.skills = SkillsRegistry()
         self._db_tables: Any = None  # lazy — only apps granted db:own-tables need it
 
     @property
@@ -302,6 +305,51 @@ class AppRuntime:
                 })
         return {"windows": windows, "nav": nav, "settings": settings,
                 "frontend": frontend}
+
+    def skills_index(self) -> list[dict[str, Any]]:
+        """Index of every ``contributes.skills`` entry for ``GET /api/apps/-/skills``.
+
+        Points at the symlink :meth:`load` registered into the shared skills
+        dir (:func:`src.apps.paths.skills_dir`) — no SKILL.md content is
+        duplicated here, just the pointer an agent runtime can read.
+        """
+        out: list[dict[str, Any]] = []
+        for app in self._apps.values():
+            slug = app.manifest.id
+            for entry in app.manifest.skills:
+                skill_id = entry.get("id")
+                if not skill_id:
+                    continue
+                link_path = os.path.join(paths.skills_dir(), f"{slug}__{skill_id}")
+                out.append({
+                    "app": slug,
+                    "id": skill_id,
+                    "description": entry.get("description", ""),
+                    "skill_md_path": os.path.join(link_path, "SKILL.md"),
+                    "registered": os.path.islink(link_path),
+                })
+        return out
+
+    def _register_skills(self, loaded: LoadedApp) -> None:
+        """Symlink each ``contributes.skills`` entry into the shared skills index.
+
+        No-op for an app that declares none. A bad entry (missing SKILL.md,
+        path escaping the package dir) is logged and skipped rather than
+        failing the whole install — same non-fatal posture as window/nav spec
+        resolution.
+        """
+        slug = loaded.manifest.id
+        for entry in loaded.manifest.skills:
+            skill_id = entry.get("id")
+            path = entry.get("path")
+            if not skill_id or not path:
+                continue
+            try:
+                link_path = self.skills.register(slug, skill_id, loaded.package_dir, path)
+            except SkillError:
+                log.exception("apps: failed to register skill %r for %s", skill_id, slug)
+                continue
+            self.journal.record(slug, "skill:register", skill_id, {"link_path": link_path})
 
     def _resolve_window(self, app: LoadedApp, entry: dict[str, Any]) -> dict[str, Any]:
         """Inline a declarative window's spec file into ``body.spec_data``.
@@ -387,6 +435,7 @@ class AppRuntime:
         self._loading = None
 
         self._apps[slug] = loaded
+        self._register_skills(loaded)
         self._invalidate_openapi()
         log.info("apps: loaded %s v%s (routes mounted=%s)",
                  slug, manifest.version, loaded.mount is not None)
@@ -474,6 +523,8 @@ class AppRuntime:
         elif kind == "watchdog:register":
             # Idempotent with the explicit cancel_all_for in unload() above.
             self.watchdog.cancel_all_for(loaded.manifest.id)
+        elif kind == "skill:register":
+            self.skills.unregister(entry.payload.get("link_path", ""))
         # route:mount (already unmounted), system_cli:install (audit-only),
         # secret:write (namespace purged above), capability:denied → no-op.
 

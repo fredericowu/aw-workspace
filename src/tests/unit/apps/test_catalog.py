@@ -185,6 +185,7 @@ def test_catalog_entry_enriched_with_publisher_resource_estimate_and_what_you_ge
     assert app["resource_estimate"] == {"cpu": "low", "memory": "-", "disk": "-"}
     assert app["what_you_get"] == {
         "mcp_tools": [], "ui_screens": ["Git & GitHub CLI", "Git"], "commands": ["git", "gh"],
+        "skills": [],
     }
 
 

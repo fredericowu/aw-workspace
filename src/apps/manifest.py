@@ -75,6 +75,10 @@ class Manifest:
         return list(self.contributes.get("settings_panels", []))
 
     @property
+    def skills(self) -> list[dict[str, Any]]:
+        return list(self.contributes.get("skills", []))
+
+    @property
     def frontend(self) -> dict[str, Any]:
         """First-class frontend code plugin (ADR Decision 3b), or ``{}``."""
         fe = self.contributes.get("frontend")
@@ -138,7 +142,13 @@ class Manifest:
             elif isinstance(cmd, str) and cmd:
                 commands.append(cmd)
 
-        return {"mcp_tools": mcp_tools, "ui_screens": ui_screens, "commands": commands}
+        skills: list[str] = []
+        for skill in self.skills:
+            if isinstance(skill, dict) and skill.get("id"):
+                skills.append(str(skill["id"]))
+
+        return {"mcp_tools": mcp_tools, "ui_screens": ui_screens, "commands": commands,
+                "skills": skills}
 
 
 def validate_manifest(data: dict[str, Any]) -> Manifest:
@@ -208,6 +218,10 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
             raise ManifestError(
                 f"window id {win.get('id')!r} must be namespaced under '{slug}.'"
             )
+
+    for skill in contributes.get("skills", []):
+        if not isinstance(skill, dict) or not skill.get("id") or not skill.get("path"):
+            raise ManifestError("each contributes.skills entry needs an 'id' and a 'path'")
 
     config_schema = data.get("config_schema", {})
     if not isinstance(config_schema, dict):

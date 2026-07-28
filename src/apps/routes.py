@@ -15,6 +15,7 @@ Endpoints (all identity-gated):
 - ``POST /api/apps/install-my-apps`` — the "Install My Apps" backend flow: read
                                        the user's registry set + converge
 - ``GET  /api/apps/-/contributions`` — frontend contributions (declarative + code)
+- ``GET  /api/apps/-/skills``        — index of app-contributed skills (``contributes.skills``)
 - ``GET  /api/apps/-/catalog``       — marketplace catalog (available apps)
 - ``GET  /api/apps/{slug}/ui/{path}``— serve a component-mode app's ESM bundle
 
@@ -321,6 +322,12 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
     @app.get("/api/apps/-/contributions")
     async def contributions(identity: dict = Depends(require_identity)):
         return runtime.contributions()
+
+    @app.get("/api/apps/-/skills")
+    async def skills(identity: dict = Depends(require_identity)):
+        """Index of ``contributes.skills`` from every loaded app — a pointer
+        list (id/description/SKILL.md path), not the skill content itself."""
+        return {"skills": runtime.skills_index()}
 
     @app.get("/api/apps/-/watchdog")
     async def watchdog_tasks(identity: dict = Depends(require_identity)):

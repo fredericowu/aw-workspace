@@ -165,14 +165,40 @@ def test_what_you_get_derives_ui_screens_and_commands():
         "nav": [{"id": "notes.nav", "label": "Notes", "opens": "notes.main"}],
         "system_clis": [{"name": "git", "installer": "install.sh"}],
         "mcp": {"provides": [{"name": "notes_search"}, "notes_create"]},
+        "skills": [{"id": "notes-howto", "path": "skills/notes-howto/SKILL.md"}],
     }, permissions=[]))
     assert m.what_you_get == {
         "mcp_tools": ["notes_search", "notes_create"],
         "ui_screens": ["Notes"],
         "commands": ["git"],
+        "skills": ["notes-howto"],
     }
 
 
 def test_what_you_get_empty_when_nothing_declared():
     m = validate_manifest(_m(contributes={}, permissions=[]))
-    assert m.what_you_get == {"mcp_tools": [], "ui_screens": [], "commands": []}
+    assert m.what_you_get == {"mcp_tools": [], "ui_screens": [], "commands": [], "skills": []}
+
+
+def test_skills_property_reads_contributes_skills():
+    m = validate_manifest(_m(contributes={
+        "skills": [{"id": "notes-howto", "path": "skills/notes-howto/SKILL.md",
+                    "description": "How to use Notes."}],
+    }, permissions=[]))
+    assert m.skills == [{"id": "notes-howto", "path": "skills/notes-howto/SKILL.md",
+                          "description": "How to use Notes."}]
+
+
+def test_skills_property_empty_when_not_declared():
+    m = validate_manifest(_m(contributes={}, permissions=[]))
+    assert m.skills == []
+
+
+def test_skills_entry_requires_id_and_path():
+    bad = _m(contributes={"skills": [{"path": "skills/x/SKILL.md"}]}, permissions=[])
+    with pytest.raises(ManifestError, match="contributes.skills"):
+        validate_manifest(bad)
+
+    bad2 = _m(contributes={"skills": [{"id": "x"}]}, permissions=[])
+    with pytest.raises(ManifestError, match="contributes.skills"):
+        validate_manifest(bad2)

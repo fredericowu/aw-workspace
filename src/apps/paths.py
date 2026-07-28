@@ -11,6 +11,9 @@ Layout (ADR Decision 8):
 * ``<home>/bin``     — app command shims (``<slug>-*``), on PATH, survive restart.
 * ``<home>/secrets`` — the workspace-side secure secret store (F4; the
   zero-knowledge store is a separate deferred card).
+* ``<home>/skills``  — symlink index of app-contributed skills (``contributes.skills``),
+  one entry per ``<app_id>__<skill_id>`` pointing at the installed app's own
+  ``skills/<id>/`` dir — no content duplication.
 """
 from __future__ import annotations
 
@@ -34,4 +37,10 @@ def bin_dir() -> str:
 def secrets_dir() -> str:
     d = os.path.join(workspace_home(), "secrets")
     os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+def skills_dir() -> str:
+    d = os.path.join(workspace_home(), "skills")
+    os.makedirs(d, exist_ok=True)
     return d
