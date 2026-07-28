@@ -88,7 +88,7 @@ class FakeCloud:
         self.delete_desired(app_id)
         self.rows.append({"app_id": app_id, "version": version, "repo": repo, "ref": ref,
                           "granted_permissions": granted_permissions or [],
-                          "config": config or {}, "state": "installed"})
+                          "config": config or {}, "signed": signed, "state": "installed"})
 
     def delete_desired(self, app_id, instance_id=""):
         self.rows = [r for r in self.rows if r["app_id"] != app_id]
@@ -106,7 +106,7 @@ class FakeMirror:
             "app_id": spec.app_id, "version": spec.version, "package_dir": package_dir,
             "repo": spec.repo, "ref": spec.ref,
             "granted_permissions": spec.granted_permissions, "config": spec.config,
-            "state": "installed"}
+            "signed": spec.signed, "state": "installed"}
 
     def forget(self, app_id):
         self.rows.pop(app_id, None)
@@ -162,6 +162,47 @@ def test_recreation_auto_reinstalls_from_registry(tmp_path, monkeypatch):
         assert rt.is_loaded("widget")
         r = await _get(host, "/api/apps/widget/")
         assert r.status_code == 200
+
+    _async(run())
+
+
+def test_local_fallback_preserves_signed_component_grants(tmp_path, monkeypatch):
+    """A signed component app must keep ``ui:code`` when boot reconcile falls
+    back to the local mirror; otherwise the SPA downgrades it and never imports
+    the bundle."""
+    repo = _make_app_repo(tmp_path, slug="devctl")
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    async def run():
+        await rc.install(AppSpec(
+            app_id="devctl",
+            repo=repo,
+            ref="main",
+            granted_permissions=["routes:register", "ui:code"],
+            signed=True,
+        ))
+
+        fallback_rows = rc.local.list()
+        assert fallback_rows[0]["signed"] is True
+        assert "ui:code" in fallback_rows[0]["granted_permissions"]
+
+        fresh_host = FastAPI()
+        fresh_rt = AppRuntime(fresh_host, guard_identity=False)
+        fallback = Reconciler(
+            fresh_rt,
+            cloud=FakeCloud(),
+            local=rc.local,
+            fetch=_fake_fetch,
+        )
+        fallback.cloud.configured = False
+
+        result = await fallback.reconcile()
+        assert result["source"] == "local"
+        loaded = fresh_rt.get("devctl")
+        assert loaded is not None
+        assert loaded.signed is True
+        assert "ui:code" in loaded.granted_permissions
 
     _async(run())
 

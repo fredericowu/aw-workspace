@@ -67,4 +67,5 @@ class AppInstall(SQLModel, table=True):
     ref: str = Field(default="HEAD")
     granted_permissions: list[str] = Field(default_factory=list, sa_column=Column(JSONB))
     config: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB))
+    signed: bool = Field(default=False)
     enabled: bool = True

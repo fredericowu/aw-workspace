@@ -86,7 +86,7 @@ class LocalMirror:
             return [
                 {"app_id": r.slug, "version": r.version, "package_dir": r.package_dir,
                  "repo": r.repo, "ref": r.ref, "granted_permissions": r.granted_permissions,
-                 "config": r.config, "state": "installed"}
+                 "config": r.config, "signed": r.signed, "state": "installed"}
                 for r in rows
             ]
 
@@ -105,6 +105,7 @@ class LocalMirror:
             row.ref = spec.ref
             row.granted_permissions = spec.granted_permissions
             row.config = spec.config
+            row.signed = spec.signed
             row.enabled = True
             session.add(row)
             session.commit()

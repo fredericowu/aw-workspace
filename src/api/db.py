@@ -105,6 +105,11 @@ def create_all_tables() -> None:
         _log.info("db: ensured BYOD schema %s exists", schema)
 
     SQLModel.metadata.create_all(engine, checkfirst=True)
+    with engine.begin() as conn:
+        conn.execute(text(
+            f'ALTER TABLE "{schema}".app_installs '
+            'ADD COLUMN IF NOT EXISTS signed BOOLEAN NOT NULL DEFAULT FALSE'
+        ))
     _log.info("db: schema %s up to date", schema)
 
 
