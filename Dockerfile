@@ -30,6 +30,15 @@ ENV AW_PORT=9030 \
     HOME=/opt/agentic-workspace \
     PYTHONUNBUFFERED=1
 
+# F4 app-shim bin dir (paths.bin_dir() == <workspace_home>/bin, i.e.
+# $HOME/.aw-workspace/bin with the HOME above) baked onto PATH for every
+# process/shell/agent in this image — not just login shells (the
+# orchestrator's /etc/profile.d/aw-bin.sh workaround only covered those).
+# Lives under the host bind-mount, so installed shims persist across
+# container recreation; this ENV is what finally makes paths.py's
+# long-standing "on PATH" claim true. Frederico decision 2026-07-28.
+ENV PATH="/opt/agentic-workspace/.aw-workspace/bin:${PATH}"
+
 EXPOSE 9030
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
