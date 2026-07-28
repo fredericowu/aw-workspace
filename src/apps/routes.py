@@ -161,6 +161,66 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         summary = await reconciler.uninstall(slug)
         return summary
 
+    @app.post("/api/apps/{slug}/update")
+    async def update_app(slug: str, identity: dict = Depends(require_identity)):
+        """Update an installed app to the marketplace catalog's current version
+        (ADR app-update-mechanism.md, Metade B). Resolves the app's catalog
+        entry, writes a new ``desired`` row (version/ref from the catalog,
+        config/granted_permissions preserved from the current install) and
+        runs ``reconcile()`` in the BACKGROUND via the same job tracker as
+        ``POST /api/apps/install`` — poll ``GET /api/apps/{slug}/install-status``
+        for progress, same status contract as install."""
+        loaded = runtime.get(slug)
+        if loaded is None:
+            return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
+
+        catalog_entry = next(
+            (a for a in get_catalog().get("apps", [])
+             if (a.get("id") or a.get("slug")) == slug),
+            None,
+        )
+        if catalog_entry is None:
+            return JSONResponse({"error": f"{slug} not found in catalog"}, status_code=404)
+
+        catalog_version = catalog_entry.get("version") or ""
+        if catalog_version and catalog_version == loaded.manifest.version:
+            return {"app_id": slug, "status": "no-op", "version": loaded.manifest.version}
+
+        if jobs.is_installing(slug):
+            return JSONResponse({"app_id": slug, "status": "installing"}, status_code=202)
+
+        spec = AppSpec(
+            app_id=slug,
+            version=catalog_version,
+            repo=catalog_entry.get("repo"),
+            ref=catalog_entry.get("ref") or "HEAD",
+            granted_permissions=loaded.granted_permissions,
+            config=loaded.config,
+            signed=loaded.signed,
+        )
+        if reconciler.cloud.configured:
+            try:
+                reconciler.cloud.put_desired(
+                    slug, version=spec.version, repo=spec.repo, ref=spec.ref,
+                    granted_permissions=spec.granted_permissions, config=spec.config,
+                    signed=spec.signed)
+            except Exception:
+                log.exception("apps: update of %s did not reach the cloud registry", slug)
+        reconciler.local.upsert(spec, loaded.package_dir)
+
+        job = jobs.start(slug)
+
+        async def _run_update() -> None:
+            try:
+                summary = await reconciler.reconcile()
+                jobs.mark_installed(slug, summary)
+            except Exception as e:  # noqa: BLE001 — surfaced via the status endpoint
+                log.exception("apps: update failed for %s", slug)
+                jobs.mark_failed(slug, f"update failed: {e}")
+
+        job.task = asyncio.create_task(_run_update())
+        return JSONResponse({"app_id": slug, "status": "installing"}, status_code=202)
+
     @app.post("/api/apps/reconcile")
     async def reconcile_now(identity: dict = Depends(require_identity)):
         """Converge the running app set to the cloud registry on demand."""

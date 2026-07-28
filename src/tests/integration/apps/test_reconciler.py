@@ -43,15 +43,15 @@ def _fake_fetch(repo: str, ref: str = "HEAD", *, slug: str, token=None, dest=Non
     return dest
 
 
-def _make_app_repo(tmp_path, slug="widget"):
-    src = tmp_path / f"src_{slug}"
+def _make_app_repo(tmp_path, slug="widget", version="1.0.0"):
+    src = tmp_path / f"src_{slug}_{version}"
     src.mkdir()
     (src / "aw-app.json").write_text(textwrap.dedent(f"""
     {{
       "manifest_version": 1,
       "id": "{slug}",
       "name": "{slug}",
-      "version": "1.0.0",
+      "version": "{version}",
       "tier": "inprocess",
       "runtime": {{"entrypoint": "plugin:AppPlugin"}},
       "permissions": ["routes:register"],
@@ -207,6 +207,64 @@ def test_reconcile_removes_undesired_and_installs_missing(tmp_path, monkeypatch)
         assert result["removed"] == ["aaa"]
         assert rt.is_loaded("bbb") and not rt.is_loaded("aaa")
         assert not result["errors"]
+
+    _async(run())
+
+
+def test_reconcile_version_drift_triggers_upgrade_uninstall_then_install(tmp_path, monkeypatch):
+    """ADR app-update-mechanism.md, Metade B (1): a desired.version bump for an
+    app already loaded is an upgrade — uninstall the old version, then install
+    the new one, in that order."""
+    repo_v1 = _make_app_repo(tmp_path, "widget", "1.0.0")
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    async def run():
+        await rc.install(AppSpec(app_id="widget", repo=repo_v1, ref="main"))
+        assert rt.get("widget").manifest.version == "1.0.0"
+
+        repo_v2 = _make_app_repo(tmp_path, "widget", "2.0.0")
+        cloud.rows = [{"app_id": "widget", "version": "2.0.0", "repo": repo_v2,
+                       "ref": "main", "granted_permissions": ["routes:register"],
+                       "config": {}, "state": "installed"}]
+
+        calls: list[tuple[str, str]] = []
+        real_uninstall = rc.uninstall
+        real_install = rc.install
+
+        async def spy_uninstall(app_id, **kw):
+            calls.append(("uninstall", app_id))
+            return await real_uninstall(app_id, **kw)
+
+        async def spy_install(spec, **kw):
+            calls.append(("install", spec.app_id))
+            return await real_install(spec, **kw)
+
+        rc.uninstall = spy_uninstall
+        rc.install = spy_install
+
+        result = await rc.reconcile()
+        assert result["upgraded"] == ["widget"]
+        assert result["installed"] == [] and result["removed"] == []
+        assert not result["errors"]
+        assert calls == [("uninstall", "widget"), ("install", "widget")]
+        assert rt.get("widget").manifest.version == "2.0.0"
+
+    _async(run())
+
+
+def test_reconcile_no_version_drift_is_a_noop(tmp_path, monkeypatch):
+    repo = _make_app_repo(tmp_path, "widget", "1.0.0")
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    async def run():
+        await rc.install(AppSpec(app_id="widget", repo=repo, ref="main"))
+
+        result = await rc.reconcile()
+        assert result["upgraded"] == []
+        assert result["installed"] == [] and result["removed"] == []
+        assert rt.get("widget").manifest.version == "1.0.0"
 
     _async(run())
 

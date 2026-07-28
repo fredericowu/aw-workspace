@@ -221,19 +221,34 @@ class Reconciler:
 
         installed: list[str] = []
         removed: list[str] = []
+        upgraded: list[str] = []
         errors: list[dict[str, str]] = []
 
         # install missing (desired but not loaded) — don't re-write the desired
-        # row we're converging TO.
+        # row we're converging TO. For apps present on both sides, a version
+        # bump in the registry is an upgrade = uninstall + install with the
+        # new spec (config/permissions survive — they come from the desired
+        # row, which is left untouched).
         for app_id, spec in desired_active.items():
-            if app_id in actual:
+            if app_id not in actual:
+                try:
+                    await self.install(spec, write_cloud=False)
+                    installed.append(app_id)
+                except Exception as e:  # noqa: BLE001 — one bad app must not block the rest
+                    log.exception("apps: reconcile failed to install %s", app_id)
+                    errors.append({"app_id": app_id, "action": "install", "error": str(e)})
                 continue
-            try:
-                await self.install(spec, write_cloud=False)
-                installed.append(app_id)
-            except Exception as e:  # noqa: BLE001 — one bad app must not block the rest
-                log.exception("apps: reconcile failed to install %s", app_id)
-                errors.append({"app_id": app_id, "action": "install", "error": str(e)})
+
+            loaded = self.runtime.get(app_id)
+            running_version = loaded.manifest.version if loaded else ""
+            if spec.version and spec.version != running_version:
+                try:
+                    await self.uninstall(app_id, write_cloud=False)
+                    await self.install(spec, write_cloud=False)
+                    upgraded.append(app_id)
+                except Exception as e:  # noqa: BLE001
+                    log.exception("apps: reconcile failed to upgrade %s", app_id)
+                    errors.append({"app_id": app_id, "action": "upgrade", "error": str(e)})
 
         # uninstall extra (loaded but not desired) — converge actual to desired;
         # leave the (absent) desired row alone.
@@ -246,7 +261,8 @@ class Reconciler:
                 errors.append({"app_id": app_id, "action": "uninstall", "error": str(e)})
 
         result = {"source": source, "desired": sorted(desired_active),
-                  "installed": installed, "removed": removed, "errors": errors}
-        log.info("apps: reconciled (%s) — installed=%s removed=%s errors=%d",
-                 source, installed, removed, len(errors))
+                  "installed": installed, "upgraded": upgraded, "removed": removed,
+                  "errors": errors}
+        log.info("apps: reconciled (%s) — installed=%s upgraded=%s removed=%s errors=%d",
+                 source, installed, upgraded, removed, len(errors))
         return result
