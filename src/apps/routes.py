@@ -71,6 +71,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 "version": a.manifest.version,
                 "tier": a.manifest.tier,
                 "icon": a.manifest.icon,
+                "has_windows": bool(a.manifest.windows),
                 "permissions": a.granted_permissions,
                 "signed": a.signed,
                 "routes": bool(a.mount),
