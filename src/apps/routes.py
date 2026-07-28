@@ -35,7 +35,7 @@ from fastapi import Body, Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
 from src.api.identity import authorize_ws, require_identity
-from src.apps.catalog import get_catalog
+from src.apps.catalog import get_catalog, list_tags
 from src.apps.install_jobs import InstallJobs
 from src.apps.manifest import ManifestError, load_manifest
 from src.apps.reconciler import AppSpec, Reconciler
@@ -219,6 +219,90 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 jobs.mark_failed(slug, f"update failed: {e}")
 
         job.task = asyncio.create_task(_run_update())
+        return JSONResponse({"app_id": slug, "status": "installing"}, status_code=202)
+
+    @app.get("/api/apps/{slug}/versions")
+    async def app_versions(slug: str, identity: dict = Depends(require_identity)):
+        """Version history for pin/rollback — replaces "which version to
+        install" as a config field (ADR: marketplace shouldn't force a
+        config prompt on install). Lists the app repo's tagged releases so
+        the Installed row's Version window can install an older/newer one
+        directly instead of editing settings."""
+        loaded = runtime.get(slug)
+        if loaded is None:
+            return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
+
+        catalog_entry = next(
+            (a for a in get_catalog().get("apps", [])
+             if (a.get("id") or a.get("slug")) == slug),
+            None,
+        )
+        repo = catalog_entry.get("repo") if catalog_entry else None
+        return {
+            "slug": slug,
+            "installed_version": loaded.manifest.version,
+            "catalog_version": catalog_entry.get("version") if catalog_entry else None,
+            "versions": list_tags(repo) if repo else [],
+        }
+
+    @app.post("/api/apps/{slug}/version")
+    async def set_app_version(slug: str, data: dict = Body(...),
+                              identity: dict = Depends(require_identity)):
+        """Pin/rollback: reinstall the app at an explicit tagged ``ref``
+        (older or newer than what's running — same mechanics either way),
+        instead of always tracking the catalog's latest like ``/update``
+        does. Same async job/status contract as install/update."""
+        loaded = runtime.get(slug)
+        if loaded is None:
+            return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
+
+        ref = data.get("ref")
+        if not ref:
+            return JSONResponse({"error": "ref is required"}, status_code=400)
+        version = data.get("version") or ref
+
+        catalog_entry = next(
+            (a for a in get_catalog().get("apps", [])
+             if (a.get("id") or a.get("slug")) == slug),
+            None,
+        )
+        repo = catalog_entry.get("repo") if catalog_entry else None
+        if not repo:
+            return JSONResponse({"error": f"{slug} not found in catalog"}, status_code=404)
+
+        if jobs.is_installing(slug):
+            return JSONResponse({"app_id": slug, "status": "installing"}, status_code=202)
+
+        spec = AppSpec(
+            app_id=slug,
+            version=version,
+            repo=repo,
+            ref=ref,
+            granted_permissions=loaded.granted_permissions,
+            config=loaded.config,
+            signed=loaded.signed,
+        )
+        if reconciler.cloud.configured:
+            try:
+                reconciler.cloud.put_desired(
+                    slug, version=spec.version, repo=spec.repo, ref=spec.ref,
+                    granted_permissions=spec.granted_permissions, config=spec.config,
+                    signed=spec.signed)
+            except Exception:
+                log.exception("apps: version pin of %s did not reach the cloud registry", slug)
+        reconciler.local.upsert(spec, loaded.package_dir)
+
+        job = jobs.start(slug)
+
+        async def _run_version() -> None:
+            try:
+                summary = await reconciler.reconcile()
+                jobs.mark_installed(slug, summary)
+            except Exception as e:  # noqa: BLE001 — surfaced via the status endpoint
+                log.exception("apps: version pin failed for %s", slug)
+                jobs.mark_failed(slug, f"version pin failed: {e}")
+
+        job.task = asyncio.create_task(_run_version())
         return JSONResponse({"app_id": slug, "status": "installing"}, status_code=202)
 
     @app.post("/api/apps/reconcile")

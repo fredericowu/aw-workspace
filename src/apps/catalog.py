@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -235,3 +236,39 @@ def get_catalog(force: bool = False) -> dict[str, Any]:
 def clear_cache() -> None:
     _cache["data"] = None
     _cache["at"] = 0.0
+
+
+_TAG_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$")
+
+
+def list_tags(repo: str, timeout: float = 10.0) -> list[dict[str, str]]:
+    """Semver-shaped git tags for a public GitHub repo, newest first.
+
+    Backs the pin/rollback version picker (an installed app's "Version"
+    window) — best-effort, returns ``[]`` on any failure rather than raising,
+    since a version list is a nice-to-have, not required for install/update
+    to keep working.
+    """
+    url = f"https://api.github.com/repos/{repo}/tags"
+    headers = {"Accept": "application/vnd.github+json"}
+    token = _git_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        resp = httpx.get(url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        tags = resp.json()
+    except Exception as e:  # noqa: BLE001 — best-effort, see docstring
+        log.warning("apps: tag list fetch failed for %s: %s", repo, e)
+        return []
+
+    parsed: list[tuple[tuple[int, int, int], dict[str, str]]] = []
+    for t in tags if isinstance(tags, list) else []:
+        name = t.get("name") or ""
+        m = _TAG_RE.match(name)
+        if not m:
+            continue
+        key = tuple(int(g) for g in m.groups())
+        parsed.append((key, {"ref": name, "version": ".".join(m.groups())}))
+    parsed.sort(key=lambda p: p[0], reverse=True)
+    return [entry for _, entry in parsed]
