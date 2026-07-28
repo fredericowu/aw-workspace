@@ -16,9 +16,12 @@ it finishes, so there's nothing further to lose).
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+from fastapi import WebSocket
 
 
 @dataclass
@@ -41,13 +44,37 @@ class InstallJob:
 
 
 class InstallJobs:
-    """Tracks in-flight/finished background installs, keyed by app id."""
+    """Tracks in-flight/finished background installs, keyed by app id.
+
+    Also broadcasts every status transition over WebSocket (``/ws/apps/install
+    -status``, see ``routes.py``) — same pattern as ``NotificationManager`` —
+    so the Marketplace panel can show live "Installing…" progress that
+    survives a page refresh instead of relying on 2s polling alone. Polling
+    is kept as a fallback (see ``AppsMarketplace.jsx``); this just makes the
+    common case near-instant and cheaper.
+    """
 
     def __init__(self) -> None:
         self._jobs: dict[str, InstallJob] = {}
+        self._listeners: set[WebSocket] = set()
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+
+    def add_listener(self, ws: WebSocket) -> None:
+        self._listeners.add(ws)
+
+    def remove_listener(self, ws: WebSocket) -> None:
+        self._listeners.discard(ws)
 
     def get(self, app_id: str) -> Optional[InstallJob]:
         return self._jobs.get(app_id)
+
+    def all_active(self) -> list[dict[str, Any]]:
+        """Snapshot of every tracked job — sent to a WS client on connect so
+        it catches up on installs that started before it connected."""
+        return [job.as_dict() for job in self._jobs.values()]
 
     def is_installing(self, app_id: str) -> bool:
         job = self._jobs.get(app_id)
@@ -56,6 +83,7 @@ class InstallJobs:
     def start(self, app_id: str) -> InstallJob:
         job = InstallJob(app_id=app_id)
         self._jobs[app_id] = job
+        self._broadcast(job)
         return job
 
     def mark_installed(self, app_id: str, summary: dict[str, Any]) -> None:
@@ -64,9 +92,27 @@ class InstallJobs:
         job.summary = summary
         job.error = None
         job.finished_at = time.time()
+        self._broadcast(job)
 
     def mark_failed(self, app_id: str, error: str) -> None:
         job = self._jobs.setdefault(app_id, InstallJob(app_id=app_id))
         job.status = "failed"
         job.error = error
         job.finished_at = time.time()
+        self._broadcast(job)
+
+    def _broadcast(self, job: InstallJob) -> None:
+        if not self._loop or not self._listeners:
+            return
+        msg = json.dumps({"type": "app_install_status", "job": job.as_dict()})
+        self._loop.call_soon_threadsafe(asyncio.ensure_future, self._send_all(msg))
+
+    async def _send_all(self, msg: str) -> None:
+        dead = []
+        for ws in self._listeners:
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self._listeners.discard(ws)

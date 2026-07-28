@@ -48,6 +48,7 @@ def create_app() -> FastAPI:
         # In-process broadcast needs the running loop to schedule sends from
         # sync callers (e.g. the apps facade) — see NotificationManager.set_loop.
         app.state.notification_mgr.set_loop(asyncio.get_running_loop())
+        app.state.app_install_jobs.set_loop(asyncio.get_running_loop())
         # Converge the running app set to the cloud registry on startup — a
         # fresh/recreated workspace auto-reinstalls the user's apps (F3).
         await reconcile_on_boot(app)

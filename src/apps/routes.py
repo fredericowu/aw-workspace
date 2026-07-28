@@ -27,13 +27,14 @@ is the reserved control slug (slugs must start with a letter — see
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 
-from fastapi import Body, Depends, FastAPI
+from fastapi import Body, Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
-from src.api.identity import require_identity
+from src.api.identity import authorize_ws, require_identity
 from src.apps.catalog import get_catalog
 from src.apps.install_jobs import InstallJobs
 from src.apps.manifest import ManifestError, load_manifest
@@ -189,6 +190,32 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                       refresh: bool = False):
         """The marketplace catalog (available apps) for the Marketplace panel."""
         return get_catalog(force=refresh)
+
+    @app.websocket("/ws/apps/install-status")
+    async def install_status_stream(websocket: WebSocket):
+        """Live push for background install progress (Marketplace panel).
+
+        On connect, sends a snapshot of every tracked job (so a client that
+        opens/refreshes mid-install catches up immediately), then streams a
+        message for every subsequent status transition (installing → installed
+        | failed). ``AppsMarketplace.jsx`` falls back to polling
+        ``GET /api/apps/{slug}/install-status`` if this connection drops."""
+        claims = authorize_ws(websocket)
+        if not claims:
+            await websocket.accept()
+            await websocket.close(code=4401, reason="unauthorized")
+            return
+        await websocket.accept()
+        for job in jobs.all_active():
+            await websocket.send_text(json.dumps({"type": "app_install_status", "job": job}))
+        jobs.add_listener(websocket)
+        try:
+            while True:
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            jobs.remove_listener(websocket)
 
     @app.get("/api/apps/{slug}/ui/{path:path}")
     async def app_ui_bundle(slug: str, path: str,
