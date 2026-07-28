@@ -130,6 +130,25 @@ def test_network_gives_name_based_url():
     assert "ports" not in fake.run_calls[-1]
 
 
+def test_network_injects_workspace_host_env():
+    """On the shared network, the container must be told how to call BACK into
+    the workspace process (e.g. aw-app-browser's Chrome reaching aw-app-proxy) —
+    127.0.0.1 inside the app container is its own loopback, never the
+    workspace's. Without a network, there's no shared reachability story, so
+    nothing is injected."""
+    fake = _FakeDocker()
+    sup = ContainerSupervisor(socket="/dev/null", network="aw-remote-host", client=fake)
+    sup.register("app", "img", 8080)
+    sup.start("app")
+    assert fake.run_calls[-1]["environment"]["AW_WORKSPACE_HOST"]
+
+    fake2 = _FakeDocker()
+    sup2 = ContainerSupervisor(socket="/dev/null", client=fake2)
+    sup2.register("app", "img", 8080)
+    sup2.start("app")
+    assert "AW_WORKSPACE_HOST" not in fake2.run_calls[-1]["environment"]
+
+
 def test_privileged_flag_rejected():
     sup = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
     with pytest.raises(ContainerError):

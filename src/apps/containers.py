@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import shlex
+import socket
 
 log = logging.getLogger(__name__)
 
@@ -166,6 +167,16 @@ class ContainerSupervisor:
         kwargs.update(_resource_kwargs(c.resources))
         if c.network:
             kwargs["network"] = c.network
+            # The container needs to call BACK into the workspace process itself
+            # (e.g. aw-app-browser's Chrome tunneling through the in-process
+            # aw-app-proxy CONNECT proxy on :9124) — 127.0.0.1 inside the app
+            # container is its OWN loopback, never the workspace's. On the
+            # shared podman network the workspace is reachable by its container
+            # name via aardvark-dns (same way it already reaches postgres/redis
+            # — see the rootless-podman-tier2 ADR), and podman sets a
+            # container's hostname to its name by default, so gethostname()
+            # gives that same resolvable name from inside the workspace.
+            kwargs["environment"]["AW_WORKSPACE_HOST"] = socket.gethostname()
         else:
             # No shared network → publish the port so the proxy host can reach it.
             kwargs["ports"] = {f"{c.port}/tcp": c.port}
