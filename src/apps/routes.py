@@ -77,6 +77,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 "config_schema": a.manifest.config_schema,
                 "settings_panels": a.manifest.settings_panels,
                 "frontend": a.manifest.frontend,
+                "requires_ui_refresh": a.manifest.requires_ui_refresh,
             }
             for a in (runtime.get(s) for s in runtime.loaded_slugs())
             if a is not None

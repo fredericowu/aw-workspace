@@ -124,6 +124,18 @@ def test_bad_publisher_rejected():
         validate_manifest(_m(publisher=""))
 
 
+def test_requires_ui_refresh_defaults_false():
+    m = validate_manifest(VALID)
+    assert m.requires_ui_refresh is False
+
+
+def test_requires_ui_refresh_can_be_declared_true():
+    # e.g. an app contributing a top-nav entry — the SPA only mounts a fresh
+    # nav/slot contribution on a real page load, not from a live refetch.
+    m = validate_manifest(_m(requires_ui_refresh=True))
+    assert m.requires_ui_refresh is True
+
+
 def test_resource_estimate_defaults_cpu_low_mem_disk_dash():
     # CPU is a traffic-light level; memory/disk default to "-" (not resident).
     m = validate_manifest(VALID)

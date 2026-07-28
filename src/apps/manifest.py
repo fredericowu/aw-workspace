@@ -94,6 +94,20 @@ class Manifest:
         return bool(self.settings_panels or self.config_schema.get("properties"))
 
     @property
+    def requires_ui_refresh(self) -> bool:
+        """Whether installing/updating/configuring this app changes something
+        the SPA only picks up on a fresh page load — new `contributes.nav`
+        entries, slot contributions, or a `contributes.frontend` bundle (ADR
+        Decision 3b). `GET /api/apps/-/contributions` IS refetched live, but
+        nothing currently re-mounts nav/slots from a stale fetch without a
+        real reload. Apps that only add backend routes/settings panels (no
+        nav/frontend contribution) should leave this false — the default —
+        since those show up in the Installed list without a reload already.
+        Not schema-validated (optional, forward-compatible like `publisher`);
+        read straight off the raw manifest dict."""
+        return bool(self.raw.get("requires_ui_refresh", False))
+
+    @property
     def what_you_get(self) -> dict[str, list[str]]:
         """Marketplace detail-view summary — MCP tools / UI screens / runnable
         commands, derived from ``contributes`` (empty where nothing is declared)."""
