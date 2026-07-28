@@ -32,7 +32,7 @@ import json
 import logging
 import os
 
-from fastapi import Body, Depends, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Body, Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
 from src.api.identity import authorize_ws, require_identity
@@ -321,8 +321,14 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         return await reconciler.reconcile()
 
     @app.get("/api/apps/-/contributions")
-    async def contributions(identity: dict = Depends(require_identity)):
-        return runtime.contributions()
+    async def contributions(request: Request, identity: dict = Depends(require_identity)):
+        body = runtime.contributions()
+        origin = str(request.base_url).rstrip("/")
+        for fe in body.get("frontend", []):
+            bundle_url = fe.get("bundle_url")
+            if isinstance(bundle_url, str) and bundle_url.startswith("/"):
+                fe["bundle_url"] = f"{origin}{bundle_url}"
+        return body
 
     @app.get("/api/apps/-/skills")
     async def skills(identity: dict = Depends(require_identity)):

@@ -74,6 +74,48 @@ def test_declarative_window_spec_is_inlined(tmp_path, monkeypatch):
     assert "Sign in with GitHub" in labels
 
 
+def test_frontend_bundle_url_is_absolute_api_origin(tmp_path, monkeypatch):
+    """The cloud SPA runs on ``<ws>.workspace`` while app bundles are served by
+    ``api.<ws>.workspace``. Dynamic import() resolves relative URLs against the
+    SPA origin, so bundle_url must leave the API already absolute."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    package = tmp_path / "component-app"
+    (package / "ui" / "dist").mkdir(parents=True)
+    (package / "demo_plugin.py").write_text("""class DemoPlugin:
+    async def activate(self, ctx):
+        return None
+
+    async def deactivate(self):
+        return None
+""", encoding="utf-8")
+    (package / "ui" / "dist" / "plugin.js").write_text(
+        "export function register() {}\n", encoding="utf-8")
+    (package / "aw-app.json").write_text("""{
+  "manifest_version": 1,
+  "id": "demo",
+  "name": "Demo",
+  "version": "0.1.0",
+  "tier": "inprocess",
+  "runtime": {"python": ">=3.11", "entrypoint": "demo_plugin:DemoPlugin"},
+  "permissions": ["ui:code", "ui:slots:core.nav"],
+  "contributes": {
+    "frontend": {"mode": "component", "bundle": "ui/dist/plugin.js"}
+  }
+}
+""", encoding="utf-8")
+
+    app, runtime, _client_unused = _client()
+    import asyncio
+    asyncio.run(runtime.load(str(package), signed=True, granted_permissions=[
+        "ui:code", "ui:slots:core.nav"]))
+
+    client = TestClient(app, base_url="https://api.demo.workspace.aw.tekflox.com")
+    contrib = client.get("/api/apps/-/contributions").json()
+    assert contrib["frontend"][0]["bundle_url"] == (
+        "https://api.demo.workspace.aw.tekflox.com/api/apps/demo/ui/plugin.js"
+    )
+
+
 def test_catalog_serves_marketplace_apps_json(monkeypatch):
     catalog_mod.clear_cache()
     payload = {
