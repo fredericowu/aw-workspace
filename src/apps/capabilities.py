@@ -29,6 +29,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "db:own-tables":     {"risk": "low",  "desc": "create/use app-owned workspace tables"},
     "commands:install":  {"risk": "low",  "desc": "install commands/CLIs that survive restart"},
     "service:manage":    {"risk": "low",  "desc": "register a start/stop background service"},
+    "watchdog:tasks":    {"risk": "low",  "desc": "register in-process periodic (watchdog) tasks"},
     "net:outbound":      {"risk": "low",  "desc": "make outbound HTTP from Tier-1 code"},
     "fs:workspace-data": {"risk": "low",  "desc": "read/write under the app's own data dir"},
     "secrets:own":       {"risk": "low",  "desc": "request the app's own secrets"},

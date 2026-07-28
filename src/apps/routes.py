@@ -176,6 +176,14 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
     async def contributions(identity: dict = Depends(require_identity)):
         return runtime.contributions()
 
+    @app.get("/api/apps/-/watchdog")
+    async def watchdog_tasks(identity: dict = Depends(require_identity)):
+        """Introspection over every app's registered watchdog tasks (F6 Cap 3):
+        per-task last_run / last_ok / last_error / consecutive_failures /
+        next_run — so a wedged poller (e.g. gh logged out) is visible without
+        crashing the app."""
+        return {"tasks": runtime.watchdog.snapshot()}
+
     @app.get("/api/apps/-/catalog")
     async def catalog(identity: dict = Depends(require_identity),
                       refresh: bool = False):

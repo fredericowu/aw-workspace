@@ -168,6 +168,26 @@ class DbFacade(_Facade):
             self._ctx.app_id, name, sql, params)
 
 
+class WatchdogFacade(_Facade):
+    """``ctx.watchdog`` — register in-process periodic (watchdog) tasks.
+
+    Gated by ``watchdog:tasks``. An app registers an ``async`` callable the
+    runtime runs on a cadence (F6 Capability 3), distinct from ``service:manage``
+    (subprocesses). Registration journals ``watchdog:register`` so uninstall
+    cancels it (the runtime also cancels every task on unload before drain).
+    """
+
+    def register(self, task_id: str, fn: "Callable[[], Awaitable[Any]]",
+                 interval_s: "float | Callable[[], float]",
+                 run_immediately: bool = True) -> dict[str, Any]:
+        self._ctx._enforce("watchdog:tasks")
+        result = self._ctx._runtime.watchdog.register(
+            self._ctx.app_id, task_id, fn, interval_s, run_immediately)
+        self._ctx._runtime.journal.record(
+            self._ctx.app_id, "watchdog:register", task_id, {})
+        return result
+
+
 class NotificationsFacade(_Facade):
     """``ctx.notify`` — fire a notification through the workspace notification engine.
 
@@ -225,6 +245,7 @@ _FACADES: dict[str, tuple[str, type[_Facade]]] = {
     "secrets:own":      ("secrets", SecretsFacade),
     "db:own-tables":    ("db", DbFacade),
     "service:manage":   ("services", ServicesFacade),
+    "watchdog:tasks":   ("watchdog", WatchdogFacade),
     "notifications:send": ("notify", NotificationsFacade),
 }
 
@@ -295,6 +316,10 @@ class AppContext:
     @property
     def services(self) -> ServicesFacade:
         return self._get_facade("services", "service:manage")  # type: ignore[return-value]
+
+    @property
+    def watchdog(self) -> WatchdogFacade:
+        return self._get_facade("watchdog", "watchdog:tasks")  # type: ignore[return-value]
 
     @property
     def notify(self) -> NotificationsFacade:

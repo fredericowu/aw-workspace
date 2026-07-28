@@ -121,7 +121,7 @@ async def _get(host, path):
 def _reconciler(tmp_path, monkeypatch, cloud):
     monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path / "apps"))
     host = FastAPI()
-    rt = AppRuntime(host)
+    rt = AppRuntime(host, guard_identity=False)
     rc = Reconciler(rt, cloud=cloud, local=FakeMirror(), fetch=_fake_fetch)
     return host, rt, rc
 

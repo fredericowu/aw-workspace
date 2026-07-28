@@ -51,7 +51,7 @@ def _async(coro):
 def test_hot_load_mounts_route_then_unload_removes_it():
     async def run():
         host = FastAPI()
-        rt = AppRuntime(host, journal=ActionJournal())
+        rt = AppRuntime(host, journal=ActionJournal(), guard_identity=False)
 
         await rt.load(HELLO_DIR)
         assert rt.is_loaded("hello")
@@ -118,7 +118,7 @@ def test_unload_waits_for_in_flight_request_to_drain(tmp_path):
 
     async def run():
         host = FastAPI()
-        rt = AppRuntime(host, drain_timeout=5)
+        rt = AppRuntime(host, drain_timeout=5, guard_identity=False)
         await rt.load(pkg)
         loaded = rt.get("slowapp")
         gate = sys.modules[f"{loaded.module_prefix}.plugin"].GATE

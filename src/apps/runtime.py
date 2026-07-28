@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import logging
 import os
 import sys
@@ -35,10 +36,116 @@ from src.apps.journal import ActionJournal
 from src.apps.manifest import Manifest, load_manifest
 from src.apps.secret_store import SecretStore
 from src.apps.services import ServiceSupervisor
+from src.apps.watchdog import WatchdogSupervisor
 
 log = logging.getLogger(__name__)
 
 DEFAULT_DRAIN_TIMEOUT = float(os.environ.get("AW_APPS_DRAIN_TIMEOUT", "10"))
+
+# Cookie the central-identity JWT lands in (mirrors src.api.identity.COOKIE_NAME).
+_ID_COOKIE = "aw_id_jwt"
+
+
+def _cookie_value(cookie_header: str, name: str) -> str:
+    """Pull one cookie value out of a raw ``Cookie:`` header (no deps)."""
+    from http.cookies import SimpleCookie
+    try:
+        jar = SimpleCookie()
+        jar.load(cookie_header)
+        morsel = jar.get(name)
+        return morsel.value if morsel else ""
+    except Exception:
+        return ""
+
+
+def _headers_dict(scope: Scope) -> dict[bytes, bytes]:
+    return {k.lower(): v for k, v in (scope.get("headers") or [])}
+
+
+def _default_verify_http(scope: Scope) -> dict | None:
+    """Verify the identity JWT on an HTTP scope (bearer header or apex cookie)."""
+    from src.api.identity import decode_identity_jwt
+    headers = _headers_dict(scope)
+    auth = headers.get(b"authorization", b"").decode()
+    if auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+    else:
+        token = _cookie_value(headers.get(b"cookie", b"").decode(), _ID_COOKIE)
+    return decode_identity_jwt(token) if token else None
+
+
+def _default_verify_ws(scope: Scope) -> dict | None:
+    """Verify the identity JWT on a WebSocket handshake (``?token=`` then cookie).
+
+    A browser cannot set custom headers on a WS, so the token comes from the
+    query param first, then the apex ``aw_id_jwt`` cookie — same order as
+    ``src.api.identity.authorize_ws``.
+    """
+    from urllib.parse import parse_qs
+
+    from src.api.identity import decode_identity_jwt
+    qs = parse_qs(scope.get("query_string", b"").decode())
+    token = (qs.get("token") or [""])[0]
+    if not token:
+        headers = _headers_dict(scope)
+        token = _cookie_value(headers.get(b"cookie", b"").decode(), _ID_COOKIE)
+    return decode_identity_jwt(token) if token else None
+
+
+class IdentityGuard:
+    """ASGI wrapper enforcing the central identity JWT on an app's sub-app.
+
+    F1 mounts the raw sub-app, so every ``/api/apps/<slug>/*`` route is
+    unauthenticated (framework routes use ``Depends(require_identity)``; app
+    routes never did). This guard is inserted by :meth:`AppRuntime._mount`
+    between the ``Mount`` and the ``_DrainableApp`` so the app never sees an
+    unauthenticated request (F6 Capability 1):
+
+    * ``http`` — missing/invalid token → 401 JSON, app never invoked.
+    * ``websocket`` — missing/invalid token → accept then ``close(4401)`` before
+      the app accepts (mirrors ``src/api/terminal.py``); app never invoked.
+
+    v1: **all** app routes are guarded — no ``public:`` escape hatch (webhooks
+    are a later manifest extension). Verifiers are injectable for tests.
+    """
+
+    def __init__(self, app: Any, verify_http=None, verify_ws=None) -> None:
+        self.app = app
+        self._verify_http = verify_http or _default_verify_http
+        self._verify_ws = verify_ws or _default_verify_ws
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        stype = scope["type"]
+        if stype == "http":
+            if self._verify_http(scope) is None:
+                await self._send_401(send)
+                return
+        elif stype == "websocket":
+            if self._verify_ws(scope) is None:
+                await self._reject_ws(receive, send)
+                return
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _send_401(send: Send) -> None:
+        body = b'{"detail":"unauthorized"}'
+        await send({
+            "type": "http.response.start", "status": 401,
+            "headers": [(b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode())],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+    @staticmethod
+    async def _reject_ws(receive: Receive, send: Send) -> None:
+        # Drain the connect event, accept, then close with the unauthorized code
+        # (4401) — same handshake as terminal.py so the browser sees a real code.
+        try:
+            await receive()  # websocket.connect
+        except Exception:
+            pass
+        await send({"type": "websocket.accept"})
+        await send({"type": "websocket.close", "code": 4401})
 
 
 class _DrainableApp:
@@ -98,16 +205,21 @@ class AppRuntime:
     """Owns the set of loaded Tier-1 apps for one host FastAPI process."""
 
     def __init__(self, host: FastAPI, journal: ActionJournal | None = None,
-                 drain_timeout: float = DEFAULT_DRAIN_TIMEOUT) -> None:
+                 drain_timeout: float = DEFAULT_DRAIN_TIMEOUT,
+                 guard_identity: bool = True) -> None:
         self.host = host
         self.journal = journal or ActionJournal()
         self.drain_timeout = drain_timeout
+        # F6 Cap 1: wrap every app mount with IdentityGuard. Off only for pure
+        # runtime unit tests that hit app subroutes without a real JWT.
+        self.guard_identity = guard_identity
         self._apps: dict[str, LoadedApp] = {}
         self._lock = asyncio.Lock()
         self._loading: LoadedApp | None = None  # set during activate() for _mount
         # F4 effect backends the capability facades route through.
         self.commands = CommandInstaller()
         self.services = ServiceSupervisor()
+        self.watchdog = WatchdogSupervisor()
         self.secret_store = SecretStore()
         self._db_tables: Any = None  # lazy — only apps granted db:own-tables need it
 
@@ -146,7 +258,7 @@ class AppRuntime:
         for app in self._apps.values():
             slug = app.manifest.id
             for win in app.manifest.windows:
-                windows.append({"app": slug, **win})
+                windows.append(self._resolve_window(app, {"app": slug, **win}))
             for entry in app.manifest.nav:
                 nav.append({"app": slug, **entry})
             for panel in app.manifest.settings_panels:
@@ -172,6 +284,33 @@ class AppRuntime:
                 })
         return {"windows": windows, "nav": nav, "settings": settings,
                 "frontend": frontend}
+
+    def _resolve_window(self, app: LoadedApp, entry: dict[str, Any]) -> dict[str, Any]:
+        """Inline a declarative window's spec file into ``body.spec_data``.
+
+        The SPA's ``AppWindow`` renders a spec object; the F1 manifest only
+        carries a ``body.spec`` file ref (``windows/main.json``), which was never
+        served — so the window was unreachable (F6 Cap 2). Resolve it here, once
+        per contributions fetch, path-scoped to the app's own package.
+        """
+        body = entry.get("body") or {}
+        spec_ref = body.get("spec")
+        if body.get("type") != "declarative" or not spec_ref or body.get("spec_data"):
+            return entry
+        pkg_root = os.path.realpath(app.package_dir)
+        target = os.path.realpath(os.path.join(pkg_root, spec_ref))
+        if not target.startswith(pkg_root + os.sep) or not os.path.isfile(target):
+            log.warning("apps: window spec %r for %s not found / out of package",
+                        spec_ref, app.manifest.id)
+            return entry
+        try:
+            with open(target, encoding="utf-8") as fh:
+                spec_data = json.load(fh)
+        except Exception:
+            log.exception("apps: failed to load window spec %r for %s",
+                          spec_ref, app.manifest.id)
+            return entry
+        return {**entry, "body": {**body, "spec_data": spec_data}}
 
     # ---- load / unload --------------------------------------------------
 
@@ -249,7 +388,14 @@ class AppRuntime:
                 self.host.router.routes.remove(loaded.mount)
             self._invalidate_openapi()
 
-        # 2. Signal long-poll/WS handlers, then drain in-flight requests.
+        # 2. Cancel the app's watchdog tasks BEFORE draining — stop producing
+        #    (poll cache, WS broadcast) while its long-lived sockets close.
+        try:
+            self.watchdog.cancel_all_for(slug)
+        except Exception:
+            log.exception("apps: cancelling watchdog tasks for %s failed", slug)
+
+        # 3. Signal long-poll/WS handlers, then drain in-flight requests.
         for hook in loaded.ctx._drain_hooks():
             try:
                 res = hook()
@@ -263,13 +409,13 @@ class AppRuntime:
                 log.warning("apps: %s did not drain within %ss (%d in flight)",
                             slug, timeout, loaded.drainable.active)
 
-        # 3. Plugin teardown.
+        # 4. Plugin teardown.
         try:
             await loaded.plugin.deactivate()
         except Exception:
             log.exception("apps: deactivate() failed for %s", slug)
 
-        # 4. Replay the journal in reverse — actually REVERT each side effect
+        # 5. Replay the journal in reverse — actually REVERT each side effect
         #    (F4): remove command shims, run the app's CLI revert script, drop
         #    app-owned tables, stop registered services. One failing revert must
         #    not block the rest; the route Mount was already removed above.
@@ -302,6 +448,9 @@ class AppRuntime:
             self.db_tables.drop(loaded.manifest.id, entry.target)
         elif kind == "service:register":
             self.services.stop_all_for(loaded.manifest.id)
+        elif kind == "watchdog:register":
+            # Idempotent with the explicit cancel_all_for in unload() above.
+            self.watchdog.cancel_all_for(loaded.manifest.id)
         # route:mount (already unmounted), system_cli:install (audit-only),
         # secret:write (namespace purged above), capability:denied → no-op.
 
@@ -316,7 +465,10 @@ class AppRuntime:
             raise RuntimeError(f"app {app_id!r} already mounted a sub-app")
 
         drainable = _DrainableApp(subapp)
-        mount = Mount(f"/api/apps/{app_id}", app=drainable)
+        # IdentityGuard sits OUTSIDE the drain tracker so a rejected (401/4401)
+        # request is never counted as in-flight against unload's drain.
+        guarded = IdentityGuard(drainable) if self.guard_identity else drainable
+        mount = Mount(f"/api/apps/{app_id}", app=guarded)
         # Mutation happens on the event loop (single process) — the list append
         # is atomic w.r.t. request matching; no free-threading hazard.
         self.host.router.routes.append(mount)

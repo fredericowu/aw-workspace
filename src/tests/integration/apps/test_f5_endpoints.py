@@ -55,6 +55,25 @@ def test_installed_list_carries_config_and_frontend_fields(tmp_path, monkeypatch
     assert contrib["frontend"] == []  # no component/iframe bundle app loaded
 
 
+def test_declarative_window_spec_is_inlined(tmp_path, monkeypatch):
+    """F6 Cap 2: contributions() inlines a declarative window's spec file into
+    body.spec_data so the SPA's AppWindow can render it (the git 'Sign in with
+    GitHub' window was unreachable — its spec file was never served)."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    app, runtime, client = _client()
+    import asyncio
+    asyncio.run(runtime.load(GIT, granted_permissions=[
+        "commands:install", "routes:register", "secrets:own",
+        "fs:workspace-data", "net:outbound"]))
+
+    win = next(w for w in client.get("/api/apps/-/contributions").json()["windows"]
+               if w["id"] == "git.main")
+    spec = win["body"]["spec_data"]
+    assert spec and "regions" in spec
+    labels = [wg.get("label") for r in spec["regions"] for wg in r.get("widgets", [])]
+    assert "Sign in with GitHub" in labels
+
+
 def test_catalog_serves_marketplace_apps_json(monkeypatch):
     catalog_mod.clear_cache()
     payload = {

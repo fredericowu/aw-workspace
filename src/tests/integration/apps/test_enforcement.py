@@ -86,7 +86,7 @@ def test_granted_route_works_but_ungranted_facades_denied_and_journaled(tmp_path
 
     async def run():
         host = FastAPI()
-        rt = AppRuntime(host, journal=ActionJournal())
+        rt = AppRuntime(host, journal=ActionJournal(), guard_identity=False)
         await rt.load(pkg, granted_permissions=["routes:register"])
 
         # the granted capability worked: the route is live

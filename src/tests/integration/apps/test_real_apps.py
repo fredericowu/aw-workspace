@@ -81,7 +81,7 @@ def test_git_installs_stores_token_secret_and_routes(tmp_path, monkeypatch):
         import httpx
 
         host = FastAPI()
-        rt = AppRuntime(host, journal=ActionJournal())
+        rt = AppRuntime(host, journal=ActionJournal(), guard_identity=False)
         _patch_installers(rt, calls)
         await rt.load(GIT, granted_permissions=[
             "commands:install", "routes:register", "secrets:own",
