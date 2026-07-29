@@ -36,18 +36,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Configure Podman on macbook-fred runner
+        run: |
+          PODMAN=/Users/aw/podman-dist/podman/bin/podman
+          if [ ! -x "$PODMAN" ]; then
+            echo "::error::Podman not found at $PODMAN"
+            exit 1
+          fi
+          "$PODMAN" machine start >/dev/null 2>&1 || true
+          echo "PODMAN=$PODMAN" >> "$GITHUB_ENV"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+          echo "/Users/aw/podman-dist/podman/bin" >> "$GITHUB_PATH"
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | "$PODMAN" login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       # ghcr.io rejects mixed-case namespaces — lowercase the owner login.
       - name: Lowercase repo owner
@@ -55,18 +57,32 @@ jobs:
         run: echo "lc=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          build-args: |
-            AW_WORKSPACE_VERSION=${{ github.sha }}
-          tags: |
-            ghcr.io/${{ steps.owner.outputs.lc }}/aw-workspace:${{ inputs.tag || 'latest' }}
-            ghcr.io/${{ steps.owner.outputs.lc }}/aw-workspace:${{ github.sha }}
-          cache-from: type=registry,ref=ghcr.io/${{ steps.owner.outputs.lc }}/aw-workspace:buildcache
-          cache-to: type=registry,ref=ghcr.io/${{ steps.owner.outputs.lc }}/aw-workspace:buildcache,mode=max
+        env:
+          OWNER_LC: ${{ steps.owner.outputs.lc }}
+          EXTRA_TAG: ${{ inputs.tag || 'latest' }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${OWNER_LC}/aw-workspace"
+          MANIFEST="localhost/aw-workspace:${{ github.sha }}"
+
+          "$PODMAN" manifest rm "$MANIFEST" >/dev/null 2>&1 || true
+          "$PODMAN" manifest create "$MANIFEST"
+
+          for platform in linux/amd64 linux/arm64; do
+            echo "==> Building $platform"
+            "$PODMAN" build \
+              --pull \
+              --platform "$platform" \
+              --manifest "$MANIFEST" \
+              --build-arg "AW_WORKSPACE_VERSION=${{ github.sha }}" \
+              .
+          done
+
+          echo "==> Pushing ${IMAGE}:${{ github.sha }}"
+          "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:${{ github.sha }}"
+
+          echo "==> Pushing ${IMAGE}:${EXTRA_TAG}"
+          "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:${EXTRA_TAG}"
 
       - name: Summary
         run: |
