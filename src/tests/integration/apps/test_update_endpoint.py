@@ -70,15 +70,15 @@ def test_update_writes_desired_and_enqueues_job(tmp_path, monkeypatch):
         assert r.status_code == 202
         assert r.json() == {"app_id": "widget", "status": "installing"}
 
-        # desired row written immediately (version/ref from the catalog)
+        job = app.state.app_install_jobs.get("widget")
+        assert job is not None and job.task is not None
+        await job.task
+
+        # desired row written by the background job (version/ref from catalog)
         assert cloud.rows[0]["version"] == "2.0.0"
         assert cloud.rows[0]["repo"] == repo_v2
         assert "widget" in reconciler.local.rows
         assert reconciler.local.rows["widget"]["version"] == "2.0.0"
-
-        job = app.state.app_install_jobs.get("widget")
-        assert job is not None and job.task is not None
-        await job.task
 
         s = await _get(app, "/api/apps/widget/install-status")
         assert s.json()["status"] == "installed"
@@ -98,9 +98,16 @@ def test_update_already_at_catalog_version_is_a_noop(tmp_path, monkeypatch):
                                     "repo": repo, "ref": "main"}])
 
         r = await _post(app, "/api/apps/widget/update")
-        assert r.status_code == 200
-        assert r.json() == {"app_id": "widget", "status": "no-op", "version": "1.0.0"}
-        assert app.state.app_install_jobs.get("widget") is None
+        assert r.status_code == 202
+        assert r.json() == {"app_id": "widget", "status": "installing"}
+
+        job = app.state.app_install_jobs.get("widget")
+        assert job is not None and job.task is not None
+        await job.task
+
+        s = await _get(app, "/api/apps/widget/install-status")
+        assert s.json()["status"] == "installed"
+        assert s.json()["summary"] == {"app_id": "widget", "status": "no-op", "version": "1.0.0"}
 
     _async(run())
 
@@ -117,7 +124,7 @@ def test_update_not_installed_is_404(tmp_path, monkeypatch):
     _async(run())
 
 
-def test_update_not_in_catalog_is_404(tmp_path, monkeypatch):
+def test_update_not_in_catalog_fails_via_status(tmp_path, monkeypatch):
     repo = _make_app_repo(tmp_path, "widget", "1.0.0")
     cloud = FakeCloud()
     app, runtime, reconciler = _app(tmp_path, monkeypatch, cloud)
@@ -127,6 +134,13 @@ def test_update_not_in_catalog_is_404(tmp_path, monkeypatch):
         _set_catalog(monkeypatch, [])  # widget not in the catalog
 
         r = await _post(app, "/api/apps/widget/update")
-        assert r.status_code == 404
+        assert r.status_code == 202
+        job = app.state.app_install_jobs.get("widget")
+        assert job is not None and job.task is not None
+        await job.task
+
+        s = await _get(app, "/api/apps/widget/install-status")
+        assert s.json()["status"] == "failed"
+        assert "not found in catalog" in s.json()["error"]
 
     _async(run())

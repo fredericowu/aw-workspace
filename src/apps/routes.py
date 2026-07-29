@@ -176,45 +176,54 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         if loaded is None:
             return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
 
-        catalog_entry = next(
-            (a for a in get_catalog().get("apps", [])
-             if (a.get("id") or a.get("slug")) == slug),
-            None,
-        )
-        if catalog_entry is None:
-            return JSONResponse({"error": f"{slug} not found in catalog"}, status_code=404)
-
-        catalog_version = catalog_entry.get("version") or ""
-        if catalog_version and catalog_version == loaded.manifest.version:
-            return {"app_id": slug, "status": "no-op", "version": loaded.manifest.version}
-
         if jobs.is_installing(slug):
             return JSONResponse({"app_id": slug, "status": "installing"}, status_code=202)
-
-        spec = AppSpec(
-            app_id=slug,
-            version=catalog_version,
-            repo=catalog_entry.get("repo"),
-            ref=catalog_entry.get("ref") or "HEAD",
-            granted_permissions=loaded.granted_permissions,
-            config=loaded.config,
-            signed=loaded.signed,
-        )
-        if reconciler.cloud.configured:
-            try:
-                reconciler.cloud.put_desired(
-                    slug, version=spec.version, repo=spec.repo, ref=spec.ref,
-                    granted_permissions=spec.granted_permissions, config=spec.config,
-                    signed=spec.signed)
-            except Exception:
-                log.exception("apps: update of %s did not reach the cloud registry", slug)
-        reconciler.local.upsert(spec, loaded.package_dir)
 
         job = jobs.start(slug)
 
         async def _run_update() -> None:
             try:
+                catalog_entry = next(
+                    (a for a in get_catalog().get("apps", [])
+                     if (a.get("id") or a.get("slug")) == slug),
+                    None,
+                )
+                if catalog_entry is None:
+                    jobs.mark_failed(slug, f"{slug} not found in catalog")
+                    return
+
+                catalog_version = catalog_entry.get("version") or ""
+                if catalog_version and catalog_version == loaded.manifest.version:
+                    jobs.mark_installed(
+                        slug,
+                        {"app_id": slug, "status": "no-op", "version": loaded.manifest.version},
+                    )
+                    return
+
+                spec = AppSpec(
+                    app_id=slug,
+                    version=catalog_version,
+                    repo=catalog_entry.get("repo"),
+                    ref=catalog_entry.get("ref") or "HEAD",
+                    granted_permissions=loaded.granted_permissions,
+                    config=loaded.config,
+                    signed=loaded.signed,
+                )
+                if reconciler.cloud.configured:
+                    try:
+                        reconciler.cloud.put_desired(
+                            slug, version=spec.version, repo=spec.repo, ref=spec.ref,
+                            granted_permissions=spec.granted_permissions, config=spec.config,
+                            signed=spec.signed)
+                    except Exception:
+                        log.exception("apps: update of %s did not reach the cloud registry", slug)
+                reconciler.local.upsert(spec, loaded.package_dir)
+
                 summary = await reconciler.reconcile()
+                for error in summary.get("errors", []):
+                    if error.get("app_id") == slug:
+                        jobs.mark_failed(slug, f"update failed: {error.get('error')}")
+                        return
                 jobs.mark_installed(slug, summary)
             except Exception as e:  # noqa: BLE001 — surfaced via the status endpoint
                 log.exception("apps: update failed for %s", slug)
