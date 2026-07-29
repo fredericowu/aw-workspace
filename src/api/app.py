@@ -70,7 +70,11 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     async def health():
-        return {"status": "ok", "workspace": os.environ.get("AW_WORKSPACE", "")}
+        return {
+            "status": "ok",
+            "workspace": os.environ.get("AW_WORKSPACE", ""),
+            "version": os.environ.get("AW_WORKSPACE_VERSION", ""),
+        }
 
     @app.get("/api/auth/status")
     async def auth_status(request: Request, authorization: str = Header(default="")):

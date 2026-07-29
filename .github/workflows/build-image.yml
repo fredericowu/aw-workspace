@@ -60,6 +60,8 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            AW_WORKSPACE_VERSION=${{ github.sha }}
           tags: |
             ghcr.io/${{ steps.owner.outputs.lc }}/aw-workspace:${{ inputs.tag || 'latest' }}
             ghcr.io/${{ steps.owner.outputs.lc }}/aw-workspace:${{ github.sha }}

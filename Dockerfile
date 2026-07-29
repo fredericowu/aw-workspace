@@ -2,6 +2,8 @@
 # Sem CLIs de agente, sem docker socket, sem build de frontend.
 FROM python:3.12-slim
 
+ARG AW_WORKSPACE_VERSION=dev
+
 # procps → `ps`, used by the terminal /procs + /kill endpoints (process badge).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl build-essential libpq-dev procps \
@@ -33,6 +35,7 @@ COPY . /opt/agentic-workspace
 # the workspace root — terminal_manager falls back to $HOME when no cwd given.
 ENV AW_PORT=9030 \
     AW_WORKSPACE_WORKERS=1 \
+    AW_WORKSPACE_VERSION=${AW_WORKSPACE_VERSION} \
     PYTHONPATH=/opt/agentic-workspace \
     HOME=/opt/agentic-workspace \
     PYTHONUNBUFFERED=1
