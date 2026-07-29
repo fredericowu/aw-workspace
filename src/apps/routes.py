@@ -161,6 +161,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         if not runtime.is_loaded(slug):
             return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
         summary = await reconciler.uninstall(slug)
+        jobs.clear(slug)
         return summary
 
     @app.post("/api/apps/{slug}/update")

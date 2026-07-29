@@ -113,6 +113,34 @@ def test_duplicate_install_while_in_progress_does_not_start_a_second_job(tmp_pat
     _async(run())
 
 
+def test_uninstall_clears_finished_install_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    app, runtime = _app()
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            r = await c.post("/api/apps/install", json={"package_dir": ESSENTIALS})
+            assert r.status_code == 202
+
+            job = app.state.app_install_jobs.get("essentials")
+            assert job is not None and job.task is not None
+            await job.task
+
+            s = await c.get("/api/apps/essentials/install-status")
+            assert s.json()["status"] == "installed"
+            assert runtime.is_loaded("essentials")
+
+            u = await c.delete("/api/apps/essentials")
+            assert u.status_code == 200
+            assert not runtime.is_loaded("essentials")
+
+            s2 = await c.get("/api/apps/essentials/install-status")
+            assert s2.status_code == 404
+
+    _async(run())
+
+
 def test_install_failure_is_reported_via_status_not_a_dropped_connection(tmp_path, monkeypatch):
     monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
     app, runtime = _app()

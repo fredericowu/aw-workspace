@@ -71,6 +71,9 @@ class InstallJobs:
     def get(self, app_id: str) -> Optional[InstallJob]:
         return self._jobs.get(app_id)
 
+    def clear(self, app_id: str) -> None:
+        self._jobs.pop(app_id, None)
+
     def all_active(self) -> list[dict[str, Any]]:
         """Snapshot of every tracked job — sent to a WS client on connect so
         it catches up on installs that started before it connected."""
