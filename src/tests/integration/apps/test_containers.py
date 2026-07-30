@@ -15,10 +15,13 @@ import textwrap
 import pytest
 from docker.errors import ImageNotFound, NotFound
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from starlette.routing import Mount
 
+from src.api.identity import require_identity
 from src.apps.containers import ContainerError, ContainerSupervisor
 from src.apps.journal import ActionJournal
+from src.apps.routes import register_apps_routes
 from src.apps.runtime import AppRuntime
 
 
@@ -218,6 +221,63 @@ def test_runtime_loads_container_app_and_reverts_on_unload(tmp_path):
         assert rt.journal.entries_for("browser") == []
         assert not [r for r in rt.host.router.routes
                     if isinstance(r, Mount) and r.path == "/api/apps/browser"]
+
+    _async(run())
+
+
+def test_container_auto_start_false_registers_without_starting(tmp_path):
+    pkg = _write_container_app(tmp_path)
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+
+        await rt.load(
+            pkg,
+            granted_permissions=["containers:manage"],
+            signed=True,
+            config={"auto_start": False},
+        )
+        assert rt.is_loaded("browser")
+        assert fake.run_calls == []
+
+        mounts = [r for r in rt.host.router.routes
+                  if isinstance(r, Mount) and r.path == "/api/apps/browser"]
+        assert len(mounts) == 1
+
+    _async(run())
+
+
+def test_config_endpoint_applies_auto_start_toggle(tmp_path):
+    pkg = _write_container_app(tmp_path)
+
+    class _Local:
+        def __init__(self):
+            self.saved = None
+
+        def update_config(self, app_id, config):
+            self.saved = (app_id, config)
+
+    async def run():
+        app = FastAPI()
+        rt = register_apps_routes(app)
+        local = _Local()
+        app.state.app_reconciler.local = local
+        app.dependency_overrides[require_identity] = lambda: {"sub": "test"}
+
+        fake = _FakeDocker()
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+        await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
+        assert fake.run_calls
+
+        client = TestClient(app)
+        r = client.post("/api/apps/browser/config", json={"config": {"auto_start": False}})
+        assert r.status_code == 200
+        assert r.json()["config"]["auto_start"] is False
+        assert local.saved[0] == "browser"
+        assert local.saved[1]["auto_start"] is False
+        assert fake.store["aw-app-browser"].removed is True
 
     _async(run())
 

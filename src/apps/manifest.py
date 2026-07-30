@@ -95,7 +95,74 @@ class Manifest:
     @property
     def has_config(self) -> bool:
         """True when the app exposes a settings/config surface the gear opens."""
-        return bool(self.settings_panels or self.config_schema.get("properties"))
+        return bool(
+            self.settings_panels
+            or self.config_schema.get("properties")
+            or self.is_managed_app
+        )
+
+    @property
+    def is_managed_app(self) -> bool:
+        """True for app surfaces whose lifecycle is owned by the workspace UI.
+
+        `body.type: managed_app` is the canonical app-authored signal. Tier-2
+        container apps are treated as managed as well because the workspace
+        owns their process controls even if an older manifest forgot the body
+        hint.
+        """
+        if self.tier == "container":
+            return True
+        for win in self.windows:
+            body = win.get("body") if isinstance(win, dict) else {}
+            if isinstance(body, dict) and body.get("type") == "managed_app":
+                return True
+        return False
+
+    @property
+    def effective_config_schema(self) -> dict[str, Any]:
+        """App schema plus framework-owned managed-app lifecycle settings."""
+        schema = dict(self.config_schema or {})
+        props = dict(schema.get("properties") or {})
+        required = list(schema.get("required") or [])
+        if self.is_managed_app:
+            framework_props = {
+                "auto_start": {
+                    "type": "boolean",
+                    "default": True,
+                    "title": "Auto-start",
+                    "description": "Start this app automatically when the workspace starts.",
+                    "x-framework": True,
+                },
+                "auth_required": {
+                    "type": "boolean",
+                    "default": True,
+                    "title": "Authentication required",
+                    "description": "Only signed-in workspace users can open this app.",
+                    "x-framework": True,
+                },
+                "public": {
+                    "type": "boolean",
+                    "default": False,
+                    "title": "Public",
+                    "description": "Expose this app through the workspace public routing layer.",
+                    "x-framework": True,
+                },
+            }
+            props = {**framework_props, **props}
+        if props:
+            schema["type"] = "object"
+            schema["properties"] = props
+            schema["required"] = required
+        return schema
+
+    def config_with_defaults(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Merge config_schema defaults with persisted config."""
+        merged: dict[str, Any] = {}
+        for key, spec in (self.effective_config_schema.get("properties") or {}).items():
+            if isinstance(spec, dict) and "default" in spec:
+                merged[key] = spec["default"]
+        merged.update(dict(config or {}))
+        return merged
 
     @property
     def requires_ui_refresh(self) -> bool:

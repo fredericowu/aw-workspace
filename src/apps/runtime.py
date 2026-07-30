@@ -21,7 +21,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import FastAPI
 from starlette.routing import Mount, get_route_path
@@ -126,8 +126,10 @@ class IdentityGuard:
     * ``websocket`` — missing/invalid token → accept then ``close(4401)`` before
       the app accepts (mirrors ``src/api/terminal.py``); app never invoked.
 
-    v1: **all** app routes are guarded — no ``public:`` escape hatch (webhooks
-    are a later manifest extension), EXCEPT the ``routes:local`` bypass below.
+    By default all app routes are guarded. A managed app can set
+    ``auth_required: false`` in its framework config to bypass this gate and
+    let the mounted app handle access itself. The ``routes:local`` bypass below
+    remains narrower: loopback callers only, only for declared local paths.
     Verifiers are injectable for tests.
 
     ``local_paths`` (ADR "Apps Own Their Front + Back Routes" Decision 2): a
@@ -146,11 +148,18 @@ class IdentityGuard:
     _LOCAL_HOSTS = ("127.0.0.1", "::1")
 
     def __init__(self, app: Any, verify_http=None, verify_ws=None,
-                 local_paths: "list[str] | None" = None) -> None:
+                 local_paths: "list[str] | None" = None,
+                 auth_required: "bool | Callable[[], bool]" = True) -> None:
         self.app = app
         self._verify_http = verify_http or _default_verify_http
         self._verify_ws = verify_ws or _default_verify_ws
         self._local_paths = frozenset(local_paths or [])
+        self._auth_required = auth_required
+
+    def _requires_auth(self) -> bool:
+        if callable(self._auth_required):
+            return bool(self._auth_required())
+        return bool(self._auth_required)
 
     def _local_bypass(self, scope: Scope) -> bool:
         if not self._local_paths:
@@ -167,7 +176,7 @@ class IdentityGuard:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         stype = scope["type"]
         if stype == "http":
-            if self._local_bypass(scope):
+            if self._local_bypass(scope) or not self._requires_auth():
                 await self.app(scope, receive, send)
                 return
             claims = self._verify_http(scope)
@@ -176,7 +185,7 @@ class IdentityGuard:
                 return
             scope["aw_identity"] = claims
         elif stype == "websocket":
-            if self._local_bypass(scope):
+            if self._local_bypass(scope) or not self._requires_auth():
                 await self.app(scope, receive, send)
                 return
             claims = self._verify_ws(scope)
@@ -606,7 +615,11 @@ class AppRuntime:
         drainable = _DrainableApp(asgi_app)
         # IdentityGuard sits OUTSIDE the drain tracker so a rejected (401/4401)
         # request is never counted as in-flight against unload's drain.
-        guarded = (IdentityGuard(drainable, local_paths=_local_paths_for(loaded))
+        guarded = (IdentityGuard(
+                       drainable,
+                       local_paths=_local_paths_for(loaded),
+                       auth_required=lambda: bool(loaded.config.get("auth_required", True)),
+                   )
                    if self.guard_identity else drainable)
         mount = Mount(f"/api/apps/{app_id}", app=guarded)
         # Mutation happens on the event loop (single process) — the list append
@@ -665,7 +678,8 @@ class AppRuntime:
         self.journal.record(slug, "container:register", image,
                             {"port": port, "run_flags": run_flags, "resources": resources})
         try:
-            self.containers.start(slug)
+            if config.get("auto_start", True):
+                self.containers.start(slug)
             proxy = ContainerReverseProxy(self.containers.base_url(slug))
             self._attach_mount(loaded, proxy)
         except Exception:

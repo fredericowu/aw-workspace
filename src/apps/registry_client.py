@@ -56,14 +56,16 @@ class CloudRegistry:
         return resp.json().get("app_installs", [])
 
     def put_desired(self, app_id: str, *, version: str, repo: str | None = None,
-                    ref: str = "HEAD", granted_permissions: list[str] | None = None,
+                    ref: str | None = "HEAD", granted_permissions: list[str] | None = None,
                     config: dict | None = None, instance_id: str = "",
                     signed: bool = False) -> dict:
         """Upsert the desired state for one app (the workspace's install flow)."""
         if not self.configured:
             return {}
-        body: dict = {"version": version, "ref": ref, "instance_id": instance_id,
+        body: dict = {"version": version, "instance_id": instance_id,
                       "signed": signed}
+        if ref is not None:
+            body["ref"] = ref
         if repo is not None:
             body["repo"] = repo
         if granted_permissions is not None:

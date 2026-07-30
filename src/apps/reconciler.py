@@ -120,6 +120,17 @@ class LocalMirror:
                 session.delete(row)
                 session.commit()
 
+    def update_config(self, app_id: str, config: dict[str, Any]) -> None:
+        from src.api.db import get_session
+        from src.api.models import AppInstall
+
+        with get_session() as session:
+            row = session.get(AppInstall, app_id)
+            if row is not None:
+                row.config = config
+                session.add(row)
+                session.commit()
+
 
 class Reconciler:
     """Converges the running app set to the cloud registry's desired state."""
@@ -144,9 +155,156 @@ class Reconciler:
         raise ValueError(
             f"app {spec.app_id!r} has neither a repo to fetch nor an on-disk package_dir")
 
+    # ---- app dependency resolution -----------------------------------------
+
+    @staticmethod
+    def _required_app_dependencies(manifest) -> list[dict[str, Any]]:
+        """Required ``dependencies.apps`` entries from a manifest.
+
+        The manifest schema keeps ``dependencies`` forward-compatible as a
+        loose object, so the reconciler validates only the app-dependency shape
+        it actually enforces. Missing ``required`` means required, matching
+        AW's component ``depends`` behavior.
+        """
+        apps = manifest.dependencies.get("apps", [])
+        if apps is None:
+            return []
+        if not isinstance(apps, list):
+            raise ValueError(
+                f"app {manifest.id!r} dependencies.apps must be a list")
+        deps: list[dict[str, Any]] = []
+        for raw in apps:
+            if isinstance(raw, str):
+                dep = {"id": raw}
+            elif isinstance(raw, dict):
+                dep = dict(raw)
+            else:
+                raise ValueError(
+                    f"app {manifest.id!r} dependency entries must be objects or strings")
+            dep_id = str(dep.get("id") or "").strip()
+            if not dep_id:
+                raise ValueError(
+                    f"app {manifest.id!r} dependency entry is missing id")
+            if dep.get("required", True) is False or dep.get("optional") is True:
+                continue
+            dep["id"] = dep_id
+            deps.append(dep)
+        return deps
+
+    def _known_dependency_rows(self) -> dict[str, dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        if self.cloud.configured:
+            try:
+                rows.extend(self.cloud.list_desired())
+            except Exception:
+                log.exception("apps: could not read cloud registry while resolving dependencies")
+        try:
+            rows.extend(self.local.list())
+        except Exception:
+            log.exception("apps: could not read local mirror while resolving dependencies")
+
+        out: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            app_id = row.get("app_id") or row.get("slug")
+            if app_id and app_id not in out:
+                out[str(app_id)] = dict(row)
+        return out
+
+    def _catalog_dependency_row(self, app_id: str) -> dict[str, Any] | None:
+        try:
+            from src.apps.catalog import get_catalog
+            apps = get_catalog().get("apps", [])
+        except Exception:
+            log.exception("apps: could not read catalog while resolving dependency %s", app_id)
+            return None
+
+        entry = next(
+            (a for a in apps if (a.get("id") or a.get("slug")) == app_id),
+            None,
+        )
+        if entry is None:
+            return None
+        return {
+            "app_id": app_id,
+            "version": entry.get("version", "") or "",
+            "repo": entry.get("repo"),
+            "ref": entry.get("ref") or "HEAD",
+            "granted_permissions": entry.get("granted_permissions") or [],
+            "config": entry.get("config") or {},
+            "signed": bool(entry.get("signed", False)),
+            "state": "installed",
+        }
+
+    def _dependency_spec(self, dep: dict[str, Any],
+                         known_rows: dict[str, dict[str, Any]] | None = None) -> AppSpec:
+        app_id = dep["id"]
+        if dep.get("repo") or dep.get("package_dir"):
+            return AppSpec(
+                app_id=app_id,
+                version=dep.get("version", "") or "",
+                repo=dep.get("repo"),
+                ref=dep.get("ref") or "HEAD",
+                granted_permissions=list(dep.get("granted_permissions") or []),
+                config=dict(dep.get("config") or {}),
+                signed=bool(dep.get("signed", False)),
+                package_dir=dep.get("package_dir"),
+            )
+
+        rows = known_rows if known_rows is not None else self._known_dependency_rows()
+        if app_id in rows:
+            return AppSpec.from_row(rows[app_id])
+
+        catalog_row = self._catalog_dependency_row(app_id)
+        if catalog_row is not None:
+            return AppSpec.from_row(catalog_row)
+
+        raise ValueError(
+            f"required dependency {app_id!r} is not installed and was not found "
+            "in the registry, local mirror, or marketplace catalog")
+
+    async def _install_dependencies(self, manifest, *, write_cloud: bool,
+                                    stack: tuple[str, ...]) -> list[str]:
+        installed: list[str] = []
+        known_rows = self._known_dependency_rows()
+        for dep in self._required_app_dependencies(manifest):
+            dep_id = dep["id"]
+            if dep_id in stack:
+                chain = " -> ".join((*stack, dep_id))
+                raise ValueError(f"cyclic app dependency chain: {chain}")
+            if self.runtime.is_loaded(dep_id):
+                continue
+            dep_spec = self._dependency_spec(dep, known_rows)
+            await self.install(dep_spec, write_cloud=write_cloud,
+                               _dependency_stack=(*stack, dep_id))
+            installed.append(dep_id)
+        return installed
+
+    def _loaded_dependency_closure(self, roots: set[str]) -> set[str]:
+        """Loaded required dependencies reachable from desired root apps.
+
+        Used by reconcile's removal pass so an implicitly loaded dependency
+        such as proxy is not immediately removed just because the desired cloud
+        row only named browser.
+        """
+        protected = set(roots)
+        changed = True
+        while changed:
+            changed = False
+            for app_id in list(protected):
+                loaded = self.runtime.get(app_id)
+                if loaded is None:
+                    continue
+                for dep in self._required_app_dependencies(loaded.manifest):
+                    dep_id = dep["id"]
+                    if dep_id not in protected:
+                        protected.add(dep_id)
+                        changed = True
+        return protected
+
     # ---- install / uninstall -----------------------------------------------
 
-    async def install(self, spec: AppSpec, *, write_cloud: bool = True) -> dict[str, Any]:
+    async def install(self, spec: AppSpec, *, write_cloud: bool = True,
+                      _dependency_stack: tuple[str, ...] = ()) -> dict[str, Any]:
         """Fetch → validate → enforce → hot-load → persist. Returns a summary."""
         package_dir = self._resolve_package_dir(spec)
         manifest = load_manifest(package_dir)
@@ -157,6 +315,9 @@ class Reconciler:
         if not spec.version:
             spec.version = manifest.version
         granted_req = spec.granted_permissions or list(manifest.permissions)
+
+        deps_installed = await self._install_dependencies(
+            manifest, write_cloud=write_cloud, stack=_dependency_stack or (manifest.id,))
 
         # runtime.load enforces the F2 grant filter (trust tier) itself and
         # returns the manifest; capture the *effective* grant for the mirror.
@@ -178,7 +339,8 @@ class Reconciler:
                               manifest.id)
 
         return {"app_id": manifest.id, "version": spec.version,
-                "granted_permissions": effective, "package_dir": package_dir}
+                "granted_permissions": effective, "package_dir": package_dir,
+                "dependencies_installed": deps_installed}
 
     async def uninstall(self, app_id: str, *, remove_repo: bool = True,
                         write_cloud: bool = True) -> dict[str, Any]:
@@ -218,7 +380,7 @@ class Reconciler:
 
         specs = [AppSpec.from_row(r) for r in desired]
         desired_active = {s.app_id: s for s in specs if s.state != "disabled"}
-        actual = set(self.runtime.loaded_slugs())
+        actual_before = set(self.runtime.loaded_slugs())
 
         installed: list[str] = []
         removed: list[str] = []
@@ -231,7 +393,7 @@ class Reconciler:
         # new spec (config/permissions survive — they come from the desired
         # row, which is left untouched).
         for app_id, spec in desired_active.items():
-            if app_id not in actual:
+            if not self.runtime.is_loaded(app_id):
                 try:
                     await self.install(spec, write_cloud=False)
                     installed.append(app_id)
@@ -253,7 +415,8 @@ class Reconciler:
 
         # uninstall extra (loaded but not desired) — converge actual to desired;
         # leave the (absent) desired row alone.
-        for app_id in actual - set(desired_active):
+        protected = self._loaded_dependency_closure(set(desired_active))
+        for app_id in (actual_before | set(self.runtime.loaded_slugs())) - protected:
             try:
                 await self.uninstall(app_id, write_cloud=False)
                 removed.append(app_id)

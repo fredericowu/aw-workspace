@@ -45,6 +45,46 @@ from src.apps.runtime import AppRuntime
 log = logging.getLogger(__name__)
 
 
+def _app_config_payload(loaded) -> dict:
+    config = loaded.manifest.config_with_defaults(loaded.config)
+    return {
+        "slug": loaded.manifest.id,
+        "config": config,
+        "config_schema": loaded.manifest.effective_config_schema,
+    }
+
+
+def _coerce_config(schema: dict, incoming: dict) -> dict:
+    props = schema.get("properties") or {}
+    config: dict = {}
+    for key, spec in props.items():
+        if key not in incoming:
+            continue
+        value = incoming[key]
+        if isinstance(spec, dict) and spec.get("type") == "boolean":
+            value = bool(value)
+        config[key] = value
+    for key, value in incoming.items():
+        if key not in config:
+            config[key] = value
+    return config
+
+
+async def _apply_runtime_config(runtime: AppRuntime, loaded, previous: dict) -> None:
+    """Apply framework-owned config to already-loaded runtime state."""
+    app_id = loaded.manifest.id
+    if loaded.manifest.tier != "container":
+        return
+    before = bool(previous.get("auto_start", True))
+    after = bool(loaded.config.get("auto_start", True))
+    if before == after:
+        return
+    if after:
+        await asyncio.to_thread(runtime.containers.start, app_id)
+    else:
+        await asyncio.to_thread(runtime.containers.stop, app_id)
+
+
 def register_apps_routes(app: FastAPI) -> AppRuntime:
     """Wire the plugin runtime + management routes onto ``app``.
 
@@ -76,9 +116,11 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 "signed": a.signed,
                 "routes": bool(a.mount),
                 "has_config": a.manifest.has_config,
-                "config_schema": a.manifest.config_schema,
+                "config_schema": a.manifest.effective_config_schema,
+                "config": a.manifest.config_with_defaults(a.config),
                 "settings_panels": a.manifest.settings_panels,
                 "frontend": a.manifest.frontend,
+                "managed_app": a.manifest.is_managed_app,
                 "requires_ui_refresh": a.manifest.requires_ui_refresh,
             }
             for a in (runtime.get(s) for s in runtime.loaded_slugs())
@@ -163,6 +205,55 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         summary = await reconciler.uninstall(slug)
         jobs.clear(slug)
         return summary
+
+    @app.get("/api/apps/{slug}/config")
+    async def get_app_config(slug: str, identity: dict = Depends(require_identity)):
+        loaded = runtime.get(slug)
+        if loaded is None:
+            return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
+        return _app_config_payload(loaded)
+
+    @app.post("/api/apps/{slug}/config")
+    async def save_app_config(slug: str, data: dict = Body(...),
+                              identity: dict = Depends(require_identity)):
+        loaded = runtime.get(slug)
+        if loaded is None:
+            return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
+
+        schema = loaded.manifest.effective_config_schema
+        previous = loaded.manifest.config_with_defaults(loaded.config)
+        incoming = data.get("config") if isinstance(data.get("config"), dict) else data
+        loaded.config = loaded.manifest.config_with_defaults(_coerce_config(schema, incoming or {}))
+        loaded.ctx.config = dict(loaded.config)
+
+        update_config = getattr(reconciler.local, "update_config", None)
+        if callable(update_config):
+            update_config(slug, loaded.config)
+        else:
+            spec = AppSpec(
+                app_id=slug,
+                version=loaded.manifest.version,
+                granted_permissions=loaded.granted_permissions,
+                config=loaded.config,
+                signed=loaded.signed,
+                package_dir=loaded.package_dir,
+            )
+            reconciler.local.upsert(spec, loaded.package_dir)
+        if reconciler.cloud.configured:
+            try:
+                reconciler.cloud.put_desired(
+                    slug,
+                    version=loaded.manifest.version,
+                    ref=None,
+                    granted_permissions=loaded.granted_permissions,
+                    config=loaded.config,
+                    signed=loaded.signed,
+                )
+            except Exception:
+                log.exception("apps: config save for %s did not reach the cloud registry", slug)
+
+        await _apply_runtime_config(runtime, loaded, previous)
+        return _app_config_payload(loaded)
 
     @app.post("/api/apps/{slug}/update")
     async def update_app(slug: str, identity: dict = Depends(require_identity)):

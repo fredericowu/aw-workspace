@@ -43,9 +43,13 @@ def _fake_fetch(repo: str, ref: str = "HEAD", *, slug: str, token=None, dest=Non
     return dest
 
 
-def _make_app_repo(tmp_path, slug="widget", version="1.0.0"):
+def _make_app_repo(tmp_path, slug="widget", version="1.0.0", dependencies=None):
     src = tmp_path / f"src_{slug}_{version}"
     src.mkdir()
+    deps_json = ""
+    if dependencies:
+        import json
+        deps_json = ',\n      "dependencies": ' + json.dumps({"apps": dependencies})
     (src / "aw-app.json").write_text(textwrap.dedent(f"""
     {{
       "manifest_version": 1,
@@ -56,6 +60,7 @@ def _make_app_repo(tmp_path, slug="widget", version="1.0.0"):
       "runtime": {{"entrypoint": "plugin:AppPlugin"}},
       "permissions": ["routes:register"],
       "contributes": {{"routes": [{{"prefix": "/api/apps/{slug}"}}]}}
+      {deps_json}
     }}
     """))
     (src / "plugin.py").write_text(textwrap.dedent(f"""
@@ -140,6 +145,38 @@ def test_install_fetches_hot_loads_and_writes_registry(tmp_path, monkeypatch):
         assert [row["app_id"] for row in cloud.list_desired()] == ["widget"]
         assert "widget" in rc.local.rows
         assert (tmp_path / "apps" / "widget" / "aw-app.json").exists()
+
+    _async(run())
+
+
+def test_install_loads_required_app_dependencies_first(tmp_path, monkeypatch):
+    dep_repo = _make_app_repo(tmp_path, "proxy")
+    browser_repo = _make_app_repo(
+        tmp_path,
+        "browser",
+        dependencies=[{"id": "proxy", "package_dir": dep_repo}],
+    )
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    async def run():
+        summary = await rc.install(AppSpec(app_id="browser", repo=browser_repo, ref="main"))
+        assert summary["dependencies_installed"] == ["proxy"]
+        assert rt.loaded_slugs() == ["proxy", "browser"]
+
+        desired_browser_only = [{
+            "app_id": "browser",
+            "version": "1.0.0",
+            "repo": browser_repo,
+            "ref": "main",
+            "granted_permissions": ["routes:register"],
+            "config": {},
+            "state": "installed",
+        }]
+        result = await rc.reconcile(desired_browser_only)
+        assert result["removed"] == []
+        assert rt.is_loaded("proxy")
+        assert rt.is_loaded("browser")
 
     _async(run())
 
