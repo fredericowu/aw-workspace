@@ -25,6 +25,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse
 
+from src.api.components import component_snapshot
 from src.api.identity import authorize_ws, require_identity
 from src.api.terminal_manager import TerminalManager, session_child_procs
 
@@ -336,7 +337,7 @@ class TerminalRoutes:
         try:
             await websocket.send_text(json.dumps({
                 "type": "init",
-                "components": {},
+                "components": component_snapshot(self.app),
                 "terminals": self.mgr.list_sessions(),
             }))
             while True:
@@ -353,5 +354,6 @@ def register_terminal_routes(app: FastAPI) -> TerminalManager:
     """Wire the terminal subsystem onto ``app``. Returns the manager."""
     mgr = TerminalManager()
     hub = StatusHub()
+    app.state.status_hub = hub
     TerminalRoutes(app, mgr, hub)
     return mgr

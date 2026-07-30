@@ -117,6 +117,14 @@ class ContainerSupervisor:
             self._client = docker.DockerClient(base_url="unix://" + self._socket)
         return self._client
 
+    def docker(self):
+        """Return the underlying Docker-compatible client for read-only helpers."""
+        return self._docker()
+
+    def registered(self) -> list[tuple[str, _Container]]:
+        """Registered Tier-2 app containers, in stable app-id order."""
+        return sorted(self._containers.items(), key=lambda item: item[0])
+
     # ---- registry -------------------------------------------------------
 
     def register(self, app_id: str, image: str, port: int,

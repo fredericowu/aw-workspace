@@ -18,6 +18,7 @@ from fastapi import Depends, FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.db import create_all_tables, get_session, get_workspace_schema
+from src.api.components import register_component_routes
 from src.api.identity import _extract_token, decode_identity_jwt, require_identity
 from src.api.models import Setting
 from src.api.notifications import register_notification_routes
@@ -119,5 +120,10 @@ def create_app() -> FastAPI:
     # Tier-1 apps hot-load into THIS process — no restart. Installed apps are
     # reloaded from the local registry on startup.
     register_apps_routes(app)
+
+    # Legacy component compatibility for the cloud SPA: exposes Tier-2 app
+    # containers through /api/components and /ws/logs so managed app title-bar
+    # controls operate against this workspace backend.
+    register_component_routes(app)
 
     return app
