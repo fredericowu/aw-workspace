@@ -6,10 +6,10 @@ name: Build + push image
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Extra tag to push alongside :latest and :<sha>"
+      version:
+        description: "Version to release (defaults to next vX.Y.Z patch)"
         type: string
-        default: "latest"
+        required: false
   push:
     branches: [master]
     paths:
@@ -23,7 +23,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -54,14 +54,48 @@ jobs:
         id: owner
         run: echo "lc=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION}" ]; then
+            version="${INPUT_VERSION}"
+          else
+            git fetch --tags --force
+            latest="$(
+              git tag -l 'v[0-9]*.[0-9]*.[0-9]*' |
+                sort -V |
+                tail -n 1
+            )"
+            if [ -z "${latest}" ]; then
+              version="v0.1.0"
+            else
+              raw="${latest#v}"
+              IFS=. read -r major minor patch <<< "${raw}"
+              patch=$((patch + 1))
+              version="v${major}.${minor}.${patch}"
+            fi
+          fi
+          if ! echo "${version}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::version must match vX.Y.Z, got ${version}"
+            exit 1
+          fi
+          if git rev-parse "${version}" >/dev/null 2>&1; then
+            echo "::error::resolved version ${version} already exists"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         env:
           OWNER_LC: ${{ steps.owner.outputs.lc }}
-          EXTRA_TAG: ${{ inputs.tag || 'latest' }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/${OWNER_LC}/aw-workspace"
-          MANIFEST="localhost/aw-workspace:${{ github.sha }}"
+          MANIFEST="localhost/aw-workspace:${VERSION}"
 
           "$PODMAN" manifest rm "$MANIFEST" >/dev/null 2>&1 || true
           "$PODMAN" manifest create "$MANIFEST"
@@ -72,24 +106,35 @@ jobs:
               --pull \
               --platform "$platform" \
               --manifest "$MANIFEST" \
-              --build-arg "AW_WORKSPACE_VERSION=${{ github.sha }}" \
+              --build-arg "AW_WORKSPACE_VERSION=${VERSION}" \
               .
           done
+
+          echo "==> Pushing ${IMAGE}:${VERSION}"
+          "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:${VERSION}"
+
+          echo "==> Pushing ${IMAGE}:latest"
+          "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:latest"
 
           echo "==> Pushing ${IMAGE}:${{ github.sha }}"
           "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:${{ github.sha }}"
 
-          echo "==> Pushing ${IMAGE}:${EXTRA_TAG}"
-          "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:${EXTRA_TAG}"
+      - name: Tag release commit
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git tag "${VERSION}" "${{ github.sha }}"
+          git push origin "${VERSION}"
 
       - name: Notify aw-backend release registry
         env:
           RELEASE_TOKEN: ${{ secrets.AW_RELEASE_WEBHOOK_TOKEN }}
           OWNER_LC: ${{ steps.owner.outputs.lc }}
+          VERSION: ${{ steps.version.outputs.version }}
           SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          EXTRA_TAG: ${{ inputs.tag || 'latest' }}
         run: |
           set -euo pipefail
           if [ -z "${RELEASE_TOKEN}" ]; then
@@ -106,10 +151,10 @@ jobs:
           sha = os.environ["SHA"]
           payload = {
               "component": "aw-workspace",
-              "version": sha[:7],
+              "version": os.environ["VERSION"],
               "sha": sha,
               "image": f"ghcr.io/{owner}/aw-workspace",
-              "tag": os.environ["EXTRA_TAG"],
+              "tag": os.environ["VERSION"],
               "url": os.environ["RUN_URL"],
               "metadata": {
                   "workflow": "build-image",
@@ -131,7 +176,7 @@ jobs:
             echo ""
             echo "| | |"
             echo "|---|---|"
-            echo "| **Image** | \`ghcr.io/${{ steps.owner.outputs.lc }}/aw-workspace:${{ github.sha }}\` |"
-            echo "| **Tag** | \`${{ inputs.tag || 'latest' }}\` |"
+            echo "| **Image** | \`ghcr.io/${{ steps.owner.outputs.lc }}/aw-workspace:${{ steps.version.outputs.version }}\` |"
+            echo "| **Version** | \`${{ steps.version.outputs.version }}\` |"
             echo "| **Platforms** | linux/amd64, linux/arm64 |"
           } >> "$GITHUB_STEP_SUMMARY"
