@@ -713,8 +713,6 @@ class AppRuntime:
         users.
         """
         host_root = os.environ.get("AW_WORKSPACE_HOST_DIR", "").strip()
-        if not host_root:
-            return os.path.realpath(container_path)
         container_root = os.path.realpath(
             os.environ.get("AW_WORKSPACE_CONTAINER_DIR", DEFAULT_WORKSPACE_CONTAINER_DIR)
         )
@@ -724,6 +722,15 @@ class AppRuntime:
         elif real_path.startswith(container_root + os.sep):
             rel = os.path.relpath(real_path, container_root)
         else:
+            return real_path
+        if not host_root:
+            if os.environ.get("AW_CONTAINER_SOCKET"):
+                raise ContainerError(
+                    "Tier-2 app volume source resolves inside "
+                    f"{container_root}, but AW_WORKSPACE_HOST_DIR is not set. "
+                    "The workspace is using a host container-engine socket, so "
+                    "bind mounts must be translated to the host workspace path."
+                )
             return real_path
         return os.path.realpath(os.path.join(host_root, rel))
 
