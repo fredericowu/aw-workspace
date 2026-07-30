@@ -53,6 +53,36 @@ def test_http_forwarding(monkeypatch):
     assert body["q"] == "x=1"
 
 
+def test_http_forwarding_adds_verified_identity_headers(monkeypatch):
+    async def echo_headers(request):
+        return JSONResponse({
+            "sub": request.headers.get("x-aw-identity-sub"),
+            "email": request.headers.get("x-aw-identity-email"),
+        })
+
+    upstream = Starlette(routes=[Route("/{p:path}", echo_headers, methods=["GET"])])
+    orig_init = httpx.AsyncClient.__init__
+
+    def patched_init(self, *args, **kwargs):
+        kwargs["transport"] = httpx.ASGITransport(app=upstream)
+        orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", patched_init)
+
+    proxy = ContainerReverseProxy("http://upstream")
+
+    async def with_identity(scope, receive, send):
+        scope["aw_identity"] = {"sub": "verified-user", "email": "user@example.test"}
+        await proxy(scope, receive, send)
+
+    app = Starlette(routes=[Mount("/api/apps/browser", app=with_identity)])
+    client = TestClient(app)
+
+    r = client.get("/api/apps/browser/headers", headers={"x-aw-identity-sub": "spoofed"})
+    assert r.status_code == 200
+    assert r.json() == {"sub": "verified-user", "email": "user@example.test"}
+
+
 def test_http_502_when_upstream_unreachable(monkeypatch):
     async def boom(self, *args, **kwargs):
         raise httpx.ConnectError("refused")

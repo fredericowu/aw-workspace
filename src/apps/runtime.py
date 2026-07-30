@@ -30,6 +30,7 @@ from starlette.types import Receive, Scope, Send
 import types
 
 from src.apps import paths
+from src.apps.fetch import apps_root
 from src.apps.base import AppContext, Plugin
 from src.apps.capabilities import filter_grants
 from src.apps.commands import CommandInstaller
@@ -662,6 +663,8 @@ class AppRuntime:
         port = rt.get("port")
         resources = rt.get("resources") or {}
         run_flags = rt.get("run_flags_needed") or rt.get("run_flags") or []
+        env = rt.get("env") or {}
+        volumes = self._container_volumes(manifest, package_dir)
 
         ctx = AppContext(
             runtime=self, app_id=slug, version=manifest.version,
@@ -674,7 +677,8 @@ class AppRuntime:
         )
 
         self.containers.register(
-            slug, image, port, run_flags=run_flags, resources=resources)
+            slug, image, port, run_flags=run_flags, resources=resources, env=env,
+            volumes=volumes)
         self.journal.record(slug, "container:register", image,
                             {"port": port, "run_flags": run_flags, "resources": resources})
         try:
@@ -696,6 +700,56 @@ class AppRuntime:
         log.info("apps: loaded container app %s v%s (image=%s)",
                  slug, manifest.version, image)
         return manifest
+
+    def _container_volumes(self, manifest: Manifest, package_dir: str) -> dict[str, dict]:
+        """Resolve package-relative ``runtime.volumes`` into Docker binds.
+
+        Shape:
+
+            "runtime": {
+              "volumes": [
+                {"source": "back/config", "target": "/app/config", "mode": "rw"}
+              ]
+            }
+
+        ``source`` normally stays inside the installed app package. The special
+        source ``$AW_APPS_ROOT`` mounts the installed-apps root read-only so
+        infrastructure apps can inspect sibling app packages without declaring
+        arbitrary host paths.
+        """
+        binds: dict[str, dict] = {}
+        package_root = os.path.realpath(package_dir)
+        for raw in manifest.runtime.get("volumes") or []:
+            if not isinstance(raw, dict):
+                raise ContainerError(
+                    f"app {manifest.id!r} runtime.volumes entries must be objects")
+            source = str(raw.get("source") or "").strip()
+            target = str(raw.get("target") or "").strip()
+            mode = str(raw.get("mode") or "rw").strip()
+            if not source or not target:
+                raise ContainerError(
+                    f"app {manifest.id!r} runtime.volumes entries need source and target")
+            if mode not in ("rw", "ro"):
+                raise ContainerError(
+                    f"app {manifest.id!r} volume mode must be 'rw' or 'ro'")
+            if source == "$AW_APPS_ROOT":
+                if mode != "ro":
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_APPS_ROOT volume must be read-only")
+                host_path = os.path.realpath(apps_root())
+                os.makedirs(host_path, exist_ok=True)
+                binds[host_path] = {"bind": target, "mode": mode}
+                continue
+            if os.path.isabs(source):
+                raise ContainerError(
+                    f"app {manifest.id!r} volume source must be package-relative")
+            host_path = os.path.realpath(os.path.join(package_root, source))
+            if not (host_path == package_root or host_path.startswith(package_root + os.sep)):
+                raise ContainerError(
+                    f"app {manifest.id!r} volume source escapes the package dir")
+            os.makedirs(host_path, exist_ok=True)
+            binds[host_path] = {"bind": target, "mode": mode}
+        return binds
 
     # ---- import isolation ----------------------------------------------
 

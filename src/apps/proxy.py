@@ -25,6 +25,10 @@ _HOP_BY_HOP = {
     b"connection", b"keep-alive", b"proxy-authenticate", b"proxy-authorization",
     b"te", b"trailers", b"transfer-encoding", b"upgrade", b"host",
 }
+_INTERNAL_HEADERS = {
+    b"x-aw-identity-sub",
+    b"x-aw-identity-email",
+}
 
 
 class ContainerReverseProxy:
@@ -61,7 +65,16 @@ class ContainerReverseProxy:
 
         body = await _read_http_body(receive)
         headers = [(k.decode("latin-1"), v.decode("latin-1"))
-                   for k, v in scope.get("headers", []) if k.lower() not in _HOP_BY_HOP]
+                   for k, v in scope.get("headers", [])
+                   if k.lower() not in _HOP_BY_HOP and k.lower() not in _INTERNAL_HEADERS]
+        identity = scope.get("aw_identity") or {}
+        if identity:
+            sub = identity.get("sub") or identity.get("user_id") or ""
+            email = identity.get("email") or ""
+            if sub:
+                headers.append(("x-aw-identity-sub", str(sub)))
+            if email:
+                headers.append(("x-aw-identity-email", str(email)))
         url = self._target(scope)
         try:
             async with httpx.AsyncClient(timeout=None) as client:

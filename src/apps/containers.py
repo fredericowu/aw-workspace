@@ -72,7 +72,8 @@ def _resource_kwargs(resources: dict | None) -> dict:
 class _Container:
     def __init__(self, app_id: str, image: str, port: int,
                  run_flags: list[str] | None, resources: dict | None,
-                 env: dict | None, network: str | None) -> None:
+                 env: dict | None, network: str | None,
+                 volumes: dict[str, dict] | None = None) -> None:
         self.app_id = app_id
         self.image = image
         self.port = int(port)
@@ -80,6 +81,7 @@ class _Container:
         self.resources = dict(resources or {})
         self.env = dict(env or {})
         self.network = network
+        self.volumes = dict(volumes or {})
         self.container_id: str | None = None
 
     @property
@@ -129,7 +131,8 @@ class ContainerSupervisor:
 
     def register(self, app_id: str, image: str, port: int,
                  run_flags: list[str] | None = None, resources: dict | None = None,
-                 env: dict | None = None, autostart: bool = False) -> None:
+                 env: dict | None = None, autostart: bool = False,
+                 volumes: dict[str, dict] | None = None) -> None:
         if app_id in self._containers:
             raise ContainerError(f"container already registered for {app_id!r}")
         if not image:
@@ -138,7 +141,7 @@ class ContainerSupervisor:
             raise ContainerError(f"app {app_id!r} tier=container requires runtime.port")
         # Validate run flags up front so a bad manifest fails at register, not run.
         _parse_run_flags(run_flags)
-        c = _Container(app_id, image, port, run_flags, resources, env, self._network)
+        c = _Container(app_id, image, port, run_flags, resources, env, self._network, volumes)
         self._containers[app_id] = c
         log.info("apps: registered container %s (image=%s port=%s network=%s)",
                  c.name, image, port, self._network)
@@ -168,6 +171,7 @@ class ContainerSupervisor:
             "name": c.name,
             "detach": True,
             "environment": c.env,
+            "volumes": c.volumes,
             # never --privileged; drop nothing extra but don't grant caps either
             "privileged": False,
         }

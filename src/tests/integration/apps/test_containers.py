@@ -176,21 +176,24 @@ def test_stop_all_for_drops_registration():
 
 # ---- runtime tier=container -------------------------------------------------
 
-def _write_container_app(tmp_path, *, perms=None):
+def _write_container_app(tmp_path, *, perms=None, runtime_extra=None):
     slug = "browser"
     pkg = tmp_path / slug
     pkg.mkdir()
     perms = perms if perms is not None else ["containers:manage"]
     import json
+    runtime = {"image": "ghcr.io/browserless/chromium", "port": 9222,
+               "run_flags_needed": ["--shm-size=1g"],
+               "resources": {"cpus": 0.5, "mem_mb": 512}}
+    if runtime_extra:
+        runtime.update(runtime_extra)
     (pkg / "aw-app.json").write_text(json.dumps({
         "manifest_version": 1,
         "id": slug,
         "name": "Browser",
         "version": "1.0.0",
         "tier": "container",
-        "runtime": {"image": "ghcr.io/browserless/chromium", "port": 9222,
-                    "run_flags_needed": ["--shm-size=1g"],
-                    "resources": {"cpus": 0.5, "mem_mb": 512}},
+        "runtime": runtime,
         "permissions": perms,
     }))
     return str(pkg)
@@ -221,6 +224,98 @@ def test_runtime_loads_container_app_and_reverts_on_unload(tmp_path):
         assert rt.journal.entries_for("browser") == []
         assert not [r for r in rt.host.router.routes
                     if isinstance(r, Mount) and r.path == "/api/apps/browser"]
+
+    _async(run())
+
+
+def test_runtime_mounts_package_relative_container_volumes(tmp_path):
+    pkg = _write_container_app(
+        tmp_path,
+        runtime_extra={
+            "volumes": [
+                {"source": "back/config", "target": "/app/config", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+
+        await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
+
+        host_config = str((tmp_path / "browser" / "back" / "config").resolve())
+        assert fake.run_calls[-1]["volumes"] == {
+            host_config: {"bind": "/app/config", "mode": "rw"}
+        }
+
+    _async(run())
+
+
+def test_runtime_mounts_apps_root_read_only(tmp_path, monkeypatch):
+    apps_root = tmp_path / "installed-apps"
+    monkeypatch.setenv("AW_APPS_ROOT", str(apps_root))
+    pkg = _write_container_app(
+        tmp_path,
+        runtime_extra={
+            "env": {"AW_APP_SCAN_ROOTS": "/workspace/apps"},
+            "volumes": [
+                {"source": "$AW_APPS_ROOT", "target": "/workspace/apps", "mode": "ro"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+
+        await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
+
+        assert fake.run_calls[-1]["environment"]["AW_APP_SCAN_ROOTS"] == "/workspace/apps"
+        assert fake.run_calls[-1]["volumes"] == {
+            str(apps_root.resolve()): {"bind": "/workspace/apps", "mode": "ro"}
+        }
+
+    _async(run())
+
+
+def test_runtime_rejects_writable_apps_root_volume(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path / "installed-apps"))
+    pkg = _write_container_app(
+        tmp_path,
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_APPS_ROOT", "target": "/workspace/apps", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
+        with pytest.raises(ContainerError):
+            await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
+
+    _async(run())
+
+
+def test_runtime_rejects_container_volume_escape(tmp_path):
+    pkg = _write_container_app(
+        tmp_path,
+        runtime_extra={
+            "volumes": [
+                {"source": "../outside", "target": "/app/config", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
+        with pytest.raises(ContainerError):
+            await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
 
     _async(run())
 

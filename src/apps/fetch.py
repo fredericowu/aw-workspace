@@ -10,7 +10,7 @@ raw-GET model (see ``catalog.py``'s marketplace fetch).
 
 Package layout (minimal F3 — the ADR's per-version ``~/.aw-workspace/apps/<slug>/
 <version>/`` layout is F8's upgrade concern): one extracted tree per app at
-``<APPS_ROOT>/<slug>``. ``APPS_ROOT`` defaults to ``/opt/agentic-workspace/apps``
+``<APPS_ROOT>/<slug>``. ``APPS_ROOT`` defaults to ``/opt/aw-workspace/apps``
 (the WORKDIR is bind-mounted from the host — see
 ``aw-workspace-base-dir-host-mount``), overridable with ``AW_APPS_ROOT`` (tests
 point it at a tmp dir).
@@ -38,7 +38,7 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_APPS_ROOT = "/opt/agentic-workspace/apps"
+_DEFAULT_APPS_ROOT = "/opt/aw-workspace/apps"
 
 
 def apps_root() -> str:
