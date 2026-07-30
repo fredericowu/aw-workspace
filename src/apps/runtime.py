@@ -46,6 +46,7 @@ from src.apps.watchdog import WatchdogSupervisor
 log = logging.getLogger(__name__)
 
 DEFAULT_DRAIN_TIMEOUT = float(os.environ.get("AW_APPS_DRAIN_TIMEOUT", "10"))
+DEFAULT_WORKSPACE_CONTAINER_DIR = "/opt/aw-workspace"
 
 # Cookie the central-identity JWT lands in (mirrors src.api.identity.COOKIE_NAME).
 _ID_COOKIE = "aw_id_jwt"
@@ -701,6 +702,31 @@ class AppRuntime:
                  slug, manifest.version, image)
         return manifest
 
+    def _container_host_bind_path(self, container_path: str) -> str:
+        """Translate workspace-internal paths to the host bind-mount path.
+
+        Tier-2 app containers are created by the host's rootless Podman socket.
+        The workspace process sees installed apps under the container path
+        (``/opt/aw-workspace``), but host Podman must receive the host-side bind
+        source (``~/aw-workspace`` by default). Without this translation Podman
+        tries to create ``/opt/aw-workspace`` on the host and fails for rootless
+        users.
+        """
+        host_root = os.environ.get("AW_WORKSPACE_HOST_DIR", "").strip()
+        if not host_root:
+            return os.path.realpath(container_path)
+        container_root = os.path.realpath(
+            os.environ.get("AW_WORKSPACE_CONTAINER_DIR", DEFAULT_WORKSPACE_CONTAINER_DIR)
+        )
+        real_path = os.path.realpath(container_path)
+        if real_path == container_root:
+            rel = ""
+        elif real_path.startswith(container_root + os.sep):
+            rel = os.path.relpath(real_path, container_root)
+        else:
+            return real_path
+        return os.path.realpath(os.path.join(host_root, rel))
+
     def _container_volumes(self, manifest: Manifest, package_dir: str) -> dict[str, dict]:
         """Resolve package-relative ``runtime.volumes`` into Docker binds.
 
@@ -736,7 +762,7 @@ class AppRuntime:
                 if mode != "ro":
                     raise ContainerError(
                         f"app {manifest.id!r} $AW_APPS_ROOT volume must be read-only")
-                host_path = os.path.realpath(apps_root())
+                host_path = self._container_host_bind_path(apps_root())
                 os.makedirs(host_path, exist_ok=True)
                 binds[host_path] = {"bind": target, "mode": mode}
                 continue
@@ -747,6 +773,7 @@ class AppRuntime:
             if not (host_path == package_root or host_path.startswith(package_root + os.sep)):
                 raise ContainerError(
                     f"app {manifest.id!r} volume source escapes the package dir")
+            host_path = self._container_host_bind_path(host_path)
             os.makedirs(host_path, exist_ok=True)
             binds[host_path] = {"bind": target, "mode": mode}
         return binds

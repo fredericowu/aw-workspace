@@ -253,6 +253,38 @@ def test_runtime_mounts_package_relative_container_volumes(tmp_path):
     _async(run())
 
 
+def test_runtime_translates_container_volume_sources_to_host_bind_dir(tmp_path, monkeypatch):
+    container_root = tmp_path / "container" / "aw-workspace"
+    host_root = tmp_path / "host" / "aw-workspace"
+    (container_root / "apps").mkdir(parents=True)
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(container_root))
+    monkeypatch.setenv("AW_WORKSPACE_HOST_DIR", str(host_root))
+    pkg = _write_container_app(
+        container_root / "apps",
+        runtime_extra={
+            "volumes": [
+                {"source": "back/config", "target": "/app/config", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+
+        await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
+
+        assert fake.run_calls[-1]["volumes"] == {
+            str((host_root / "apps" / "browser" / "back" / "config").resolve()): {
+                "bind": "/app/config",
+                "mode": "rw",
+            }
+        }
+
+    _async(run())
+
+
 def test_runtime_mounts_apps_root_read_only(tmp_path, monkeypatch):
     apps_root = tmp_path / "installed-apps"
     monkeypatch.setenv("AW_APPS_ROOT", str(apps_root))
@@ -276,6 +308,37 @@ def test_runtime_mounts_apps_root_read_only(tmp_path, monkeypatch):
         assert fake.run_calls[-1]["environment"]["AW_APP_SCAN_ROOTS"] == "/workspace/apps"
         assert fake.run_calls[-1]["volumes"] == {
             str(apps_root.resolve()): {"bind": "/workspace/apps", "mode": "ro"}
+        }
+
+    _async(run())
+
+
+def test_runtime_translates_apps_root_volume_to_host_bind_dir(tmp_path, monkeypatch):
+    container_root = tmp_path / "container" / "aw-workspace"
+    host_root = tmp_path / "host" / "aw-workspace"
+    apps_root = container_root / "apps"
+    apps_root.mkdir(parents=True)
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(container_root))
+    monkeypatch.setenv("AW_WORKSPACE_HOST_DIR", str(host_root))
+    monkeypatch.setenv("AW_APPS_ROOT", str(apps_root))
+    pkg = _write_container_app(
+        apps_root,
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_APPS_ROOT", "target": "/workspace/apps", "mode": "ro"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+
+        await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
+
+        assert fake.run_calls[-1]["volumes"] == {
+            str((host_root / "apps").resolve()): {"bind": "/workspace/apps", "mode": "ro"}
         }
 
     _async(run())
