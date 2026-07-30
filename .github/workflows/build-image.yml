@@ -1,10 +1,7 @@
 name: Build + push image
 
-# Manual by default (cost/quota conscious, same policy as other apps) —
-# also fires on push to main when the image-relevant files change.
-#
-# Auto-triggers disabled 2026-07-26 per Frederico (no automatic GHA runs for now).
-# Manual via the Actions tab. Re-enable when ready.
+# Builds the workspace image on image-relevant pushes and publishes the
+# resulting release to aw-backend so aw-console can enable workspace updates.
 
 on:
   workflow_dispatch:
@@ -13,12 +10,13 @@ on:
         description: "Extra tag to push alongside :latest and :<sha>"
         type: string
         default: "latest"
-  # push:
-  #   branches: [main]
-  #   paths:
-  #     - "Dockerfile"
-  #     - "src/**"
-  #     - "requirements.txt"
+  push:
+    branches: [master]
+    paths:
+      - "Dockerfile"
+      - "src/**"
+      - "requirements.txt"
+      - ".github/workflows/build-image.yml"
 
 concurrency:
   group: build-image
@@ -83,6 +81,48 @@ jobs:
 
           echo "==> Pushing ${IMAGE}:${EXTRA_TAG}"
           "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:${EXTRA_TAG}"
+
+      - name: Notify aw-backend release registry
+        env:
+          RELEASE_TOKEN: ${{ secrets.AW_RELEASE_WEBHOOK_TOKEN }}
+          OWNER_LC: ${{ steps.owner.outputs.lc }}
+          SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EXTRA_TAG: ${{ inputs.tag || 'latest' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RELEASE_TOKEN}" ]; then
+            echo "::warning::AW_RELEASE_WEBHOOK_TOKEN is not set; skipping release publish"
+            exit 0
+          fi
+
+          SHORT_SHA="${SHA::7}"
+          python3 - <<'PY' > /tmp/aw-workspace-release.json
+          import json
+          import os
+
+          owner = os.environ["OWNER_LC"]
+          sha = os.environ["SHA"]
+          payload = {
+              "component": "aw-workspace",
+              "version": sha[:7],
+              "sha": sha,
+              "image": f"ghcr.io/{owner}/aw-workspace",
+              "tag": os.environ["EXTRA_TAG"],
+              "url": os.environ["RUN_URL"],
+              "metadata": {
+                  "workflow": "build-image",
+                  "run_id": os.environ["RUN_ID"],
+              },
+          }
+          print(json.dumps(payload))
+          PY
+
+          curl -fsS -X POST "https://api.aw.tekflox.com/api/releases/publish" \
+            -H "Content-Type: application/json" \
+            -H "X-Release-Token: ${RELEASE_TOKEN}" \
+            --data-binary @/tmp/aw-workspace-release.json
 
       - name: Summary
         run: |
