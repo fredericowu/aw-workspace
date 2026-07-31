@@ -92,6 +92,23 @@ class Manifest:
         return list(self.contributes.get("skills", []))
 
     @property
+    def reload_mcp_gateway_on_save(self) -> bool:
+        """``contributes.mcp.reload_on_save`` — true for an app that ships
+        its own root ``mcp.json`` (scanned directly by the MCP Gateway's
+        app-scan, ADR "aw-app-mcp-tools contributes mcp.json"), where a
+        config change can affect which servers/tools that file declares
+        (e.g. a per-tool enable/disable toggle). ``save_app_config`` checks
+        this after calling the plugin's ``on_config_saved`` hook (which is
+        what actually rewrites the app's mcp.json) and, if true, calls the
+        installed mcp-gateway app's ``POST /reload`` so the change takes
+        effect without a full gateway restart.
+
+        Distinct from ``contributes.mcp.provides`` (marketplace "what you
+        get" tool list, see ``what_you_get``) — same ``contributes.mcp``
+        object, different sibling key, unrelated purposes."""
+        return bool(self.contributes.get("mcp", {}).get("reload_on_save", False))
+
+    @property
     def frontend(self) -> dict[str, Any]:
         """First-class frontend code plugin (ADR Decision 3b), or ``{}``."""
         fe = self.contributes.get("frontend")

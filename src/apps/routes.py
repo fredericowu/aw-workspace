@@ -85,6 +85,36 @@ async def _apply_runtime_config(runtime: AppRuntime, loaded, previous: dict) -> 
         await asyncio.to_thread(runtime.containers.stop, app_id)
 
 
+async def _reload_mcp_gateway(runtime: AppRuntime) -> None:
+    """POST /reload on the installed mcp-gateway app's OWN internal
+    container address — never the public app-proxy route, so this never
+    "hairpins" out through the edge/Caddy just to call back in.
+    ``containers.base_url()`` resolves the same podman-network hostname the
+    reverse proxy itself targets (see ContainerSupervisor.base_url).
+
+    X-AW-Identity-Sub satisfies the gateway's admin auth (same trust path
+    /admin/config already accepts for a forwarded end-user identity) without
+    aw-workspace needing to know the gateway's own bearer secret, which
+    lives only in that container's own config/gateway.json.
+
+    Best-effort: a missing/unreachable/not-yet-started gateway logs and
+    does not fail the config save that triggered it — the app's own config
+    change already landed either way, and the gateway will pick it up on
+    its own next reload/restart regardless."""
+    if not runtime.is_loaded("mcp-gateway"):
+        return
+    try:
+        import httpx
+        base_url = runtime.containers.base_url("mcp-gateway")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(f"{base_url}/reload",
+                                     headers={"X-AW-Identity-Sub": "aw-workspace"})
+            resp.raise_for_status()
+        log.info("apps: mcp-gateway reload triggered — %s", resp.json())
+    except Exception:
+        log.exception("apps: failed to trigger mcp-gateway /reload")
+
+
 def register_apps_routes(app: FastAPI) -> AppRuntime:
     """Wire the plugin runtime + management routes onto ``app``.
 
@@ -255,6 +285,19 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 log.exception("apps: config save for %s did not reach the cloud registry", slug)
 
         await _apply_runtime_config(runtime, loaded, previous)
+
+        # Let the app react to its own new config first (e.g. an app with
+        # contributes.mcp.reload_on_save regenerates its own mcp.json on
+        # disk here) — THEN hot-reload the gateway, so it scans the
+        # already-updated file rather than racing it. Duck-typed getattr,
+        # not a hard dependency on the Plugin base class — some in-repo test
+        # plugins predate this hook and don't subclass Plugin.
+        on_config_saved = getattr(loaded.plugin, "on_config_saved", None)
+        if callable(on_config_saved):
+            await on_config_saved(loaded.ctx)
+        if loaded.manifest.reload_mcp_gateway_on_save:
+            await _reload_mcp_gateway(runtime)
+
         return _app_config_payload(loaded)
 
     @app.post("/api/apps/{slug}/update")

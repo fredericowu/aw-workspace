@@ -255,3 +255,23 @@ def test_skills_entry_requires_id_and_path():
     bad2 = _m(contributes={"skills": [{"id": "x"}]}, permissions=[])
     with pytest.raises(ManifestError, match="contributes.skills"):
         validate_manifest(bad2)
+
+
+def test_reload_mcp_gateway_on_save_true_when_declared():
+    m = validate_manifest(_m(contributes={"mcp": {"reload_on_save": True}}, permissions=[]))
+    assert m.reload_mcp_gateway_on_save is True
+
+
+def test_reload_mcp_gateway_on_save_false_by_default():
+    m = validate_manifest(_m(contributes={}, permissions=[]))
+    assert m.reload_mcp_gateway_on_save is False
+
+
+def test_reload_mcp_gateway_on_save_independent_of_mcp_provides():
+    # Same contributes.mcp object, unrelated sibling key (what_you_get's
+    # marketplace tool list) — declaring one must not imply the other.
+    m = validate_manifest(_m(contributes={
+        "mcp": {"provides": [{"name": "notes_search"}]},
+    }, permissions=[]))
+    assert m.reload_mcp_gateway_on_save is False
+    assert m.what_you_get["mcp_tools"] == ["notes_search"]

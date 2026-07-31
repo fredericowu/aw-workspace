@@ -33,6 +33,20 @@ class Plugin:
     async def deactivate(self) -> None:  # pragma: no cover - overridden
         return None
 
+    async def on_config_saved(self, ctx: "AppContext") -> None:
+        """Called by save_app_config AFTER ``ctx.config`` is updated to the
+        newly-saved values — optional hook for a plugin that needs to react
+        to a settings change beyond just reading ``ctx.config`` lazily next
+        time (e.g. an app with ``contributes.mcp: true`` regenerating its
+        own mcp.json on disk from the new config, which the MCP Gateway's
+        POST /reload — triggered right after this returns, see
+        routes.save_app_config — then picks up).
+
+        No-op by default; a plugin only needs to override this if a config
+        change has some side effect to apply beyond the config dict itself.
+        """
+        return None
+
 
 class _Facade:
     """Base for a capability-gated facade.
