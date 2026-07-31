@@ -152,6 +152,28 @@ def test_network_injects_workspace_host_env():
     assert "AW_WORKSPACE_HOST" not in fake2.run_calls[-1]["environment"]
 
 
+def test_injects_workspace_slug_env_when_set(monkeypatch):
+    """AW_WORKSPACE_SLUG lets a container app namespace something by this
+    workspace's identity (e.g. aw-mcp-gateway prefixing published tool
+    names) — unlike AW_WORKSPACE_HOST this isn't network-gated, since it's
+    identity metadata, not a reachability detail."""
+    monkeypatch.setenv("AW_WORKSPACE", "fredericowu")
+    fake = _FakeDocker()
+    sup = ContainerSupervisor(socket="/dev/null", client=fake)  # no network
+    sup.register("app", "img", 8080)
+    sup.start("app")
+    assert fake.run_calls[-1]["environment"]["AW_WORKSPACE_SLUG"] == "fredericowu"
+
+
+def test_no_workspace_slug_env_when_unset(monkeypatch):
+    monkeypatch.delenv("AW_WORKSPACE", raising=False)
+    fake = _FakeDocker()
+    sup = ContainerSupervisor(socket="/dev/null", client=fake)
+    sup.register("app", "img", 8080)
+    sup.start("app")
+    assert "AW_WORKSPACE_SLUG" not in fake.run_calls[-1]["environment"]
+
+
 def test_privileged_flag_rejected():
     sup = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
     with pytest.raises(ContainerError):

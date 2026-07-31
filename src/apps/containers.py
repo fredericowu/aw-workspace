@@ -177,6 +177,15 @@ class ContainerSupervisor:
         }
         kwargs.update(_parse_run_flags(c.run_flags))
         kwargs.update(_resource_kwargs(c.resources))
+        # This workspace's own slug (AW_WORKSPACE, set by whatever launched
+        # this process) — apps that need to namespace something by workspace
+        # identity (e.g. aw-mcp-gateway prefixing its published tool names)
+        # read it from here instead of each needing its own plumbing.
+        # Unconditional (unlike AW_WORKSPACE_HOST below) since it's identity
+        # metadata, not a network detail.
+        workspace_slug = os.environ.get("AW_WORKSPACE", "")
+        if workspace_slug:
+            kwargs["environment"]["AW_WORKSPACE_SLUG"] = workspace_slug
         if c.network:
             kwargs["network"] = c.network
             # The container needs to call BACK into the workspace process itself
