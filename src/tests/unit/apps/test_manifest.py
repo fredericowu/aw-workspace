@@ -183,6 +183,35 @@ def test_launchable_windows_keeps_windows_not_used_as_settings_panels():
     assert [w["id"] for w in m.launchable_windows] == ["notes.main"]
 
 
+def test_public_field_editable_for_a_standalone_container_app():
+    m = validate_manifest(_m(tier="container", runtime={"image": "ghcr.io/x", "port": 8080},
+                             permissions=["containers:manage"], contributes={}))
+    public = m.effective_config_schema["properties"]["public"]
+    assert public["default"] is False
+    assert "x-disabled" not in public
+
+
+def test_public_field_locked_true_for_a_non_standalone_managed_app():
+    # An inprocess app whose window is body.type: managed_app is still
+    # "managed" (framework-owned lifecycle) but has no process/subdomain of
+    # its own — public isn't a real toggle for it.
+    m = validate_manifest(_m(contributes={
+        "windows": [{"id": "notes.main", "title": "Notes", "body": {"type": "managed_app", "app_id": "other"}}],
+    }, permissions=[]))
+    assert m.is_managed_app is True
+    assert m.standalone_app is False
+    public = m.effective_config_schema["properties"]["public"]
+    assert public["default"] is True
+    assert public["x-disabled"] is True
+
+
+def test_config_with_defaults_forces_locked_public_true_even_if_persisted_false():
+    m = validate_manifest(_m(contributes={
+        "windows": [{"id": "notes.main", "title": "Notes", "body": {"type": "managed_app", "app_id": "other"}}],
+    }, permissions=[]))
+    assert m.config_with_defaults({"public": False})["public"] is True
+
+
 def test_what_you_get_derives_ui_screens_and_commands():
     m = validate_manifest(_m(contributes={
         "windows": [{"id": "notes.main", "title": "Notes"}],

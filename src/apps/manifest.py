@@ -106,6 +106,27 @@ class Manifest:
         return str(self.raw.get("icon", ""))
 
     @property
+    def standalone_app(self) -> bool:
+        """Whether this app has a separate process of its own to start/stop/
+        restart independently of the aw-workspace process.
+
+        No new manifest field needed — this is fully implied by the existing
+        ``tier`` + ``runtime.standalone`` shape (ADR Decision 4):
+          * ``tier: container`` — always its own process (a docker/podman
+            container) => True.
+          * ``tier: inprocess`` with a ``runtime.standalone`` block — can
+            ALSO run as its own separate process => True.
+          * ``tier: inprocess`` with no ``runtime.standalone`` block — routes
+            register directly inside the aw-workspace process; any
+            ``ctx.services``-managed subprocess it spawns is an internal
+            implementation detail the app itself owns and restarts, not a
+            unit of process control the framework/UI exposes => False.
+        """
+        if self.tier == "container":
+            return True
+        return bool(self.runtime.get("standalone"))
+
+    @property
     def has_config(self) -> bool:
         """True when the app exposes a settings/config surface the gear opens."""
         return bool(
@@ -155,10 +176,23 @@ class Manifest:
                 },
                 "public": {
                     "type": "boolean",
-                    "default": False,
+                    # Only a standalone app (its own process/subdomain — see
+                    # standalone_app) has a public routing layer to toggle.
+                    # A non-standalone managed app is always reachable
+                    # through the workspace's own routing, so this reads as
+                    # permanently "on" and locked instead of just vanishing
+                    # (which would read as "not exposed" — misleading).
+                    "default": True if not self.standalone_app else False,
                     "title": "Public",
-                    "description": "Expose this app through the workspace public routing layer.",
+                    "description": (
+                        "This app has no standalone process/subdomain of its "
+                        "own — it's always reachable through the workspace's "
+                        "own routing, not independently toggleable."
+                        if not self.standalone_app else
+                        "Expose this app through the workspace public routing layer."
+                    ),
                     "x-framework": True,
+                    **({"x-disabled": True} if not self.standalone_app else {}),
                 },
             }
             props = {**framework_props, **props}
@@ -171,10 +205,17 @@ class Manifest:
     def config_with_defaults(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
         """Merge config_schema defaults with persisted config."""
         merged: dict[str, Any] = {}
-        for key, spec in (self.effective_config_schema.get("properties") or {}).items():
+        properties = self.effective_config_schema.get("properties") or {}
+        for key, spec in properties.items():
             if isinstance(spec, dict) and "default" in spec:
                 merged[key] = spec["default"]
         merged.update(dict(config or {}))
+        # A locked x-disabled field (e.g. "public" on a non-standalone
+        # managed app) always reads as its default — any older persisted
+        # value predating this lock (or a stray PATCH) can't override it.
+        for key, spec in properties.items():
+            if isinstance(spec, dict) and spec.get("x-disabled"):
+                merged[key] = spec["default"]
         return merged
 
     @property
