@@ -128,11 +128,18 @@ class IdentityGuard:
     * ``websocket`` — missing/invalid token → accept then ``close(4401)`` before
       the app accepts (mirrors ``src/api/terminal.py``); app never invoked.
 
-    By default all app routes are guarded. A managed app can set
-    ``auth_required: false`` in its framework config to bypass this gate and
-    let the mounted app handle access itself. The ``routes:local`` bypass below
-    remains narrower: loopback callers only, only for declared local paths.
-    Verifiers are injectable for tests.
+    By default all app routes are guarded (401/4401 on missing or invalid
+    identity). A managed app can set ``auth_required: false`` in its
+    framework config to let the app decide access itself instead — but this
+    is NOT "no auth", it's "the app's own auth is the final gate": identity
+    is still verified and forwarded (``scope["aw_identity"]``) whenever the
+    caller presents one (e.g. a logged-in browser's cookie), just never
+    required. This lets one route serve both a cookie-based dashboard caller
+    and a bearer-token-only external caller under the same relaxed setting —
+    see ``mcp-gateway``'s ``admin/config``, which accepts either. The
+    ``routes:local`` bypass below remains narrower and unconditional: loopback
+    callers only, only for declared local paths, no identity check attempted
+    at all. Verifiers are injectable for tests.
 
     ``local_paths`` (ADR "Apps Own Their Front + Back Routes" Decision 2): a
     mount-relative path (e.g. ``/eval``) that skips the JWT check when the
@@ -178,7 +185,23 @@ class IdentityGuard:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         stype = scope["type"]
         if stype == "http":
-            if self._local_bypass(scope) or not self._requires_auth():
+            if self._local_bypass(scope):
+                await self.app(scope, receive, send)
+                return
+            if not self._requires_auth():
+                # "App decides": the framework no longer hard-gates this
+                # route, but a caller's identity is still verified and
+                # forwarded when present (e.g. a logged-in browser session)
+                # — only a MISSING/invalid identity is tolerated instead of
+                # 401ing, deferring the final call to the app's own auth (a
+                # bearer token, an API key, ...). Without this, an app that
+                # turns auth_required off to accept external bearer-token
+                # callers would ALSO stop seeing identity for its own
+                # dashboard users, breaking any admin UI that expects
+                # scope["aw_identity"] to be set for a normal logged-in call.
+                claims = self._verify_http(scope)
+                if claims is not None:
+                    scope["aw_identity"] = claims
                 await self.app(scope, receive, send)
                 return
             claims = self._verify_http(scope)
@@ -187,7 +210,13 @@ class IdentityGuard:
                 return
             scope["aw_identity"] = claims
         elif stype == "websocket":
-            if self._local_bypass(scope) or not self._requires_auth():
+            if self._local_bypass(scope):
+                await self.app(scope, receive, send)
+                return
+            if not self._requires_auth():
+                claims = self._verify_ws(scope)
+                if claims is not None:
+                    scope["aw_identity"] = claims
                 await self.app(scope, receive, send)
                 return
             claims = self._verify_ws(scope)

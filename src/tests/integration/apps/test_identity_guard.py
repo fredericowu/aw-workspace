@@ -112,6 +112,38 @@ def test_auth_required_false_bypasses_identity(tmp_path, monkeypatch):
     assert r.json() == {"ok": True}
 
 
+def test_auth_required_false_still_forwards_identity_when_present(tmp_path, monkeypatch):
+    # "App decides" is not "no auth": a caller who DOES present a valid
+    # identity still gets it forwarded at scope["aw_identity"] even with
+    # auth_required off — only a MISSING/invalid one is tolerated instead of
+    # 401ing. Lets one route serve both a cookie-based dashboard caller and
+    # a bearer-token-only external caller under the same relaxed setting.
+    monkeypatch.setattr(
+        identity, "decode_identity_jwt",
+        lambda tok: {"sub": "u"} if tok == "good" else None)
+    app = FastAPI()
+    rt = AppRuntime(app, guard_identity=True)
+    asyncio.run(rt.load(
+        _write_app(tmp_path),
+        granted_permissions=["routes:register"],
+        config={"auth_required": False},
+    ))
+
+    client = TestClient(app)
+    # No identity presented at all — still let through (app decides).
+    r = client.get("/api/apps/guarded/whoami")
+    assert r.status_code == 200
+    assert r.json() == {"aw_identity": None}
+    # A valid identity IS forwarded, not discarded, when present.
+    r = client.get("/api/apps/guarded/whoami", headers={"Authorization": "Bearer good"})
+    assert r.status_code == 200
+    assert r.json() == {"aw_identity": {"sub": "u"}}
+    # An INVALID identity doesn't 401 either (app decides) — just isn't forwarded.
+    r = client.get("/api/apps/guarded/whoami", headers={"Authorization": "Bearer bad"})
+    assert r.status_code == 200
+    assert r.json() == {"aw_identity": None}
+
+
 def test_ws_without_token_closes_4401(guarded_app):
     client = TestClient(guarded_app)
     with pytest.raises(WebSocketDisconnect) as ei:
