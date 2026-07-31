@@ -47,7 +47,11 @@ ENV AW_PORT=9030 \
 # Lives under the host bind-mount, so installed shims persist across
 # container recreation; this ENV is what finally makes paths.py's
 # long-standing "on PATH" claim true. Frederico decision 2026-07-28.
-ENV PATH="/opt/aw-workspace/.aw-workspace/bin:${PATH}"
+#
+# /opt/aw-workspace/bin holds this repo's OWN `aw-workspace` CLI (see
+# skills/aw-workspace/SKILL.md) — on PATH so it's callable from any cwd/shell
+# (including agent sessions) without `./bin/` prefixing.
+ENV PATH="/opt/aw-workspace/bin:/opt/aw-workspace/.aw-workspace/bin:${PATH}"
 
 EXPOSE 9030
 

@@ -1,4 +1,4 @@
-"""./aw marketplace install <app> [--update] — install or update an app from
+"""aw-workspace marketplace install <app> [--update] — install or update an app from
 this workspace's marketplace catalog, via the same ``/api/apps/*`` routes the
 Apps SPA uses (see ``src/apps/routes.py``)."""
 from __future__ import annotations
@@ -17,7 +17,7 @@ _POLL_TIMEOUT = 180.0
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="./aw marketplace", description=DESCRIPTION,
+        prog="aw-workspace marketplace", description=DESCRIPTION,
     )
     sub = parser.add_subparsers(dest="action", required=True)
 
@@ -59,7 +59,7 @@ def _install(app_id: str, update: bool) -> int:
     if update:
         status, body = local_client.request("POST", f"/api/apps/{app_id}/update")
         if status == 404:
-            print(f"'{app_id}' is not installed — run './aw marketplace install {app_id}' first.")
+            print(f"'{app_id}' is not installed — run 'aw-workspace marketplace install {app_id}' first.")
             return 1
         if status not in (200, 202):
             print(f"error: update failed ({status}): {body}")
