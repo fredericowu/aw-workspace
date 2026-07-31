@@ -65,8 +65,21 @@ def _extract_token(request: Request, authorization: str) -> str:
     return request.cookies.get(COOKIE_NAME, "")
 
 
+def _local_cli_authorized(request: Request) -> bool:
+    """True if the request carries this workspace's own ``./aw`` CLI secret
+    (see ``src/apps/paths.py``'s ``get_or_create_cli_token``) — lets the CLI
+    call identity-gated routes without a browser-issued ``aw_id_jwt``."""
+    from src.apps.paths import LOCAL_CLI_HEADER, get_or_create_cli_token
+
+    presented = request.headers.get(LOCAL_CLI_HEADER)
+    return bool(presented) and presented == get_or_create_cli_token()
+
+
 async def require_identity(request: Request, authorization: str = Header(default="")) -> dict:
     """FastAPI dependency — returns the verified JWT claims dict or 401s."""
+    if _local_cli_authorized(request):
+        return {"sub": "local-cli", "local_cli": True}
+
     token = _extract_token(request, authorization)
     if not token:
         raise HTTPException(status_code=401, detail="unauthorized")
