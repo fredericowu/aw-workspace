@@ -159,6 +159,30 @@ def test_bad_resource_estimate_mem_disk_must_be_nonempty_string(bad):
         validate_manifest(_m(resource_estimate=bad))
 
 
+def test_launchable_windows_excludes_settings_only_window():
+    # aw-app-git's shape: its one window only hosts the settings form (gh
+    # login) — nothing to "launch" from the Installed grid, so it should be
+    # categorized as a Runnable (CLI), not a UI app.
+    m = validate_manifest(_m(contributes={
+        "windows": [{"id": "notes.main", "title": "Git & GitHub CLI"}],
+        "settings_panels": [{"id": "notes.settings", "window": "notes.main"}],
+        "system_clis": [{"name": "git", "installer": "install.sh"}],
+    }, permissions=[]))
+    assert m.windows == [{"id": "notes.main", "title": "Git & GitHub CLI"}]
+    assert m.launchable_windows == []
+
+
+def test_launchable_windows_keeps_windows_not_used_as_settings_panels():
+    m = validate_manifest(_m(contributes={
+        "windows": [
+            {"id": "notes.main", "title": "Notes"},
+            {"id": "notes.settings", "title": "Notes settings"},
+        ],
+        "settings_panels": [{"id": "notes.cfg", "window": "notes.settings"}],
+    }, permissions=[]))
+    assert [w["id"] for w in m.launchable_windows] == ["notes.main"]
+
+
 def test_what_you_get_derives_ui_screens_and_commands():
     m = validate_manifest(_m(contributes={
         "windows": [{"id": "notes.main", "title": "Notes"}],

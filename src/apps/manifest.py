@@ -75,6 +75,19 @@ class Manifest:
         return list(self.contributes.get("settings_panels", []))
 
     @property
+    def launchable_windows(self) -> list[dict[str, Any]]:
+        """``windows`` minus any that only serve as a settings panel.
+
+        An app like aw-app-git contributes one window purely to host its
+        gear-icon settings form (auth method, token, ...) — nothing a user
+        would "launch" from the Installed grid. Apps view categorization
+        (UI vs Runnables) uses this instead of the raw ``windows`` list so
+        settings-only apps land in Runnables alongside other CLI-only apps.
+        """
+        settings_window_ids = {p.get("window") for p in self.settings_panels}
+        return [w for w in self.windows if w.get("id") not in settings_window_ids]
+
+    @property
     def skills(self) -> list[dict[str, Any]]:
         return list(self.contributes.get("skills", []))
 
