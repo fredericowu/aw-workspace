@@ -106,6 +106,17 @@ class Manifest:
         return str(self.raw.get("icon", ""))
 
     @property
+    def category(self) -> str:
+        """UI grouping bucket (App Launcher / Workspace nav sidebar).
+
+        Optional, forward-compatible top-level field — like ``publisher`` —
+        so existing manifests keep validating unchanged. Defaults to
+        ``"Apps"`` (the existing decoupled-apps grid bucket) when a manifest
+        doesn't declare one.
+        """
+        return str(self.raw.get("category") or "Apps")
+
+    @property
     def standalone_app(self) -> bool:
         """Whether this app has a separate process of its own to start/stop/
         restart independently of the aw-workspace process.
@@ -118,7 +129,8 @@ class Manifest:
             ALSO run as its own separate process => True.
           * ``tier: inprocess`` with no ``runtime.standalone`` block — routes
             register directly inside the aw-workspace process; any
-            ``ctx.services``-managed subprocess it spawns is an internal
+            ``ctx.services``-managed subprocess it spawns (see
+            ``src.apps.services.ServiceSupervisor``) is an internal
             implementation detail the app itself owns and restarts, not a
             unit of process control the framework/UI exposes => False.
         """

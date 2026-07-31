@@ -15,8 +15,14 @@ import os
 import shlex
 import signal
 import subprocess
+import threading
+from collections import deque
 
 log = logging.getLogger(__name__)
+
+# Bounded backlog kept per service so a log-window snapshot has something to
+# show without holding unbounded process output in memory.
+_LOG_BACKLOG = 500
 
 
 class ServiceError(RuntimeError):
@@ -32,6 +38,13 @@ class _Service:
         self.package_dir = package_dir
         self.autostart = autostart
         self.proc: subprocess.Popen | None = None
+        # Real stdout/stderr of the managed subprocess, captured by a
+        # background reader thread — see ServiceSupervisor.start(). This is
+        # the only log source available for a `tier: inprocess` app's
+        # managed service; there is no separate container/log driver to
+        # query the way ContainerSupervisor does.
+        self.log_lines: deque[str] = deque(maxlen=_LOG_BACKLOG)
+        self._reader_thread: threading.Thread | None = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -60,13 +73,38 @@ class ServiceSupervisor:
         svc = self._require(app_id, service_id)
         if svc.proc is not None and svc.proc.poll() is None:
             return self.status(app_id, service_id)  # already running
+        svc.log_lines.clear()
         svc.proc = subprocess.Popen(
             shlex.split(svc.start), cwd=svc.package_dir,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
             start_new_session=True,  # own process group so stop kills children
         )
         log.info("apps: started service %s/%s pid=%s", app_id, service_id, svc.proc.pid)
+
+        def _pump(proc: subprocess.Popen, buf: deque[str]) -> None:
+            try:
+                if proc.stdout is None:
+                    return
+                for line in iter(proc.stdout.readline, ""):
+                    buf.append(line.rstrip("\n"))
+            except Exception:
+                log.exception("apps: log reader for service %s/%s crashed", app_id, service_id)
+
+        svc._reader_thread = threading.Thread(
+            target=_pump, args=(svc.proc, svc.log_lines), daemon=True,
+        )
+        svc._reader_thread.start()
         return self.status(app_id, service_id)
+
+    def logs(self, app_id: str, service_id: str) -> list[str]:
+        """Return the buffered stdout/stderr backlog for a managed service."""
+        svc = self._require(app_id, service_id)
+        return list(svc.log_lines)
+
+    def registered(self) -> list[tuple[str, str]]:
+        """``(app_id, service_id)`` pairs for every registered service."""
+        return list(self._services.keys())
 
     def stop(self, app_id: str, service_id: str, timeout: float = 5.0) -> dict:
         svc = self._require(app_id, service_id)

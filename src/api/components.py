@@ -39,8 +39,51 @@ def _app_id_from_key(key: str) -> str:
     return key
 
 
+def _service_key(app_id: str, service_id: str) -> str:
+    return f"service:{app_id}:{service_id}"
+
+
+def _service_snapshot(app: FastAPI) -> list[dict]:
+    """Return `ctx.services`-managed subprocesses (F4) in the legacy shape.
+
+    Unlike Tier-2 containers, these are `tier: inprocess` apps' OWN managed
+    subprocesses (ServiceSupervisor) — e.g. aw-app-proxy's CONNECT-tunnel
+    server. There is no container engine backing them, so status/logs come
+    straight from the supervisor's Popen + captured stdout/stderr instead of
+    `docker inspect` / `docker logs`.
+    """
+    rt = _runtime(app)
+    services = getattr(rt, "services", None)
+    if rt is None or services is None:
+        return []
+
+    rows: list[dict] = []
+    for app_id, service_id in services.registered():
+        loaded = rt.get(app_id)
+        manifest = getattr(loaded, "manifest", None)
+        status = rt.services.status(app_id, service_id)
+        running = bool(status.get("running"))
+        rows.append({
+            "key": _service_key(app_id, service_id),
+            "component": f"{app_id}:{service_id}",
+            "mode": "service",
+            "description": getattr(manifest, "description", "") or f"{app_id} service",
+            "category": getattr(manifest, "category", None) or "Apps",
+            "standalone_app": bool(getattr(manifest, "standalone_app", False)),
+            "port": None,
+            "depends": [],
+            "setup_required": False,
+            "menu_display": True,
+            "status": "running" if running else "off",
+            "running": running,
+            "pid": status.get("pid"),
+        })
+    return rows
+
+
 def component_snapshot(app: FastAPI) -> list[dict]:
-    """Return Tier-2 app containers in the legacy frontend component shape."""
+    """Return Tier-2 app containers + Tier-1 managed services in the legacy
+    frontend component shape."""
     rt = _runtime(app)
     if rt is None:
         return []
@@ -59,7 +102,8 @@ def component_snapshot(app: FastAPI) -> list[dict]:
             "component": app_id,
             "mode": "docker",
             "description": getattr(manifest, "description", "") or f"{app_id} app container",
-            "category": "Apps",
+            "category": getattr(manifest, "category", None) or "Apps",
+            "standalone_app": bool(getattr(manifest, "standalone_app", True)),
             "port": getattr(container, "port", None),
             "depends": [],
             "setup_required": False,
@@ -70,13 +114,21 @@ def component_snapshot(app: FastAPI) -> list[dict]:
             "image": getattr(container, "image", None),
             "url": status.get("url"),
         })
+    rows.extend(_service_snapshot(app))
     return rows
 
 
 def _component_for(app: FastAPI, key: str) -> tuple[str, dict] | tuple[None, JSONResponse]:
-    app_id = _app_id_from_key(key)
     rt = _runtime(app)
-    if rt is None or app_id not in dict(rt.containers.registered()):
+    if rt is None:
+        return None, JSONResponse({"error": f"Unknown component: {key}"}, status_code=404)
+    if key.startswith("service:"):
+        row = next((c for c in _service_snapshot(app) if c["key"] == key), None)
+        if row is None:
+            return None, JSONResponse({"error": f"Unknown component: {key}"}, status_code=404)
+        return key, row
+    app_id = _app_id_from_key(key)
+    if app_id not in dict(rt.containers.registered()):
         return None, JSONResponse({"error": f"Unknown component: {key}"}, status_code=404)
     row = next((c for c in component_snapshot(app) if c["component"] == app_id), None)
     if row is None:
@@ -104,14 +156,26 @@ class ComponentRoutes:
         return row
 
     async def start_component(self, key: str, identity: dict = Depends(require_identity)):
+        if key.startswith("service:"):
+            return await self._mutate_service(
+                key, "started", lambda rt, aid, sid: asyncio.to_thread(rt.services.start, aid, sid))
         return await self._mutate(
             key, "started", lambda rt, app_id: asyncio.to_thread(rt.containers.start, app_id))
 
     async def stop_component(self, key: str, identity: dict = Depends(require_identity)):
+        if key.startswith("service:"):
+            return await self._mutate_service(
+                key, "stopped", lambda rt, aid, sid: asyncio.to_thread(rt.services.stop, aid, sid))
         return await self._mutate(
             key, "stopped", lambda rt, app_id: asyncio.to_thread(rt.containers.stop, app_id))
 
     async def restart_component(self, key: str, identity: dict = Depends(require_identity)):
+        if key.startswith("service:"):
+            async def restart_service(rt, aid, sid):
+                await asyncio.to_thread(rt.services.stop, aid, sid)
+                return await asyncio.to_thread(rt.services.start, aid, sid)
+            return await self._mutate_service(key, "restarted", restart_service)
+
         async def restart(rt, app_id):
             await asyncio.to_thread(rt.containers.stop, app_id)
             return await asyncio.to_thread(rt.containers.start, app_id)
@@ -136,6 +200,29 @@ class ComponentRoutes:
             hub.broadcast_soon(payload)
         return payload
 
+    async def _mutate_service(self, key: str, action: str, fn):
+        _, row = _component_for(self.app, key)
+        if row is None:
+            return JSONResponse({"error": f"Unknown component: {key}"}, status_code=404)
+        parts = key.split(":", 2)
+        if len(parts) != 3:
+            return JSONResponse({"error": f"Malformed service key: {key}"}, status_code=400)
+        _, app_id, service_id = parts
+        rt = _runtime(self.app)
+        try:
+            result = fn(rt, app_id, service_id)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as e:  # ServiceError or subprocess failure
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+        updated = next((c for c in _service_snapshot(self.app) if c["key"] == key), row)
+        payload = {"key": updated["key"], "action": action, **updated, "result": result}
+        hub = getattr(self.app.state, "status_hub", None)
+        if hub is not None:
+            hub.broadcast_soon(payload)
+        return payload
+
     async def log_stream(self, websocket: WebSocket, key: str):
         claims = authorize_ws(websocket)
         if not claims:
@@ -150,6 +237,28 @@ class ComponentRoutes:
 
         await websocket.accept()
         rt = _runtime(self.app)
+
+        if key.startswith("service:"):
+            _, svc_app_id, service_id = key.split(":", 2)
+            try:
+                lines = await asyncio.to_thread(rt.services.logs, svc_app_id, service_id)
+                if lines:
+                    await websocket.send_text("\n".join(lines) + "\n")
+                else:
+                    await websocket.send_text(
+                        "(no output captured yet for this managed service)\n")
+            except Exception as e:
+                await websocket.send_text(f"Unable to read service logs: {e}\n")
+
+            try:
+                while True:
+                    msg = await websocket.receive()
+                    if msg.get("type") == "websocket.disconnect":
+                        break
+            except WebSocketDisconnect:
+                pass
+            return
+
         container = dict(rt.containers.registered())[app_id]
         try:
             obj = await asyncio.to_thread(rt.containers.docker().containers.get, container.name)

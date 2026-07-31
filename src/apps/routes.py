@@ -110,6 +110,8 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 "description": a.manifest.description,
                 "version": a.manifest.version,
                 "tier": a.manifest.tier,
+                "category": a.manifest.category,
+                "standalone_app": a.manifest.standalone_app,
                 "icon": a.manifest.icon,
                 "has_windows": bool(a.manifest.launchable_windows),
                 "permissions": a.granted_permissions,
