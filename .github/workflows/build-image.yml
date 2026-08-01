@@ -1,8 +1,9 @@
 name: Build + push image
 
-# Builds the workspace image on every push to master (for now — no path
-# filter) and publishes the resulting release to aw-backend so aw-console
-# can enable workspace updates.
+# Manual only (for now — Frederico decision 2026-08-01): image + release
+# publish is workflow_dispatch-only while aw-workspace is under active
+# single-repo development, so every commit/push doesn't cut a release.
+# Flip the `push` trigger back on once this settles down.
 
 on:
   workflow_dispatch:
@@ -11,8 +12,6 @@ on:
         description: "Version to release (defaults to next vX.Y.Z patch)"
         type: string
         required: false
-  push:
-    branches: [master]
 
 concurrency:
   group: build-image
@@ -28,7 +27,13 @@ jobs:
     runs-on: [self-hosted, aw-workspace]
     timeout-minutes: 30
     steps:
+      # fetch-depth: 0 — full history, not a shallow clone, because this
+      # checkout is COPYed into the image (including .git) so the running
+      # container is a real, workable git repo (Frederico decision
+      # 2026-08-01), not just a source snapshot.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Configure Podman on macbook-fred runner
         run: |

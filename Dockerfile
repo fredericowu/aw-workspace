@@ -5,16 +5,19 @@ FROM python:3.12-slim
 ARG AW_WORKSPACE_VERSION=dev
 
 # procps → `ps`, used by the terminal /procs + /kill endpoints (process badge).
+# git → the baked-in repo (COPY . below, including .git) is meant to be
+# worked on from inside the container, not just read.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl build-essential libpq-dev procps \
+        curl build-essential libpq-dev procps git \
     && rm -rf /var/lib/apt/lists/*
 
-# `aw` user (UID/GID 1001, standard Ubuntu first-user convention) — created so
-# a non-root option EXISTS, not used by default. The container still runs as
-# root (no `USER aw` here); which apps opt into running as this user is a
-# future per-app `run_as`-style manifest field, not implemented yet.
-# Frederico decision 2026-07-28.
-RUN groupadd -g 1001 aw && useradd -u 1001 -g 1001 -m -s /bin/bash aw
+# `ubuntu` user (UID/GID 1001, standard Ubuntu first-user convention) — this
+# is now the container's DEFAULT user (see `USER ubuntu` below), not just an
+# opt-in option. Every process (the app itself, `docker exec`/terminal
+# logins, PTY subprocesses spawned by the terminal feature) runs as this
+# user. Frederico decision 2026-08-01 (supersedes the root-by-default
+# 2026-07-28 decision).
+RUN groupadd -g 1001 ubuntu && useradd -u 1001 -g 1001 -m -s /bin/bash ubuntu
 
 # The aw-workspace runtime lives at /opt/aw-workspace (not /app, and not the
 # monolith's /opt/agentic-workspace). On a BYOD host this same path is
@@ -26,7 +29,14 @@ WORKDIR /opt/aw-workspace
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
+# Full checkout (including .git — see the `fetch-depth: 0` checkout in
+# build-image.yml) baked into the image so a first-boot host seed (see
+# aw-remote-host's install.sh) starts from a real, working git repo — not
+# just a source-code snapshot — and survives via the host bind-mount from
+# then on. Frederico decision 2026-08-01.
 COPY . /opt/aw-workspace
+RUN chown -R ubuntu:ubuntu /opt/aw-workspace \
+    && git config --system --add safe.directory /opt/aw-workspace
 
 # Single worker: the terminal feature keeps PTY sessions in-process memory, so
 # create/WS must land on the same worker. A single-user data-plane doesn't need
@@ -57,5 +67,10 @@ EXPOSE 9030
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
     CMD curl -fsS http://localhost:9030/api/health || exit 1
+
+# Default user for PID 1 AND for `docker/podman exec` (no `-u` flag needed to
+# log in as ubuntu) — every child process (PTY terminal sessions, etc.)
+# inherits it. Must come last: everything above needs root (apt-get, chown).
+USER ubuntu
 
 CMD ["python", "-m", "src.start.workspace"]
