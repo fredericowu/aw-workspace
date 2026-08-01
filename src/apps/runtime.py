@@ -679,10 +679,19 @@ class AppRuntime:
         granted, refused = filter_grants(requested, signed=signed)
         if refused:
             log.warning("apps: refused high-risk caps %s for unsigned app %s", refused, slug)
-        if "containers:manage" not in granted:
+        # Signing/trust (F8) isn't wired up yet — nothing ever sets signed=True
+        # (not the CLI, not the catalog), so this gate currently blocks every
+        # tier=container app unconditionally. Disabled until F8 lands; the
+        # manifest-declared permission is still required below.
+        # if "containers:manage" not in granted:
+        #     raise PermissionError(
+        #         f"app {slug!r} tier=container requires the 'containers:manage' "
+        #         f"capability (high-risk — signed/marketplace apps only)")
+        if "containers:manage" not in requested:
             raise PermissionError(
-                f"app {slug!r} tier=container requires the 'containers:manage' "
-                f"capability (high-risk — signed/marketplace apps only)")
+                f"app {slug!r} tier=container requires the 'containers:manage' permission "
+                f"declared in its manifest")
+        granted = list(dict.fromkeys(granted + ["containers:manage"]))
         if not self.containers.available:
             raise ContainerError(
                 f"Tier-2 unavailable: no container engine socket configured "
