@@ -68,6 +68,11 @@ ENV AW_PORT=9030 \
 # (including agent sessions) without `./bin/` prefixing.
 ENV PATH="/opt/aw-workspace/bin:/opt/aw-workspace/.aw-workspace/bin:${PATH}"
 
+# Also symlinked at the workspace root (WORKDIR, above) so `./aw-workspace`
+# works too — the PATH entry above already makes the bare `aw-workspace`
+# form work from anywhere; this just covers the `./`-explicit habit.
+RUN ln -sf bin/aw-workspace /opt/aw-workspace/aw-workspace
+
 EXPOSE 9030
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
