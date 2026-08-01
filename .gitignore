@@ -7,3 +7,10 @@ __pycache__/
 coverage.xml
 htmlcov/
 coverage/
+
+# HOME=/opt/aw-workspace (see Dockerfile), so runtime state that normally
+# lives under a user's home dir ends up inside the repo working tree —
+# none of it is project source.
+/repos/
+/apps/
+/.*/
