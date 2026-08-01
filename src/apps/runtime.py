@@ -807,19 +807,31 @@ class AppRuntime:
                 if mode != "ro":
                     raise ContainerError(
                         f"app {manifest.id!r} $AW_APPS_ROOT volume must be read-only")
+                # mkdir on the container-local path — this process only has
+                # that one mounted (see the bug note below) — THEN translate
+                # for the bind-mount source the host's podman needs.
+                os.makedirs(apps_root(), exist_ok=True)
                 host_path = self._container_host_bind_path(apps_root())
-                os.makedirs(host_path, exist_ok=True)
                 binds[host_path] = {"bind": target, "mode": mode}
                 continue
             if os.path.isabs(source):
                 raise ContainerError(
                     f"app {manifest.id!r} volume source must be package-relative")
-            host_path = os.path.realpath(os.path.join(package_root, source))
-            if not (host_path == package_root or host_path.startswith(package_root + os.sep)):
+            local_path = os.path.realpath(os.path.join(package_root, source))
+            if not (local_path == package_root or local_path.startswith(package_root + os.sep)):
                 raise ContainerError(
                     f"app {manifest.id!r} volume source escapes the package dir")
-            host_path = self._container_host_bind_path(host_path)
-            os.makedirs(host_path, exist_ok=True)
+            # mkdir BEFORE translating to the host bind-mount path — a
+            # Tier-2 install (host podman socket, AW_WORKSPACE_HOST_DIR set)
+            # runs this process inside the workspace container, which only
+            # has the container-local path mounted; the translated host
+            # path (e.g. /home/aw-remote-host/aw-workspace/...) isn't
+            # visible here at all, so os.makedirs on it always raised
+            # PermissionError/FileNotFoundError — found live installing
+            # mcp-gateway on workspace "aw". The container-local mkdir
+            # reaches the same directory via the bind mount either way.
+            os.makedirs(local_path, exist_ok=True)
+            host_path = self._container_host_bind_path(local_path)
             binds[host_path] = {"bind": target, "mode": mode}
         return binds
 
