@@ -7,8 +7,11 @@ ARG AW_WORKSPACE_VERSION=dev
 # procps → `ps`, used by the terminal /procs + /kill endpoints (process badge).
 # git → the baked-in repo (COPY . below, including .git) is meant to be
 # worked on from inside the container, not just read.
+# sudo → the `ubuntu` user is unprivileged by default (see USER below); sudo
+# lets terminal sessions install packages / touch root-owned paths on demand
+# instead of everyone needing `docker exec -u root`. Frederico decision 2026-08-01.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl build-essential libpq-dev procps git \
+        curl build-essential libpq-dev procps git sudo \
     && rm -rf /var/lib/apt/lists/*
 
 # `ubuntu` user (UID/GID 1001, standard Ubuntu first-user convention) — this
@@ -17,7 +20,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # logins, PTY subprocesses spawned by the terminal feature) runs as this
 # user. Frederico decision 2026-08-01 (supersedes the root-by-default
 # 2026-07-28 decision).
-RUN groupadd -g 1001 ubuntu && useradd -u 1001 -g 1001 -m -s /bin/bash ubuntu
+RUN groupadd -g 1001 ubuntu && useradd -u 1001 -g 1001 -m -s /bin/bash ubuntu \
+    && echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu \
+    && chmod 0440 /etc/sudoers.d/ubuntu
 
 # The aw-workspace runtime lives at /opt/aw-workspace (not /app, and not the
 # monolith's /opt/agentic-workspace). On a BYOD host this same path is
