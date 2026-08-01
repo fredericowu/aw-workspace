@@ -1,7 +1,8 @@
 name: Build + push image
 
-# Builds the workspace image on image-relevant pushes and publishes the
-# resulting release to aw-backend so aw-console can enable workspace updates.
+# Builds the workspace image on every push to master (for now — no path
+# filter) and publishes the resulting release to aw-backend so aw-console
+# can enable workspace updates.
 
 on:
   workflow_dispatch:
@@ -12,11 +13,6 @@ on:
         required: false
   push:
     branches: [master]
-    paths:
-      - "Dockerfile"
-      - "src/**"
-      - "requirements.txt"
-      - ".github/workflows/build-image.yml"
 
 concurrency:
   group: build-image
