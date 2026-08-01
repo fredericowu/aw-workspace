@@ -36,32 +36,48 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 # then on. Frederico decision 2026-08-01.
 COPY . /opt/aw-workspace
 RUN chown -R ubuntu:ubuntu /opt/aw-workspace \
-    && git config --system --add safe.directory /opt/aw-workspace
+    && git config --system --add safe.directory /opt/aw-workspace \
+    && mkdir -p /opt/home /opt/data && chown ubuntu:ubuntu /opt/home /opt/data
 
 # Single worker: the terminal feature keeps PTY sessions in-process memory, so
 # create/WS must land on the same worker. A single-user data-plane doesn't need
 # more. Revisit if a stateless multi-worker backing store is added (MIGRATION.md).
-# HOME=/opt/aw-workspace so a fresh terminal (Agents → Terminals) opens in
-# the workspace root — terminal_manager falls back to $HOME when no cwd given.
+#
+# Three separate persistence tiers (Frederico decision 2026-08-01), each its
+# own bind mount on a BYOD host (see aw-remote-host's install.sh):
+#   /opt/aw-workspace — WORKDIR, the code itself. Host-mounted, but `Update`
+#                        wipes/replaces it from the fresh image on every run.
+#   /opt/home          — HOME. Dotfiles (~/.claude, shell history, etc.) —
+#                        a separate mount outside /opt/aw-workspace, so
+#                        `Update`'s wipe never sees it. Survives forever.
+#   /opt/data           — AW_WORKSPACE_HOME (was $HOME/.aw-workspace). App-
+#                        installed bin shims/secrets/skills (paths.py). Also
+#                        a separate mount, same reason — previously only
+#                        survived Update via a name-based exclusion in
+#                        aw-remote-host's sync logic; now structurally safe.
+# AW_WORKSPACE_ROOT tells terminal_manager.py where a fresh terminal (no
+# explicit cwd) should open — the code, not $HOME (see terminal_manager.py).
 ENV AW_PORT=9030 \
     AW_WORKSPACE_WORKERS=1 \
     AW_WORKSPACE_VERSION=${AW_WORKSPACE_VERSION} \
     PYTHONPATH=/opt/aw-workspace \
-    HOME=/opt/aw-workspace \
+    AW_WORKSPACE_ROOT=/opt/aw-workspace \
+    HOME=/opt/home \
+    AW_WORKSPACE_HOME=/opt/data \
     PYTHONUNBUFFERED=1
 
-# F4 app-shim bin dir (paths.bin_dir() == <workspace_home>/bin, i.e.
-# $HOME/.aw-workspace/bin with the HOME above) baked onto PATH for every
-# process/shell/agent in this image — not just login shells (the
-# orchestrator's /etc/profile.d/aw-bin.sh workaround only covered those).
-# Lives under the host bind-mount, so installed shims persist across
-# container recreation; this ENV is what finally makes paths.py's
-# long-standing "on PATH" claim true. Frederico decision 2026-07-28.
+# F4 app-shim bin dir (paths.bin_dir() == AW_WORKSPACE_HOME/bin == /opt/data/bin
+# per the ENV above) baked onto PATH for every process/shell/agent in this
+# image — not just login shells (the orchestrator's /etc/profile.d/aw-bin.sh
+# workaround only covered those). Lives under its own host bind-mount, so
+# installed shims persist across container recreation AND Update; this ENV
+# is what finally makes paths.py's long-standing "on PATH" claim true.
+# Frederico decision 2026-07-28 (path updated 2026-08-01).
 #
 # /opt/aw-workspace/bin holds this repo's OWN `aw-workspace` CLI (see
 # skills/aw-workspace/SKILL.md) — on PATH so it's callable from any cwd/shell
 # (including agent sessions) without `./bin/` prefixing.
-ENV PATH="/opt/aw-workspace/bin:/opt/aw-workspace/.aw-workspace/bin:${PATH}"
+ENV PATH="/opt/aw-workspace/bin:/opt/data/bin:${PATH}"
 
 EXPOSE 9030
 
