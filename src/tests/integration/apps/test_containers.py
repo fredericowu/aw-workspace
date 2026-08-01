@@ -518,16 +518,17 @@ def test_config_endpoint_applies_auto_start_toggle(tmp_path):
     _async(run())
 
 
-def test_container_app_requires_containers_manage(tmp_path):
-    # unsigned → filter_grants strips the high-risk cap → load refused
+def test_container_app_loads_unsigned(tmp_path):
+    # Signature/trust gating is disabled (Frederico decision 2026-08-01) —
+    # see filter_grants' docstring. An unsigned app now keeps containers:manage
+    # same as a signed one, so this loads instead of raising PermissionError.
     pkg = _write_container_app(tmp_path)
 
     async def run():
         rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
         rt.containers = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
-        with pytest.raises(PermissionError):
-            await rt.load(pkg, granted_permissions=["containers:manage"], signed=False)
-        assert not rt.is_loaded("browser")
+        await rt.load(pkg, granted_permissions=["containers:manage"], signed=False)
+        assert rt.is_loaded("browser")
 
     _async(run())
 

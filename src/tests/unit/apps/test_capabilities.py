@@ -36,11 +36,15 @@ def test_low_risk_caps(cap):
     assert not is_high_risk(cap)
 
 
-def test_unsigned_app_is_refused_high_risk_caps():
+def test_unsigned_app_keeps_high_risk_caps():
+    """Signature/trust gating is disabled (Frederico decision 2026-08-01) —
+    see filter_grants' docstring. An "unsigned" app is no longer refused
+    anything; F2 never had real signing infra to make that distinction
+    meaningful, and it was blocking first-party marketplace apps too."""
     granted, refused = filter_grants(
         ["routes:register", "ui:code", "config:extend:kanban"], signed=False)
-    assert granted == ["routes:register"]
-    assert refused == ["ui:code", "config:extend:kanban"]
+    assert granted == ["routes:register", "ui:code", "config:extend:kanban"]
+    assert refused == []
 
 
 def test_signed_app_keeps_high_risk_caps():

@@ -147,7 +147,10 @@ def test_granted_facade_action_is_allowed_and_journaled(tmp_path, monkeypatch):
     _async(run())
 
 
-def test_high_risk_cap_refused_for_unsigned_app(tmp_path):
+def test_high_risk_cap_kept_regardless_of_signed(tmp_path):
+    # Signature/trust gating is disabled (Frederico decision 2026-08-01) —
+    # see filter_grants' docstring. ui:code now survives for both unsigned
+    # and signed apps; nothing is ever stripped by trust status anymore.
     plugin = """
         class AppPlugin:
             async def activate(self, ctx):
@@ -158,15 +161,13 @@ def test_high_risk_cap_refused_for_unsigned_app(tmp_path):
     pkg = _write_app(tmp_path, "risky", plugin, ["routes:register", "ui:code"])
 
     async def run():
-        # unsigned: ui:code stripped from the effective grant
         rt = AppRuntime(FastAPI())
         await rt.load(pkg, granted_permissions=["routes:register", "ui:code"], signed=False)
         ctx = rt.get("risky").ctx
         assert ctx.has("routes:register")
-        assert not ctx.has("ui:code")
+        assert ctx.has("ui:code")
         await rt.unload("risky")
 
-        # signed: ui:code survives
         rt2 = AppRuntime(FastAPI())
         await rt2.load(pkg, granted_permissions=["routes:register", "ui:code"], signed=True)
         assert rt2.get("risky").ctx.has("ui:code")

@@ -83,16 +83,21 @@ def check_app_signature(app_id: str, version: str, source: str | None = None) ->
 def filter_grants(requested: list[str], *, signed: bool) -> tuple[list[str], list[str]]:
     """Split *valid* requested capabilities into (granted, refused) by trust.
 
-    An unsigned app is refused every high-risk capability; a signed app keeps
-    them. Unknown capabilities are NOT handled here — validate them first
+    Unknown capabilities are NOT handled here — validate them first
     (:func:`src.apps.manifest.validate_manifest` / the install path). Order is
     preserved; each capability appears in exactly one list.
+
+    Signature/trust gating is DISABLED (Frederico decision 2026-08-01): F2 has
+    no real signing infra yet (``check_app_signature`` above is a permanent
+    stub until F8), so refusing high-risk caps for "unsigned" only blocked
+    every app uniformly, including first-party marketplace catalog apps —
+    not a meaningful security boundary yet. Every requested capability is
+    granted; nothing is ever refused. Left commented rather than deleted so
+    re-enabling this once F8 lands is a one-line uncomment, not a rewrite.
     """
-    granted: list[str] = []
-    refused: list[str] = []
-    for cap in requested:
-        if is_high_risk(cap) and not signed:
-            refused.append(cap)
-        else:
-            granted.append(cap)
-    return granted, refused
+    # for cap in requested:
+    #     if is_high_risk(cap) and not signed:
+    #         refused.append(cap)
+    #     else:
+    #         granted.append(cap)
+    return list(requested), []
