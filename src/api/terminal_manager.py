@@ -296,21 +296,17 @@ class TerminalManager:
         shell = self._shell()
 
         # Resolve the starting directory: caller-supplied (absolute or relative
-        # to the workspace root), else the workspace root. A missing dir falls
-        # back to the workspace root so a typo never drops the shell somewhere
-        # surprising. Deliberately NOT $HOME — HOME points at the separate
-        # /opt/home persistence mount (survives Update), while the code a
-        # fresh terminal should actually open in lives at AW_WORKSPACE_ROOT
-        # (/opt/aw-workspace, the host-mounted, Update-managed source tree).
-        workspace_root = os.environ.get("AW_WORKSPACE_ROOT", "/opt/aw-workspace")
-        effective_cwd = workspace_root
+        # to HOME), else HOME. A missing dir falls back to HOME so a typo never
+        # drops the shell somewhere surprising.
+        home = os.environ.get("HOME") or os.path.expanduser("~") or "/root"
+        effective_cwd = home
         if cwd:
-            candidate = cwd if os.path.isabs(cwd) else os.path.join(workspace_root, cwd)
+            candidate = cwd if os.path.isabs(cwd) else os.path.join(home, cwd)
             candidate = os.path.normpath(candidate)
             if os.path.isdir(candidate):
                 effective_cwd = candidate
             else:
-                logger.warning("create: cwd=%s not found, using workspace root", candidate)
+                logger.warning("create: cwd=%s not found, using HOME", candidate)
 
         if command:
             inner = f"cd {_sh_quote(effective_cwd)}; {command}"
