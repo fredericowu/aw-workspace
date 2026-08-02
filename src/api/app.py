@@ -29,16 +29,27 @@ log = logging.getLogger(__name__)
 
 
 def _spa_origin_regex() -> str:
-    """CORS allow-origin regex for the cloud SPA that talks to this workspace.
+    """CORS allow-origin regex for callers that talk to this workspace.
 
     Three-plane split: the SPA is served at ``https://<slug>.workspace.<domain>``
     and calls this API cross-origin (same apex) at ``api.<slug>.workspace.<domain>``,
     sending the apex ``aw_id_jwt`` cookie. Restrict to this workspace's own slug
-    when known; fall back to any ``<slug>.workspace`` host in dev."""
+    when known; fall back to any ``<slug>.workspace`` host in dev.
+
+    Also allows browser-extension origins (``chrome-extension://…``,
+    ``moz-extension://…``, ``safari-web-extension://…``) — apps like
+    aw-app-proxy's aw-sync extension are, by design, called cross-origin
+    from an extension popup, not from this workspace's own SPA. CORS here
+    is a browser courtesy, not the security boundary: every one of these
+    routes is still behind IdentityGuard's Bearer JWT check regardless of
+    what Origin sent the request, so widening this doesn't widen who can
+    actually call in — only who gets a CORS grant to try (found
+    2026-08-02: the aw-sync extension's POSTs were silently blocked at
+    the browser's own preflight, request never left the client)."""
     slug = os.environ.get("AW_WORKSPACE", "")
-    if slug:
-        return rf"^https://{re.escape(slug)}\.workspace\..+$"
-    return r"^https://[^.]+\.workspace\..+$"
+    spa = rf"https://{re.escape(slug)}\.workspace\..+" if slug else r"https://[^.]+\.workspace\..+"
+    extensions = r"(?:chrome|moz|safari-web)-extension://.+"
+    return rf"^(?:{spa}|{extensions})$"
 
 
 def create_app() -> FastAPI:
