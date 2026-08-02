@@ -80,6 +80,41 @@ def test_hot_load_mounts_route_then_unload_removes_it():
     _async(run())
 
 
+def test_hot_load_also_mounts_app_subdomain_host_route():
+    """Same view, second entry point: <app_id>.app.<anything> routes to the
+    identical guarded ASGI app as /api/apps/<app_id>/*, with no path prefix
+    (Caddy's *.app.<slug>.workspace wildcard already tunnels this Host header
+    here unconditionally — see aw-backend's workspace_caddy_template.py)."""
+    async def run():
+        host = FastAPI()
+        rt = AppRuntime(host, journal=ActionJournal(), guard_identity=False)
+
+        await rt.load(HELLO_DIR)
+        assert rt.is_loaded("hello")
+
+        transport = httpx.ASGITransport(app=host)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            # Any suffix after "hello.app." matches — workspace slug + domain
+            # are irrelevant here since Caddy already scoped the request to
+            # this workspace before it ever reached this process.
+            r = await c.get("/", headers={"host": "hello.app.aw.workspace.aw.tekflox.com"})
+            assert r.status_code == 200
+            assert r.json() == {"app": "hello", "ok": True, "version": "1.0.0"}
+            r2 = await c.get("/greet/fred", headers={"host": "hello.app.someother.suffix.example"})
+            assert r2.json()["message"] == "Hello, fred!"
+
+            # A request for a DIFFERENT app's subdomain must not match.
+            r3 = await c.get("/", headers={"host": "not-hello.app.aw.workspace.aw.tekflox.com"})
+            assert r3.status_code == 404
+
+        await rt.unload("hello")
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            r = await c.get("/", headers={"host": "hello.app.aw.workspace.aw.tekflox.com"})
+            assert r.status_code == 404
+
+    _async(run())
+
+
 def test_openapi_reflects_mount_and_unmount():
     async def run():
         host = FastAPI()

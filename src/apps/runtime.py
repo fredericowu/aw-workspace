@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from fastapi import FastAPI
-from starlette.routing import Mount, get_route_path
+from starlette.routing import Host, Mount, get_route_path
 from starlette.types import Receive, Scope, Send
 
 import types
@@ -312,6 +312,7 @@ class LoadedApp:
     config: dict[str, Any] = field(default_factory=dict)
     signed: bool = False
     mount: Mount | None = None
+    host_mount: Host | None = None
     drainable: _DrainableApp | None = None
     module_prefix: str = ""
 
@@ -525,6 +526,8 @@ class AppRuntime:
             if loaded.mount is not None and loaded.mount in self.host.router.routes:
                 self.host.router.routes.remove(loaded.mount)
                 self._invalidate_openapi()
+            if loaded.host_mount is not None and loaded.host_mount in self.host.router.routes:
+                self.host.router.routes.remove(loaded.host_mount)
             self.journal.clear_app(slug)
             self._unimport(module_prefix)
             raise
@@ -552,6 +555,8 @@ class AppRuntime:
         async with self._lock:
             if loaded.mount is not None and loaded.mount in self.host.router.routes:
                 self.host.router.routes.remove(loaded.mount)
+            if loaded.host_mount is not None and loaded.host_mount in self.host.router.routes:
+                self.host.router.routes.remove(loaded.host_mount)
             self._invalidate_openapi()
 
         # 2. Cancel the app's watchdog tasks BEFORE draining — stop producing
@@ -653,10 +658,25 @@ class AppRuntime:
                    )
                    if self.guard_identity else drainable)
         mount = Mount(f"/api/apps/{app_id}", app=guarded)
+        # Second entry point for the SAME guarded ASGI app: a per-app subdomain
+        # (<app_id>.app.<anything>, e.g. proxy.app.aw.workspace.aw.tekflox.com)
+        # that Caddy's *.app.<slug>.workspace wildcard already forwards here
+        # unconditionally (see aw-backend's workspace_caddy_template.py — that
+        # wildcard has been reserved and tunneled since the F4 split, just
+        # never read on this side). Host() dispatches with the path taken
+        # as-is (no /api/apps/<slug> prefix needed) — same view, same
+        # IdentityGuard, same permissions, just addressed by host instead of
+        # path. {_}` is a required-but-unused capture group so Host's path-
+        # style compiler accepts a bare literal-with-suffix pattern; Starlette's
+        # default str convertor doesn't exclude "." so it happily swallows the
+        # rest of the hostname (workspace slug + domain) in one match.
+        host_mount = Host(f"{app_id}.app.{{_:str}}", app=guarded)
         # Mutation happens on the event loop (single process) — the list append
         # is atomic w.r.t. request matching; no free-threading hazard.
         self.host.router.routes.append(mount)
+        self.host.router.routes.append(host_mount)
         loaded.mount = mount
+        loaded.host_mount = host_mount
         loaded.drainable = drainable
         self.journal.record(app_id, "route:mount", f"/api/apps/{app_id}",
                             {"version": loaded.manifest.version})
@@ -730,6 +750,8 @@ class AppRuntime:
             # forget journal entries for this app.
             if loaded.mount is not None and loaded.mount in self.host.router.routes:
                 self.host.router.routes.remove(loaded.mount)
+            if loaded.host_mount is not None and loaded.host_mount in self.host.router.routes:
+                self.host.router.routes.remove(loaded.host_mount)
             self.containers.stop_all_for(slug)
             self.journal.clear_app(slug)
             raise
