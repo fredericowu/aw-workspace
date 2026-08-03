@@ -23,7 +23,7 @@ from src.api.db import get_engine, get_workspace_schema
 
 log = logging.getLogger(__name__)
 
-_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_-]*$")
 
 
 class DbTableError(RuntimeError):
