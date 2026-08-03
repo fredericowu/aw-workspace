@@ -16,11 +16,28 @@ Two related surfaces, both journaled so uninstall reverts them:
 Both the installer and the revert script are run from the app's package dir so
 their relative paths resolve; the app never gets a raw shell handle — it calls
 the gated ``ctx.commands`` facade, which routes here.
+
+**System-CLI drift healing** — reconcile-on-boot only reinstalls an app that
+isn't currently loaded (``src/apps/reconciler.py``); once an app is loaded, the
+runtime never again checks that the CLIs it installed are still on disk. If
+something outside the app's own lifecycle removes a binary (a package purge
+run by hand, an unrelated apt operation, a base-image layer rebuilt under a
+long-lived container without a full recreation — this is what happened to
+``gh`` in aw-app-git, found 2026-08-03), the app is stuck reporting "installed"
+with a dead CLI until it's manually uninstalled/reinstalled or the whole
+workspace is recreated. ``record_system_cli``/``missing_system_clis``/``heal``
+back a generic, per-app-code-free fix: every ``install_system_cli`` call
+auto-registers itself here, and ``AppRuntime.start_system_cli_healer`` (one
+runtime-owned periodic task, not gated by any app's ``watchdog:tasks``
+permission) re-runs an app's own installer script whenever ``command -v
+<name>`` goes missing — the installer IS the app's heal logic, so no app needs
+to write or register anything extra.
 """
 from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 
 from src.apps import paths
@@ -50,6 +67,9 @@ class CommandInstaller:
 
     def __init__(self, timeout: float = DEFAULT_TIMEOUT) -> None:
         self.timeout = timeout
+        # (app_id, cli_name) -> (package_dir, installer_script) for every
+        # install_system_cli call, so the healer can re-run the right script.
+        self._system_clis: dict[tuple[str, str], tuple[str, str]] = {}
 
     # ---- system CLIs (installer scripts) --------------------------------
 
@@ -58,6 +78,29 @@ class CommandInstaller:
 
     def run_revert(self, package_dir: str, script: str) -> str:
         return self._run(package_dir, script, what="revert")
+
+    def record_system_cli(self, app_id: str, name: str, package_dir: str,
+                           installer: str) -> None:
+        """Track a CLI an app installed so the healer can re-check/re-run it
+        later. Called by ``CommandsFacade.install_system_cli`` — apps never
+        call this directly."""
+        self._system_clis[(app_id, name)] = (package_dir, installer)
+
+    def forget_system_clis_for(self, app_id: str) -> None:
+        """Drop everything tracked for an app on uninstall — an uninstalled
+        app's CLI is gone on purpose, not drift to heal."""
+        for key in [k for k in self._system_clis if k[0] == app_id]:
+            del self._system_clis[key]
+
+    def missing_system_clis(self) -> list[tuple[str, str]]:
+        """``(app_id, name)`` pairs for every tracked CLI no longer on PATH."""
+        return [key for key in self._system_clis if shutil.which(key[1]) is None]
+
+    def heal(self, app_id: str, name: str) -> str:
+        """Re-run the app's own installer for one missing CLI (idempotent —
+        the same script every ``install_system_cli`` call already ran)."""
+        package_dir, installer = self._system_clis[(app_id, name)]
+        return self.run_installer(package_dir, installer)
 
     def _run(self, package_dir: str, script: str, *, what: str) -> str:
         path = _resolve(package_dir, script)

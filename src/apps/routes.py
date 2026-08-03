@@ -553,3 +553,9 @@ async def reconcile_on_boot(app: FastAPI) -> None:
         log.info("apps: boot reconcile — %s", result)
     except Exception:
         log.exception("apps: boot reconcile failed")
+    # Boot reconcile only (re)installs apps that aren't currently loaded; an
+    # already-loaded app's system CLIs are never re-checked otherwise. Start
+    # the runtime-owned healer so drift (a CLI removed outside the app's own
+    # lifecycle) gets caught while the process keeps running, not just on the
+    # next full workspace recreation.
+    app.state.app_runtime.start_system_cli_healer()

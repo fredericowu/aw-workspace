@@ -116,6 +116,8 @@ class CommandsFacade(_Facade):
         self._ctx._enforce("commands:install")
         output = self._ctx._runtime.commands.run_installer(
             self._ctx.package_dir, installer)
+        self._ctx._runtime.commands.record_system_cli(
+            self._ctx.app_id, name, self._ctx.package_dir, installer)
         self._ctx._runtime.journal.record(
             self._ctx.app_id, "system_cli:install", name, {"installer": installer})
         # The app's revert script is app-level (one uninstall.sh reverses every

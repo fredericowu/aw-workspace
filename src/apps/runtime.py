@@ -48,6 +48,14 @@ log = logging.getLogger(__name__)
 DEFAULT_DRAIN_TIMEOUT = float(os.environ.get("AW_APPS_DRAIN_TIMEOUT", "10"))
 DEFAULT_WORKSPACE_CONTAINER_DIR = "/opt/aw-workspace"
 
+# System-CLI healer cadence — see CommandInstaller's module docstring for why
+# this exists. "__system__" can't collide with a real app slug (manifest.
+# SLUG_RE requires slugs to start with a letter), so it's a safe sentinel key
+# for the runtime's own watchdog task.
+DEFAULT_CLI_HEAL_INTERVAL_S = float(os.environ.get("AW_APPS_CLI_HEAL_INTERVAL_S", "300"))
+_CLI_HEALER_APP_ID = "__system__"
+_CLI_HEALER_TASK_ID = "system-cli-health"
+
 # Cookie the central-identity JWT lands in (mirrors src.api.identity.COOKIE_NAME).
 _ID_COOKIE = "aw_id_jwt"
 
@@ -349,6 +357,31 @@ class AppRuntime:
             self._db_tables = DbTables()
         return self._db_tables
 
+    # ---- system-CLI drift healing ----------------------------------------
+
+    def start_system_cli_healer(self, interval_s: float = DEFAULT_CLI_HEAL_INTERVAL_S) -> None:
+        """Start the runtime-owned periodic re-check of every CLI installed
+        via ``install_system_cli`` (git, gh, aws, gcloud, ...) — one task,
+        covering every app for free, no ``watchdog:tasks`` permission needed
+        since this is core runtime code, not an app driving its own facade.
+        Call once, from an async context (``reconcile_on_boot``); idempotent.
+        """
+        if _CLI_HEALER_TASK_ID in self.watchdog.task_ids_for(_CLI_HEALER_APP_ID):
+            return
+        self.watchdog.register(
+            _CLI_HEALER_APP_ID, _CLI_HEALER_TASK_ID, self._heal_system_clis,
+            interval_s, run_immediately=False,
+        )
+
+    async def _heal_system_clis(self) -> None:
+        for app_id, name in self.commands.missing_system_clis():
+            try:
+                await asyncio.to_thread(self.commands.heal, app_id, name)
+                log.warning("apps: healed missing system CLI %r for %s (was gone, reinstalled)",
+                            name, app_id)
+            except Exception:
+                log.exception("apps: failed to heal system CLI %r for %s", name, app_id)
+
     # ---- introspection --------------------------------------------------
 
     def is_loaded(self, slug: str) -> bool:
@@ -603,6 +636,9 @@ class AppRuntime:
         except Exception:
             log.exception("apps: purging secrets for %s failed", slug)
 
+        # An uninstalled app's CLI is gone on purpose — stop the healer from
+        # trying to resurrect it (system_cli:revert-hook already ran above).
+        self.commands.forget_system_clis_for(slug)
         self.journal.clear_app(slug)
         self._unimport(loaded.module_prefix)
         del self._apps[slug]
