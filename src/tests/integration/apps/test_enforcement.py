@@ -147,10 +147,12 @@ def test_granted_facade_action_is_allowed_and_journaled(tmp_path, monkeypatch):
     _async(run())
 
 
-def test_high_risk_cap_kept_regardless_of_signed(tmp_path):
-    # Signature/trust gating is disabled (Frederico decision 2026-08-01) —
-    # see filter_grants' docstring. ui:code now survives for both unsigned
-    # and signed apps; nothing is ever stripped by trust status anymore.
+def test_high_risk_cap_stripped_for_unsigned_kept_for_signed(tmp_path):
+    # Trust gating re-enabled 2026-08-04 — see filter_grants' docstring.
+    # ``signed`` is now computed automatically from marketplace-catalog
+    # membership upstream (never client-supplied), so the runtime's own
+    # defence-in-depth filter is meaningful again: ui:code is stripped for
+    # an unsigned app's effective grant, kept for a signed one.
     plugin = """
         class AppPlugin:
             async def activate(self, ctx):
@@ -165,7 +167,7 @@ def test_high_risk_cap_kept_regardless_of_signed(tmp_path):
         await rt.load(pkg, granted_permissions=["routes:register", "ui:code"], signed=False)
         ctx = rt.get("risky").ctx
         assert ctx.has("routes:register")
-        assert ctx.has("ui:code")
+        assert not ctx.has("ui:code")
         await rt.unload("risky")
 
         rt2 = AppRuntime(FastAPI())

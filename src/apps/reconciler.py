@@ -389,9 +389,9 @@ class Reconciler:
 
         # install missing (desired but not loaded) — don't re-write the desired
         # row we're converging TO. For apps present on both sides, a version
-        # bump in the registry is an upgrade = uninstall + install with the
-        # new spec (config/permissions survive — they come from the desired
-        # row, which is left untouched).
+        # bump OR a trust/grant change in the registry is an upgrade =
+        # uninstall + install with the new spec (config/permissions survive —
+        # they come from the desired row, which is left untouched).
         for app_id, spec in desired_active.items():
             if not self.runtime.is_loaded(app_id):
                 try:
@@ -404,7 +404,19 @@ class Reconciler:
 
             loaded = self.runtime.get(app_id)
             running_version = loaded.manifest.version if loaded else ""
-            if spec.version and spec.version != running_version:
+            version_changed = bool(spec.version) and spec.version != running_version
+            # `signed` flips when the cloud re-derives it from marketplace-
+            # catalog membership (ADR Decision 4); granted_permissions can
+            # change independently too (a consent-screen re-grant, or a
+            # trust flip re-deriving the effective set — see
+            # routes/app_installs.py's upsert_install). Neither used to be
+            # detected here, so a currently-loaded app kept running with a
+            # stale grant until something else forced a version bump.
+            trust_changed = bool(loaded) and (
+                loaded.signed != spec.signed
+                or set(loaded.granted_permissions) != set(spec.granted_permissions)
+            )
+            if version_changed or trust_changed:
                 try:
                     await self.uninstall(app_id, write_cloud=False)
                     await self.install(spec, write_cloud=False)

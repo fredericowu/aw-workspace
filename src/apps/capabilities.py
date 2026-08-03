@@ -88,17 +88,22 @@ def filter_grants(requested: list[str], *, signed: bool) -> tuple[list[str], lis
     (:func:`src.apps.manifest.validate_manifest` / the install path). Order is
     preserved; each capability appears in exactly one list.
 
-    Signature/trust gating is DISABLED (Frederico decision 2026-08-01): F2 has
-    no real signing infra yet (``check_app_signature`` above is a permanent
-    stub until F8), so refusing high-risk caps for "unsigned" only blocked
-    every app uniformly, including first-party marketplace catalog apps —
-    not a meaningful security boundary yet. Every requested capability is
-    granted; nothing is ever refused. Left commented rather than deleted so
-    re-enabling this once F8 lands is a one-line uncomment, not a rewrite.
+    Signature/trust gating was DISABLED 2026-08-01 (Frederico decision): F2
+    had no real signing infra (``check_app_signature`` above is a permanent
+    stub until full F8 hash-pinning), so refusing high-risk caps for
+    "unsigned" only blocked every app uniformly, including first-party
+    marketplace catalog apps — not a meaningful security boundary.
+    Re-enabled 2026-08-04: the cloud registry now computes ``signed``
+    automatically from marketplace-catalog membership (never client-supplied
+    — see aw-backend's ``src/api/marketplace_catalog.py`` +
+    ``routes/app_installs.py``) and threads it through the desired-state
+    ``AppSpec`` this function receives, so the check below is real again.
     """
-    # for cap in requested:
-    #     if is_high_risk(cap) and not signed:
-    #         refused.append(cap)
-    #     else:
-    #         granted.append(cap)
-    return list(requested), []
+    granted: list[str] = []
+    refused: list[str] = []
+    for cap in requested:
+        if is_high_risk(cap) and not signed:
+            refused.append(cap)
+        else:
+            granted.append(cap)
+    return granted, refused
