@@ -1,7 +1,9 @@
 """Route-level tests for the ported terminal API + WebSockets.
 
-Covers the identity gate (REST + both WebSockets), the CRUD contract the SPA
-depends on, and the empty agent-session surface. The DB layer is stubbed
+Covers the identity gate (REST + both WebSockets) and the CRUD contract the
+SPA depends on. Agent-session history (``/api/v2/agent-sessions*``) moved to
+``aw-app-code-agent-clis`` (2026-08-03) — no longer a core route, so no
+longer tested here. The DB layer is stubbed
 (``create_all_tables`` → no-op) because terminals are in-memory and identity
 is verified offline — so this runs with no Postgres.
 
@@ -83,13 +85,6 @@ def test_terminal_crud_contract(ctx):
 
     assert client.delete(f"/api/terminals/{tid}").json()["success"] is True
     assert all(t["id"] != tid for t in client.get("/api/terminals").json())
-
-
-def test_agent_sessions_empty_but_present(ctx):
-    client, token = ctx
-    client.cookies.set("aw_id_jwt", token)
-    assert client.get("/api/v2/agent-sessions?type=claude").json() == []
-    assert client.delete("/api/v2/agent-sessions/whatever").json()["success"] is True
 
 
 def _assert_ws_closed(client, path, expected_code):

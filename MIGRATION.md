@@ -18,7 +18,7 @@ Which plane owns which route family. Update this table with every migration.
 | `/api/health`, `/api/auth/status`, `/api/settings/*` | **aw-workspace** | skeleton (F2/M1) |
 | `/api/identity/*`, JWKS, provisioning, tunnel control | aw-backend (cloud) | control-plane, never on BYOD |
 | **`/api/terminals*`, `/ws/terminal/*`** | **aw-workspace** | migration #1 — PTY shells run on the BYOD host |
-| `/api/v2/agent-sessions*` | **aw-workspace** | present but empty (no agent CLIs on the slim image yet) |
+| `/api/apps/code-agent-clis/agent-sessions*` | **app:code-agent-clis** | moved off the `/api/v2/agent-sessions*` core stub 2026-08-03 — this app installs the CLIs, so it's the one that can discover their on-disk sessions; also owns the "Agents" nav menu (`core.nav` slot) |
 | `/ws/status` | **aw-workspace** | slim subset — terminal list push only, for now |
 | **`/api/notify*`, `/ws/notifications`** | **aw-workspace** | notification engine — also reachable from Tier-1 apps via `ctx.notify` (`notifications:send`) |
 | `/api/tasks*`, `/api/plans*`, agent execution, `/api/files*` | monolith (not yet migrated) | future strangler steps |
@@ -35,12 +35,16 @@ single-tenant host; they get migrated as the BYOD product needs them.
    modules are entangled with subsystems the slim BYOD image doesn't have
    (a global `StateManager`, GNU `screen`, the v2 session DB tables, agent-CLI
    detection, prompt detection, `codex_mcp_env`, …). Cut them. For terminal:
-   dropped `screen`-backing + the `screen_sessions`/`agent_sessions`/
-   `window_sessions` tables, the Claude `PromptDetector`, and all
-   claude/codex/cursor/gemini `--resume` session-id detection — the slim image
-   ships no agent CLIs, so a terminal is just a shell (or an arbitrary command).
-   Kept the PTY mechanics (fork/exec, non-blocking fan-out reader, resize,
-   chunked write, scrollback) verbatim so the byte contract is unchanged.
+   dropped `screen`-backing and the Claude `PromptDetector`, so a terminal is
+   just a shell (or an arbitrary command) — kept the PTY mechanics (fork/exec,
+   non-blocking fan-out reader, resize, chunked write, scrollback) verbatim so
+   the byte contract is unchanged. Agent-session history (the
+   `screen_sessions`/`agent_sessions`/`window_sessions` tables + claude/codex/
+   copilot/cursor `--resume` session-id detection) was initially dropped
+   entirely for the same "no agent CLIs on the slim image" reason, then
+   reinstated 2026-08-03 as **`aw-app-code-agent-clis`**'s own on-disk
+   discovery + `ctx.db` soft-delete overlay (not a DB-tables port — see that
+   app's `sessions.py`), once that app started actually installing the CLIs.
 
 3. **Add the identity gate.** Guard every REST route with
    `Depends(require_identity)` (offline EdDSA/JWKS verification, mirroring
@@ -56,8 +60,10 @@ single-tenant host; they get migrated as the BYOD product needs them.
    field names, and WS framing (for terminal: inbound binary = keystrokes,
    inbound text `{"type":"resize",...}` = control, all server→client frames are
    raw output bytes). If a monolith feature can't be honored yet, keep the route
-   present and return a safe empty/no-op shape (e.g. `/api/v2/agent-sessions` →
-   `[]`) so the SPA never 404s.
+   present and return a safe empty/no-op shape so the SPA never 404s — or, once
+   an app can genuinely own the feature (like `aw-app-code-agent-clis` now does
+   for agent-sessions), retire the core stub and point the SPA at the app's own
+   route instead of leaving a permanent empty placeholder in core.
 
 5. **Mind stateful routes + worker count.** In-memory session state (PTY fds,
    subscriber queues) only lives in ONE uvicorn worker, so create-on-worker-A /

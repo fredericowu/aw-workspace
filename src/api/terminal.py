@@ -3,12 +3,21 @@
 REST for lifecycle + a PTY WebSocket for I/O, plus a slim ``/ws/status`` push
 socket so the SPA's terminal list stays live. Strangler-fig port of the
 monolith's ``src/api/routes/terminal.py`` — the API + WS byte/JSON contract is
-preserved EXACTLY so the cloud SPA (aw-frontend) talks to this unchanged via
-its ``apiBase`` shim (``api.<ws>.workspace`` + the apex ``aw_id_jwt`` cookie).
+preserved EXACTLY so the cloud SPA (aw-workspace-ui) talks to this unchanged
+via its ``apiBase`` shim (``api.<ws>.workspace`` + the apex ``aw_id_jwt``
+cookie).
 
-Identity gate: every ``/api/terminals*`` and ``/api/v2/agent-sessions*`` route
-requires a valid identity JWT (``require_identity``); both WebSockets validate
-the JWT before doing anything (``authorize_ws`` — cookie or ``?token=``).
+Identity gate: every ``/api/terminals*`` route requires a valid identity JWT
+(``require_identity``); both WebSockets validate the JWT before doing
+anything (``authorize_ws`` — cookie or ``?token=``).
+
+Agent-session history (``/api/v2/agent-sessions*``) used to live here as an
+always-empty stub ("no agent CLIs on the BYOD image yet"). Per the
+2026-08-03 decision to decouple Terminals+AgentsNav's session-history piece
+out of core (see docs/knowledge_base/docs/architecture/
+monolith-migration-roadmap.md), it moved to the app that actually installs
+those CLIs — ``aw-app-code-agent-clis``'s ``/api/apps/code-agent-clis/
+agent-sessions`` route. The plain PTY terminal shell below stays core.
 """
 
 from __future__ import annotations
@@ -84,11 +93,6 @@ class TerminalRoutes:
         app.get("/api/terminals/{session_id}/scrollback")(self.get_scrollback)
         app.get("/api/terminals/{session_id}/procs")(self.list_procs)
         app.post("/api/terminals/{session_id}/procs/{pid}/kill")(self.kill_proc)
-
-        # Agent-session history: no agent CLIs on the BYOD image (yet), so the
-        # picker is always empty — but the routes exist so the SPA never 404s.
-        app.get("/api/v2/agent-sessions")(self.list_agent_sessions_v2)
-        app.delete("/api/v2/agent-sessions/{session_id}")(self.hide_agent_session_v2)
 
         app.websocket("/ws/terminal/{session_id}")(self.terminal_stream)
         app.websocket("/ws/status")(self.status_stream)
@@ -225,16 +229,6 @@ class TerminalRoutes:
         with open(dest, "wb") as f:
             shutil.copyfileobj(file.file, f)
         return {"path": dest, "filename": file.filename}
-
-    async def list_agent_sessions_v2(self, type: str = None,
-                                    identity: dict = Depends(require_identity)):
-        # No agent CLIs on the slim BYOD image yet — empty by design.
-        return []
-
-    async def hide_agent_session_v2(self, session_id: str, restore: int = 0,
-                                   type: str = None,
-                                   identity: dict = Depends(require_identity)):
-        return {"success": True, "id": session_id, "visible": bool(restore)}
 
     # ---- WebSockets -----------------------------------------------------
 
