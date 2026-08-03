@@ -46,32 +46,34 @@ RUN chown -R ubuntu:ubuntu /opt/aw-workspace \
 # Single worker: the terminal feature keeps PTY sessions in-process memory, so
 # create/WS must land on the same worker. A single-user data-plane doesn't need
 # more. Revisit if a stateless multi-worker backing store is added (MIGRATION.md).
-# HOME=/opt/aw-workspace so a fresh terminal (Agents → Terminals) opens in
-# the workspace root — terminal_manager falls back to $HOME when no cwd given.
+# HOME is left at its useradd default (/home/ubuntu) — overriding it to
+# /opt/aw-workspace was confusing (a fresh terminal opening in the workspace
+# root is a nice-to-have, not worth hijacking $HOME for). AW_WORKSPACE_HOME is
+# set explicitly instead: it's what paths.py's workspace_home() actually reads
+# for F4 app state (bin shims, secrets, skills), and it must keep pointing at
+# /opt/aw-workspace/.aw-workspace to match the hardcoded PATH entry below and
+# the existing host bind-mount — decoupled from $HOME on purpose.
 ENV AW_PORT=9030 \
     AW_WORKSPACE_WORKERS=1 \
     AW_WORKSPACE_VERSION=${AW_WORKSPACE_VERSION} \
     PYTHONPATH=/opt/aw-workspace \
-    HOME=/opt/aw-workspace \
+    AW_WORKSPACE_HOME=/opt/aw-workspace/.aw-workspace \
     PYTHONUNBUFFERED=1
 
 # F4 app-shim bin dir (paths.bin_dir() == <workspace_home>/bin, i.e.
-# $HOME/.aw-workspace/bin with the HOME above) baked onto PATH for every
-# process/shell/agent in this image — not just login shells (the
+# $AW_WORKSPACE_HOME/bin with the AW_WORKSPACE_HOME above) baked onto PATH for
+# every process/shell/agent in this image — not just login shells (the
 # orchestrator's /etc/profile.d/aw-bin.sh workaround only covered those).
 # Lives under the host bind-mount, so installed shims persist across
 # container recreation; this ENV is what finally makes paths.py's
 # long-standing "on PATH" claim true. Frederico decision 2026-07-28.
 #
-# /opt/aw-workspace/bin holds this repo's OWN `aw-workspace` CLI (see
-# skills/aw-workspace/SKILL.md) — on PATH so it's callable from any cwd/shell
-# (including agent sessions) without `./bin/` prefixing.
-ENV PATH="/opt/aw-workspace/bin:/opt/aw-workspace/.aw-workspace/bin:${PATH}"
-
-# Also symlinked at the workspace root (WORKDIR, above) so `./aw-workspace`
-# works too — the PATH entry above already makes the bare `aw-workspace`
-# form work from anywhere; this just covers the `./`-explicit habit.
-RUN ln -sf bin/aw-workspace /opt/aw-workspace/aw-workspace
+# This repo's OWN `aw-workspace-cli` CLI (see skills/aw-workspace/SKILL.md)
+# lives at the repo root (./aw-workspace-cli, which is also WORKDIR above) —
+# putting the repo root itself on PATH is what makes the bare
+# `aw-workspace-cli` form work on PATH from any cwd/shell (including agent
+# sessions), no bin/ dir or symlink needed.
+ENV PATH="/opt/aw-workspace:/opt/aw-workspace/.aw-workspace/bin:${PATH}"
 
 EXPOSE 9030
 

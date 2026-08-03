@@ -8,9 +8,9 @@ coverage.xml
 htmlcov/
 coverage/
 
-# HOME=/opt/aw-workspace (see Dockerfile), so runtime state that normally
-# lives under a user's home dir ends up inside the repo working tree —
-# none of it is project source.
+# AW_WORKSPACE_HOME=/opt/aw-workspace/.aw-workspace (see Dockerfile) and
+# repos/ below also live inside this repo's working tree — none of it is
+# project source, it's runtime state that happens to sit under the same path.
 /repos/
 /apps/*
 !/apps/README.md
