@@ -808,7 +808,12 @@ class AppRuntime:
         ``source`` normally stays inside the installed app package. The special
         source ``$AW_APPS_ROOT`` mounts the installed-apps root read-only so
         infrastructure apps can inspect sibling app packages without declaring
-        arbitrary host paths.
+        arbitrary host paths. ``$AW_MCP_JSON`` mounts ONLY the workspace's root
+        ``.mcp.json`` file (never a wider host path) read-write, so an app that
+        is itself an MCP endpoint (today: aw-mcp-gateway) can register its own
+        entry there on boot — gated behind the high-risk ``mcp:register-gateway``
+        permission (ADR Decision 4 trust tiering) since it's the one volume kind
+        that lets a container touch something outside its own package.
         """
         binds: dict[str, dict] = {}
         package_root = os.path.realpath(package_dir)
@@ -834,6 +839,24 @@ class AppRuntime:
                 # for the bind-mount source the host's podman needs.
                 os.makedirs(apps_root(), exist_ok=True)
                 host_path = self._container_host_bind_path(apps_root())
+                binds[host_path] = {"bind": target, "mode": mode}
+                continue
+            if source == "$AW_MCP_JSON":
+                if mode != "rw":
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_MCP_JSON volume must be read-write")
+                if "mcp:register-gateway" not in manifest.permissions:
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_MCP_JSON volume requires the "
+                        f"'mcp:register-gateway' permission declared in its manifest")
+                mcp_json_path = os.path.join(
+                    os.path.realpath(os.environ.get(
+                        "AW_WORKSPACE_CONTAINER_DIR", DEFAULT_WORKSPACE_CONTAINER_DIR)),
+                    ".mcp.json")
+                if not os.path.isfile(mcp_json_path):
+                    with open(mcp_json_path, "w") as f:
+                        f.write('{"mcpServers": {}}\n')
+                host_path = self._container_host_bind_path(mcp_json_path)
                 binds[host_path] = {"bind": target, "mode": mode}
                 continue
             if os.path.isabs(source):

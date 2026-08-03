@@ -10,6 +10,7 @@ orchestrator with the socket mounted.
 from __future__ import annotations
 
 import asyncio
+import json
 import textwrap
 
 import pytest
@@ -437,6 +438,117 @@ def test_runtime_rejects_writable_apps_root_volume(tmp_path, monkeypatch):
         rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
         rt.containers = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
         with pytest.raises(ContainerError):
+            await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
+
+    _async(run())
+
+
+def test_runtime_mounts_mcp_json_read_write(tmp_path, monkeypatch):
+    container_root = tmp_path / "aw-workspace"
+    container_root.mkdir()
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(container_root))
+    monkeypatch.delenv("AW_WORKSPACE_HOST_DIR", raising=False)
+    monkeypatch.delenv("AW_CONTAINER_SOCKET", raising=False)
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage", "mcp:register-gateway"],
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_MCP_JSON", "target": "/host-mcp.json", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+
+        await rt.load(pkg, granted_permissions=["containers:manage", "mcp:register-gateway"],
+                      signed=True)
+
+        mcp_json = container_root / ".mcp.json"
+        assert mcp_json.is_file()  # created on the fly since it didn't exist
+        assert json.loads(mcp_json.read_text()) == {"mcpServers": {}}
+        assert fake.run_calls[-1]["volumes"] == {
+            str(mcp_json.resolve()): {"bind": "/host-mcp.json", "mode": "rw"}
+        }
+
+    _async(run())
+
+
+def test_runtime_mounts_existing_mcp_json_without_clobbering_it(tmp_path, monkeypatch):
+    container_root = tmp_path / "aw-workspace"
+    container_root.mkdir()
+    (container_root / ".mcp.json").write_text(json.dumps({"mcpServers": {"other": {}}}))
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(container_root))
+    monkeypatch.delenv("AW_WORKSPACE_HOST_DIR", raising=False)
+    monkeypatch.delenv("AW_CONTAINER_SOCKET", raising=False)
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage", "mcp:register-gateway"],
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_MCP_JSON", "target": "/host-mcp.json", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
+        await rt.load(pkg, granted_permissions=["containers:manage", "mcp:register-gateway"],
+                      signed=True)
+
+        assert json.loads((container_root / ".mcp.json").read_text()) == {
+            "mcpServers": {"other": {}}
+        }
+
+    _async(run())
+
+
+def test_runtime_rejects_readonly_mcp_json_volume(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path))
+    monkeypatch.delenv("AW_WORKSPACE_HOST_DIR", raising=False)
+    monkeypatch.delenv("AW_CONTAINER_SOCKET", raising=False)
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage", "mcp:register-gateway"],
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_MCP_JSON", "target": "/host-mcp.json", "mode": "ro"}
+            ]
+        },
+    )
+
+    async def run():
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
+        with pytest.raises(ContainerError, match="read-write"):
+            await rt.load(pkg, granted_permissions=["containers:manage", "mcp:register-gateway"],
+                          signed=True)
+
+    _async(run())
+
+
+def test_runtime_rejects_mcp_json_volume_without_permission(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path))
+    monkeypatch.delenv("AW_WORKSPACE_HOST_DIR", raising=False)
+    monkeypatch.delenv("AW_CONTAINER_SOCKET", raising=False)
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage"],  # missing mcp:register-gateway
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_MCP_JSON", "target": "/host-mcp.json", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
+        with pytest.raises(ContainerError, match="mcp:register-gateway"):
             await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
 
     _async(run())
