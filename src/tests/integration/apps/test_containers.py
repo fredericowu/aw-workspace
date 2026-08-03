@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import textwrap
 
 import pytest
@@ -569,6 +570,168 @@ def test_runtime_rejects_mcp_json_volume_without_permission(tmp_path, monkeypatc
         rt.containers = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
         with pytest.raises(ContainerError, match="mcp:register-gateway"):
             await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
+
+    _async(run())
+
+
+def test_runtime_mounts_app_data_read_write(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage", "fs:workspace-data"],
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_APP_DATA", "target": "/app/persist", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+
+        await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data"],
+                      signed=True)
+
+        data_dir = tmp_path / "home" / "data" / "browser"
+        assert data_dir.is_dir()  # created on the fly since it didn't exist
+        assert fake.run_calls[-1]["volumes"] == {
+            str(data_dir.resolve()): {"bind": "/app/persist", "mode": "rw"}
+        }
+
+    _async(run())
+
+
+def test_runtime_app_data_survives_uninstall_and_reinstall(tmp_path, monkeypatch):
+    """The whole point of $AW_APP_DATA: unlike a package-relative volume
+    (removed wholesale by uninstall's shutil.rmtree of the package dir —
+    see remove_app_repo in fetch.py), this directory lives OUTSIDE the
+    package dir and must still be there — with whatever the app wrote to
+    it — after an uninstall + reinstall cycle."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage", "fs:workspace-data"],
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_APP_DATA", "target": "/app/persist", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+
+        await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data"],
+                      signed=True)
+        data_dir = tmp_path / "home" / "data" / "browser"
+        (data_dir / "important.db").write_text("state that must survive")
+
+        await rt.unload("browser")
+        # Simulate uninstall's package-dir wipe (fetch.remove_app_repo) —
+        # the reconciler always re-fetches a fresh package dir on install,
+        # so this is what a real uninstall+reinstall does to `pkg`.
+        shutil.rmtree(pkg)
+        pkg2 = _write_container_app(
+            tmp_path,
+            perms=["containers:manage", "fs:workspace-data"],
+            runtime_extra={
+                "volumes": [
+                    {"source": "$AW_APP_DATA", "target": "/app/persist", "mode": "rw"}
+                ]
+            },
+        )
+        await rt.load(pkg2, granted_permissions=["containers:manage", "fs:workspace-data"],
+                      signed=True)
+
+        assert (data_dir / "important.db").read_text() == "state that must survive"
+
+    _async(run())
+
+
+def test_runtime_rejects_readonly_app_data_volume(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage", "fs:workspace-data"],
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_APP_DATA", "target": "/app/persist", "mode": "ro"}
+            ]
+        },
+    )
+
+    async def run():
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
+        with pytest.raises(ContainerError, match="read-write"):
+            await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data"],
+                          signed=True)
+
+    _async(run())
+
+
+def test_runtime_rejects_app_data_volume_without_permission(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage"],  # missing fs:workspace-data
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_APP_DATA", "target": "/app/persist", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
+        with pytest.raises(ContainerError, match="fs:workspace-data"):
+            await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
+
+    _async(run())
+
+
+def test_runtime_namespaces_app_data_by_app_id(tmp_path, monkeypatch):
+    """Two different apps mounting $AW_APP_DATA must land in two different
+    host directories — never share state just because both opted in."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+
+        pkg_a = tmp_path / "app-a"
+        pkg_a.mkdir()
+        (pkg_a / "aw-app.json").write_text(json.dumps({
+            "manifest_version": 1, "id": "app-a", "name": "A", "version": "1.0.0",
+            "tier": "container",
+            "runtime": {"image": "img", "port": 9000,
+                        "volumes": [{"source": "$AW_APP_DATA", "target": "/data", "mode": "rw"}]},
+            "permissions": ["containers:manage", "fs:workspace-data"],
+        }))
+        pkg_b = tmp_path / "app-b"
+        pkg_b.mkdir()
+        (pkg_b / "aw-app.json").write_text(json.dumps({
+            "manifest_version": 1, "id": "app-b", "name": "B", "version": "1.0.0",
+            "tier": "container",
+            "runtime": {"image": "img", "port": 9001,
+                        "volumes": [{"source": "$AW_APP_DATA", "target": "/data", "mode": "rw"}]},
+            "permissions": ["containers:manage", "fs:workspace-data"],
+        }))
+
+        await rt.load(str(pkg_a), granted_permissions=["containers:manage", "fs:workspace-data"], signed=True)
+        await rt.load(str(pkg_b), granted_permissions=["containers:manage", "fs:workspace-data"], signed=True)
+
+        vol_a = [c["volumes"] for c in fake.run_calls if c["name"] == "aw-app-app-a"][0]
+        vol_b = [c["volumes"] for c in fake.run_calls if c["name"] == "aw-app-app-b"][0]
+        assert list(vol_a.keys()) != list(vol_b.keys())
+        assert str(tmp_path / "home" / "data" / "app-a") in vol_a
+        assert str(tmp_path / "home" / "data" / "app-b") in vol_b
 
     _async(run())
 

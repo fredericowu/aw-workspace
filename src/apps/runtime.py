@@ -850,6 +850,22 @@ class AppRuntime:
         entry there on boot — gated behind the high-risk ``mcp:register-gateway``
         permission (ADR Decision 4 trust tiering) since it's the one volume kind
         that lets a container touch something outside its own package.
+
+        ``$AW_APP_DATA`` mounts a per-app directory under the workspace home
+        (``paths.workspace_home()/data/<app_id>``, the same durable-storage
+        tree ``bin/``/``secrets/``/``skills/`` already live under — see
+        ``paths.py``'s module docstring) read-write. Package-relative volumes
+        look persistent but are NOT: ``uninstall`` (``fetch.remove_app_repo``)
+        deletes the entire installed package directory, including anything
+        mounted from inside it — found live 2026-08-03 when reinstalling
+        aw-mcp-gateway silently wiped its ``back/config/gateway.json`` (the
+        persisted bearer token) back to the repo's fresh default. Any app
+        with real state to keep across uninstall/update (a database
+        directory, generated config, tokens) should mount ``$AW_APP_DATA``
+        instead. Gated behind ``fs:workspace-data`` (already the Tier-1
+        equivalent — "read/write under the app's own data dir") rather than
+        a new capability, since the blast radius is the same: an app's own
+        namespaced slice, nothing else's.
         """
         binds: dict[str, dict] = {}
         package_root = os.path.realpath(package_dir)
@@ -893,6 +909,19 @@ class AppRuntime:
                     with open(mcp_json_path, "w") as f:
                         f.write('{"mcpServers": {}}\n')
                 host_path = self._container_host_bind_path(mcp_json_path)
+                binds[host_path] = {"bind": target, "mode": mode}
+                continue
+            if source == "$AW_APP_DATA":
+                if mode != "rw":
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_APP_DATA volume must be read-write")
+                if "fs:workspace-data" not in manifest.permissions:
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_APP_DATA volume requires the "
+                        f"'fs:workspace-data' permission declared in its manifest")
+                data_dir = os.path.join(paths.workspace_home(), "data", manifest.id)
+                os.makedirs(data_dir, exist_ok=True)
+                host_path = self._container_host_bind_path(data_dir)
                 binds[host_path] = {"bind": target, "mode": mode}
                 continue
             if os.path.isabs(source):
