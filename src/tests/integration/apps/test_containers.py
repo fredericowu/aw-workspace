@@ -153,6 +153,25 @@ def test_network_injects_workspace_host_env():
     assert "AW_WORKSPACE_HOST" not in fake2.run_calls[-1]["environment"]
 
 
+def test_network_injects_self_host_env():
+    """The reverse direction of AW_WORKSPACE_HOST: an app that needs to
+    publish its OWN reachable address (e.g. aw-mcp-gateway writing its entry
+    into the host .mcp.json) can't use 127.0.0.1 either — same reasoning,
+    mirrored. Network-gated like AW_WORKSPACE_HOST, since there's no shared
+    reachability story without one."""
+    fake = _FakeDocker()
+    sup = ContainerSupervisor(socket="/dev/null", network="aw-remote-host", client=fake)
+    sup.register("app", "img", 8080)
+    sup.start("app")
+    assert fake.run_calls[-1]["environment"]["AW_APP_SELF_HOST"] == "aw-app-app"
+
+    fake2 = _FakeDocker()
+    sup2 = ContainerSupervisor(socket="/dev/null", client=fake2)
+    sup2.register("app", "img", 8080)
+    sup2.start("app")
+    assert "AW_APP_SELF_HOST" not in fake2.run_calls[-1]["environment"]
+
+
 def test_injects_workspace_slug_env_when_set(monkeypatch):
     """AW_WORKSPACE_SLUG lets a container app namespace something by this
     workspace's identity (e.g. aw-mcp-gateway prefixing published tool

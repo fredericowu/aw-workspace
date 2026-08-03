@@ -198,6 +198,15 @@ class ContainerSupervisor:
             # container's hostname to its name by default, so gethostname()
             # gives that same resolvable name from inside the workspace.
             kwargs["environment"]["AW_WORKSPACE_HOST"] = socket.gethostname()
+            # The reverse direction: an app that needs to publish its OWN
+            # address for something else to dial back in (e.g. aw-mcp-gateway
+            # writing its own entry into the host's .mcp.json, ADR "container
+            # apps can register themselves") can't use 127.0.0.1 either — that
+            # resolves inside its own netns, not from whatever process reads
+            # the file. c.name (`aw-app-{app_id}`) is exactly what siblings on
+            # this shared network already resolve it by (aardvark-dns), same
+            # mechanism as AW_WORKSPACE_HOST above, just the other direction.
+            kwargs["environment"]["AW_APP_SELF_HOST"] = c.name
         else:
             # No shared network → publish the port so the proxy host can reach it.
             kwargs["ports"] = {f"{c.port}/tcp": c.port}
