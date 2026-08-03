@@ -439,9 +439,9 @@ class AppRuntime:
     def skills_index(self) -> list[dict[str, Any]]:
         """Index of every ``contributes.skills`` entry for ``GET /api/apps/-/skills``.
 
-        Points at the symlink :meth:`load` registered into the shared skills
-        dir (:func:`src.apps.paths.skills_dir`) — no SKILL.md content is
-        duplicated here, just the pointer an agent runtime can read.
+        Points at the copy :meth:`load` placed into the shared skills dir
+        (:func:`src.apps.paths.skills_dir`) — an agent runtime reads
+        ``skill_md_path`` directly; this index itself carries no content.
         """
         out: list[dict[str, Any]] = []
         for app in self._apps.values():
@@ -450,18 +450,18 @@ class AppRuntime:
                 skill_id = entry.get("id")
                 if not skill_id:
                     continue
-                link_path = os.path.join(paths.skills_dir(), f"{slug}__{skill_id}")
+                dest_path = os.path.join(paths.skills_dir(), f"{slug}__{skill_id}")
                 out.append({
                     "app": slug,
                     "id": skill_id,
                     "description": entry.get("description", ""),
-                    "skill_md_path": os.path.join(link_path, "SKILL.md"),
-                    "registered": os.path.islink(link_path),
+                    "skill_md_path": os.path.join(dest_path, "SKILL.md"),
+                    "registered": os.path.isdir(dest_path),
                 })
         return out
 
     def _register_skills(self, loaded: LoadedApp) -> None:
-        """Symlink each ``contributes.skills`` entry into the shared skills index.
+        """Copy each ``contributes.skills`` entry into the shared skills index.
 
         No-op for an app that declares none. A bad entry (missing SKILL.md,
         path escaping the package dir) is logged and skipped rather than
@@ -475,11 +475,11 @@ class AppRuntime:
             if not skill_id or not path:
                 continue
             try:
-                link_path = self.skills.register(slug, skill_id, loaded.package_dir, path)
+                dest_path = self.skills.register(slug, skill_id, loaded.package_dir, path)
             except SkillError:
                 log.exception("apps: failed to register skill %r for %s", skill_id, slug)
                 continue
-            self.journal.record(slug, "skill:register", skill_id, {"link_path": link_path})
+            self.journal.record(slug, "skill:register", skill_id, {"dest_path": dest_path})
 
     def _resolve_window(self, app: LoadedApp, entry: dict[str, Any]) -> dict[str, Any]:
         """Inline a declarative window's spec file into ``body.spec_data``.
@@ -661,7 +661,7 @@ class AppRuntime:
             # Idempotent with the explicit cancel_all_for in unload() above.
             self.watchdog.cancel_all_for(loaded.manifest.id)
         elif kind == "skill:register":
-            self.skills.unregister(entry.payload.get("link_path", ""))
+            self.skills.unregister(entry.payload.get("dest_path", ""))
         # route:mount (already unmounted), system_cli:install (audit-only),
         # secret:write (namespace purged above), capability:denied → no-op.
 
