@@ -1,4 +1,4 @@
-"""aw-workspace update <workspace|remote-host> — trigger the same lifecycle action
+"""aw-workspace-cli update <workspace|remote-host> — trigger the same lifecycle action
 aw-console's Workspace > Manage > Update button calls, straight from a
 terminal inside the workspace.
 
@@ -27,7 +27,7 @@ _TARGET_PATHS = {
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="aw-workspace update", description=DESCRIPTION)
+    parser = argparse.ArgumentParser(prog="aw-workspace-cli update", description=DESCRIPTION)
     parser.add_argument("target", choices=sorted(_TARGET_PATHS), help="What to update")
     parser.add_argument(
         "--token", help="Central-identity bearer token (defaults to $AW_ID_TOKEN)",

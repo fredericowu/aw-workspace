@@ -1,4 +1,4 @@
-"""HTTP client for the ``aw-workspace`` CLI talking to *this same workspace's* own
+"""HTTP client for the ``aw-workspace-cli`` CLI talking to *this same workspace's* own
 FastAPI server (the one started by ``src.start.workspace``) over loopback.
 
 Auth: the browser SPA authenticates with the central-identity ``aw_id_jwt``

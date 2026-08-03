@@ -12,5 +12,6 @@ coverage/
 # lives under a user's home dir ends up inside the repo working tree —
 # none of it is project source.
 /repos/
-/apps/
+/apps/*
+!/apps/README.md
 /.*/

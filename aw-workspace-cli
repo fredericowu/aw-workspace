@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-aw-workspace — this workspace's own CLI. Named ``aw-workspace`` (not
+aw-workspace-cli — this workspace's own CLI. Named ``aw-workspace-cli`` (not
 ``aw``) so it can't be confused with the monolith's ``./aw`` — an LLM/agent
 that has both on PATH would otherwise conflate two very different tools.
 
@@ -9,17 +9,16 @@ there with ``COMMAND``, ``DESCRIPTION``, and ``run(args) -> int`` and it
 becomes available immediately.
 
 Usage:
-    aw-workspace <command> [args...]
-    aw-workspace help
+    aw-workspace-cli <command> [args...]
+    aw-workspace-cli help
 """
 import importlib
 import os
 import pkgutil
 import sys
 
-# This script lives in <repo>/bin/aw-workspace — the repo root (where
-# src/ lives) is one directory up.
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# This script lives at <repo>/aw-workspace-cli (repo root, where src/ lives).
+BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 import src.cli.commands as commands_pkg  # noqa: E402
@@ -38,13 +37,13 @@ def main() -> int:
     commands = _discover_commands()
 
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        sys.argv = ["help"] + sys.argv[2:]
-
-    name, rest = sys.argv[1], sys.argv[2:]
+        name, rest = "help", []
+    else:
+        name, rest = sys.argv[1], sys.argv[2:]
     module = commands.get(name)
     if module is None:
-        print(f"aw-workspace: unknown command '{name}'")
-        print("Run 'aw-workspace help' to list available commands.")
+        print(f"aw-workspace-cli: unknown command '{name}'")
+        print("Run 'aw-workspace-cli help' to list available commands.")
         return 1
 
     return module.run(rest) or 0
