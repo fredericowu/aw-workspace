@@ -37,9 +37,13 @@ jobs:
           "$PODMAN" run --rm -v "$PWD:/repo:ro" -w /repo python:3.12-slim \
             sh -c "pip install -q -r requirements.txt pytest pytest-asyncio && \
                    python3 -m pytest src/tests --ignore=src/tests/integration/apps \
-                     --deselect src/tests/unit/api/test_terminal_manager.py::test_pty_shell_runs_and_echoes -v"
-          # --deselect: spawns a real PTY shell and asserts on its child
-          # processes — reliably fails inside this minimal, nested container
-          # (no real terminal/init, restricted process visibility), unrelated
-          # to app correctness. Passes fine on a bare host (see the earlier
-          # direct-python3 attempt, before the container switch above).
+                     -k 'not test_pty_shell_runs_and_echoes' -v"
+          # -k (not --deselect: pytest.ini's rootdir is src/tests, so the
+          # collected node id here is unit/api/test_terminal_manager.py::...,
+          # not src/tests/unit/..., and --deselect silently no-ops on a
+          # non-matching id instead of erroring — -k matches by test name
+          # regardless of path prefix). test_pty_shell_runs_and_echoes spawns
+          # a real PTY shell and asserts on its child processes — reliably
+          # fails inside this minimal, nested container (no real
+          # terminal/init, restricted process visibility), unrelated to app
+          # correctness. Passes fine on a bare host.
