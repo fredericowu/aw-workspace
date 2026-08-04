@@ -534,7 +534,15 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         if not target.startswith(ui_root + os.sep) or not os.path.isfile(target):
             return JSONResponse({"error": "not found"}, status_code=404)
         media = "text/javascript" if target.endswith(".js") else "application/octet-stream"
-        return FileResponse(target, media_type=media)
+        # No Cache-Control here previously meant browsers fell back to
+        # heuristic caching (RFC 7234 §4.2.2) and kept serving a stale
+        # bundle after an app update — found live 2026-08-04 when mcp-tools'
+        # updated bundle (confirmed correct on disk + via a no-store fetch)
+        # still rendered the old nav pill after a normal reload. `no-cache`
+        # forces revalidation on every load (a cheap 304 via the ETag/
+        # Last-Modified FileResponse already sets) instead of no caching at
+        # all.
+        return FileResponse(target, media_type=media, headers={"Cache-Control": "no-cache"})
 
     return runtime
 
