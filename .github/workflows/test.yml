@@ -3,18 +3,15 @@ name: Test
 on:
   push:
   pull_request:
-    branches: [main]
+    branches: [master]
 
 jobs:
   unit:
-    runs-on: [self-hosted, aw-baremetal]
+    runs-on: [self-hosted, aw-workspace]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Install deps
-        run: pip install -r requirements.txt pytest pytest-asyncio
+        run: python3 -m pip install -r requirements.txt pytest pytest-asyncio
       - name: Test suite
         # --ignore=src/tests/integration/apps: those tests load a fixture app
         # at examples/apps/hello/aw-app.json that isn't checked into the repo
@@ -22,4 +19,4 @@ jobs:
         # empty), so they fail on a missing file regardless of source changes.
         # Pre-existing gap, not something this workflow should paper over
         # silently — tracked separately from wiring up CI.
-        run: pytest src/tests --ignore=src/tests/integration/apps -v
+        run: python3 -m pytest src/tests --ignore=src/tests/integration/apps -v
