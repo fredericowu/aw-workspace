@@ -603,6 +603,37 @@ def test_runtime_mounts_app_data_read_write(tmp_path, monkeypatch):
     _async(run())
 
 
+def test_runtime_mounts_kb_dir_at_top_level_not_namespaced_by_app_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage", "fs:workspace-data"],
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_KB_DIR", "target": "/app/kb_output", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+
+        await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data"],
+                      signed=True)
+
+        # Unlike $AW_APP_DATA (home/data/<app_id>), this is a shared top-level
+        # dir — no "browser" (the test app's id) segment in the path.
+        kb_dir = tmp_path / "home" / "knowledge_base"
+        assert kb_dir.is_dir()
+        assert fake.run_calls[-1]["volumes"] == {
+            str(kb_dir.resolve()): {"bind": "/app/kb_output", "mode": "rw"}
+        }
+
+    _async(run())
+
+
 def test_runtime_app_data_survives_uninstall_and_reinstall(tmp_path, monkeypatch):
     """The whole point of $AW_APP_DATA: unlike a package-relative volume
     (removed wholesale by uninstall's shutil.rmtree of the package dir —

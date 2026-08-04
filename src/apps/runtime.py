@@ -866,6 +866,14 @@ class AppRuntime:
         equivalent — "read/write under the app's own data dir") rather than
         a new capability, since the blast radius is the same: an app's own
         namespaced slice, nothing else's.
+
+        ``$AW_KB_DIR`` mounts ``paths.workspace_home()/knowledge_base`` — unlike
+        ``$AW_APP_DATA`` this is a shared, TOP-LEVEL, non-namespaced location
+        (deliberately not ``data/<app_id>``), so the kb app's indexed markdown
+        tree is directly browsable from a workspace terminal at
+        ``/opt/aw-workspace/.aw-workspace/knowledge_base`` rather than buried
+        inside its own private data dir. Reuses ``fs:workspace-data`` rather
+        than a new capability since only the kb app is expected to declare it.
         """
         binds: dict[str, dict] = {}
         package_root = os.path.realpath(package_dir)
@@ -922,6 +930,26 @@ class AppRuntime:
                 data_dir = os.path.join(paths.workspace_home(), "data", manifest.id)
                 os.makedirs(data_dir, exist_ok=True)
                 host_path = self._container_host_bind_path(data_dir)
+                binds[host_path] = {"bind": target, "mode": mode}
+                continue
+            if source == "$AW_KB_DIR":
+                if mode != "rw":
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_KB_DIR volume must be read-write")
+                if "fs:workspace-data" not in manifest.permissions:
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_KB_DIR volume requires the "
+                        f"'fs:workspace-data' permission declared in its manifest")
+                # Deliberately NOT namespaced under data/<app_id> like $AW_APP_DATA —
+                # this mounts workspace_home()/knowledge_base directly, a shared,
+                # top-level, workspace-visible location (Frederico 2026-08-04: wants
+                # the KB's indexed markdown tree browsable at
+                # /opt/aw-workspace/.aw-workspace/knowledge_base from a workspace
+                # terminal, not buried inside the kb app's own private data dir).
+                # Only the kb app is expected to ever declare this.
+                kb_dir = os.path.join(paths.workspace_home(), "knowledge_base")
+                os.makedirs(kb_dir, exist_ok=True)
+                host_path = self._container_host_bind_path(kb_dir)
                 binds[host_path] = {"bind": target, "mode": mode}
                 continue
             if os.path.isabs(source):
