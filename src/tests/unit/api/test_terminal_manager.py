@@ -173,3 +173,54 @@ def test_insecure_state_reported_and_toggle_flips_it():
             mgr.remove(session.id)
 
     asyncio.run(run())
+
+
+def test_extract_agent_session_id_from_session_id_flag():
+    from src.api.terminal_manager import _extract_agent_session_id
+
+    assert _extract_agent_session_id(
+        "claude --session-id abc-123 --dangerously-skip-permissions"
+    ) == "abc-123"
+
+
+def test_extract_agent_session_id_from_resume_flag():
+    from src.api.terminal_manager import _extract_agent_session_id
+
+    assert _extract_agent_session_id("claude --resume abc-123") == "abc-123"
+    assert _extract_agent_session_id("cursor-agent --resume xyz-789") == "xyz-789"
+
+
+def test_extract_agent_session_id_from_codex_bare_resume():
+    from src.api.terminal_manager import _extract_agent_session_id
+
+    assert _extract_agent_session_id("codex resume abc-123") == "abc-123"
+
+
+def test_extract_agent_session_id_none_for_plain_terminal():
+    from src.api.terminal_manager import _extract_agent_session_id
+
+    assert _extract_agent_session_id(None) is None
+    assert _extract_agent_session_id("bash -l") is None
+
+
+@pytest.mark.integration
+def test_created_session_reports_real_agent_session_id():
+    """Regression for 2026-08-04: agent_session_id was hardcoded None in
+    list_sessions()/the REST payload, so the Agents-nav flyout's "detection
+    still pending" state never resolved (stuck "starting…" forever) and the
+    session showed a second time as a spurious on-disk-discovered duplicate."""
+    async def run():
+        mgr = TerminalManager()
+        session = mgr.create(
+            name="claude - abcd",
+            command="claude --session-id real-uuid-1234 --dangerously-skip-permissions",
+            session_type="claude",
+        )
+        try:
+            session.start_reader(asyncio.get_running_loop())
+            listed = {s["id"]: s for s in mgr.list_sessions()}
+            assert listed[session.id]["agent_session_id"] == "real-uuid-1234"
+        finally:
+            mgr.remove(session.id)
+
+    asyncio.run(run())

@@ -128,7 +128,7 @@ class TerminalSession:
 
     def __init__(self, session_id: str, fd: int, pid: int, name: str,
                  session_type: str = "terminal", command: str | None = None,
-                 insecure: bool = False):
+                 insecure: bool = False, agent_session_id: str | None = None):
         self.id = session_id
         self.fd = fd
         self.pid = pid
@@ -136,6 +136,7 @@ class TerminalSession:
         self.type = session_type
         self.command = command
         self.insecure = insecure
+        self.agent_session_id = agent_session_id
         self.alive = True
         self._subscribers: set[asyncio.Queue] = set()
         self._reader_started = False
@@ -331,6 +332,7 @@ class TerminalManager:
             session_id, master_fd, pid, name,
             session_type=session_type, command=command,
             insecure=_is_insecure_command(command, session_type),
+            agent_session_id=_extract_agent_session_id(command),
         )
         self.sessions[session_id] = session
         logger.info("Terminal created: %s (%s, type=%s, pid=%d)", session_id, name, session_type, pid)
@@ -400,7 +402,7 @@ class TerminalManager:
                 "type": s.type,
                 "alive": s.alive,
                 "insecure": s.insecure,
-                "agent_session_id": None,
+                "agent_session_id": s.agent_session_id,
             }
             for s in self.sessions.values()
         ]
@@ -461,3 +463,51 @@ def _set_command_insecure(command: str | None, session_type: str, insecure: bool
     if not insecure and has_flag:
         return " ".join(command.replace(flag, "").split())
     return command
+
+
+# Ported from the monolith (agentic-workspace/src/api/terminal_manager.py's
+# TerminalManager._extract_resume_argument/_extract_agent_session_id) —
+# found 2026-08-04: this BYOD port hardcoded "agent_session_id": None
+# everywhere, so the Agents-nav flyout's "detection still pending" state
+# (App.jsx/aw-app-code-agent-clis's plugin.jsx) could never resolve — every
+# launched session showed "starting…" forever, AND (since the flyout's
+# dedup between live terminals and on-disk-discovered sessions keys off
+# agent_session_id) the same session appeared a second time as a spurious
+# "discovered" entry with a garbled name. The id is trivially recoverable
+# from the launch command itself — every launch already embeds
+# `--session-id <uuid>` (new) or `--resume <uuid>`/`resume <uuid>`
+# (reused) — no file-watching/DB needed for this.
+def _extract_resume_argument(command: str | None) -> str | None:
+    """Extract ``--resume <id>`` (or codex's bare ``resume <id>``) from a
+    command string."""
+    if not command:
+        return None
+    import shlex
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    for i, p in enumerate(parts):
+        if p == "--resume" and i + 1 < len(parts):
+            return parts[i + 1]
+        if p == "resume" and i > 0 and parts[i - 1] == "codex" and i + 1 < len(parts):
+            return parts[i + 1]
+    return None
+
+
+def _extract_agent_session_id(command: str | None) -> str | None:
+    """Extract an agent conversation id from resume/start command syntax."""
+    resume_arg = _extract_resume_argument(command)
+    if resume_arg:
+        return resume_arg
+    if not command:
+        return None
+    import shlex
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    for i, p in enumerate(parts):
+        if p == "--session-id" and i + 1 < len(parts):
+            return parts[i + 1]
+    return None

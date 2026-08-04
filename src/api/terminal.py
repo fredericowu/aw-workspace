@@ -100,7 +100,8 @@ class TerminalRoutes:
     def _terminal_payload(self, session):
         return {
             "id": session.id, "name": session.name, "type": session.type,
-            "alive": session.alive, "insecure": session.insecure, "agent_session_id": None,
+            "alive": session.alive, "insecure": session.insecure,
+            "agent_session_id": session.agent_session_id,
         }
 
     def _broadcast_terminals(self, session_id=None, action=None):
