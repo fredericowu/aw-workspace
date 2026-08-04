@@ -119,3 +119,57 @@ def test_fanout_to_multiple_subscribers():
             mgr.remove(session.id)
 
     asyncio.run(run())
+
+
+def test_is_insecure_command_detects_type_specific_flag():
+    from src.api.terminal_manager import _is_insecure_command
+
+    assert _is_insecure_command("claude --session-id x --dangerously-skip-permissions", "claude")
+    assert not _is_insecure_command("claude --session-id x", "claude")
+    assert _is_insecure_command("copilot --allow-all", "copilot")
+    assert not _is_insecure_command(None, "claude")
+    assert not _is_insecure_command("claude --session-id x", "terminal")  # no flag mapped
+
+
+def test_set_command_insecure_adds_and_removes_flag():
+    from src.api.terminal_manager import _set_command_insecure
+
+    on = _set_command_insecure("claude --session-id x", "claude", True)
+    assert on == "claude --session-id x --dangerously-skip-permissions"
+
+    off = _set_command_insecure(on, "claude", False)
+    assert off == "claude --session-id x"
+
+    # idempotent — already in the target state is a no-op
+    assert _set_command_insecure(on, "claude", True) == on
+    assert _set_command_insecure(off, "claude", False) == off
+
+
+@pytest.mark.integration
+def test_insecure_state_reported_and_toggle_flips_it():
+    """Regression for 2026-08-04: list_sessions()/the REST payload hardcoded
+    insecure=False regardless of the actual running command, and restart's
+    `is_insecure` was silently dropped whenever no fresh `command` was also
+    sent — the toggle UI always showed "secure" and re-toggling did nothing."""
+    async def run():
+        mgr = TerminalManager()
+        session = mgr.create(
+            name="sec", command="claude --session-id x --dangerously-skip-permissions",
+            session_type="claude",
+        )
+        try:
+            session.start_reader(asyncio.get_running_loop())
+            listed = {s["id"]: s for s in mgr.list_sessions()}
+            assert listed[session.id]["insecure"] is True
+
+            # Toggle to secure WITHOUT resending `command` — the frontend's
+            # "detection still pending" fallback path.
+            restarted = mgr.restart(session.id, name="sec", is_insecure=False)
+            restarted.start_reader(asyncio.get_running_loop())
+            listed = {s["id"]: s for s in mgr.list_sessions()}
+            assert listed[session.id]["insecure"] is False
+            assert "--dangerously-skip-permissions" not in restarted.command
+        finally:
+            mgr.remove(session.id)
+
+    asyncio.run(run())

@@ -100,7 +100,7 @@ class TerminalRoutes:
     def _terminal_payload(self, session):
         return {
             "id": session.id, "name": session.name, "type": session.type,
-            "alive": session.alive, "insecure": False, "agent_session_id": None,
+            "alive": session.alive, "insecure": session.insecure, "agent_session_id": None,
         }
 
     def _broadcast_terminals(self, session_id=None, action=None):
@@ -150,6 +150,7 @@ class TerminalRoutes:
             command=data.get("command"),
             name=data.get("name"),
             new_session=data.get("new_session", False),
+            is_insecure=data.get("is_insecure"),
         )
         if not session:
             return {"error": "Session not found", "success": False}

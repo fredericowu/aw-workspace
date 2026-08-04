@@ -127,13 +127,15 @@ class TerminalSession:
     _exit_callback = None
 
     def __init__(self, session_id: str, fd: int, pid: int, name: str,
-                 session_type: str = "terminal", command: str | None = None):
+                 session_type: str = "terminal", command: str | None = None,
+                 insecure: bool = False):
         self.id = session_id
         self.fd = fd
         self.pid = pid
         self.name = name
         self.type = session_type
         self.command = command
+        self.insecure = insecure
         self.alive = True
         self._subscribers: set[asyncio.Queue] = set()
         self._reader_started = False
@@ -328,6 +330,7 @@ class TerminalManager:
         session = TerminalSession(
             session_id, master_fd, pid, name,
             session_type=session_type, command=command,
+            insecure=_is_insecure_command(command, session_type),
         )
         self.sessions[session_id] = session
         logger.info("Terminal created: %s (%s, type=%s, pid=%d)", session_id, name, session_type, pid)
@@ -347,7 +350,8 @@ class TerminalManager:
         return session
 
     def restart(self, session_id: str, command: str | None = None, name: str | None = None,
-                rows: int = 24, cols: int = 80, new_session: bool = False) -> TerminalSession | None:
+                rows: int = 24, cols: int = 80, new_session: bool = False,
+                is_insecure: bool | None = None) -> TerminalSession | None:
         """Kill the existing session and spawn a fresh one with the same ID."""
         old = self.sessions.pop(session_id, None)
         if old:
@@ -360,6 +364,12 @@ class TerminalManager:
         old_type = old.type if old else "terminal"
         old_name = name or (old.name if old else session_id)
         old_command = command if command is not None else (old.command if old else None)
+        # `is_insecure` with no fresh `command` is the toggle UI's "detection
+        # still pending" fallback (App.jsx's toggleInsecure) — flip the flag
+        # in place on whatever command was already running instead of
+        # silently dropping the request (the bug this whole block fixes).
+        if is_insecure is not None and command is None:
+            old_command = _set_command_insecure(old_command, old_type, is_insecure)
         return self.create(
             name=old_name, rows=rows, cols=cols, command=old_command,
             session_type=old_type, session_id=session_id,
@@ -389,7 +399,7 @@ class TerminalManager:
                 "name": s.name,
                 "type": s.type,
                 "alive": s.alive,
-                "insecure": False,
+                "insecure": s.insecure,
                 "agent_session_id": None,
             }
             for s in self.sessions.values()
@@ -410,3 +420,44 @@ class TerminalManager:
 def _sh_quote(s: str) -> str:
     import shlex
     return shlex.quote(s)
+
+
+# The flag each CLI's "insecure" mode maps to (mirrors aw-workspace-ui's
+# App.jsx _buildAgentCommand — the ONE place a session's command is actually
+# built). "insecure" was never tracked server-side: list_sessions()/the REST
+# payload hardcoded `"insecure": False` regardless of what was really running,
+# and restart_terminal() silently dropped an incoming `is_insecure` whenever
+# the caller didn't also resend a full `command` — the toggle UI always
+# showed "secure" and re-toggling was a no-op. Fixed 2026-08-04 by deriving
+# insecure state FROM the actual command string (source of truth, no separate
+# bookkeeping to drift) instead of a caller-asserted flag.
+_INSECURE_FLAGS = {
+    "claude": "--dangerously-skip-permissions",
+    "copilot": "--allow-all",
+    "cursor": "--approve-mcps --yolo",
+    "codex": "--dangerously-bypass-approvals-and-sandbox",
+    "gemini": "--yolo",
+}
+
+
+def _is_insecure_command(command: str | None, session_type: str) -> bool:
+    flag = _INSECURE_FLAGS.get(session_type)
+    return bool(command and flag and flag in command)
+
+
+def _set_command_insecure(command: str | None, session_type: str, insecure: bool) -> str | None:
+    """Add/remove the type's insecure flag from `command`, preserving the rest.
+
+    Used by restart() when the caller sends `is_insecure` without a fresh
+    `command` (the frontend's "detection still pending" fallback) — the old
+    command is reused verbatim except for this one flag.
+    """
+    flag = _INSECURE_FLAGS.get(session_type)
+    if not command or not flag:
+        return command
+    has_flag = flag in command
+    if insecure and not has_flag:
+        return f"{command} {flag}"
+    if not insecure and has_flag:
+        return " ".join(command.replace(flag, "").split())
+    return command
