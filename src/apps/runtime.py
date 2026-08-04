@@ -793,6 +793,7 @@ class AppRuntime:
             raise
 
         self._apps[slug] = loaded
+        self._register_skills(loaded)
         self._invalidate_openapi()
         log.info("apps: loaded container app %s v%s (image=%s)",
                  slug, manifest.version, image)

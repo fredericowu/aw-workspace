@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import textwrap
 
@@ -21,6 +22,7 @@ from fastapi.testclient import TestClient
 from starlette.routing import Mount
 
 from src.api.identity import require_identity
+from src.apps import paths
 from src.apps.containers import ContainerError, ContainerSupervisor
 from src.apps.journal import ActionJournal
 from src.apps.routes import register_apps_routes
@@ -219,7 +221,7 @@ def test_stop_all_for_drops_registration():
 
 # ---- runtime tier=container -------------------------------------------------
 
-def _write_container_app(tmp_path, *, perms=None, runtime_extra=None):
+def _write_container_app(tmp_path, *, perms=None, runtime_extra=None, skills=None):
     slug = "browser"
     pkg = tmp_path / slug
     pkg.mkdir()
@@ -230,7 +232,7 @@ def _write_container_app(tmp_path, *, perms=None, runtime_extra=None):
                "resources": {"cpus": 0.5, "mem_mb": 512}}
     if runtime_extra:
         runtime.update(runtime_extra)
-    (pkg / "aw-app.json").write_text(json.dumps({
+    manifest = {
         "manifest_version": 1,
         "id": slug,
         "name": "Browser",
@@ -238,7 +240,15 @@ def _write_container_app(tmp_path, *, perms=None, runtime_extra=None):
         "tier": "container",
         "runtime": runtime,
         "permissions": perms,
-    }))
+    }
+    if skills is not None:
+        manifest["contributes"] = {"skills": skills}
+    (pkg / "aw-app.json").write_text(json.dumps(manifest))
+    if skills:
+        for entry in skills:
+            skill_md = pkg / entry["path"]
+            skill_md.parent.mkdir(parents=True, exist_ok=True)
+            skill_md.write_text("# how to use this app\n")
     return str(pkg)
 
 
@@ -267,6 +277,39 @@ def test_runtime_loads_container_app_and_reverts_on_unload(tmp_path):
         assert rt.journal.entries_for("browser") == []
         assert not [r for r in rt.host.router.routes
                     if isinstance(r, Mount) and r.path == "/api/apps/browser"]
+
+    _async(run())
+
+
+def test_runtime_registers_skills_for_a_container_tier_app(tmp_path, monkeypatch):
+    """Tier-2 (container) apps declare ``contributes.skills`` same as Tier-1 —
+    the early ``return`` in ``_load_container`` used to skip the
+    ``_register_skills`` call entirely, so a container app's skill never
+    reached the shared skills index Claude Code discovers from."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
+    pkg = _write_container_app(tmp_path, skills=[
+        {"id": "how-to", "path": "skills/how-to/SKILL.md"},
+    ])
+
+    async def run():
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
+
+        await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
+
+        index = rt.skills_index()
+        assert index == [{
+            "app": "browser", "id": "how-to", "description": "",
+            "skill_md_path": os.path.join(paths.skills_dir(), "browser__how-to", "SKILL.md"),
+            "registered": True,
+        }]
+
+        kinds = [(e.kind, e.target) for e in rt.journal.entries_for("browser")]
+        assert ("skill:register", "how-to") in kinds
+
+        await rt.unload("browser")
+        assert not os.path.isdir(os.path.join(paths.skills_dir(), "browser__how-to"))
 
     _async(run())
 
