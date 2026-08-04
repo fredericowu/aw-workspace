@@ -357,6 +357,24 @@ class AppRuntime:
             self._db_tables = DbTables()
         return self._db_tables
 
+    def _apply_migrations(self, manifest: Manifest, package_dir: str) -> None:
+        """Apply the app's pending migrations/*.sql, if it declares a dir
+        (src/apps/migrations.py). Called on every load() — install AND
+        update — after plugin.activate() so a migration can ALTER a table
+        the app's own bootstrap code just ensured exists. One app's
+        migration failure is logged, not fatal to the load — the app's
+        CREATE TABLE IF NOT EXISTS already gave it a working baseline
+        schema; a missed ALTER degrades a feature, it doesn't brick the app."""
+        from src.apps.migrations import apply_migrations, migrations_dir_for
+
+        migrations_dir = migrations_dir_for(package_dir, manifest.migrations)
+        if migrations_dir is None:
+            return
+        try:
+            apply_migrations(manifest.id, migrations_dir)
+        except Exception:
+            log.exception("apps: applying migrations for %s failed", manifest.id)
+
     # ---- system-CLI drift healing ----------------------------------------
 
     def start_system_cli_healer(self, interval_s: float = DEFAULT_CLI_HEAL_INTERVAL_S) -> None:
@@ -566,6 +584,9 @@ class AppRuntime:
             raise
         self._loading = None
 
+        if "db:own-tables" in granted:
+            self._apply_migrations(manifest, package_dir)
+
         self._apps[slug] = loaded
         self._register_skills(loaded)
         self._invalidate_openapi()
@@ -652,7 +673,14 @@ class AppRuntime:
         elif kind == "system_cli:revert-hook":
             self.commands.run_revert(loaded.package_dir, entry.target)
         elif kind == "db:table":
-            self.db_tables.drop(loaded.manifest.id, entry.target)
+            # Deliberately NOT dropped (2026-08-04 decision — see db_tables.py's
+            # module docstring): reconcile()'s upgrade path is uninstall+install
+            # for a plain version bump, so dropping here wiped an app's data on
+            # every routine update, not just a real uninstall. CREATE TABLE IF
+            # NOT EXISTS on the next load() is already idempotent-safe against
+            # existing data; schema evolution is the migrations/ mechanism's job
+            # (src/apps/migrations.py), not an unload-time drop.
+            pass
         elif kind == "service:register":
             self.services.stop_all_for(loaded.manifest.id)
         elif kind == "container:register":

@@ -9,8 +9,16 @@ primitive — see ``src.api.db``); raw DDL/DML is schema-qualified explicitly he
 because ``schema_translate_map`` only rewrites SQLAlchemy ``Table`` metadata, not
 text SQL.
 
-Uninstall **drops** the app's tables (task F4 acceptance). The journal records
-each ``db:table`` create so the runtime knows which to drop on reverse replay.
+Tables are NEVER dropped automatically (2026-08-04 decision, reversing the
+original F4 acceptance criteria) — ``reconcile()``'s upgrade path is
+uninstall+install for a plain version bump, so an unconditional drop-on-unload
+wiped an app's data on every routine update, not just a genuine uninstall.
+``create()``'s ``CREATE TABLE IF NOT EXISTS`` is idempotent-safe against
+existing data across reloads; schema evolution beyond the initial create is
+the ``migrations/`` mechanism's job (see ``src/apps/migrations.py``), applied
+at both install and update. ``drop()`` below still exists for a future
+explicit "reset this app's data" admin action, but nothing in the runtime
+calls it automatically anymore.
 """
 from __future__ import annotations
 
@@ -72,7 +80,9 @@ class DbTables:
                 else conn.execute(text(stmt), params or {})
 
     def drop(self, app_id: str, name: str) -> None:
-        """Drop an app's table (uninstall). Idempotent."""
+        """Drop an app's table. NOT called automatically by the runtime
+        anymore (see module docstring) — reserved for a future explicit
+        "reset this app's data" admin action. Idempotent."""
         _validate(app_id, name)
         with get_engine().begin() as conn:
             conn.execute(text(f"DROP TABLE IF EXISTS {self._qualified(name)}"))
