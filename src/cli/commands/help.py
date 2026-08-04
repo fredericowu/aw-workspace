@@ -6,17 +6,12 @@ DESCRIPTION = "Show this help message"
 
 
 def run(args: list[str]) -> int:
-    import importlib
-    import pkgutil
+    from src.cli.discovery import discover_commands
 
-    import src.cli.commands as commands_pkg
-
-    entries = []
-    for _, name, _ in sorted(pkgutil.iter_modules(commands_pkg.__path__)):
-        module = importlib.import_module(f"src.cli.commands.{name}")
-        command = getattr(module, "COMMAND", name)
-        description = getattr(module, "DESCRIPTION", "")
-        entries.append((command, description))
+    entries = sorted(
+        (command, getattr(module, "DESCRIPTION", ""))
+        for command, module in discover_commands().items()
+    )
     width = max((len(c) for c, _ in entries), default=0)
 
     print("aw-workspace-cli")

@@ -4,37 +4,29 @@ aw-workspace-cli — this workspace's own CLI. Named ``aw-workspace-cli`` (not
 ``aw``) so it can't be confused with the monolith's ``./aw`` — an LLM/agent
 that has both on PATH would otherwise conflate two very different tools.
 
-Commands are auto-discovered from ``src/cli/commands/*.py``. Drop a new file
-there with ``COMMAND``, ``DESCRIPTION``, and ``run(args) -> int`` and it
-becomes available immediately.
+Commands are auto-discovered from two places — ``src/cli/commands/*.py``
+(built into this repo) and ``<apps_root>/<slug>/commands/*.py`` (one per
+installed app, so each app ships and owns its own CLI surface with no
+change needed here). Drop a file with ``COMMAND``, ``DESCRIPTION``, and
+``run(args) -> int`` in either location and it becomes available
+immediately — see ``src/cli/discovery.py``.
 
 Usage:
     aw-workspace-cli <command> [args...]
     aw-workspace-cli help
 """
-import importlib
 import os
-import pkgutil
 import sys
 
 # This script lives at <repo>/aw-workspace-cli (repo root, where src/ lives).
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, BASE_DIR)
 
-import src.cli.commands as commands_pkg  # noqa: E402
-
-
-def _discover_commands() -> dict:
-    found = {}
-    for _, name, _ in pkgutil.iter_modules(commands_pkg.__path__):
-        module = importlib.import_module(f"src.cli.commands.{name}")
-        command = getattr(module, "COMMAND", name)
-        found[command] = module
-    return found
+from src.cli.discovery import discover_commands  # noqa: E402
 
 
 def main() -> int:
-    commands = _discover_commands()
+    commands = discover_commands()
 
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         name, rest = "help", []
