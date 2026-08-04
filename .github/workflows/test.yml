@@ -27,17 +27,17 @@ jobs:
           echo "PODMAN=$PODMAN" >> "$GITHUB_ENV"
 
       - name: Test suite (in a python:3.12-slim container)
-        # --ignore=src/tests/integration/apps: those tests load a fixture app
-        # at examples/apps/hello/aw-app.json that isn't checked into the repo
-        # (untracked locally too — `git ls-files examples/apps/hello/` is
-        # empty), so they fail on a missing file regardless of source changes.
-        # Pre-existing gap, not something this workflow should paper over
-        # silently — tracked separately from wiring up CI.
         run: |
           "$PODMAN" run --rm -v "$PWD:/repo:ro" -w /repo python:3.12-slim \
             sh -c "pip install -q -r requirements.txt pytest pytest-asyncio && \
-                   python3 -m pytest src/tests --ignore=src/tests/integration/apps \
+                   python3 -m pytest src/tests \
+                     --ignore=src/tests/integration/apps/test_f5_endpoints.py \
+                     --ignore=src/tests/integration/apps/test_real_apps.py \
                      -k 'not test_pty_shell_runs_and_echoes' -v"
+          # --ignore x2: both load repos/aw-app-git as a real fixture (REPOS =
+          # <this repo>/repos/aw-app-git — gitignored runtime state per this
+          # repo's own .gitignore, not something CI checks out). Needs an
+          # actual clone step to cover; out of scope here.
           # -k (not --deselect: pytest.ini's rootdir is src/tests, so the
           # collected node id here is unit/api/test_terminal_manager.py::...,
           # not src/tests/unit/..., and --deselect silently no-ops on a

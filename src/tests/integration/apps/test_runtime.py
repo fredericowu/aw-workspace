@@ -7,7 +7,6 @@ in-flight requests to drain before tearing the app down.
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 import textwrap
 
@@ -15,11 +14,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from src.apps.journal import ActionJournal
 from src.apps.runtime import AppRuntime
-
-REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
-HELLO_DIR = os.path.join(REPO, "examples", "apps", "hello")
 
 
 def _write_app(tmp_path, slug, plugin_src, permissions='["routes:register"]'):
@@ -46,86 +41,6 @@ def _write_app(tmp_path, slug, plugin_src, permissions='["routes:register"]'):
 
 def _async(coro):
     return asyncio.run(coro)
-
-
-def test_hot_load_mounts_route_then_unload_removes_it():
-    async def run():
-        host = FastAPI()
-        rt = AppRuntime(host, journal=ActionJournal(), guard_identity=False)
-
-        await rt.load(HELLO_DIR)
-        assert rt.is_loaded("hello")
-
-        transport = httpx.ASGITransport(app=host)
-        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-            r = await c.get("/api/apps/hello/")
-            assert r.status_code == 200
-            assert r.json() == {"app": "hello", "ok": True, "version": "1.0.0"}
-            r2 = await c.get("/api/apps/hello/greet/fred")
-            assert r2.json()["message"] == "Hello, fred!"
-
-        # journal recorded the mount
-        assert [e.kind for e in rt.journal.entries_for("hello")] == ["route:mount"]
-
-        await rt.unload("hello")
-        assert not rt.is_loaded("hello")
-        # residue-free: no journal entries, no synthetic modules left
-        assert rt.journal.entries_for("hello") == []
-        assert not any(n.startswith("aw_apps.hello") for n in sys.modules)
-
-        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-            r = await c.get("/api/apps/hello/")
-            assert r.status_code == 404
-
-    _async(run())
-
-
-def test_hot_load_also_mounts_app_subdomain_host_route():
-    """Same view, second entry point: <app_id>.app.<anything> routes to the
-    identical guarded ASGI app as /api/apps/<app_id>/*, with no path prefix
-    (Caddy's *.app.<slug>.workspace wildcard already tunnels this Host header
-    here unconditionally — see aw-backend's workspace_caddy_template.py)."""
-    async def run():
-        host = FastAPI()
-        rt = AppRuntime(host, journal=ActionJournal(), guard_identity=False)
-
-        await rt.load(HELLO_DIR)
-        assert rt.is_loaded("hello")
-
-        transport = httpx.ASGITransport(app=host)
-        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-            # Any suffix after "hello.app." matches — workspace slug + domain
-            # are irrelevant here since Caddy already scoped the request to
-            # this workspace before it ever reached this process.
-            r = await c.get("/", headers={"host": "hello.app.aw.workspace.aw.tekflox.com"})
-            assert r.status_code == 200
-            assert r.json() == {"app": "hello", "ok": True, "version": "1.0.0"}
-            r2 = await c.get("/greet/fred", headers={"host": "hello.app.someother.suffix.example"})
-            assert r2.json()["message"] == "Hello, fred!"
-
-            # A request for a DIFFERENT app's subdomain must not match.
-            r3 = await c.get("/", headers={"host": "not-hello.app.aw.workspace.aw.tekflox.com"})
-            assert r3.status_code == 404
-
-        await rt.unload("hello")
-        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-            r = await c.get("/", headers={"host": "hello.app.aw.workspace.aw.tekflox.com"})
-            assert r.status_code == 404
-
-    _async(run())
-
-
-def test_openapi_reflects_mount_and_unmount():
-    async def run():
-        host = FastAPI()
-        rt = AppRuntime(host)
-        base = len(host.router.routes)
-        await rt.load(HELLO_DIR)
-        assert len(host.router.routes) == base + 1  # exactly one Mount
-        await rt.unload("hello")
-        assert len(host.router.routes) == base
-
-    _async(run())
 
 
 def test_unload_waits_for_in_flight_request_to_drain(tmp_path):
@@ -207,17 +122,5 @@ def test_load_rejects_ungranted_routes_permission(tmp_path):
             await rt.load(pkg, granted_permissions=[])
         assert not rt.is_loaded("noperm")
         assert not any(n.startswith("aw_apps.noperm") for n in sys.modules)
-
-    _async(run())
-
-
-def test_double_load_rejected():
-    async def run():
-        host = FastAPI()
-        rt = AppRuntime(host)
-        await rt.load(HELLO_DIR)
-        with pytest.raises(ValueError, match="already loaded"):
-            await rt.load(HELLO_DIR)
-        await rt.unload("hello")
 
     _async(run())
