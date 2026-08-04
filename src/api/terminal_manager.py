@@ -296,17 +296,27 @@ class TerminalManager:
         shell = self._shell()
 
         # Resolve the starting directory: caller-supplied (absolute or relative
-        # to HOME), else HOME. A missing dir falls back to HOME so a typo never
-        # drops the shell somewhere surprising.
+        # to the workspace root), else the workspace root itself — NOT $HOME.
+        # A terminal/agent (claude/codex/copilot/cursor-agent) with no caller-
+        # supplied cwd always means to start in the workspace checkout, never
+        # in the unrelated $HOME the PTY's login shell happens to run under
+        # (found 2026-08-04: every Agents-nav-launched CLI session opened
+        # Claude's "Accessing workspace: /home/ubuntu" trust prompt instead of
+        # /opt/aw-workspace — the frontend never sends `cwd` at all, so this
+        # default was the only thing deciding it). A missing dir falls back to
+        # HOME so a typo/misconfigured env never drops the shell somewhere
+        # nonexistent.
         home = os.environ.get("HOME") or os.path.expanduser("~") or "/root"
-        effective_cwd = home
+        workspace_root = os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace")
+        default_cwd = workspace_root if os.path.isdir(workspace_root) else home
+        effective_cwd = default_cwd
         if cwd:
-            candidate = cwd if os.path.isabs(cwd) else os.path.join(home, cwd)
+            candidate = cwd if os.path.isabs(cwd) else os.path.join(default_cwd, cwd)
             candidate = os.path.normpath(candidate)
             if os.path.isdir(candidate):
                 effective_cwd = candidate
             else:
-                logger.warning("create: cwd=%s not found, using HOME", candidate)
+                logger.warning("create: cwd=%s not found, using %s", candidate, default_cwd)
 
         if command:
             inner = f"cd {_sh_quote(effective_cwd)}; {command}"

@@ -68,6 +68,28 @@ def test_command_session_runs_given_command():
 
 
 @pytest.mark.integration
+def test_default_cwd_is_workspace_root_not_home(tmp_path, monkeypatch):
+    """No caller-supplied cwd (the Agents-nav path, launching claude/codex/
+    copilot/cursor-agent) must start in the workspace root, not $HOME —
+    regression for the 2026-08-04 bug where every agent session opened
+    Claude's "Accessing workspace: /home/ubuntu" trust prompt instead of
+    /opt/aw-workspace."""
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path))
+
+    async def run():
+        mgr = TerminalManager()
+        session = mgr.create(name="cwd-check", command="pwd", session_type="terminal")
+        try:
+            session.start_reader(asyncio.get_running_loop())
+            text = await _wait_for(session, str(tmp_path))
+            assert str(tmp_path) in text, repr(text[-200:])
+        finally:
+            mgr.remove(session.id)
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_fanout_to_multiple_subscribers():
     async def run():
         mgr = TerminalManager()
