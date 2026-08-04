@@ -160,12 +160,25 @@ class ContainerSupervisor:
         except NotFound:
             pass
 
-        # Pull the image if it isn't present locally.
+        # Always try to pull first — app images are tagged mutably (``:latest``
+        # or a moving release tag), so a locally-cached image under that tag
+        # can be stale even though it's "present" (observed: a fresh release
+        # silently kept serving the previous build's assets because the old
+        # tag already resolved locally and was never re-fetched). Only fall
+        # back to whatever's cached when the registry itself is unreachable
+        # (offline/BYOD-friendly), matching the catalog's own stale-is-better-
+        # than-broken fallback (see ``src.apps.catalog.get_catalog``).
         try:
-            client.images.get(c.image)
-        except ImageNotFound:
             log.info("apps: pulling image %s for %s", c.image, c.name)
             client.images.pull(c.image)
+        except Exception:  # noqa: BLE001 — registry unreachable, fall back to cache
+            try:
+                client.images.get(c.image)
+            except ImageNotFound:
+                raise
+            log.warning(
+                "apps: pull failed for %s, starting %s from cached image", c.image, c.name
+            )
 
         kwargs: dict = {
             "name": c.name,
