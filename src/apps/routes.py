@@ -321,7 +321,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         async def _run_update() -> None:
             try:
                 catalog_entry = next(
-                    (a for a in get_catalog().get("apps", [])
+                    (a for a in get_catalog(force=True).get("apps", [])
                      if (a.get("id") or a.get("slug")) == slug),
                     None,
                 )
