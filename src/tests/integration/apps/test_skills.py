@@ -64,6 +64,7 @@ def _write_app(tmp_path, slug, *, with_skill: bool):
 
 def test_app_with_skill_gets_registered_on_load(tmp_path, monkeypatch):
     monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
     pkg = _write_app(tmp_path, "notes", with_skill=True)
 
     async def run():
@@ -100,6 +101,7 @@ def test_reregister_does_not_clobber_a_users_live_edit(tmp_path, monkeypatch):
     skills dir) — that re-``register()`` must leave an existing copy alone
     rather than re-copying over it and silently discarding the edit."""
     monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
     pkg = _write_app(tmp_path, "notes", with_skill=True)
 
     async def run():
@@ -124,6 +126,7 @@ def test_reregister_does_not_clobber_a_users_live_edit(tmp_path, monkeypatch):
 
 def test_app_without_skills_is_a_noop(tmp_path, monkeypatch):
     monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
     pkg = _write_app(tmp_path, "plain", with_skill=False)
 
     async def run():

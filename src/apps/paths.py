@@ -11,16 +11,23 @@ Layout (ADR Decision 8):
 * ``<home>/bin``     — app command shims (``<slug>-*``), on PATH, survive restart.
 * ``<home>/secrets`` — the workspace-side secure secret store (F4; the
   zero-knowledge store is a separate deferred card).
-* ``<home>/skills``  — symlink index of app-contributed skills (``contributes.skills``),
-  one entry per ``<app_id>__<skill_id>`` pointing at the installed app's own
-  ``skills/<id>/`` dir — no content duplication.
 * ``<home>/cli-token`` — random secret (0600) the ``./aw`` CLI presents to
   prove it's running on the same machine as the server; see ``local_client.py``.
+
+App-contributed skills (``contributes.skills``) are the one exception to the
+"lives under ``<home>``" rule: they're copied into ``<workspace root>/skills/``
+(top-level, alongside this repo's own built-in skills) instead, because that's
+the path Claude Code and other CLI agents actually auto-discover from their
+project cwd — a location under ``AW_WORKSPACE_HOME`` is invisible to them.
+``_register_skills()`` re-copies on every app ``activate()`` (boot/reconcile),
+so this self-heals if a core-image update ever touches ``skills/``.
 """
 from __future__ import annotations
 
 import os
 import secrets
+
+DEFAULT_WORKSPACE_CONTAINER_DIR = "/opt/aw-workspace"
 
 LOCAL_CLI_HEADER = "X-AW-Local-Cli-Token"
 
@@ -46,7 +53,18 @@ def secrets_dir() -> str:
 
 
 def skills_dir() -> str:
-    d = os.path.join(workspace_home(), "skills")
+    """Top-level ``skills/`` at the workspace root, not under ``AW_WORKSPACE_HOME``.
+
+    Claude Code (and other CLI agents) auto-discover ``<cwd>/skills/<id>/SKILL.md``
+    from the workspace's project root — the same place this repo's own
+    ``skills/aw-workspace/SKILL.md`` already lives. A path under the
+    ``.aw-workspace`` state dir would be durable but invisible to that
+    discovery mechanism.
+    """
+    root = os.path.realpath(
+        os.environ.get("AW_WORKSPACE_CONTAINER_DIR", DEFAULT_WORKSPACE_CONTAINER_DIR)
+    )
+    d = os.path.join(root, "skills")
     os.makedirs(d, exist_ok=True)
     return d
 

@@ -3,19 +3,21 @@
 An app's ``aw-app.json`` can declare skills it teaches an agent to use — each
 entry names a ``SKILL.md`` relative to the app's package dir (ADR: decoupled
 apps framework). Registration **copies** (never symlinks) the skill's own
-directory into the shared workspace skills index
-(``<AW_WORKSPACE_HOME>/skills/<app_id>__<skill_id>``) — the app's package dir
-is immutable by design (an update overwrites it wholesale), so a symlink
-would make a user's in-place edits to their live skill vanish/break the
-moment the app updates. Once copied, the workspace's own copy is the user's
-to edit; re-registering (every boot re-activates every installed app) never
-overwrites an existing copy. Reverted (copy removed) on uninstall via the
-journal, same shape as the ``commands`` bin-shim facade.
+directory into the workspace's top-level skills index
+(``paths.skills_dir()`` — ``<workspace root>/skills/<app_id>__<skill_id>``,
+the same directory Claude Code auto-discovers ``SKILL.md`` files from) — the
+app's package dir is immutable by design (an update overwrites it wholesale),
+so a symlink would make a user's in-place edits to their live skill
+vanish/break the moment the app updates. Once copied, the workspace's own
+copy is the user's to edit; re-registering (every boot re-activates every
+installed app) never overwrites an existing copy. Reverted (copy removed) on
+uninstall via the journal, same shape as the ``commands`` bin-shim facade.
 
-Known gap: ``<AW_WORKSPACE_HOME>/skills`` isn't committed/backed up anywhere
-today, so a user's edits don't survive a full workspace recreation — that's a
-separate, not-yet-solved persistence question, not something this registry
-can fix on its own.
+Because the destination lives at the workspace root, not under
+``AW_WORKSPACE_HOME``, a core-image update could in principle touch it — but
+every installed app re-``register()``s its skills on every boot (reconcile),
+so the index self-heals. A user's own edits to an already-registered copy
+are still never clobbered, per the check above.
 """
 from __future__ import annotations
 
