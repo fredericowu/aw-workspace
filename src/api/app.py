@@ -65,13 +65,17 @@ def create_app() -> FastAPI:
         # sync callers (e.g. the apps facade) — see NotificationManager.set_loop.
         app.state.notification_mgr.set_loop(asyncio.get_running_loop())
         app.state.app_install_jobs.set_loop(asyncio.get_running_loop())
+        # A freshly-installed/recreated workspace always gets a workspace API
+        # key with zero manual steps — get_or_create is a no-op once one
+        # already exists in the settings table. MUST run before
+        # reconcile_on_boot: an app's own activate() (e.g. aw-app-whiteboard's
+        # mcp/self_register.py) reads AW_WORKSPACE_API_KEY from os.environ to
+        # put in its self-registered mcp.json — publishing the key AFTER apps
+        # already loaded would silently ship that entry with no auth header.
+        get_or_create_workspace_api_key()
         # Converge the running app set to the cloud registry on startup — a
         # fresh/recreated workspace auto-reinstalls the user's apps (F3).
         await reconcile_on_boot(app)
-        # A freshly-installed/recreated workspace always gets a workspace API
-        # key with zero manual steps — get_or_create is a no-op once one
-        # already exists in the settings table.
-        get_or_create_workspace_api_key()
         yield
 
     app = FastAPI(title="aw-workspace", version="0.1.0", lifespan=lifespan)
