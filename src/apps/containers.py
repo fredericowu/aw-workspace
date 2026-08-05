@@ -187,6 +187,17 @@ class ContainerSupervisor:
             "volumes": c.volumes,
             # never --privileged; drop nothing extra but don't grant caps either
             "privileged": False,
+            # Root cause of "it should come back up on its own but doesn't":
+            # without a restart policy, podman/docker never restarts this
+            # container on its own — only the NEXT aw-workspace process boot
+            # (reconcile_on_boot -> this same start()) would bring it back.
+            # A crash, OOM-kill, or the container engine itself restarting
+            # independently of the aw-workspace process left it dead
+            # indefinitely. "unless-stopped" survives all of those while still
+            # respecting an explicit stop() (the app framework's own
+            # auto_start=false / uninstall path calls stop(), which force-
+            # removes the container outright — no conflict with the policy).
+            "restart_policy": {"Name": "unless-stopped"},
         }
         kwargs.update(_parse_run_flags(c.run_flags))
         kwargs.update(_resource_kwargs(c.resources))

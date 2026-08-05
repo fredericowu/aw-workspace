@@ -118,6 +118,20 @@ def test_register_start_status_stop_roundtrip():
     assert sup.status("browser")["running"] is False
 
 
+def test_start_sets_unless_stopped_restart_policy():
+    # Root cause of an app container not "coming back up on its own" after a
+    # crash or the container engine restarting independently of the
+    # aw-workspace process: without this, only the NEXT aw-workspace boot
+    # (reconcile_on_boot -> start()) would ever revive it.
+    fake = _FakeDocker()
+    sup = ContainerSupervisor(socket="/dev/null", client=fake)
+    sup.register("browser", "img:1", 9222)
+    sup.start("browser")
+
+    call = fake.run_calls[-1]
+    assert call["restart_policy"] == {"Name": "unless-stopped"}
+
+
 def test_pulls_missing_image():
     fake = _FakeDocker(image_present=False)
     sup = ContainerSupervisor(socket="/dev/null", client=fake)
