@@ -89,6 +89,42 @@ class TestDecodeIdentityJwt:
         assert identity_mod.decode_identity_jwt("not-a-jwt") is None
 
 
+class TestFetchPublicKeyPemRetries:
+    def test_retries_transient_network_failures_and_succeeds(self, monkeypatch):
+        monkeypatch.delenv("AW_AUTH_PUBLIC_KEY", raising=False)
+        monkeypatch.setenv("AW_BACKEND_URL", "http://fake-backend")
+        monkeypatch.setattr(identity_mod, "_FETCH_RETRY_DELAY_S", 0)
+
+        calls = {"n": 0}
+
+        def flaky_get(url, timeout):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise identity_mod.httpx.ConnectError("connection refused")
+            return type("Resp", (), {
+                "text": "the-pem",
+                "raise_for_status": lambda self: None,
+            })()
+
+        monkeypatch.setattr(identity_mod.httpx, "get", flaky_get)
+
+        assert identity_mod._fetch_public_key_pem() == "the-pem"
+        assert calls["n"] == 3
+
+    def test_raises_the_last_error_after_exhausting_retries(self, monkeypatch):
+        monkeypatch.delenv("AW_AUTH_PUBLIC_KEY", raising=False)
+        monkeypatch.setenv("AW_BACKEND_URL", "http://fake-backend")
+        monkeypatch.setattr(identity_mod, "_FETCH_RETRY_DELAY_S", 0)
+
+        def always_fails(url, timeout):
+            raise identity_mod.httpx.ConnectError("connection refused")
+
+        monkeypatch.setattr(identity_mod.httpx, "get", always_fails)
+
+        with pytest.raises(identity_mod.httpx.ConnectError):
+            identity_mod._fetch_public_key_pem()
+
+
 class TestRequireIdentityDependency:
     def test_raises_401_with_no_token(self, monkeypatch):
         _private_pem, public_pem = _pem_pair()

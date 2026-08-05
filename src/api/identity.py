@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 
 import httpx
 import jwt as pyjwt
@@ -24,6 +25,18 @@ JWT_ALGORITHM = "EdDSA"
 _public_key_pem: str | None = None
 _lock = threading.Lock()
 
+# A container that just (re)started can hit a network hiccup reaching
+# aw-backend on this VERY FIRST identity-gated request (DNS/routing still
+# settling right after boot). Without a retry, decode_identity_jwt's broad
+# except swallows that network failure and reports it identically to "bad
+# token" — a perfectly valid, unexpired JWT gets 401'd once, which the SPA's
+# apiFetch treated as a real logout with zero grace (found live 2026-08-05,
+# recurring "login expired" reports that correlated with app
+# install/update/reinstall cycles, which recreate this container). Retrying
+# here fixes it at the source instead of only papering over it client-side.
+_FETCH_RETRIES = 3
+_FETCH_RETRY_DELAY_S = 0.5
+
 
 def _fetch_public_key_pem() -> str:
     backend_url = os.environ.get("AW_BACKEND_URL", "").rstrip("/")
@@ -32,9 +45,17 @@ def _fetch_public_key_pem() -> str:
             "neither AW_AUTH_PUBLIC_KEY nor AW_BACKEND_URL is set — cannot "
             "verify identity JWTs"
         )
-    resp = httpx.get(f"{backend_url}/api/identity/public-key", timeout=10.0)
-    resp.raise_for_status()
-    return resp.text
+    last_exc: Exception | None = None
+    for attempt in range(_FETCH_RETRIES):
+        try:
+            resp = httpx.get(f"{backend_url}/api/identity/public-key", timeout=10.0)
+            resp.raise_for_status()
+            return resp.text
+        except Exception as e:  # noqa: BLE001 — retried below, re-raised after last attempt
+            last_exc = e
+            if attempt < _FETCH_RETRIES - 1:
+                time.sleep(_FETCH_RETRY_DELAY_S * (attempt + 1))
+    raise last_exc
 
 
 def get_public_key_pem() -> str:
