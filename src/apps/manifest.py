@@ -157,7 +157,17 @@ class Manifest:
 
     @property
     def has_config(self) -> bool:
-        """True when the app exposes a settings/config surface the gear opens."""
+        """True when the app exposes a settings/config surface the gear opens.
+
+        ``config_visible: false`` (top-level manifest field, default true) is
+        an explicit override — an app can declare a real ``config_schema``
+        for its own internal use (read via ``ctx.config``/the ``/config``
+        route) without surfacing a Settings gear/entry for it. Not every app
+        has user-facing settings (e.g. a Runnables-style CLI-only app), so
+        this lets a manifest keep the schema without forcing UI on it.
+        """
+        if self.raw.get("config_visible") is False:
+            return False
         return bool(
             self.settings_panels
             or self.config_schema.get("properties")

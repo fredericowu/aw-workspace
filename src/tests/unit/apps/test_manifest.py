@@ -275,3 +275,31 @@ def test_reload_mcp_gateway_on_save_independent_of_mcp_provides():
     }, permissions=[]))
     assert m.reload_mcp_gateway_on_save is False
     assert m.what_you_get["mcp_tools"] == ["notes_search"]
+
+
+def test_has_config_true_when_config_schema_has_properties():
+    m = validate_manifest(_m(config_schema={
+        "type": "object",
+        "properties": {"greeting": {"type": "string", "default": "Hello"}},
+    }))
+    assert m.has_config is True
+
+
+def test_has_config_false_when_config_visible_is_false():
+    # An app can keep a real config_schema for its own internal use
+    # (ctx.config) without surfacing a Settings gear/entry for it — not
+    # every app has user-facing settings.
+    m = validate_manifest(_m(config_schema={
+        "type": "object",
+        "properties": {"greeting": {"type": "string", "default": "Hello"}},
+    }, config_visible=False))
+    assert m.has_config is False
+
+
+def test_config_visible_defaults_true():
+    m = validate_manifest(_m(config_schema={
+        "type": "object",
+        "properties": {"greeting": {"type": "string", "default": "Hello"}},
+    }))
+    assert m.raw.get("config_visible") is None
+    assert m.has_config is True
