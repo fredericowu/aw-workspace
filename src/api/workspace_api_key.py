@@ -15,6 +15,15 @@ server, another app) rather than kept workspace-local — which is exactly
 why every mint/rotate ALSO writes it to ``<AW_WORKSPACE_HOME>/.env`` (see
 ``_write_env``): a process outside this FastAPI app (no DB access of its
 own) can source that file and read ``AW_WORKSPACE_API_KEY`` directly.
+
+An in-process Tier-1 app (e.g. aw-app-whiteboard) shares this SAME Python
+process, so a rewritten .env file alone would never reach it — nothing
+re-execs this process or reloads its environment. ``_publish`` also sets
+``os.environ[ENV_VAR_NAME]`` directly (every time the key is read/minted,
+not just on first create), so an app's own plain ``os.environ.get(...)``
+read (no core-module import — apps must not reach into ``src.api.*``,
+only the ``ctx`` facades and, for exactly this shared-secret case, this one
+environment variable) always sees the live value in the same process.
 """
 from __future__ import annotations
 
@@ -58,6 +67,14 @@ def _write_env(key: str) -> None:
         f.writelines(lines)
 
 
+def _publish(key: str) -> None:
+    """Make ``key`` visible both to THIS process (in-process apps reading
+    ``os.environ`` directly) and to any OTHER process (external MCP/app
+    reading ``.env``)."""
+    os.environ[ENV_VAR_NAME] = key
+    _write_env(key)
+
+
 def _read(session) -> str | None:
     row = session.get(Setting, SETTING_KEY)
     return (row.value or {}).get("key") if row else None
@@ -80,27 +97,30 @@ def get_workspace_api_key() -> str | None:
 
 
 def get_or_create_workspace_api_key() -> str:
-    """Return the current key, generating (and persisting to .env) one on
-    first use — called at app boot so every installed workspace has a key
-    with no manual step, and again lazily if the Settings UI is opened
-    before boot ever ran (belt and suspenders)."""
+    """Return the current key, generating (and publishing to os.environ +
+    .env) one on first use — called at app boot so every installed
+    workspace has a key with no manual step, and again lazily if the
+    Settings UI is opened before boot ever ran (belt and suspenders).
+    Always (re)publishes even when not freshly generated, so a worker
+    process that didn't mint the key still gets it into its own env."""
     with get_session() as session:
         existing = _read(session)
         if existing:
+            _publish(existing)
             return existing
         key = secrets.token_hex(32)
         _store(session, key)
-    _write_env(key)
+    _publish(key)
     return key
 
 
 def regenerate_workspace_api_key() -> str:
-    """Mint a brand new key, persist it, and rewrite .env — invalidates the
+    """Mint a brand new key, persist it, and republish — invalidates the
     previous key immediately (any caller still presenting it gets 401)."""
     key = secrets.token_hex(32)
     with get_session() as session:
         _store(session, key)
-    _write_env(key)
+    _publish(key)
     return key
 
 

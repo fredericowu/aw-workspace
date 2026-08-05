@@ -121,3 +121,33 @@ def test_verify_rejects_wrong_key(env):
 
     get_or_create_workspace_api_key()
     assert verify_workspace_api_key("not-the-real-key") is False
+
+
+def test_get_or_create_publishes_to_process_env(env, monkeypatch):
+    # An in-process Tier-1 app (e.g. aw-app-whiteboard) reads plain
+    # os.environ, not the .env file — get_or_create must set it directly,
+    # not just write it to disk for OTHER processes to pick up.
+    from src.api.workspace_api_key import ENV_VAR_NAME, get_or_create_workspace_api_key
+
+    monkeypatch.delenv(ENV_VAR_NAME, raising=False)
+    key = get_or_create_workspace_api_key()
+    assert os.environ[ENV_VAR_NAME] == key
+
+
+def test_get_or_create_republishes_even_when_key_already_existed(env, monkeypatch):
+    # A worker process that didn't mint the key (another worker did) must
+    # still see it in ITS OWN os.environ once it calls get_or_create.
+    from src.api.workspace_api_key import ENV_VAR_NAME, get_or_create_workspace_api_key
+
+    key = get_or_create_workspace_api_key()
+    monkeypatch.delenv(ENV_VAR_NAME, raising=False)
+    assert get_or_create_workspace_api_key() == key
+    assert os.environ[ENV_VAR_NAME] == key
+
+
+def test_regenerate_publishes_to_process_env(env):
+    from src.api.workspace_api_key import ENV_VAR_NAME, get_or_create_workspace_api_key, regenerate_workspace_api_key
+
+    get_or_create_workspace_api_key()
+    new_key = regenerate_workspace_api_key()
+    assert os.environ[ENV_VAR_NAME] == new_key
