@@ -182,3 +182,59 @@ def test_reload_mcp_gateway_skips_when_gateway_app_not_installed(tmp_path, monke
     app, runtime, client = _client()
     assert runtime.is_loaded("mcp-gateway") is False
     _async(routes_mod._reload_mcp_gateway(runtime))  # must not raise
+
+
+class _FakeLoadedRuntime:
+    """Minimal stand-in exposing exactly what _reload_mcp_gateway touches:
+    is_loaded("mcp-gateway") -> True, containers.base_url("mcp-gateway")."""
+
+    def is_loaded(self, slug):
+        return slug == "mcp-gateway"
+
+    class containers:
+        @staticmethod
+        def base_url(slug):
+            return "http://fake-gateway:9200"
+
+
+def test_reload_mcp_gateway_retries_a_just_created_container_not_ready_yet(monkeypatch):
+    # is_loaded("mcp-gateway") only means containers.start() returned — the
+    # gateway's own FastAPI app may not be listening yet. Confirmed live:
+    # the very first reload attempt right after installing it in the SAME
+    # reconcile pass connection-refused.
+    monkeypatch.setattr("asyncio.sleep", lambda *_: _async_noop())
+
+    calls = {"n": 0}
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"upstreams": ["whiteboard"]}
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise ConnectionRefusedError("gateway not listening yet")
+            return _FakeResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient", _FakeAsyncClient)
+
+    _async(routes_mod._reload_mcp_gateway(_FakeLoadedRuntime()))
+
+    assert calls["n"] == 3  # 2 failures + 1 success, no exception raised
+
+
+async def _async_noop():
+    return None

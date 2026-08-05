@@ -100,19 +100,34 @@ async def _reload_mcp_gateway(runtime: AppRuntime) -> None:
     Best-effort: a missing/unreachable/not-yet-started gateway logs and
     does not fail the config save that triggered it — the app's own config
     change already landed either way, and the gateway will pick it up on
-    its own next reload/restart regardless."""
+    its own next reload/restart regardless.
+
+    Retried a few times with backoff: ``is_loaded`` only means the
+    gateway's CONTAINER was created (``containers.start()`` returned),
+    not that its own FastAPI app has finished booting and is listening yet
+    — confirmed live, this call raced a just-created gateway container and
+    silently connection-refused on the first attempt during the SAME
+    reconcile pass that just installed it."""
     if not runtime.is_loaded("mcp-gateway"):
         return
-    try:
-        import httpx
-        base_url = runtime.containers.base_url("mcp-gateway")
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(f"{base_url}/reload",
-                                     headers={"X-AW-Identity-Sub": "aw-workspace"})
-            resp.raise_for_status()
-        log.info("apps: mcp-gateway reload triggered — %s", resp.json())
-    except Exception:
-        log.exception("apps: failed to trigger mcp-gateway /reload")
+    import asyncio
+
+    import httpx
+    base_url = runtime.containers.base_url("mcp-gateway")
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(f"{base_url}/reload",
+                                         headers={"X-AW-Identity-Sub": "aw-workspace"})
+                resp.raise_for_status()
+            log.info("apps: mcp-gateway reload triggered — %s", resp.json())
+            return
+        except Exception:
+            if attempt < attempts:
+                await asyncio.sleep(1.0 * attempt)
+            else:
+                log.exception("apps: failed to trigger mcp-gateway /reload after %d attempts", attempts)
 
 
 def register_apps_routes(app: FastAPI) -> AppRuntime:
