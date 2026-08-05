@@ -37,11 +37,13 @@ def _sign(private_pem: bytes, **claims) -> str:
     return pyjwt.encode(payload, private_pem, algorithm="EdDSA")
 
 
-def _fake_request(token: str | None = None) -> Request:
+def _fake_request(token: str | None = None, *, extra_headers: dict[str, str] | None = None) -> Request:
     headers = []
     cookie = f"{identity_mod.COOKIE_NAME}={token}".encode() if token else b""
     if cookie:
         headers.append((b"cookie", cookie))
+    for k, v in (extra_headers or {}).items():
+        headers.append((k.lower().encode(), v.encode()))
     scope = {
         "type": "http",
         "headers": headers,
@@ -141,3 +143,25 @@ class TestRequireIdentityDependency:
 
         claims = asyncio.run(identity_mod.require_identity(_fake_request(token), authorization=""))
         assert claims["sub"] == "1"
+
+
+class TestRequireIdentityWithWorkspaceApiKey:
+    """A valid X-Api-Key header authenticates framework routes the same way
+    a JWT does — a second, independent path alongside _local_cli_authorized."""
+
+    def test_valid_api_key_is_accepted(self, monkeypatch):
+        import src.api.workspace_api_key as api_key_mod
+        monkeypatch.setattr(api_key_mod, "verify_workspace_api_key", lambda presented: presented == "good-key")
+
+        req = _fake_request(extra_headers={api_key_mod.HEADER_NAME: "good-key"})
+        claims = asyncio.run(identity_mod.require_identity(req, authorization=""))
+        assert claims == {"sub": "workspace-api-key", "api_key": True}
+
+    def test_invalid_api_key_falls_through_to_401(self, monkeypatch):
+        import src.api.workspace_api_key as api_key_mod
+        monkeypatch.setattr(api_key_mod, "verify_workspace_api_key", lambda presented: presented == "good-key")
+
+        req = _fake_request(extra_headers={api_key_mod.HEADER_NAME: "wrong-key"})
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(identity_mod.require_identity(req, authorization=""))
+        assert exc_info.value.status_code == 401

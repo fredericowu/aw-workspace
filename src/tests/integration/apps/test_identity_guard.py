@@ -205,3 +205,24 @@ def test_local_paths_bypass_does_not_apply_to_non_loopback_callers(local_bypass_
     # — the escape hatch is for in-workspace callers only.
     client = TestClient(local_bypass_app, client=("10.0.0.5", 12345))
     assert client.post("/api/apps/guarded/eval").status_code == 401
+
+
+def test_valid_workspace_api_key_authenticates_app_routes(guarded_app, monkeypatch):
+    # A workspace API key lets an external app/MCP call ANY installed app's
+    # routes without a browser-issued JWT — same guard, second credential.
+    import src.api.workspace_api_key as api_key_mod
+    monkeypatch.setattr(api_key_mod, "verify_workspace_api_key", lambda presented: presented == "the-real-key")
+
+    client = TestClient(guarded_app)
+    r = client.get("/api/apps/guarded/whoami", headers={api_key_mod.HEADER_NAME: "the-real-key"})
+    assert r.status_code == 200
+    assert r.json() == {"aw_identity": {"sub": "workspace-api-key", "api_key": True}}
+
+
+def test_wrong_workspace_api_key_is_401ed(guarded_app, monkeypatch):
+    import src.api.workspace_api_key as api_key_mod
+    monkeypatch.setattr(api_key_mod, "verify_workspace_api_key", lambda presented: presented == "the-real-key")
+
+    client = TestClient(guarded_app)
+    r = client.get("/api/apps/guarded/", headers={api_key_mod.HEADER_NAME: "wrong-key"})
+    assert r.status_code == 401

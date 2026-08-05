@@ -96,10 +96,23 @@ def _local_cli_authorized(request: Request) -> bool:
     return bool(presented) and presented == get_or_create_cli_token()
 
 
+def _workspace_api_key_authorized(request: Request) -> bool:
+    """True if the request carries a valid workspace-wide API key (see
+    ``src.api.workspace_api_key``) — lets another app/MCP call framework
+    routes the same way ``_default_verify_http`` lets it call app routes."""
+    from src.api.workspace_api_key import HEADER_NAME, verify_workspace_api_key
+
+    presented = request.headers.get(HEADER_NAME, "")
+    return verify_workspace_api_key(presented)
+
+
 async def require_identity(request: Request, authorization: str = Header(default="")) -> dict:
     """FastAPI dependency — returns the verified JWT claims dict or 401s."""
     if _local_cli_authorized(request):
         return {"sub": "local-cli", "local_cli": True}
+
+    if _workspace_api_key_authorized(request):
+        return {"sub": "workspace-api-key", "api_key": True}
 
     token = _extract_token(request, authorization)
     if not token:

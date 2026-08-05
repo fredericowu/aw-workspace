@@ -77,9 +77,17 @@ def _headers_dict(scope: Scope) -> dict[bytes, bytes]:
 
 
 def _default_verify_http(scope: Scope) -> dict | None:
-    """Verify the identity JWT on an HTTP scope (bearer header or apex cookie)."""
+    """Verify the identity JWT on an HTTP scope (bearer header or apex cookie),
+    or the workspace-wide ``X-Api-Key`` header (``src.api.workspace_api_key``)
+    — lets another app/MCP authenticate into ANY installed app's routes with
+    the shared workspace key instead of a browser-issued JWT (first consumer:
+    an external whiteboard MCP process)."""
     from src.api.identity import decode_identity_jwt
+    from src.api.workspace_api_key import HEADER_NAME, verify_workspace_api_key
     headers = _headers_dict(scope)
+    api_key = headers.get(HEADER_NAME.lower().encode(), b"").decode()
+    if api_key and verify_workspace_api_key(api_key):
+        return {"sub": "workspace-api-key", "api_key": True}
     auth = headers.get(b"authorization", b"").decode()
     if auth.lower().startswith("bearer "):
         token = auth[7:].strip()

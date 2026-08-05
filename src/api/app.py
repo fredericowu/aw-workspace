@@ -23,6 +23,10 @@ from src.api.identity import _extract_token, decode_identity_jwt, require_identi
 from src.api.models import Setting
 from src.api.notifications import register_notification_routes
 from src.api.terminal import register_terminal_routes
+from src.api.workspace_api_key import (
+    get_or_create_workspace_api_key,
+    regenerate_workspace_api_key,
+)
 from src.apps.routes import reconcile_on_boot, register_apps_routes
 
 log = logging.getLogger(__name__)
@@ -64,6 +68,10 @@ def create_app() -> FastAPI:
         # Converge the running app set to the cloud registry on startup — a
         # fresh/recreated workspace auto-reinstalls the user's apps (F3).
         await reconcile_on_boot(app)
+        # A freshly-installed/recreated workspace always gets a workspace API
+        # key with zero manual steps — get_or_create is a no-op once one
+        # already exists in the settings table.
+        get_or_create_workspace_api_key()
         yield
 
     app = FastAPI(title="aw-workspace", version="0.1.0", lifespan=lifespan)
@@ -115,6 +123,19 @@ def create_app() -> FastAPI:
             session.add(row)
             session.commit()
         return {"key": key, "value": value, "schema": get_workspace_schema()}
+
+    # Workspace API key (Integrations settings item): a single shared secret
+    # other apps/MCPs present as an X-Api-Key header to authenticate into
+    # this workspace (see src/api/workspace_api_key.py + IdentityGuard's
+    # _default_verify_http). Owner-only (JWT-gated) — the key itself is
+    # only ever handed out over these two identity-gated routes.
+    @app.get("/api/settings/workspace-api-key")
+    async def get_workspace_api_key_route(identity: dict = Depends(require_identity)):
+        return {"key": get_or_create_workspace_api_key()}
+
+    @app.post("/api/settings/workspace-api-key/regenerate")
+    async def regenerate_workspace_api_key_route(identity: dict = Depends(require_identity)):
+        return {"key": regenerate_workspace_api_key()}
 
     # Terminal feature (strangler migration #1): PTY shells on this BYOD host.
     # In-memory session state → must run single-worker (see AW_WORKSPACE_WORKERS
