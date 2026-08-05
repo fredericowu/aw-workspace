@@ -468,7 +468,7 @@ class AppRuntime:
                 skill_id = entry.get("id")
                 if not skill_id:
                     continue
-                dest_path = os.path.join(paths.skills_dir(), f"{slug}__{skill_id}")
+                dest_path = os.path.join(paths.skills_dir(), skill_id)
                 out.append({
                     "app": slug,
                     "id": skill_id,

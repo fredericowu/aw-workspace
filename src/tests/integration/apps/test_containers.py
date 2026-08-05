@@ -301,7 +301,7 @@ def test_runtime_registers_skills_for_a_container_tier_app(tmp_path, monkeypatch
         index = rt.skills_index()
         assert index == [{
             "app": "browser", "id": "how-to", "description": "",
-            "skill_md_path": os.path.join(paths.skills_dir(), "browser__how-to", "SKILL.md"),
+            "skill_md_path": os.path.join(paths.skills_dir(), "how-to", "SKILL.md"),
             "registered": True,
         }]
 
@@ -309,7 +309,7 @@ def test_runtime_registers_skills_for_a_container_tier_app(tmp_path, monkeypatch
         assert ("skill:register", "how-to") in kinds
 
         await rt.unload("browser")
-        assert not os.path.isdir(os.path.join(paths.skills_dir(), "browser__how-to"))
+        assert not os.path.isdir(os.path.join(paths.skills_dir(), "how-to"))
 
     _async(run())
 

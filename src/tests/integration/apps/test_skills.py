@@ -71,7 +71,7 @@ def test_app_with_skill_gets_registered_on_load(tmp_path, monkeypatch):
         rt = AppRuntime(FastAPI(), journal=ActionJournal())
         await rt.load(pkg)
 
-        dest_path = os.path.join(paths.skills_dir(), "notes__how-to")
+        dest_path = os.path.join(paths.skills_dir(), "how-to")
         assert os.path.isdir(dest_path)
         assert not os.path.islink(dest_path)
         assert os.path.isfile(os.path.join(dest_path, "SKILL.md"))
@@ -108,7 +108,7 @@ def test_reregister_does_not_clobber_a_users_live_edit(tmp_path, monkeypatch):
         rt1 = AppRuntime(FastAPI(), journal=ActionJournal())
         await rt1.load(pkg)
 
-        dest_path = os.path.join(paths.skills_dir(), "notes__how-to")
+        dest_path = os.path.join(paths.skills_dir(), "how-to")
         skill_md = os.path.join(dest_path, "SKILL.md")
         with open(skill_md, "a") as f:
             f.write("\nUser's own note, added after install.\n")
@@ -138,5 +138,34 @@ def test_app_without_skills_is_a_noop(tmp_path, monkeypatch):
         assert [e for e in rt.journal.entries_for("plain") if e.kind == "skill:register"] == []
 
         await rt.unload("plain")
+
+    _async(run())
+
+
+def test_two_apps_with_the_same_skill_id_collide_instead_of_clobbering(tmp_path, monkeypatch):
+    """Skill ids are unprefixed at the destination now (no more <app>__<id>),
+    so two apps declaring the same id land at the same path. The second
+    app's load must fail loudly (and non-fatally for the rest of that app's
+    load — same posture as any other bad skills entry) rather than silently
+    overwriting the first app's copy or silently pretending to succeed."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
+    pkg_a = _write_app(tmp_path, "notes", with_skill=True)
+    pkg_b = _write_app(tmp_path, "other", with_skill=True)
+
+    async def run():
+        rt = AppRuntime(FastAPI(), journal=ActionJournal())
+        await rt.load(pkg_a)
+        await rt.load(pkg_b)
+
+        dest_path = os.path.join(paths.skills_dir(), "how-to")
+        assert open(os.path.join(dest_path, ".aw-app-id")).read().strip() == "notes"
+
+        # "other" never actually claimed the shared "how-to" dir — it's
+        # "notes"'s copy, untouched (and never journaled for "other").
+        kinds = [(e.kind, e.target) for e in rt.journal.entries_for("other")]
+        assert ("skill:register", "how-to") not in kinds
+        kinds_notes = [(e.kind, e.target) for e in rt.journal.entries_for("notes")]
+        assert ("skill:register", "how-to") in kinds_notes
 
     _async(run())
