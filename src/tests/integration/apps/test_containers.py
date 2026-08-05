@@ -677,6 +677,59 @@ def test_runtime_mounts_kb_dir_at_top_level_not_namespaced_by_app_id(tmp_path, m
     _async(run())
 
 
+def test_runtime_mounts_workspace_repos_read_only(tmp_path, monkeypatch):
+    container_root = tmp_path / "workspace"
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(container_root))
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage", "fs:workspace-data"],
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_WORKSPACE_REPOS", "target": "/workspace-repos", "mode": "ro"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+
+        await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data"],
+                      signed=True)
+
+        repos_dir = container_root / "repos"
+        assert repos_dir.is_dir()
+        assert fake.run_calls[-1]["volumes"] == {
+            str(repos_dir.resolve()): {"bind": "/workspace-repos", "mode": "ro"}
+        }
+
+    _async(run())
+
+
+def test_runtime_rejects_writable_workspace_repos_volume(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "workspace"))
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage", "fs:workspace-data"],
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_WORKSPACE_REPOS", "target": "/workspace-repos", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+        with pytest.raises(ContainerError, match="read-only"):
+            await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data"],
+                          signed=True)
+
+    _async(run())
+
+
 def test_runtime_app_data_survives_uninstall_and_reinstall(tmp_path, monkeypatch):
     """The whole point of $AW_APP_DATA: unlike a package-relative volume
     (removed wholesale by uninstall's shutil.rmtree of the package dir —

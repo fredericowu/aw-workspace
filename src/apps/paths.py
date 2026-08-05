@@ -69,6 +69,22 @@ def skills_dir() -> str:
     return d
 
 
+def repos_dir() -> str:
+    """Top-level ``repos/`` at the workspace root — where a user/agent working
+    from a workspace terminal clones repos for general dev work (the git
+    app's uncommitted-changes watchdog scans every immediate child of this
+    directory too). Same "workspace root, not durable-state-dir" placement
+    as ``skills_dir()`` — visible from any workspace terminal at
+    ``/opt/aw-workspace/repos``, not tucked away under ``AW_WORKSPACE_HOME``.
+    """
+    root = os.path.realpath(
+        os.environ.get("AW_WORKSPACE_CONTAINER_DIR", DEFAULT_WORKSPACE_CONTAINER_DIR)
+    )
+    d = os.path.join(root, "repos")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def get_or_create_cli_token() -> str:
     """Return the local-CLI shared secret, generating it on first use.
 

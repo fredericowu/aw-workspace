@@ -873,7 +873,14 @@ class AppRuntime:
         ``source`` normally stays inside the installed app package. The special
         source ``$AW_APPS_ROOT`` mounts the installed-apps root read-only so
         infrastructure apps can inspect sibling app packages without declaring
-        arbitrary host paths. ``$AW_MCP_JSON`` mounts ONLY the workspace's root
+        arbitrary host paths. ``$AW_WORKSPACE_REPOS`` similarly mounts
+        ``paths.repos_dir()`` (``/opt/aw-workspace/repos`` — where a workspace
+        terminal clones repos for general dev work) read-only, so an app can
+        read something already checked out there instead of needing its own
+        redundant clone (Frederico, 2026-08-05: "eu quero apontar uma pasta e
+        ele mapear" — kb should be able to map a repo already present in the
+        workspace's own repos/ dir, not be forced through its own git clone).
+        ``$AW_MCP_JSON`` mounts ONLY the workspace's root
         ``.mcp.json`` file (never a wider host path) read-write, so an app that
         is itself an MCP endpoint (today: aw-mcp-gateway) can register its own
         entry there on boot — gated behind the high-risk ``mcp:register-gateway``
@@ -928,6 +935,21 @@ class AppRuntime:
                 # for the bind-mount source the host's podman needs.
                 os.makedirs(apps_root(), exist_ok=True)
                 host_path = self._container_host_bind_path(apps_root())
+                binds[host_path] = {"bind": target, "mode": mode}
+                continue
+            if source == "$AW_WORKSPACE_REPOS":
+                if mode != "ro":
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_WORKSPACE_REPOS volume must be read-only")
+                # paths.repos_dir() — /opt/aw-workspace/repos, where a user/agent
+                # working from a workspace terminal clones repos for general
+                # dev work (git app's watchdog scans it too). Read-only so an
+                # app with a legitimate reason to READ a repo already checked
+                # out here (e.g. kb mapping it without a redundant clone of
+                # its own) can, without being able to touch the user's actual
+                # working checkout.
+                os.makedirs(paths.repos_dir(), exist_ok=True)
+                host_path = self._container_host_bind_path(paths.repos_dir())
                 binds[host_path] = {"bind": target, "mode": mode}
                 continue
             if source == "$AW_MCP_JSON":
