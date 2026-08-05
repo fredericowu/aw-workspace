@@ -43,13 +43,15 @@ def _fake_fetch(repo: str, ref: str = "HEAD", *, slug: str, token=None, dest=Non
     return dest
 
 
-def _make_app_repo(tmp_path, slug="widget", version="1.0.0", dependencies=None):
+def _make_app_repo(tmp_path, slug="widget", version="1.0.0", dependencies=None,
+                    reload_mcp_gateway_on_save=False):
     src = tmp_path / f"src_{slug}_{version}"
     src.mkdir()
     deps_json = ""
     if dependencies:
         import json
         deps_json = ',\n      "dependencies": ' + json.dumps({"apps": dependencies})
+    mcp_json = ',\n      "mcp": {"reload_on_save": true}' if reload_mcp_gateway_on_save else ""
     (src / "aw-app.json").write_text(textwrap.dedent(f"""
     {{
       "manifest_version": 1,
@@ -59,7 +61,7 @@ def _make_app_repo(tmp_path, slug="widget", version="1.0.0", dependencies=None):
       "tier": "inprocess",
       "runtime": {{"entrypoint": "plugin:AppPlugin"}},
       "permissions": ["routes:register"],
-      "contributes": {{"routes": [{{"prefix": "/api/apps/{slug}"}}]}}
+      "contributes": {{"routes": [{{"prefix": "/api/apps/{slug}"}}]{mcp_json}}}
       {deps_json}
     }}
     """))
@@ -364,3 +366,43 @@ def test_reconcile_one_bad_app_does_not_block_others(tmp_path, monkeypatch):
         assert any(e["app_id"] == "broken" for e in result["errors"])
 
     _async(run())
+
+
+def test_install_triggers_mcp_gateway_reload_when_manifest_opts_in(tmp_path, monkeypatch):
+    # An app that self-registers its own mcp.json on activate() (e.g.
+    # aw-app-whiteboard) only gets picked up by an ALREADY-RUNNING
+    # mcp-gateway on its own next reload/restart — install()/update() must
+    # trigger that reload itself, reusing the same reload_on_save flag/hook
+    # config-save already uses.
+    calls = []
+
+    async def fake_reload(runtime):
+        calls.append(runtime)
+
+    monkeypatch.setattr("src.apps.routes._reload_mcp_gateway", fake_reload)
+
+    repo = _make_app_repo(tmp_path, "widget-mcp", reload_mcp_gateway_on_save=True)
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    _async(rc.install(AppSpec(app_id="widget-mcp", repo=repo, ref="main")))
+
+    assert len(calls) == 1
+    assert calls[0] is rt
+
+
+def test_install_does_not_reload_gateway_when_manifest_opts_out(tmp_path, monkeypatch):
+    calls = []
+
+    async def fake_reload(runtime):
+        calls.append(runtime)
+
+    monkeypatch.setattr("src.apps.routes._reload_mcp_gateway", fake_reload)
+
+    repo = _make_app_repo(tmp_path, "widget-plain", reload_mcp_gateway_on_save=False)
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    _async(rc.install(AppSpec(app_id="widget-plain", repo=repo, ref="main")))
+
+    assert calls == []

@@ -338,6 +338,16 @@ class Reconciler:
                 log.exception("apps: install of %s did not reach the cloud registry",
                               manifest.id)
 
+        # An app that self-registers an mcp.json on activate() (e.g.
+        # aw-app-whiteboard) only gets picked up by an ALREADY-RUNNING
+        # mcp-gateway on its own next reload/restart — mcp-gateway's own
+        # boot-time scan can't see a file that doesn't exist yet if this app
+        # gets installed/updated afterward. Deferred import: routes.py
+        # imports FROM this module, so a top-level import here would cycle.
+        if loaded is not None and loaded.manifest.reload_mcp_gateway_on_save:
+            from src.apps.routes import _reload_mcp_gateway
+            await _reload_mcp_gateway(self.runtime)
+
         return {"app_id": manifest.id, "version": spec.version,
                 "granted_permissions": effective, "package_dir": package_dir,
                 "dependencies_installed": deps_installed}
