@@ -1,0 +1,35 @@
+# The Dockerfile's `COPY . /opt/aw-workspace` has no filter of its own —
+# without this file, ANY stray path sitting in the build context (e.g. a
+# self-hosted CI runner's own checkout dir) gets baked into the image
+# verbatim, .gitignore or not (.dockerignore is the only thing `docker
+# build`/`podman build` actually consult).
+#
+# CLI credential dirs/files are the ones that mattered in practice: a
+# `.claude`/`.codex`/etc left in a build runner's checkout got baked into
+# an image, and every `aw-remote-host` workspace `Update()` then synced
+# that baked (mostly-empty, dev-time) copy over
+# /opt/aw-workspace/.claude — the exact path aw-app-agents-platform-runners'
+# execute.py uses as the shared, persisted source it resyncs Workspace
+# Runner CLI logins from before every spawn — silently wiping live
+# credentials on every workspace update. See internal/ops/ops.go's
+# syncWorkspaceSource in aw-remote-host for the matching belt-and-braces
+# skip (this file prevents the bad image from ever being built in the
+# first place; that skip protects hosts already running an old image that
+# has one baked in).
+.claude/
+.claude.json
+.codex/
+.copilot/
+.cursor/
+
+.git/
+.github/
+.pytest_cache/
+__pycache__/
+*.pyc
+.env
+.venv/
+.coverage
+coverage.xml
+htmlcov/
+coverage/
