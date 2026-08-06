@@ -32,7 +32,21 @@ RUN groupadd -g 1001 ubuntu && useradd -u 1001 -g 1001 -m -s /bin/bash ubuntu \
 WORKDIR /opt/aw-workspace
 
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# Installed into a venv under the host-bind-mounted tree (not the system
+# site-packages) so this workspace's own process AND every sibling CLI-agent
+# runner container (aw-app-agents-platform-runners' execute.py, which mounts
+# this same tree read-write into a DIFFERENT base image) can resolve the same
+# packages via one shared location instead of drifting. Frederico decision
+# 2026-08-05: cross-image binary sharing (the venv's own interpreter, any
+# compiled C-extension wheel like psycopg[binary]/cryptography) is NOT safe
+# across different base images/distros — only PYTHONPATH-import a venv's
+# site-packages from a sibling, never its bin/python. See execute.py's own
+# comment at the PYTHONPATH assignment for the runner side of this.
+RUN python3 -m venv /opt/aw-workspace/.aw-workspace/venv \
+    && /opt/aw-workspace/.aw-workspace/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
+    && sha256sum /tmp/requirements.txt | awk '{print $1}' \
+       > /opt/aw-workspace/.aw-workspace/venv/.requirements.sha256
 
 # Full checkout (including .git — see the `fetch-depth: 0` checkout in
 # build-image.yml) baked into the image so a first-boot host seed (see
@@ -73,7 +87,12 @@ ENV AW_PORT=9030 \
 # putting the repo root itself on PATH is what makes the bare
 # `aw-workspace-cli` form work on PATH from any cwd/shell (including agent
 # sessions), no bin/ dir or symlink needed.
-ENV PATH="/opt/aw-workspace:/opt/aw-workspace/.aw-workspace/bin:${PATH}"
+#
+# venv/bin goes FIRST: `python`/`pip` (and aw-workspace-cli's own
+# `#!/usr/bin/env python3` shebang) resolve to the venv here, inside THIS
+# image only — never prepend this to PATH in a different base image/container
+# (see the venv RUN step's comment above).
+ENV PATH="/opt/aw-workspace/.aw-workspace/venv/bin:/opt/aw-workspace:/opt/aw-workspace/.aw-workspace/bin:${PATH}"
 
 EXPOSE 9030
 
