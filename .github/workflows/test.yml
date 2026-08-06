@@ -16,15 +16,20 @@ jobs:
       # (e.g. fastapi==0.135.2). build-image.yml sidesteps this by building
       # everything inside a container; do the same here instead of trying
       # to get a modern Python installed on the bare host.
-      - name: Configure Podman on macbook-fred runner
+      - name: Select container engine (Podman on macbook-fred, Docker on bare-metal)
         run: |
-          PODMAN=/Users/aw/podman-dist/podman/bin/podman
-          if [ ! -x "$PODMAN" ]; then
-            echo "::error::Podman not found at $PODMAN"
+          MAC_PODMAN=/Users/aw/podman-dist/podman/bin/podman
+          if [ -x "$MAC_PODMAN" ]; then
+            "$MAC_PODMAN" machine start >/dev/null 2>&1 || true
+            echo "PODMAN=$MAC_PODMAN" >> "$GITHUB_ENV"
+          elif command -v podman >/dev/null 2>&1; then
+            echo "PODMAN=podman" >> "$GITHUB_ENV"
+          elif command -v docker >/dev/null 2>&1; then
+            echo "PODMAN=docker" >> "$GITHUB_ENV"
+          else
+            echo "::error::No container engine (podman/docker) found on this runner"
             exit 1
           fi
-          "$PODMAN" machine start >/dev/null 2>&1 || true
-          echo "PODMAN=$PODMAN" >> "$GITHUB_ENV"
 
       - name: Test suite (in a python:3.12-slim container)
         run: |

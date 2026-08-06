@@ -35,20 +35,33 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Configure Podman on macbook-fred runner
+      - name: Select container engine (Podman on macbook-fred, Docker on bare-metal)
         run: |
-          PODMAN=/Users/aw/podman-dist/podman/bin/podman
-          if [ ! -x "$PODMAN" ]; then
-            echo "::error::Podman not found at $PODMAN"
+          MAC_PODMAN=/Users/aw/podman-dist/podman/bin/podman
+          if [ -x "$MAC_PODMAN" ]; then
+            "$MAC_PODMAN" machine start >/dev/null 2>&1 || true
+            echo "ENGINE=podman" >> "$GITHUB_ENV"
+            echo "PODMAN=$MAC_PODMAN" >> "$GITHUB_ENV"
+            echo "/usr/local/bin" >> "$GITHUB_PATH"
+            echo "/Users/aw/podman-dist/podman/bin" >> "$GITHUB_PATH"
+          elif command -v docker >/dev/null 2>&1; then
+            echo "ENGINE=docker" >> "$GITHUB_ENV"
+          else
+            echo "::error::No container engine (podman/docker) found on this runner"
             exit 1
           fi
-          "$PODMAN" machine start >/dev/null 2>&1 || true
-          echo "PODMAN=$PODMAN" >> "$GITHUB_ENV"
-          echo "/usr/local/bin" >> "$GITHUB_PATH"
-          echo "/Users/aw/podman-dist/podman/bin" >> "$GITHUB_PATH"
+
+      - name: Set up Docker buildx (bare-metal only)
+        if: env.ENGINE == 'docker'
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | "$PODMAN" login ghcr.io -u "${{ github.actor }}" --password-stdin
+        run: |
+          if [ "$ENGINE" = "podman" ]; then
+            echo "${{ secrets.GITHUB_TOKEN }}" | "$PODMAN" login ghcr.io -u "${{ github.actor }}" --password-stdin
+          else
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          fi
 
       # ghcr.io rejects mixed-case namespaces — lowercase the owner login.
       - name: Lowercase repo owner
@@ -96,29 +109,40 @@ jobs:
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/${OWNER_LC}/aw-workspace"
-          MANIFEST="localhost/aw-workspace:${VERSION}"
 
-          "$PODMAN" manifest rm "$MANIFEST" >/dev/null 2>&1 || true
-          "$PODMAN" manifest create "$MANIFEST"
+          if [ "$ENGINE" = "podman" ]; then
+            MANIFEST="localhost/aw-workspace:${VERSION}"
+            "$PODMAN" manifest rm "$MANIFEST" >/dev/null 2>&1 || true
+            "$PODMAN" manifest create "$MANIFEST"
 
-          for platform in linux/amd64 linux/arm64; do
-            echo "==> Building $platform"
-            "$PODMAN" build \
+            for platform in linux/amd64 linux/arm64; do
+              echo "==> Building $platform"
+              "$PODMAN" build \
+                --pull \
+                --platform "$platform" \
+                --manifest "$MANIFEST" \
+                --build-arg "AW_WORKSPACE_VERSION=${VERSION}" \
+                .
+            done
+
+            echo "==> Pushing ${IMAGE}:${VERSION}"
+            "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:${VERSION}"
+            echo "==> Pushing ${IMAGE}:latest"
+            "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:latest"
+            echo "==> Pushing ${IMAGE}:${{ github.sha }}"
+            "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:${{ github.sha }}"
+          else
+            echo "==> Building + pushing linux/amd64,linux/arm64 via buildx"
+            docker buildx build \
               --pull \
-              --platform "$platform" \
-              --manifest "$MANIFEST" \
+              --platform linux/amd64,linux/arm64 \
               --build-arg "AW_WORKSPACE_VERSION=${VERSION}" \
+              -t "${IMAGE}:${VERSION}" \
+              -t "${IMAGE}:latest" \
+              -t "${IMAGE}:${{ github.sha }}" \
+              --push \
               .
-          done
-
-          echo "==> Pushing ${IMAGE}:${VERSION}"
-          "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:${VERSION}"
-
-          echo "==> Pushing ${IMAGE}:latest"
-          "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:latest"
-
-          echo "==> Pushing ${IMAGE}:${{ github.sha }}"
-          "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:${{ github.sha }}"
+          fi
 
       - name: Tag release commit
         env:
