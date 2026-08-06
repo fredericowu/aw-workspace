@@ -406,3 +406,49 @@ def test_install_does_not_reload_gateway_when_manifest_opts_out(tmp_path, monkey
     _async(rc.install(AppSpec(app_id="widget-plain", repo=repo, ref="main")))
 
     assert calls == []
+
+
+def test_install_does_not_block_the_event_loop_during_fetch(tmp_path, monkeypatch):
+    """Regression (reported live 2026-08-06, Frederico) — measured a real
+    ~15s stall of an UNRELATED /api/health call while ``reconcile()`` was
+    mid-fetch for an app upgrade. ``fetch_app_repo`` (synchronous
+    httpx.stream + tarfile download/extract) was called directly from
+    ``Reconciler.install()``'s async body with no ``asyncio.to_thread`` —
+    fixed by offloading the fetch (and the cloud-registry writes/removes)
+    to a thread, same pattern as the containers.py fix from the day before."""
+    import time
+
+    repo = _make_app_repo(tmp_path)
+    cloud = FakeCloud()
+    PULL_DELAY = 0.3
+    TICK_TOTAL = 0.2
+
+    def slow_fetch(*args, **kwargs):
+        time.sleep(PULL_DELAY)
+        return _fake_fetch(*args, **kwargs)
+
+    monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path / "apps"))
+    host = FastAPI()
+    rt = AppRuntime(host, guard_identity=False)
+    rc = Reconciler(rt, cloud=cloud, local=FakeMirror(), fetch=slow_fetch)
+
+    async def run():
+        async def other_work():
+            for _ in range(4):
+                await asyncio.sleep(0.05)
+
+        start = time.monotonic()
+        install_task = asyncio.create_task(
+            rc.install(AppSpec(app_id="widget", repo=repo, ref="main")))
+        other_task = asyncio.create_task(other_work())
+        await asyncio.gather(install_task, other_task)
+        elapsed = time.monotonic() - start
+
+        assert rt.is_loaded("widget")
+        assert elapsed < 0.4, (
+            f"install() took {elapsed:.3f}s alongside other_work — event loop "
+            f"was blocked (expected ~{max(PULL_DELAY, TICK_TOTAL)}s if truly "
+            f"concurrent, ~{PULL_DELAY + TICK_TOTAL}s if serialized)"
+        )
+
+    _async(run())

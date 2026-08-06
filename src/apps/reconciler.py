@@ -24,6 +24,7 @@ workspace's ``AppInstall`` PG mirror.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
@@ -306,7 +307,14 @@ class Reconciler:
     async def install(self, spec: AppSpec, *, write_cloud: bool = True,
                       _dependency_stack: tuple[str, ...] = ()) -> dict[str, Any]:
         """Fetch → validate → enforce → hot-load → persist. Returns a summary."""
-        package_dir = self._resolve_package_dir(spec)
+        # _resolve_package_dir does a synchronous tarball download + extract
+        # (fetch.fetch_app_repo, httpx.stream + tarfile) when spec.repo is set
+        # — offloaded to a thread so a reconcile pass fetching/upgrading an
+        # app's code doesn't freeze the whole workspace's single asyncio
+        # event loop for the length of that HTTP download. Reported live
+        # 2026-08-06 (measured a ~15s stall of an unrelated /api/health call
+        # during a two-app upgrade reconcile).
+        package_dir = await asyncio.to_thread(self._resolve_package_dir, spec)
         manifest = load_manifest(package_dir)
         if spec.app_id and manifest.id != spec.app_id:
             raise ValueError(
@@ -330,7 +338,8 @@ class Reconciler:
         self.local.upsert(spec, package_dir)
         if write_cloud and self.cloud.configured:
             try:
-                self.cloud.put_desired(
+                await asyncio.to_thread(
+                    self.cloud.put_desired,
                     manifest.id, version=spec.version, repo=spec.repo, ref=spec.ref,
                     granted_permissions=effective, config=spec.config,
                     signed=spec.signed)
@@ -358,10 +367,10 @@ class Reconciler:
         if self.runtime.is_loaded(app_id):
             await self.runtime.unload(app_id)
         self.local.forget(app_id)
-        removed_repo = self._remove(app_id) if remove_repo else False
+        removed_repo = await asyncio.to_thread(self._remove, app_id) if remove_repo else False
         if write_cloud and self.cloud.configured:
             try:
-                self.cloud.delete_desired(app_id)
+                await asyncio.to_thread(self.cloud.delete_desired, app_id)
             except Exception:
                 log.exception("apps: uninstall of %s did not reach the cloud registry",
                               app_id)
@@ -377,7 +386,7 @@ class Reconciler:
         if desired is None:
             if self.cloud.configured:
                 try:
-                    desired = self.cloud.list_desired()
+                    desired = await asyncio.to_thread(self.cloud.list_desired)
                     source = "cloud"
                 except Exception:
                     log.exception("apps: reconcile could not read the cloud registry; "
