@@ -654,7 +654,7 @@ class AppRuntime:
         #    not block the rest; the route Mount was already removed above.
         for entry in self.journal.reverse_for(slug):
             try:
-                self._revert_entry(entry, loaded)
+                await self._revert_entry(entry, loaded)
             except Exception:
                 log.exception("apps: revert of %s %s failed for %s",
                               entry.kind, entry.target, slug)
@@ -673,13 +673,23 @@ class AppRuntime:
         del self._apps[slug]
         log.info("apps: unloaded %s", slug)
 
-    def _revert_entry(self, entry: Any, loaded: LoadedApp) -> None:
-        """Reverse a single journaled side effect (uninstall replay, F4)."""
+    async def _revert_entry(self, entry: Any, loaded: LoadedApp) -> None:
+        """Reverse a single journaled side effect (uninstall replay, F4).
+
+        reconcile()'s upgrade path is uninstall+install for a plain version
+        bump (see the db:table comment below), so this runs on EVERY routine
+        app update, not just a real uninstall. ``services.stop_all_for``
+        (subprocess wait), ``containers.stop_all_for`` (docker/podman API),
+        and ``commands.run_revert`` (subprocess) all do blocking I/O — each
+        offloaded to a thread so an app update can't freeze the whole
+        workspace's single asyncio event loop (every other request/WS/
+        terminal) for however long that takes. Reported live 2026-08-05.
+        """
         kind = entry.kind
         if kind == "command:install":
             self.commands.remove_shim(entry.payload.get("bin_path", ""))
         elif kind == "system_cli:revert-hook":
-            self.commands.run_revert(loaded.package_dir, entry.target)
+            await asyncio.to_thread(self.commands.run_revert, loaded.package_dir, entry.target)
         elif kind == "db:table":
             # Deliberately NOT dropped (2026-08-04 decision — see db_tables.py's
             # module docstring): reconcile()'s upgrade path is uninstall+install
@@ -690,9 +700,9 @@ class AppRuntime:
             # (src/apps/migrations.py), not an unload-time drop.
             pass
         elif kind == "service:register":
-            self.services.stop_all_for(loaded.manifest.id)
+            await asyncio.to_thread(self.services.stop_all_for, loaded.manifest.id)
         elif kind == "container:register":
-            self.containers.stop_all_for(loaded.manifest.id)
+            await asyncio.to_thread(self.containers.stop_all_for, loaded.manifest.id)
         elif kind == "watchdog:register":
             # Idempotent with the explicit cancel_all_for in unload() above.
             self.watchdog.cancel_all_for(loaded.manifest.id)
@@ -814,7 +824,11 @@ class AppRuntime:
                             {"port": port, "run_flags": run_flags, "resources": resources})
         try:
             if config.get("auto_start", True):
-                self.containers.start(slug)
+                # Blocking docker/podman API call (image pull + container run) —
+                # offloaded to a thread so it can't freeze the workspace's single
+                # asyncio event loop (every other request/WS/terminal) for
+                # however long the pull takes. Reported live 2026-08-05.
+                await asyncio.to_thread(self.containers.start, slug)
             proxy = ContainerReverseProxy(self.containers.base_url(slug))
             self._attach_mount(loaded, proxy)
         except Exception:
@@ -824,7 +838,7 @@ class AppRuntime:
                 self.host.router.routes.remove(loaded.mount)
             if loaded.host_mount is not None and loaded.host_mount in self.host.router.routes:
                 self.host.router.routes.remove(loaded.host_mount)
-            self.containers.stop_all_for(slug)
+            await asyncio.to_thread(self.containers.stop_all_for, slug)
             self.journal.clear_app(slug)
             raise
 

@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import textwrap
+import time
 
 import pytest
 from docker.errors import ImageNotFound, NotFound
@@ -68,9 +69,13 @@ class _FakeContainers:
 
 
 class _FakeImages:
-    def __init__(self, present: bool = True) -> None:
+    def __init__(self, present: bool = True, pull_delay: float = 0.0) -> None:
         self.present = present
         self.pulled: list[str] = []
+        # A real blocking sleep (not asyncio.sleep) — simulates docker-py's
+        # actual synchronous network I/O for the event-loop-blocking regression
+        # test below. 0 by default so every other test is unaffected.
+        self.pull_delay = pull_delay
 
     def get(self, image: str):
         if not self.present:
@@ -78,16 +83,18 @@ class _FakeImages:
         return object()
 
     def pull(self, image: str) -> None:
+        if self.pull_delay:
+            time.sleep(self.pull_delay)
         self.pulled.append(image)
         self.present = True
 
 
 class _FakeDocker:
-    def __init__(self, image_present: bool = True) -> None:
+    def __init__(self, image_present: bool = True, pull_delay: float = 0.0) -> None:
         self.store: dict = {}
         self.run_calls: list = []
         self.containers = _FakeContainers(self.store, self.run_calls)
-        self.images = _FakeImages(image_present)
+        self.images = _FakeImages(image_present, pull_delay=pull_delay)
 
 
 # ---- supervisor -------------------------------------------------------------
@@ -291,6 +298,51 @@ def test_runtime_loads_container_app_and_reverts_on_unload(tmp_path):
         assert rt.journal.entries_for("browser") == []
         assert not [r for r in rt.host.router.routes
                     if isinstance(r, Mount) and r.path == "/api/apps/browser"]
+
+    _async(run())
+
+
+def test_load_container_app_does_not_block_the_event_loop(tmp_path):
+    """Regression (reported live 2026-08-05, Frederico): installing/updating
+    a Tier-2 (container) app used to call the synchronous docker-py client
+    (image pull + container run) directly from async code — since asyncio is
+    single-threaded, that blocking call froze the ENTIRE workspace (every
+    other request/WS/terminal) for as long as the pull took, not just the
+    one app's own install. Fixed by offloading to a thread
+    (asyncio.to_thread); this proves a concurrent task can make progress
+    DURING a slow "pull" instead of waiting for it to finish first.
+    """
+    pkg = _write_container_app(tmp_path)
+    PULL_DELAY = 0.3
+    TICK_TOTAL = 0.2  # 4 ticks * 50ms
+
+    async def run():
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(
+            socket="/dev/null", client=_FakeDocker(image_present=False, pull_delay=PULL_DELAY))
+
+        async def other_work():
+            for _ in range(4):
+                await asyncio.sleep(0.05)
+
+        start = time.monotonic()
+        load_task = asyncio.create_task(rt.load(pkg, granted_permissions=["containers:manage"], signed=True))
+        other_task = asyncio.create_task(other_work())
+        await asyncio.gather(load_task, other_task)
+        elapsed = time.monotonic() - start
+
+        assert rt.is_loaded("browser")
+        # Concurrent (fixed): wall time ~= max(PULL_DELAY, TICK_TOTAL) = 0.3s —
+        # other_work overlaps the "pull" instead of waiting for it to finish
+        # first. Blocking (the bug): wall time ~= PULL_DELAY + TICK_TOTAL =
+        # 0.5s, since the sync pull call hogs the only event loop thread and
+        # other_work's asyncio.sleep ticks can't even get scheduled until it
+        # returns. The midpoint (0.4s) cleanly separates the two.
+        assert elapsed < 0.4, (
+            f"load() took {elapsed:.3f}s alongside other_work — event loop was "
+            f"blocked (expected ~{max(PULL_DELAY, TICK_TOTAL)}s if truly concurrent, "
+            f"~{PULL_DELAY + TICK_TOTAL}s if serialized)"
+        )
 
     _async(run())
 
