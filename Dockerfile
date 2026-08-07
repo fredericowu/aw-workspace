@@ -104,4 +104,10 @@ HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
 # inherits it. Must come last: everything above needs root (apt-get, chown).
 USER ubuntu
 
-CMD ["python", "-m", "src.start.workspace"]
+# Boot under the image's BASE interpreter via an ABSOLUTE path (bypasses the
+# venv-first PATH above on purpose): PID 1 must start even when the persistent
+# mount's venv is missing or its bin/python is a dangling symlink, so
+# src.start.workspace can (re)build the venv on the mount and only THEN
+# os.execv into it (_reexec_into_venv). Using bare `python` here would exec the
+# venv's interpreter and deadlock boot whenever that venv is absent/broken.
+CMD ["/usr/local/bin/python3", "-m", "src.start.workspace"]
