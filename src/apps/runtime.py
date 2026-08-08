@@ -97,19 +97,33 @@ def _default_verify_http(scope: Scope) -> dict | None:
 
 
 def _default_verify_ws(scope: Scope) -> dict | None:
-    """Verify the identity JWT on a WebSocket handshake (``?token=`` then cookie).
+    """Verify a WebSocket handshake: workspace ``X-Api-Key`` header, then the
+    identity JWT (``?token=`` query param, then the apex ``aw_id_jwt`` cookie).
 
-    A browser cannot set custom headers on a WS, so the token comes from the
-    query param first, then the apex ``aw_id_jwt`` cookie — same order as
-    ``src.api.identity.authorize_ws``.
+    A JS ``new WebSocket()`` in a real browser tab can't set custom headers,
+    so a human's session always resolves via the query-param/cookie path
+    (same order as ``src.api.identity.authorize_ws``) — this mirrors
+    ``_default_verify_http``'s API-key check for the same reason that one
+    exists: a non-browser caller (this workspace's own CLI, an external MCP,
+    a CDP-driven automation tool that CAN set upgrade-request headers) needs
+    a way in that isn't a browser-issued JWT. Confirmed missing live
+    2026-08-08: a Tier-2 app's WebSocket-dependent UI (aw-app-code-server's
+    extension host connections) hung/timed out under a Playwright session
+    authenticated only via ``X-Api-Key`` — every one of its WS handshakes
+    was silently 4401ing since this function never looked at the header the
+    HTTP requests in the very same session were already passing.
     """
     from urllib.parse import parse_qs
 
     from src.api.identity import decode_identity_jwt
+    from src.api.workspace_api_key import HEADER_NAME, verify_workspace_api_key
+    headers = _headers_dict(scope)
+    api_key = headers.get(HEADER_NAME.lower().encode(), b"").decode()
+    if api_key and verify_workspace_api_key(api_key):
+        return {"sub": "workspace-api-key", "api_key": True}
     qs = parse_qs(scope.get("query_string", b"").decode())
     token = (qs.get("token") or [""])[0]
     if not token:
-        headers = _headers_dict(scope)
         token = _cookie_value(headers.get(b"cookie", b"").decode(), _ID_COOKIE)
     return decode_identity_jwt(token) if token else None
 

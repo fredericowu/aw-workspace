@@ -83,6 +83,44 @@ def test_http_forwarding_adds_verified_identity_headers(monkeypatch):
     assert r.json() == {"sub": "verified-user", "email": "user@example.test"}
 
 
+def test_http_forwarding_strips_stale_content_encoding(monkeypatch):
+    # Upstream serves a real gzip-compressed body (like code-server's HTML).
+    # httpx auto-decompresses before we ever see resp.content, so forwarding
+    # the upstream's own content-encoding/content-length verbatim would tell
+    # the downstream client "this body is still gzipped" when it isn't —
+    # confirmed live against aw-app-code-server (page rendered as mojibake).
+    import gzip
+
+    from starlette.responses import Response
+
+    body = b"<html>hello world</html>" * 50
+
+    async def gzipped(request):
+        return Response(
+            content=gzip.compress(body),
+            media_type="text/html",
+            headers={"content-encoding": "gzip"},
+        )
+
+    upstream = Starlette(routes=[Route("/{p:path}", gzipped, methods=["GET"])])
+    orig_init = httpx.AsyncClient.__init__
+
+    def patched_init(self, *args, **kwargs):
+        kwargs["transport"] = httpx.ASGITransport(app=upstream)
+        orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", patched_init)
+
+    proxy = ContainerReverseProxy("http://upstream")
+    app = Starlette(routes=[Mount("/api/apps/code-server", app=proxy)])
+    client = TestClient(app)
+
+    r = client.get("/api/apps/code-server/")
+    assert r.status_code == 200
+    assert r.content == body
+    assert "content-encoding" not in r.headers
+
+
 def test_http_502_when_upstream_unreachable(monkeypatch):
     async def boom(self, *args, **kwargs):
         raise httpx.ConnectError("refused")

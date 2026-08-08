@@ -25,6 +25,16 @@ _HOP_BY_HOP = {
     b"connection", b"keep-alive", b"proxy-authenticate", b"proxy-authorization",
     b"te", b"trailers", b"transfer-encoding", b"upgrade", b"host",
 }
+# httpx transparently gunzips (or br/deflate-decodes) a compressed upstream
+# response before we ever see `resp.content` — so forwarding the upstream's
+# own `content-encoding`/`content-length` headers verbatim lies to the
+# downstream browser: it receives PLAIN bytes labeled as compressed (and at
+# the wrong length), tries to gunzip already-decompressed data, and renders
+# garbage. Confirmed live 2026-08-08 against aw-app-code-server (code-server
+# gzips its index.html) — the page loaded (200) but rendered as mojibake.
+# Dropping both lets Starlette/uvicorn recompute a correct content-length
+# for the actual (decompressed) body we send.
+_RESPONSE_HEADERS_TO_STRIP = _HOP_BY_HOP | {b"content-encoding", b"content-length"}
 _INTERNAL_HEADERS = {
     b"x-aw-identity-sub",
     b"x-aw-identity-email",
@@ -87,7 +97,7 @@ class ContainerReverseProxy:
 
         out_headers = [(k.encode("latin-1"), v.encode("latin-1"))
                        for k, v in resp.headers.items()
-                       if k.lower().encode() not in _HOP_BY_HOP]
+                       if k.lower().encode() not in _RESPONSE_HEADERS_TO_STRIP]
         await send({"type": "http.response.start", "status": resp.status_code,
                     "headers": out_headers})
         await send({"type": "http.response.body", "body": resp.content})

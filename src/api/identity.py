@@ -114,15 +114,22 @@ async def require_identity(request: Request, authorization: str = Header(default
 
 
 def authorize_ws(websocket: WebSocket) -> dict | None:
-    """Verify the identity JWT for a WebSocket handshake, returning claims or None.
+    """Verify a WebSocket handshake, returning claims or None.
 
-    A browser cannot set custom headers on a WebSocket, so the token is taken
-    from (in order): the ``?token=`` query param (short-lived, explicit), then
-    the apex ``aw_id_jwt`` cookie (sent automatically to ``api.<ws>.workspace``
-    since the cookie lives on the shared apex domain). Returns the verified
-    claims dict, or ``None`` if no valid token is present — the caller closes
-    the socket. Never raises.
+    Checked in order: the workspace-wide ``X-Api-Key`` header (mirrors
+    ``_workspace_api_key_authorized`` above — a non-browser caller that CAN
+    set upgrade-request headers, e.g. this workspace's own CLI or an
+    automation tool driving a browser over CDP, authenticates the same way
+    it already does for HTTP); then the ``?token=`` query param (short-lived,
+    explicit); then the apex ``aw_id_jwt`` cookie (sent automatically to
+    ``api.<ws>.workspace`` since the cookie lives on the shared apex domain
+    — this is the path a real browser tab's plain ``new WebSocket()`` relies
+    on, since it can't set custom headers). Returns the verified claims
+    dict, or ``None`` if nothing valid is present — the caller closes the
+    socket. Never raises.
     """
+    if _workspace_api_key_authorized(websocket):
+        return {"sub": "workspace-api-key", "api_key": True}
     token = websocket.query_params.get("token") or websocket.cookies.get(COOKIE_NAME, "")
     if not token:
         return None

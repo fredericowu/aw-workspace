@@ -226,3 +226,35 @@ def test_wrong_workspace_api_key_is_401ed(guarded_app, monkeypatch):
     client = TestClient(guarded_app)
     r = client.get("/api/apps/guarded/", headers={api_key_mod.HEADER_NAME: "wrong-key"})
     assert r.status_code == 401
+
+
+def test_ws_with_workspace_api_key_header_is_accepted(guarded_app, monkeypatch):
+    # Mirrors the HTTP workspace-api-key path above — a caller that can set
+    # WS upgrade-request headers (this workspace's own CLI, an external
+    # MCP, a CDP-driven automation tool) authenticates the same way it
+    # already does for HTTP, instead of needing a browser-issued JWT it has
+    # no way to hold. Confirmed missing live 2026-08-08: aw-app-code-server's
+    # WebSocket-dependent UI hung under a Playwright session authenticated
+    # only via X-Api-Key — every WS handshake 4401'd while HTTP calls in the
+    # same session succeeded.
+    import src.api.workspace_api_key as api_key_mod
+    monkeypatch.setattr(api_key_mod, "verify_workspace_api_key", lambda presented: presented == "the-real-key")
+
+    client = TestClient(guarded_app)
+    with client.websocket_connect(
+        "/api/apps/guarded/ws", headers={api_key_mod.HEADER_NAME: "the-real-key"}
+    ) as ws:
+        assert ws.receive_text() == "hello"
+
+
+def test_ws_with_wrong_workspace_api_key_header_closes_4401(guarded_app, monkeypatch):
+    import src.api.workspace_api_key as api_key_mod
+    monkeypatch.setattr(api_key_mod, "verify_workspace_api_key", lambda presented: presented == "the-real-key")
+
+    client = TestClient(guarded_app)
+    with pytest.raises(WebSocketDisconnect) as ei:
+        with client.websocket_connect(
+            "/api/apps/guarded/ws", headers={api_key_mod.HEADER_NAME: "wrong-key"}
+        ) as ws:
+            ws.receive_text()
+    assert ei.value.code == 4401

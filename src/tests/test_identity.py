@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import HTTPException
 from starlette.requests import Request
+from starlette.websockets import WebSocket
 
 from src.api import identity as identity_mod
 
@@ -52,6 +53,23 @@ def _fake_request(token: str | None = None, *, extra_headers: dict[str, str] | N
         "query_string": b"",
     }
     return Request(scope)
+
+
+def _fake_websocket(token: str | None = None, *, query_token: str | None = None,
+                     extra_headers: dict[str, str] | None = None) -> WebSocket:
+    headers = []
+    cookie = f"{identity_mod.COOKIE_NAME}={token}".encode() if token else b""
+    if cookie:
+        headers.append((b"cookie", cookie))
+    for k, v in (extra_headers or {}).items():
+        headers.append((k.lower().encode(), v.encode()))
+    scope = {
+        "type": "websocket",
+        "headers": headers,
+        "path": "/",
+        "query_string": (f"token={query_token}".encode() if query_token else b""),
+    }
+    return WebSocket(scope, receive=None, send=None)
 
 
 class TestDecodeIdentityJwt:
@@ -165,3 +183,51 @@ class TestRequireIdentityWithWorkspaceApiKey:
         with pytest.raises(HTTPException) as exc_info:
             asyncio.run(identity_mod.require_identity(req, authorization=""))
         assert exc_info.value.status_code == 401
+
+
+class TestAuthorizeWs:
+    def test_no_token_returns_none(self, monkeypatch):
+        _private_pem, public_pem = _pem_pair()
+        monkeypatch.setenv("AW_AUTH_PUBLIC_KEY", public_pem)
+
+        assert identity_mod.authorize_ws(_fake_websocket()) is None
+
+    def test_query_token_is_accepted(self, monkeypatch):
+        private_pem, public_pem = _pem_pair()
+        monkeypatch.setenv("AW_AUTH_PUBLIC_KEY", public_pem)
+        token = _sign(private_pem)
+
+        claims = identity_mod.authorize_ws(_fake_websocket(query_token=token))
+        assert claims["sub"] == "1"
+
+    def test_cookie_token_is_accepted(self, monkeypatch):
+        private_pem, public_pem = _pem_pair()
+        monkeypatch.setenv("AW_AUTH_PUBLIC_KEY", public_pem)
+        token = _sign(private_pem)
+
+        claims = identity_mod.authorize_ws(_fake_websocket(token))
+        assert claims["sub"] == "1"
+
+
+class TestAuthorizeWsWithWorkspaceApiKey:
+    """A valid X-Api-Key header authenticates a WebSocket handshake the same
+    way it already does for HTTP — a real browser tab's plain
+    ``new WebSocket()`` can't set custom headers so this only ever matters
+    for a non-browser caller (this workspace's own CLI, an external MCP, a
+    CDP-driven automation tool). Confirmed missing live 2026-08-08: every WS
+    handshake in an X-Api-Key-only session was silently 4401ing while HTTP
+    calls in that same session succeeded."""
+
+    def test_valid_api_key_is_accepted(self, monkeypatch):
+        import src.api.workspace_api_key as api_key_mod
+        monkeypatch.setattr(api_key_mod, "verify_workspace_api_key", lambda presented: presented == "good-key")
+
+        ws = _fake_websocket(extra_headers={api_key_mod.HEADER_NAME: "good-key"})
+        assert identity_mod.authorize_ws(ws) == {"sub": "workspace-api-key", "api_key": True}
+
+    def test_invalid_api_key_falls_through_to_none(self, monkeypatch):
+        import src.api.workspace_api_key as api_key_mod
+        monkeypatch.setattr(api_key_mod, "verify_workspace_api_key", lambda presented: presented == "good-key")
+
+        ws = _fake_websocket(extra_headers={api_key_mod.HEADER_NAME: "wrong-key"})
+        assert identity_mod.authorize_ws(ws) is None
