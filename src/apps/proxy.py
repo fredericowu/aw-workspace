@@ -6,10 +6,11 @@ same :class:`~src.apps.runtime.IdentityGuard` as Tier-1 sub-apps), and it
 forwards every request to the container's ``base_url`` — both plain HTTP and
 WebSocket (the aw-app-browser CDP endpoint needs WS).
 
-Kept deliberately small: HTTP is buffered-forwarded via ``httpx``; WebSocket is
-bridged via the ``websockets`` client with two pump tasks. Starlette strips the
-mount prefix before we see the scope, so ``scope["path"]`` is already the
-container-relative path.
+Kept deliberately small: HTTP is a byte-for-byte passthrough via ``httpx``
+(the RAW, undecoded response — see ``_http``'s docstring for why); WebSocket
+is bridged via the ``websockets`` client with two pump tasks. Starlette
+strips the mount prefix before we see the scope, so ``scope["path"]`` is
+already the container-relative path.
 """
 from __future__ import annotations
 
@@ -25,16 +26,6 @@ _HOP_BY_HOP = {
     b"connection", b"keep-alive", b"proxy-authenticate", b"proxy-authorization",
     b"te", b"trailers", b"transfer-encoding", b"upgrade", b"host",
 }
-# httpx transparently gunzips (or br/deflate-decodes) a compressed upstream
-# response before we ever see `resp.content` — so forwarding the upstream's
-# own `content-encoding`/`content-length` headers verbatim lies to the
-# downstream browser: it receives PLAIN bytes labeled as compressed (and at
-# the wrong length), tries to gunzip already-decompressed data, and renders
-# garbage. Confirmed live 2026-08-08 against aw-app-code-server (code-server
-# gzips its index.html) — the page loaded (200) but rendered as mojibake.
-# Dropping both lets Starlette/uvicorn recompute a correct content-length
-# for the actual (decompressed) body we send.
-_RESPONSE_HEADERS_TO_STRIP = _HOP_BY_HOP | {b"content-encoding", b"content-length"}
 _INTERNAL_HEADERS = {
     b"x-aw-identity-sub",
     b"x-aw-identity-email",
@@ -71,29 +62,51 @@ class ContainerReverseProxy:
         return base + path + (f"?{qs}" if qs else "")
 
     async def _http(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Byte-for-byte passthrough — same philosophy as the monolith's Caddy
+        talking straight to the container: don't decode/re-encode anything,
+        just relay exactly what the upstream sent.
+
+        Earlier versions of this method used ``client.request(...)`` and
+        forwarded ``resp.content`` (httpx's transparently DECOMPRESSED body)
+        alongside the upstream's own ``content-encoding`` header — two
+        separate bugs came out of that, both confirmed live 2026-08-08
+        against aw-app-code-server (code-server gzips its responses):
+
+        1. ``resp.content`` is decompressed, but the forwarded headers still
+           claimed ``content-encoding: gzip`` — the browser received PLAIN
+           bytes labeled compressed and rendered garbage trying to gunzip
+           them.
+        2. httpx only decompresses encodings it has a registered decoder
+           for — ``br``/``zstd`` decoders only exist if the optional
+           ``brotli``/``zstandard`` packages are installed (neither is in
+           this image). For those, httpx's ``_get_content_decoder()`` hits a
+           ``KeyError``, silently swallows it, and falls back to
+           ``IdentityDecoder`` — so ``resp.content`` was the raw, STILL-
+           compressed bytes with no error raised at all. A real browser's
+           Accept-Encoding lists ``br``/``zstd`` right alongside gzip, so
+           this bit even after "fixing" (1) by stripping the header: this
+           proxy would tell Caddy the (still-brotli-compressed) body was
+           plain, and Caddy's own ``encode gzip`` would gzip already-
+           compressed bytes — a valid outer gzip wrapper around garbage.
+
+        Both problems are really the same root mistake: trying to be
+        smart (decode, then re-describe) about a body this proxy has no
+        need to understand. ``client.send(..., stream=True)`` +
+        ``resp.aiter_raw()`` reads the response WITHOUT decompressing it, so
+        the bytes we forward and the ``content-encoding``/``content-length``
+        headers describing them are always consistent — whatever the
+        upstream sent, whatever encoding it picked, no decoder required, no
+        optional package needed. Caddy (which sits in front of this proxy
+        and does its own ``encode gzip zstd``) then does exactly what it
+        already does for every other route: skip re-encoding a response
+        that's already encoded, or freshly encode one that isn't.
+        """
         import httpx
 
         body = await _read_http_body(receive)
         headers = [(k.decode("latin-1"), v.decode("latin-1"))
                    for k, v in scope.get("headers", [])
-                   if k.lower() not in _HOP_BY_HOP and k.lower() not in _INTERNAL_HEADERS
-                   and k.lower() != b"accept-encoding"]
-        # Force an Accept-Encoding httpx can ALWAYS fully decode, instead of
-        # forwarding the browser's own value verbatim. httpx silently drops
-        # any content-encoding it doesn't have a decoder for (SUPPORTED_
-        # DECODERS only has br/zstd if the optional `brotli`/`zstandard`
-        # packages are installed — neither is in this image) and falls back
-        # to IdentityDecoder with NO error — resp.content then ends up as
-        # the raw, still-compressed bytes. Confirmed live 2026-08-08: a
-        # browser's real multi-algorithm Accept-Encoding let code-server
-        # pick `br`; httpx silently no-op'd; this proxy's own content-
-        # encoding-stripping (below) then told Caddy the (still br-
-        # compressed) body was plain, so Caddy gzip-compressed already-
-        # compressed bytes — a valid outer gzip wrapper around garbage.
-        # gzip/deflate are always decodable (Python's stdlib zlib, no extra
-        # package needed), so pinning to those guarantees resp.content is
-        # genuinely the decompressed body every time.
-        headers.append(("accept-encoding", "gzip, deflate"))
+                   if k.lower() not in _HOP_BY_HOP and k.lower() not in _INTERNAL_HEADERS]
         identity = scope.get("aw_identity") or {}
         if identity:
             sub = identity.get("sub") or identity.get("user_id") or ""
@@ -105,8 +118,11 @@ class ContainerReverseProxy:
         url = self._target(scope)
         try:
             async with httpx.AsyncClient(timeout=None) as client:
-                resp = await client.request(
+                req = client.build_request(
                     scope["method"], url, headers=headers, content=body)
+                resp = await client.send(req, stream=True)
+                raw_body = b"".join([chunk async for chunk in resp.aiter_raw()])
+                await resp.aclose()
         except Exception as e:  # container down / unreachable → 502, don't crash host
             log.warning("apps: proxy to %s failed: %s", url, e)
             await _send_502(send)
@@ -114,10 +130,10 @@ class ContainerReverseProxy:
 
         out_headers = [(k.encode("latin-1"), v.encode("latin-1"))
                        for k, v in resp.headers.items()
-                       if k.lower().encode() not in _RESPONSE_HEADERS_TO_STRIP]
+                       if k.lower().encode() not in _HOP_BY_HOP]
         await send({"type": "http.response.start", "status": resp.status_code,
                     "headers": out_headers})
-        await send({"type": "http.response.body", "body": resp.content})
+        await send({"type": "http.response.body", "body": raw_body})
 
     # ---- WebSocket ------------------------------------------------------
 

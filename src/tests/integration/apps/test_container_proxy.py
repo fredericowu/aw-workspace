@@ -83,17 +83,11 @@ def test_http_forwarding_adds_verified_identity_headers(monkeypatch):
     assert r.json() == {"sub": "verified-user", "email": "user@example.test"}
 
 
-def test_http_forwarding_pins_accept_encoding_to_what_httpx_can_decode(monkeypatch):
-    # A real browser's Accept-Encoding lists br/zstd, which httpx can only
-    # decode if the optional brotli/zstandard packages are installed (they
-    # aren't in this image). If forwarded verbatim, the upstream could pick
-    # `br`; httpx then silently falls back to IdentityDecoder (no error) and
-    # resp.content ends up as the raw, still-compressed bytes — this proxy's
-    # own content-encoding stripping would then lie to Caddy about the body
-    # being plain, and Caddy would gzip already-compressed bytes. Confirmed
-    # live 2026-08-08 against aw-app-code-server. Pin to gzip/deflate
-    # (Python stdlib zlib, always decodable) regardless of what the
-    # downstream client advertised.
+def test_http_forwarding_does_not_alter_accept_encoding(monkeypatch):
+    # No reason to touch this anymore — the proxy never decodes the
+    # response, so it doesn't matter what encoding the upstream ends up
+    # picking. Forward the caller's own Accept-Encoding unchanged, same as
+    # every other non-hop-by-hop header.
     async def echo_accept_encoding(request):
         return JSONResponse({"accept_encoding": request.headers.get("accept-encoding")})
 
@@ -115,15 +109,21 @@ def test_http_forwarding_pins_accept_encoding_to_what_httpx_can_decode(monkeypat
         headers={"accept-encoding": "gzip, deflate, br, zstd"},
     )
     assert r.status_code == 200
-    assert r.json() == {"accept_encoding": "gzip, deflate"}
+    assert r.json() == {"accept_encoding": "gzip, deflate, br, zstd"}
 
 
-def test_http_forwarding_strips_stale_content_encoding(monkeypatch):
-    # Upstream serves a real gzip-compressed body (like code-server's HTML).
-    # httpx auto-decompresses before we ever see resp.content, so forwarding
-    # the upstream's own content-encoding/content-length verbatim would tell
-    # the downstream client "this body is still gzipped" when it isn't —
-    # confirmed live against aw-app-code-server (page rendered as mojibake).
+def test_http_forwarding_relays_a_compressed_body_untouched(monkeypatch):
+    # Upstream serves a real gzip-compressed body (like code-server's HTML)
+    # with an accurate content-encoding header. The proxy must relay the RAW
+    # bytes AND that header exactly as received — no decode, no re-describe
+    # — so a standards-compliant client downstream (TestClient's own httpx,
+    # here) can decode it correctly. Earlier versions of this proxy called
+    # resp.content (httpx's DECOMPRESSED body) while still forwarding the
+    # upstream's original content-encoding header, or silently failed to
+    # decompress encodings httpx has no decoder for (br/zstd without the
+    # optional packages) — both produced a body/header mismatch that
+    # rendered as garbage. Confirmed live 2026-08-08 against
+    # aw-app-code-server.
     import gzip
 
     from starlette.responses import Response
@@ -152,15 +152,18 @@ def test_http_forwarding_strips_stale_content_encoding(monkeypatch):
 
     r = client.get("/api/apps/code-server/")
     assert r.status_code == 200
+    assert r.headers["content-encoding"] == "gzip"
+    # TestClient's own httpx client decodes this correctly ONLY if the raw
+    # bytes we relayed are genuinely gzip-compressed AND the header truthfully
+    # describes them — the exact pairing the old implementation broke.
     assert r.content == body
-    assert "content-encoding" not in r.headers
 
 
 def test_http_502_when_upstream_unreachable(monkeypatch):
     async def boom(self, *args, **kwargs):
         raise httpx.ConnectError("refused")
 
-    monkeypatch.setattr(httpx.AsyncClient, "request", boom)
+    monkeypatch.setattr(httpx.AsyncClient, "send", boom)
 
     proxy = ContainerReverseProxy("http://127.0.0.1:1")
     app = Starlette(routes=[Mount("/api/apps/x", app=proxy)])
