@@ -27,6 +27,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--update", action="store_true",
         help="Update an already-installed app to the catalog's current version",
     )
+
+    sub.add_parser(
+        "update-all",
+        help="Update every installed app to the catalog's current version",
+    )
     return parser
 
 
@@ -36,6 +41,8 @@ def run(args: list[str]) -> int:
 
     if ns.action == "install":
         return _install(ns.app, update=ns.update)
+    if ns.action == "update-all":
+        return _update_all()
 
     parser.print_help()
     return 1
@@ -57,14 +64,7 @@ def _install(app_id: str, update: bool) -> int:
         return 1
 
     if update:
-        status, body = local_client.request("POST", f"/api/apps/{app_id}/update")
-        if status == 404:
-            print(f"'{app_id}' is not installed — run 'aw-workspace-cli marketplace install {app_id}' first.")
-            return 1
-        if status not in (200, 202):
-            print(f"error: update failed ({status}): {body}")
-            return 1
-        return 0 if _poll_until_done(app_id) else 1
+        return _update_one(app_id)
 
     payload = {
         "app_id": app_id,
@@ -81,6 +81,45 @@ def _install(app_id: str, update: bool) -> int:
         return 1
 
     return 0 if _poll_until_done(app_id) else 1
+
+
+def _update_one(app_id: str) -> int:
+    """Update a single installed app; returns a process-style exit code."""
+    status, body = local_client.request("POST", f"/api/apps/{app_id}/update")
+    if status == 404:
+        print(f"'{app_id}' is not installed — run 'aw-workspace-cli marketplace install {app_id}' first.")
+        return 1
+    if status not in (200, 202):
+        print(f"error: update failed ({status}): {body}")
+        return 1
+    return 0 if _poll_until_done(app_id) else 1
+
+
+def _installed_slugs() -> list[str] | None:
+    """Slugs of every installed app, or ``None`` if the listing call failed."""
+    status, body = local_client.request("GET", "/api/apps")
+    if status != 200 or not isinstance(body, list):
+        print(f"error: could not list installed apps ({status}): {body}")
+        return None
+    return [s for s in (a.get("slug") for a in body if isinstance(a, dict)) if s]
+
+
+def _update_all() -> int:
+    slugs = _installed_slugs()
+    if slugs is None:
+        return 1
+    if not slugs:
+        print("no apps installed — nothing to update")
+        return 0
+
+    print(f"updating {len(slugs)} installed app(s): {', '.join(slugs)}")
+    failed = [slug for slug in slugs if _update_one(slug) != 0]
+
+    if failed:
+        print(f"done — {len(slugs) - len(failed)} ok, {len(failed)} failed: {', '.join(failed)}")
+        return 1
+    print(f"done — all {len(slugs)} app(s) up to date")
+    return 0
 
 
 def _poll_until_done(app_id: str) -> bool:
