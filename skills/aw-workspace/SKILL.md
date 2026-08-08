@@ -29,11 +29,41 @@ updating apps, and updating the workspace or its remote host.
 
 ```bash
 aw-workspace-cli help
-aw-workspace-cli marketplace install <app>
-aw-workspace-cli marketplace install <app> --update
+aw-workspace-cli status                       # health + components + mapped folders
+aw-workspace-cli apps [<slug>] [--json]
+aw-workspace-cli start|stop|restart <app>     # a component, by bare app slug
+aw-workspace-cli logs <app> [-f]
+aw-workspace-cli folders list|add|rm|browse   # map ANY folder — see below
+aw-workspace-cli test [pytest args...]
+aw-workspace-cli marketplace install <app> [--update]
 aw-workspace-cli update workspace
 aw-workspace-cli update remote-host --token <central-identity-jwt>
 ```
+
+Most of these are ports of the monolith's `./aw` verbs (`status`, `start`,
+`stop`, `restart`, `logs`, `test`) re-pointed at this workspace's own API, so
+muscle memory from `agentic-workspace` carries over. Lifecycle commands take a
+bare app slug (`kb`), not the legacy `docker:aw-kb` component key.
+
+### Mapped folders
+
+`folders` is the no-repository-binding way to make a directory available to
+apps — the successor to the monolith's `knowledge_base.map_paths` in
+`aw.json`:
+
+```bash
+aw-workspace-cli folders add /opt/aw-workspace/docs        # name defaults to "docs"
+aw-workspace-cli folders add /srv/datasets --name data --mode rw
+aw-workspace-cli folders browse /opt/aw-workspace          # find a path to map
+aw-workspace-cli folders list
+aw-workspace-cli folders rm docs
+```
+
+The folder does **not** have to be a git checkout, and does not have to live
+under `repos/`. Any app whose manifest declares a `$AW_WORKSPACE_FOLDERS`
+volume gets every mapped folder bind-mounted at `<target>/<name>`, and adding
+or removing one re-mounts it into those already-running containers (see
+`src/api/folders.py` and `AppRuntime.remap_folders`).
 
 `aw-workspace-cli` works from any cwd/shell inside the container — no `./`
 prefix, no `cd` into the repo first.
@@ -55,8 +85,15 @@ src/cli/
   local_client.py               # HTTP client for THIS workspace's own API
   commands/
     help.py
+    apps.py                      # aw-workspace-cli apps
+    folders.py                   # aw-workspace-cli folders list|add|rm|browse
+    logs.py                      # aw-workspace-cli logs <component> [-f]
     marketplace.py               # aw-workspace-cli marketplace install <app> [--update]
+    start.py / stop.py / restart.py   # thin wrappers over src/cli/lifecycle.py
+    status.py                    # aw-workspace-cli status
+    test.py                      # aw-workspace-cli test
     update.py                    # aw-workspace-cli update <workspace|remote-host>
+  lifecycle.py                   # shared component resolution for start/stop/restart/logs
 ```
 
 `aw-workspace-cli` auto-discovers every module in `src/cli/commands/` via

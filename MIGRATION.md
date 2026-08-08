@@ -21,6 +21,7 @@ Which plane owns which route family. Update this table with every migration.
 | `/api/apps/code-agent-clis/agent-sessions*` | **app:code-agent-clis** | moved off the `/api/v2/agent-sessions*` core stub 2026-08-03 — this app installs the CLIs, so it's the one that can discover their on-disk sessions; also owns the "Agents" nav menu (`core.nav` slot) |
 | `/ws/status` | **aw-workspace** | slim subset — terminal list push only, for now |
 | **`/api/notify*`, `/ws/notifications`** | **aw-workspace** | notification engine — also reachable from Tier-1 apps via `ctx.notify` (`notifications:send`) |
+| **`/api/folders*`** | **aw-workspace** | mapped folders — the monolith's `knowledge_base.map_paths` (`aw.json`) generalised into workspace state: point at ANY directory, no git repo/`repos/` prefix; apps declaring the `$AW_WORKSPACE_FOLDERS` volume get one bind per folder |
 | `/api/tasks*`, `/api/plans*`, agent execution, `/api/files*` | monolith (not yet migrated) | future strangler steps |
 
 The rest of the dashboard's routes are still served by the monolith on the

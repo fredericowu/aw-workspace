@@ -939,6 +939,14 @@ class AppRuntime:
         a new capability, since the blast radius is the same: an app's own
         namespaced slice, nothing else's.
 
+        ``$AW_WORKSPACE_FOLDERS`` is the general form of ``$AW_WORKSPACE_REPOS``
+        and the one that finally drops the repo binding: it expands to one bind
+        per **mapped folder** (``src/api/folders.py``) at ``<target>/<name>``,
+        so a user can point at any directory — not only a git checkout that
+        happens to sit under ``repos/`` — and every app declaring the
+        placeholder picks it up (Frederico 2026-08-08). Also reuses
+        ``fs:workspace-data``; see ``$AW_KB_DIR`` below for the same rationale.
+
         ``$AW_KB_DIR`` mounts ``paths.workspace_home()/knowledge_base`` — unlike
         ``$AW_APP_DATA`` this is a shared, TOP-LEVEL, non-namespaced location
         (deliberately not ``data/<app_id>``), so the kb app's indexed markdown
@@ -1039,6 +1047,36 @@ class AppRuntime:
                 host_path = self._container_host_bind_path(kb_dir)
                 binds[host_path] = {"bind": target, "mode": mode}
                 continue
+            if source == "$AW_WORKSPACE_FOLDERS":
+                # The repo-binding escape hatch. Unlike every other placeholder
+                # this one expands to *N* binds — one per folder the user mapped
+                # (see src/api/folders.py) — landing each at <target>/<name>.
+                # An app therefore declares ONE volume and transparently gains
+                # every folder the user points at afterwards, with no manifest
+                # change and no requirement that the folder be a git checkout
+                # under repos/ (which is exactly what $AW_WORKSPACE_REPOS could
+                # never express).
+                #
+                # Per-folder mode wins over the declared one, but is CLAMPED by
+                # it: a manifest asking for "ro" can never be widened to "rw" by
+                # a folder the user happened to map read-write, so the app's own
+                # declaration stays the ceiling.
+                if "fs:workspace-data" not in manifest.permissions:
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_WORKSPACE_FOLDERS volume requires the "
+                        f"'fs:workspace-data' permission declared in its manifest")
+                for folder in self._mapped_folders():
+                    folder_mode = "ro" if mode == "ro" else folder.get("mode", "ro")
+                    src_path = folder["path"]
+                    # No mkdir: a mapped folder is something that already exists
+                    # (possibly only on the host — see folders.describe()'s
+                    # `exists`), never something we conjure into being.
+                    host_path = self._container_host_bind_path(src_path)
+                    binds[host_path] = {
+                        "bind": f"{target.rstrip('/')}/{folder['name']}",
+                        "mode": folder_mode,
+                    }
+                continue
             if os.path.isabs(source):
                 raise ContainerError(
                     f"app {manifest.id!r} volume source must be package-relative")
@@ -1059,6 +1097,64 @@ class AppRuntime:
             host_path = self._container_host_bind_path(local_path)
             binds[host_path] = {"bind": target, "mode": mode}
         return binds
+
+    # ---- mapped folders --------------------------------------------------
+
+    @staticmethod
+    def _mapped_folders() -> list[dict]:
+        """The user's mapped folders (``src/api/folders.py``), or ``[]``.
+
+        Imported lazily and defensively: ``_container_volumes`` also runs in
+        unit tests and offline tooling with no DB behind it, and "no folders
+        mapped" is the correct degradation there — an unreachable settings
+        table must not make every Tier-2 app fail to load.
+        """
+        try:
+            from src.api.folders import list_folders
+            return list_folders()
+        except Exception:  # noqa: BLE001 — no DB / not migrated yet
+            log.debug("apps: mapped-folder lookup failed; treating as none", exc_info=True)
+            return []
+
+    def _declares_mapped_folders(self, manifest: Manifest) -> bool:
+        return any(
+            isinstance(v, dict) and str(v.get("source") or "").strip() == "$AW_WORKSPACE_FOLDERS"
+            for v in (manifest.runtime.get("volumes") or [])
+        )
+
+    async def remap_folders(self) -> list[str]:
+        """Recreate every container app that mounts ``$AW_WORKSPACE_FOLDERS``.
+
+        Bind mounts are frozen at container creation, so the folder set an app
+        sees is whatever existed when it last started. Called after a folder is
+        mapped/unmapped so the change lands without the user having to know
+        that, and restricted to apps that actually declare the placeholder —
+        mapping a folder shouldn't bounce unrelated containers.
+
+        Returns the slugs that were recreated (best-effort per app: one app
+        failing to come back is logged, not propagated, so the rest still get
+        the new mapping).
+        """
+        remapped: list[str] = []
+        for slug, loaded in list(self._apps.items()):
+            if loaded.manifest.tier != "container":
+                continue
+            if not self._declares_mapped_folders(loaded.manifest):
+                continue
+            try:
+                rt = loaded.manifest.runtime
+                volumes = self._container_volumes(loaded.manifest, loaded.package_dir)
+                self.containers.register(
+                    slug, str(rt.get("image", "")), rt.get("port"),
+                    run_flags=rt.get("run_flags_needed") or rt.get("run_flags") or [],
+                    resources=rt.get("resources") or {}, env=rt.get("env") or {},
+                    volumes=volumes)
+                await asyncio.to_thread(self.containers.start, slug)
+                remapped.append(slug)
+                log.info("apps: remapped folders into %s (%d binds)", slug, len(volumes))
+            except Exception:  # noqa: BLE001 — one app must not block the others
+                log.exception("apps: could not remap folders into %s", slug)
+        return remapped
 
     # ---- import isolation ----------------------------------------------
 

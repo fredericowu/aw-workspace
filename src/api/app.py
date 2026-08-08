@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.db import create_all_tables, get_session, get_workspace_schema
 from src.api.components import register_component_routes
+from src.api.folders import register_folder_routes
 from src.api.identity import _extract_token, decode_identity_jwt, require_identity
 from src.api.models import Setting
 from src.api.notifications import register_notification_routes
@@ -156,6 +157,12 @@ def create_app() -> FastAPI:
     # Tier-1 app can also fire through it via AppContext.notifications
     # (src/apps/base.py), which reaches the same manager off app.state.
     register_notification_routes(app)
+
+    # Mapped folders: point the workspace at ANY directory (no git repo
+    # required) and hand it to apps by name — the repo-bound
+    # $AW_WORKSPACE_REPOS placeholder's general replacement. See
+    # src/api/folders.py.
+    register_folder_routes(app)
 
     # Decoupled-apps framework (F1): plugin runtime + /api/apps management.
     # Tier-1 apps hot-load into THIS process — no restart. Installed apps are
