@@ -33,10 +33,21 @@ DEFAULT_WORKSPACE_CONTAINER_DIR = "/opt/aw-workspace"
 def workspace_home_path() -> str:
     """Resolve the workspace home dir WITHOUT creating it — for read-only
     callers (the ``aw-workspace-cli``) that must not fail if the dir isn't
-    theirs to ``makedirs`` (e.g. the ``~`` fallback on a locked-down $HOME)."""
-    return os.environ.get("AW_WORKSPACE_HOME") or os.path.join(
-        os.path.expanduser("~"), ".aw-workspace"
+    theirs to ``makedirs``.
+
+    When ``AW_WORKSPACE_HOME`` is unset the fallback is
+    ``<container dir>/.aw-workspace`` (the host-mounted workspace tree), NOT
+    ``~/.aw-workspace``: the CLI is often invoked from a spawned agent-runner
+    container whose ``$HOME`` (``/home/ubuntu``) is its own, but which shares
+    the workspace mount at ``/opt/aw-workspace`` — that's where the server's
+    ``.env`` (API key + external URL) actually lives."""
+    home = os.environ.get("AW_WORKSPACE_HOME")
+    if home:
+        return home
+    root = os.path.realpath(
+        os.environ.get("AW_WORKSPACE_CONTAINER_DIR", DEFAULT_WORKSPACE_CONTAINER_DIR)
     )
+    return os.path.join(root, ".aw-workspace")
 
 
 def workspace_home() -> str:
