@@ -187,6 +187,7 @@ def test_catalog_entry_enriched_with_publisher_resource_estimate_and_what_you_ge
         "mcp_tools": [], "ui_screens": ["Git & GitHub CLI", "Git"], "commands": ["git", "gh"],
         "skills": [],
     }
+    assert app["dependencies"] == {}
 
 
 def test_catalog_entry_manifest_fetch_failure_leaves_entry_unenriched(monkeypatch):

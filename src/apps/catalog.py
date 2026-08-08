@@ -133,9 +133,13 @@ def _fetch_app_manifest(repo: str, ref: str, timeout: float = 10.0) -> dict[str,
 
 
 def _enrich_with_manifest(app: dict[str, Any]) -> dict[str, Any]:
-    """Add ``publisher`` / ``resource_estimate`` / ``what_you_get`` to a catalog
-    entry, derived from the app's own ``aw-app.json`` (best-effort — the entry
-    is returned unchanged if the manifest can't be fetched or fails validation)."""
+    """Add ``publisher`` / ``resource_estimate`` / ``what_you_get`` /
+    ``dependencies`` to a catalog entry, derived from the app's own
+    ``aw-app.json`` (best-effort — the entry is returned unchanged if the
+    manifest can't be fetched or fails validation). ``dependencies`` is what
+    ``marketplace update-all`` (aw-workspace-cli) reads to order its updates —
+    without it the CLI would only see id/version/repo, not the app-dependency
+    graph the reconciler already enforces at install time."""
     repo = app.get("repo")
     if not repo:
         return app
@@ -152,6 +156,7 @@ def _enrich_with_manifest(app: dict[str, Any]) -> dict[str, Any]:
         "publisher": app.get("publisher") or manifest.publisher,
         "resource_estimate": app.get("resource_estimate") or manifest.resource_estimate,
         "what_you_get": manifest.what_you_get,
+        "dependencies": manifest.dependencies,
     }
 
 
