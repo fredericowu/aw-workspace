@@ -147,7 +147,7 @@ class TestRequireIdentityDependency:
 
 class TestRequireIdentityWithWorkspaceApiKey:
     """A valid X-Api-Key header authenticates framework routes the same way
-    a JWT does — a second, independent path alongside _local_cli_authorized."""
+    a JWT does — the CLI and external apps/MCPs both use this path."""
 
     def test_valid_api_key_is_accepted(self, monkeypatch):
         import src.api.workspace_api_key as api_key_mod

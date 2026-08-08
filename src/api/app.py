@@ -27,6 +27,7 @@ from src.api.workspace_api_key import (
     get_or_create_workspace_api_key,
     regenerate_workspace_api_key,
 )
+from src.api.workspace_url import publish_workspace_api_url
 from src.apps.routes import reconcile_on_boot, register_apps_routes
 
 log = logging.getLogger(__name__)
@@ -73,6 +74,10 @@ def create_app() -> FastAPI:
         # put in its self-registered mcp.json — publishing the key AFTER apps
         # already loaded would silently ship that entry with no auth header.
         get_or_create_workspace_api_key()
+        # Publish this workspace's own external API URL next to the key, so an
+        # aw-workspace-cli running in a spawned agent-runner container (no
+        # loopback to the server) can reach it via the public tunnel edge.
+        publish_workspace_api_url()
         # Converge the running app set to the cloud registry on startup — a
         # fresh/recreated workspace auto-reinstalls the user's apps (F3).
         await reconcile_on_boot(app)

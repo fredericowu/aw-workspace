@@ -9,11 +9,10 @@ a file, so it survives a full container recreation as long as Postgres does.
 Auto-generated on first read (``get_or_create``) so a freshly-installed
 workspace always has one without any manual step.
 
-Mirrors ``src.apps.paths.get_or_create_cli_token``'s "same machine" secret,
-but this one is meant to be handed to *other processes* (a separate MCP
-server, another app) rather than kept workspace-local — which is exactly
-why every mint/rotate ALSO writes it to ``<AW_WORKSPACE_HOME>/.env`` (see
-``_write_env``): a process outside this FastAPI app (no DB access of its
+This is the single shared secret for non-browser callers — a separate MCP
+server, another app, or this workspace's own ``aw-workspace-cli`` — which is
+exactly why every mint/rotate ALSO writes it to ``<AW_WORKSPACE_HOME>/.env``
+(see ``_write_env``): a process outside this FastAPI app (no DB access of its
 own) can source that file and read ``AW_WORKSPACE_API_KEY`` directly.
 
 An in-process Tier-1 app (e.g. aw-app-whiteboard) shares this SAME Python
@@ -32,7 +31,7 @@ import secrets
 
 from src.api.db import get_session
 from src.api.models import Setting
-from src.apps.paths import workspace_home
+from src.apps.paths import env_file, upsert_workspace_env
 
 SETTING_KEY = "workspace_api_key"
 ENV_VAR_NAME = "AW_WORKSPACE_API_KEY"
@@ -40,39 +39,15 @@ HEADER_NAME = "X-Api-Key"
 
 
 def _env_path() -> str:
-    return os.path.join(workspace_home(), ".env")
-
-
-def _write_env(key: str) -> None:
-    """Upsert ``AW_WORKSPACE_API_KEY=<key>`` into ``<home>/.env``, preserving
-    every other line already there (other apps may share this same file)."""
-    path = _env_path()
-    prefix = f"{ENV_VAR_NAME}="
-    lines: list[str] = []
-    found = False
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith(prefix):
-                    lines.append(f"{prefix}{key}\n")
-                    found = True
-                else:
-                    lines.append(line)
-    except FileNotFoundError:
-        pass
-    if not found:
-        lines.append(f"{prefix}{key}\n")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.writelines(lines)
+    return env_file()
 
 
 def _publish(key: str) -> None:
     """Make ``key`` visible both to THIS process (in-process apps reading
-    ``os.environ`` directly) and to any OTHER process (external MCP/app
-    reading ``.env``)."""
+    ``os.environ`` directly) and to any OTHER process (external MCP/app, or
+    the ``aw-workspace-cli``, reading ``.env``)."""
     os.environ[ENV_VAR_NAME] = key
-    _write_env(key)
+    upsert_workspace_env(ENV_VAR_NAME, key)
 
 
 def _read(session) -> str | None:

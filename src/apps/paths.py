@@ -11,8 +11,9 @@ Layout (ADR Decision 8):
 * ``<home>/bin``     — app command shims (``<slug>-*``), on PATH, survive restart.
 * ``<home>/secrets`` — the workspace-side secure secret store (F4; the
   zero-knowledge store is a separate deferred card).
-* ``<home>/cli-token`` — random secret (0600) the ``./aw`` CLI presents to
-  prove it's running on the same machine as the server; see ``local_client.py``.
+* ``<home>/.env``    — mirrors ``AW_WORKSPACE_API_KEY`` (0600) so sibling
+  processes like the ``aw-workspace-cli`` can authenticate without DB access
+  (written at boot by ``src.api.workspace_api_key``; read by ``local_client.py``).
 
 App-contributed skills (``contributes.skills``) are the one exception to the
 "lives under ``<home>``" rule: they're copied into ``<workspace root>/skills/``
@@ -25,19 +26,58 @@ so this self-heals if a core-image update ever touches ``skills/``.
 from __future__ import annotations
 
 import os
-import secrets
 
 DEFAULT_WORKSPACE_CONTAINER_DIR = "/opt/aw-workspace"
 
-LOCAL_CLI_HEADER = "X-AW-Local-Cli-Token"
+
+def workspace_home_path() -> str:
+    """Resolve the workspace home dir WITHOUT creating it — for read-only
+    callers (the ``aw-workspace-cli``) that must not fail if the dir isn't
+    theirs to ``makedirs`` (e.g. the ``~`` fallback on a locked-down $HOME)."""
+    return os.environ.get("AW_WORKSPACE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".aw-workspace"
+    )
 
 
 def workspace_home() -> str:
-    home = os.environ.get("AW_WORKSPACE_HOME")
-    if not home:
-        home = os.path.join(os.path.expanduser("~"), ".aw-workspace")
+    home = workspace_home_path()
     os.makedirs(home, exist_ok=True)
     return home
+
+
+def env_file() -> str:
+    """``<home>/.env`` — the shared file the server writes secrets/config into
+    (``AW_WORKSPACE_API_KEY``, ``AW_WORKSPACE_API_URL``, …) so sibling
+    processes with no DB access, like the ``aw-workspace-cli``, can read them."""
+    return os.path.join(workspace_home(), ".env")
+
+
+def upsert_workspace_env(name: str, value: str) -> None:
+    """Upsert ``name=value`` into ``<home>/.env`` (0600), preserving every
+    other line — several secrets/config values share this one file, so this
+    is the single writer for all of them."""
+    path = env_file()
+    prefix = f"{name}="
+    lines: list[str] = []
+    found = False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith(prefix):
+                    lines.append(f"{prefix}{value}\n")
+                    found = True
+                else:
+                    lines.append(line)
+    except FileNotFoundError:
+        pass
+    if not found:
+        lines.append(f"{prefix}{value}\n")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # O_CREAT's mode only applies on first creation; force 0600 every write so
+    # a pre-existing (looser) secrets file is always tightened.
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.writelines(lines)
 
 
 def bin_dir() -> str:
@@ -83,26 +123,3 @@ def repos_dir() -> str:
     d = os.path.join(root, "repos")
     os.makedirs(d, exist_ok=True)
     return d
-
-
-def get_or_create_cli_token() -> str:
-    """Return the local-CLI shared secret, generating it on first use.
-
-    Anyone who can read this file already has filesystem access to the
-    workspace container — the token only proves "same machine", not "is a
-    real user"; it exists so ``./aw`` can call the workspace's own identity-
-    gated API without a browser-issued ``aw_id_jwt``.
-    """
-    path = os.path.join(workspace_home(), "cli-token")
-    try:
-        with open(path, "r") as f:
-            token = f.read().strip()
-            if token:
-                return token
-    except FileNotFoundError:
-        pass
-    token = secrets.token_hex(32)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(token)
-    return token
