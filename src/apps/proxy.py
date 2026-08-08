@@ -76,7 +76,24 @@ class ContainerReverseProxy:
         body = await _read_http_body(receive)
         headers = [(k.decode("latin-1"), v.decode("latin-1"))
                    for k, v in scope.get("headers", [])
-                   if k.lower() not in _HOP_BY_HOP and k.lower() not in _INTERNAL_HEADERS]
+                   if k.lower() not in _HOP_BY_HOP and k.lower() not in _INTERNAL_HEADERS
+                   and k.lower() != b"accept-encoding"]
+        # Force an Accept-Encoding httpx can ALWAYS fully decode, instead of
+        # forwarding the browser's own value verbatim. httpx silently drops
+        # any content-encoding it doesn't have a decoder for (SUPPORTED_
+        # DECODERS only has br/zstd if the optional `brotli`/`zstandard`
+        # packages are installed — neither is in this image) and falls back
+        # to IdentityDecoder with NO error — resp.content then ends up as
+        # the raw, still-compressed bytes. Confirmed live 2026-08-08: a
+        # browser's real multi-algorithm Accept-Encoding let code-server
+        # pick `br`; httpx silently no-op'd; this proxy's own content-
+        # encoding-stripping (below) then told Caddy the (still br-
+        # compressed) body was plain, so Caddy gzip-compressed already-
+        # compressed bytes — a valid outer gzip wrapper around garbage.
+        # gzip/deflate are always decodable (Python's stdlib zlib, no extra
+        # package needed), so pinning to those guarantees resp.content is
+        # genuinely the decompressed body every time.
+        headers.append(("accept-encoding", "gzip, deflate"))
         identity = scope.get("aw_identity") or {}
         if identity:
             sub = identity.get("sub") or identity.get("user_id") or ""

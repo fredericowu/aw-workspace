@@ -83,6 +83,41 @@ def test_http_forwarding_adds_verified_identity_headers(monkeypatch):
     assert r.json() == {"sub": "verified-user", "email": "user@example.test"}
 
 
+def test_http_forwarding_pins_accept_encoding_to_what_httpx_can_decode(monkeypatch):
+    # A real browser's Accept-Encoding lists br/zstd, which httpx can only
+    # decode if the optional brotli/zstandard packages are installed (they
+    # aren't in this image). If forwarded verbatim, the upstream could pick
+    # `br`; httpx then silently falls back to IdentityDecoder (no error) and
+    # resp.content ends up as the raw, still-compressed bytes — this proxy's
+    # own content-encoding stripping would then lie to Caddy about the body
+    # being plain, and Caddy would gzip already-compressed bytes. Confirmed
+    # live 2026-08-08 against aw-app-code-server. Pin to gzip/deflate
+    # (Python stdlib zlib, always decodable) regardless of what the
+    # downstream client advertised.
+    async def echo_accept_encoding(request):
+        return JSONResponse({"accept_encoding": request.headers.get("accept-encoding")})
+
+    upstream = Starlette(routes=[Route("/{p:path}", echo_accept_encoding, methods=["GET"])])
+    orig_init = httpx.AsyncClient.__init__
+
+    def patched_init(self, *args, **kwargs):
+        kwargs["transport"] = httpx.ASGITransport(app=upstream)
+        orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", patched_init)
+
+    proxy = ContainerReverseProxy("http://upstream")
+    app = Starlette(routes=[Mount("/api/apps/code-server", app=proxy)])
+    client = TestClient(app)
+
+    r = client.get(
+        "/api/apps/code-server/",
+        headers={"accept-encoding": "gzip, deflate, br, zstd"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"accept_encoding": "gzip, deflate"}
+
+
 def test_http_forwarding_strips_stale_content_encoding(monkeypatch):
     # Upstream serves a real gzip-compressed body (like code-server's HTML).
     # httpx auto-decompresses before we ever see resp.content, so forwarding
