@@ -10,7 +10,7 @@ import asyncio
 
 import httpx
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 from starlette.testclient import TestClient
 
@@ -170,3 +170,81 @@ def test_http_502_when_upstream_unreachable(monkeypatch):
     client = TestClient(app)
     r = client.get("/api/apps/x/anything")
     assert r.status_code == 502
+
+
+# --- heuristic-caching guard -------------------------------------------------
+#
+# App backends set no Cache-Control at all, so browsers invent a freshness
+# lifetime and serve stale HTML/JSON without revalidating (RFC 9111 4.2.2).
+# The proxy closes that hole for the two content types where it's never
+# correct, and only when the upstream said nothing.
+
+
+def _proxy_to(upstream, monkeypatch, mount="/api/apps/kb"):
+    orig_init = httpx.AsyncClient.__init__
+
+    def patched_init(self, *args, **kwargs):
+        kwargs["transport"] = httpx.ASGITransport(app=upstream)
+        orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", patched_init)
+    proxy = ContainerReverseProxy("http://upstream")
+    return TestClient(Starlette(routes=[Mount(mount, app=proxy)]))
+
+
+def test_html_without_cache_control_becomes_no_store(monkeypatch):
+    """index.html is the only unhashed file Vite emits and it names the hashed
+    bundle — caching it pins the whole app to the previous build."""
+    async def index(request):
+        return HTMLResponse("<!doctype html><html></html>")
+
+    upstream = Starlette(routes=[Route("/{p:path}", index, methods=["GET"])])
+    client = _proxy_to(upstream, monkeypatch)
+
+    r = client.get("/api/apps/kb/")
+
+    assert r.headers["cache-control"] == "no-store, must-revalidate"
+
+
+def test_json_without_cache_control_becomes_no_store(monkeypatch):
+    """API GETs come back with no validator at all, so a cached response can
+    outlive the state it describes."""
+    async def data(request):
+        return JSONResponse({"folders": ["aw-docs"]})
+
+    upstream = Starlette(routes=[Route("/{p:path}", data, methods=["GET"])])
+    client = _proxy_to(upstream, monkeypatch)
+
+    r = client.get("/api/apps/kb/api/kb/repos")
+
+    assert r.headers["cache-control"] == "no-store, must-revalidate"
+
+
+def test_upstream_cache_control_is_never_overridden(monkeypatch):
+    """An app that made a deliberate caching choice keeps it — this proxy adds,
+    it does not rewrite."""
+    async def cached(request):
+        return JSONResponse({"ok": True}, headers={"cache-control": "max-age=60"})
+
+    upstream = Starlette(routes=[Route("/{p:path}", cached, methods=["GET"])])
+    client = _proxy_to(upstream, monkeypatch)
+
+    r = client.get("/api/apps/kb/api/thing")
+
+    assert r.headers["cache-control"] == "max-age=60"
+    # Exactly one — an appended duplicate would let either value win per client.
+    assert [v for k, v in r.headers.multi_items() if k.lower() == "cache-control"] == ["max-age=60"]
+
+
+def test_hashed_assets_are_left_cacheable(monkeypatch):
+    """JS/CSS filenames ARE their cache keys — caching them hard is the point,
+    and no-store here would defeat the whole hashed-bundle design."""
+    async def asset(request):
+        return Response(b"console.log(1)", media_type="text/javascript")
+
+    upstream = Starlette(routes=[Route("/{p:path}", asset, methods=["GET"])])
+    client = _proxy_to(upstream, monkeypatch)
+
+    r = client.get("/api/apps/kb/assets/index-D5K2CSjZ.js")
+
+    assert "cache-control" not in r.headers

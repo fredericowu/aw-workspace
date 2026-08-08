@@ -11,6 +11,12 @@ Kept deliberately small: HTTP is a byte-for-byte passthrough via ``httpx``
 is bridged via the ``websockets`` client with two pump tasks. Starlette
 strips the mount prefix before we see the scope, so ``scope["path"]`` is
 already the container-relative path.
+
+The single exception to "passthrough" is a ``Cache-Control: no-store`` added
+to HTML/JSON responses that arrived with no caching directive at all — see
+``_NO_STORE_CONTENT_TYPES``. It's additive only (an app that sets its own
+``Cache-Control`` keeps it) and exists because heuristic browser caching
+otherwise pins an app to a previous deploy.
 """
 from __future__ import annotations
 
@@ -30,6 +36,51 @@ _INTERNAL_HEADERS = {
     b"x-aw-identity-sub",
     b"x-aw-identity-email",
 }
+
+# Content types we refuse to let a browser cache on its own recognisance.
+#
+# App backends are FastAPI + `StaticFiles(html=True)` (the aw-app-template
+# pattern every app is scaffolded from), and NEITHER sets `Cache-Control`.
+# With no `Cache-Control` and no `Expires`, a browser falls back to HEURISTIC
+# freshness (RFC 9111 4.2.2) — it invents a lifetime, typically 10% of the
+# time since `Last-Modified`, and serves from cache WITHOUT revalidating. The
+# ETag `StaticFiles` does send is useless in that window because nothing ever
+# asks.
+#
+# Two distinct failure modes, both reported live 2026-08-08 (Frederico, on
+# iPad Safari — which applies heuristics especially aggressively):
+#
+# 1. HTML — `index.html` is the only unhashed file Vite emits, and it names
+#    the hashed bundle. A stale index.html therefore pins the ENTIRE app to
+#    the previous build, no matter how many times the new one is deployed.
+# 2. JSON — API GETs come back with no validator at all (not even an ETag),
+#    so a cached response can outlive the state it describes. This is the
+#    nastier one: the freshly-loaded app asks for data and the browser
+#    answers from memory, which reads as "the server ignored my change".
+#
+# Only applied when the upstream said NOTHING about caching — an app that
+# sets its own `Cache-Control` is making a deliberate choice and keeps it.
+# Hashed assets (JS/CSS/fonts/images) are untouched: their filenames are
+# their cache keys, so caching them hard is the whole point.
+_NO_STORE_CONTENT_TYPES = (b"text/html", b"application/json")
+_NO_STORE_VALUE = b"no-store, must-revalidate"
+
+
+def _cache_control_override(headers) -> bytes | None:
+    """``no-store`` for uncacheable-by-nature payloads, else ``None``.
+
+    ``headers`` is the outgoing list of ``(name, value)`` byte pairs.
+    """
+    content_type = b""
+    for name, value in headers:
+        lowered = name.lower()
+        if lowered == b"cache-control":
+            return None  # upstream was explicit — respect it
+        if lowered == b"content-type":
+            content_type = value.lower()
+    if any(content_type.startswith(t) for t in _NO_STORE_CONTENT_TYPES):
+        return _NO_STORE_VALUE
+    return None
 
 
 class ContainerReverseProxy:
@@ -131,6 +182,11 @@ class ContainerReverseProxy:
         out_headers = [(k.encode("latin-1"), v.encode("latin-1"))
                        for k, v in resp.headers.items()
                        if k.lower().encode() not in _HOP_BY_HOP]
+        # The one place this proxy is NOT a pure passthrough — and only ever
+        # additive, never a rewrite (see _cache_control_override).
+        override = _cache_control_override(out_headers)
+        if override is not None:
+            out_headers.append((b"cache-control", override))
         await send({"type": "http.response.start", "status": resp.status_code,
                     "headers": out_headers})
         await send({"type": "http.response.body", "body": raw_body})
