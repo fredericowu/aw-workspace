@@ -187,3 +187,122 @@ def test_mapped_folders_degrades_to_empty_without_a_database(monkeypatch):
     monkeypatch.setattr("src.api.folders.list_folders", boom)
 
     assert AppRuntime._mapped_folders() == []
+
+
+# --- remap_folders -----------------------------------------------------------
+#
+# Regression: the first cut called containers.register() here, which refuses to
+# overwrite an existing registration ("container already registered for 'kb'").
+# Every folder mapped after an app was loaded silently failed to reach it — the
+# route still returned 200 because a failed remap must not fail the mapping, so
+# nothing surfaced except an empty `remapped_apps`. Exercise the real method.
+
+
+class _FakeContainers:
+    def __init__(self) -> None:
+        self.volumes: dict[str, dict] = {}
+        self.started: list[str] = []
+        self.registered_calls = 0
+
+    def register(self, *args, **kwargs):
+        self.registered_calls += 1
+        raise AssertionError("remap must not re-register an already-registered app")
+
+    def set_volumes(self, app_id, volumes):
+        self.volumes[app_id] = volumes
+
+    def start(self, app_id):
+        self.started.append(app_id)
+
+
+def _loaded_app(tmp_path, volumes, tier="container"):
+    from types import SimpleNamespace
+
+    manifest = SimpleNamespace(
+        id="kb", tier=tier, runtime={"volumes": volumes, "image": "img", "port": 1},
+        permissions=["fs:workspace-data", "containers:manage"],
+    )
+    return SimpleNamespace(manifest=manifest, package_dir=str(tmp_path))
+
+
+async def _remap(rt):
+    return await rt.remap_folders()
+
+
+def test_remap_updates_volumes_and_restarts_the_app(monkeypatch, tmp_path):
+    import asyncio
+
+    from src.apps.runtime import AppRuntime
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    monkeypatch.setattr(
+        AppRuntime, "_mapped_folders",
+        staticmethod(lambda: [{"name": "docs", "path": str(docs), "mode": "ro"}]))
+
+    rt = AppRuntime.__new__(AppRuntime)
+    rt.containers = _FakeContainers()
+    rt._apps = {"kb": _loaded_app(tmp_path, [
+        {"source": "$AW_WORKSPACE_FOLDERS", "target": "/workspace-folders", "mode": "ro"},
+    ])}
+
+    assert asyncio.run(_remap(rt)) == ["kb"]
+    assert rt.containers.started == ["kb"]
+    assert rt.containers.volumes["kb"][str(docs)] == {
+        "bind": "/workspace-folders/docs", "mode": "ro"}
+    assert rt.containers.registered_calls == 0
+
+
+def test_remap_skips_apps_that_never_asked_for_folders(monkeypatch, tmp_path):
+    """Mapping a folder must not bounce unrelated containers."""
+    import asyncio
+
+    from src.apps.runtime import AppRuntime
+
+    monkeypatch.setattr(AppRuntime, "_mapped_folders", staticmethod(lambda: []))
+
+    rt = AppRuntime.__new__(AppRuntime)
+    rt.containers = _FakeContainers()
+    rt._apps = {"browser": _loaded_app(tmp_path, [
+        {"source": "$AW_APP_DATA", "target": "/data", "mode": "rw"},
+    ])}
+
+    assert asyncio.run(_remap(rt)) == []
+    assert rt.containers.started == []
+
+
+def test_remap_skips_tier1_apps(monkeypatch, tmp_path):
+    import asyncio
+
+    from src.apps.runtime import AppRuntime
+
+    monkeypatch.setattr(AppRuntime, "_mapped_folders", staticmethod(lambda: []))
+
+    rt = AppRuntime.__new__(AppRuntime)
+    rt.containers = _FakeContainers()
+    rt._apps = {"proxy": _loaded_app(tmp_path, [
+        {"source": "$AW_WORKSPACE_FOLDERS", "target": "/f", "mode": "ro"},
+    ], tier="inprocess")}
+
+    assert asyncio.run(_remap(rt)) == []
+
+
+def test_one_failing_app_does_not_block_the_others(monkeypatch, tmp_path):
+    import asyncio
+
+    from src.apps.runtime import AppRuntime
+
+    monkeypatch.setattr(AppRuntime, "_mapped_folders", staticmethod(lambda: []))
+
+    class _HalfBroken(_FakeContainers):
+        def start(self, app_id):
+            if app_id == "broken":
+                raise RuntimeError("podman is down")
+            super().start(app_id)
+
+    vols = [{"source": "$AW_WORKSPACE_FOLDERS", "target": "/f", "mode": "ro"}]
+    rt = AppRuntime.__new__(AppRuntime)
+    rt.containers = _HalfBroken()
+    rt._apps = {"broken": _loaded_app(tmp_path, vols), "kb": _loaded_app(tmp_path, vols)}
+
+    assert asyncio.run(_remap(rt)) == ["kb"]

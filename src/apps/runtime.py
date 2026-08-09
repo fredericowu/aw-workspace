@@ -1142,13 +1142,10 @@ class AppRuntime:
             if not self._declares_mapped_folders(loaded.manifest):
                 continue
             try:
-                rt = loaded.manifest.runtime
                 volumes = self._container_volumes(loaded.manifest, loaded.package_dir)
-                self.containers.register(
-                    slug, str(rt.get("image", "")), rt.get("port"),
-                    run_flags=rt.get("run_flags_needed") or rt.get("run_flags") or [],
-                    resources=rt.get("resources") or {}, env=rt.get("env") or {},
-                    volumes=volumes)
+                # set_volumes + start, NOT register: the app is already
+                # registered and nothing but the bind set is changing.
+                self.containers.set_volumes(slug, volumes)
                 await asyncio.to_thread(self.containers.start, slug)
                 remapped.append(slug)
                 log.info("apps: remapped folders into %s (%d binds)", slug, len(volumes))

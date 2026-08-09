@@ -148,6 +148,18 @@ class ContainerSupervisor:
         if autostart:
             self.start(app_id)
 
+    def set_volumes(self, app_id: str, volumes: dict[str, dict]) -> None:
+        """Replace the bind set the NEXT ``start()`` will create the container with.
+
+        Binds are fixed at container creation, so changing what an app can see
+        (today: the user's mapped folders — see ``AppRuntime.remap_folders``)
+        means recreating it. ``register()`` deliberately refuses to overwrite an
+        existing registration, and re-registering would be the wrong verb
+        anyway: nothing about the app's identity, image or ports is changing —
+        only this one field.
+        """
+        self._require(app_id).volumes = volumes
+
     def start(self, app_id: str) -> dict:
         c = self._require(app_id)
         client = self._docker()
