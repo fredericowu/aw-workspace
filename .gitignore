@@ -15,6 +15,13 @@ coverage/
 /apps/*
 !/apps/README.md
 /.*/
+# ...except .github, which is real project source (CI workflows). A negation
+# can only re-include a path whose PARENT directory isn't excluded, so the
+# directory has to be un-ignored here, before any rule below tries to name a
+# file inside it. Without this, `/.*/` above silently swallows every NEW file
+# under .github/ — the existing workflows only survive because they were
+# already tracked, and git never re-evaluates ignores for tracked files.
+!/.github/
 
 # --- Agent-facing generated state (aw-workspace-cli agent sync) --------------
 # skills/ is the source of truth; the per-CLI dirs below are exact mirrors and
@@ -26,9 +33,11 @@ coverage/
 .gemini/
 
 # Per-CLI mirrors of AGENTS.md — generated, not hand-edited. Edit AGENTS.md.
+# Note copilot-instructions.md sits INSIDE the just-un-ignored .github/, so it
+# needs its own rule — it's the one file there that isn't project source.
 CLAUDE.md
 GEMINI.md
-.github/copilot-instructions.md
+/.github/copilot-instructions.md
 
 # Playwright MCP scratch output
 .playwright-mcp/
