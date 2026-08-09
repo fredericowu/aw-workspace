@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.db import create_all_tables, get_session, get_workspace_schema
 from src.api.components import register_component_routes
+from src.api.agent_routes import register_agent_routes, sync_on_boot
 from src.api.folders import register_folder_routes
 from src.api.identity import _extract_token, decode_identity_jwt, require_identity
 from src.api.models import Setting
@@ -82,6 +83,10 @@ def create_app() -> FastAPI:
         # Converge the running app set to the cloud registry on startup — a
         # fresh/recreated workspace auto-reinstalls the user's apps (F3).
         await reconcile_on_boot(app)
+        # AFTER reconcile: an app's activate() copies its contributes.skills
+        # into skills/ (AppRuntime._register_skills), so syncing earlier would
+        # mirror a skills/ tree that's about to change.
+        await sync_on_boot()
         yield
 
     app = FastAPI(title="aw-workspace", version="0.1.0", lifespan=lifespan)
@@ -163,6 +168,11 @@ def create_app() -> FastAPI:
     # $AW_WORKSPACE_REPOS placeholder's general replacement. See
     # src/api/folders.py.
     register_folder_routes(app)
+
+    # POST /api/agent/sync — the HTTP face of `aw-workspace-cli agent sync`,
+    # so the SPA can re-run the fan-out without a terminal. See
+    # src/api/agent_routes.py.
+    register_agent_routes(app)
 
     # Decoupled-apps framework (F1): plugin runtime + /api/apps management.
     # Tier-1 apps hot-load into THIS process — no restart. Installed apps are

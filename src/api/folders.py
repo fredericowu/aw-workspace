@@ -50,6 +50,7 @@ Consumers
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -248,6 +249,70 @@ def register_folder_routes(app: FastAPI) -> None:
         return {"removed": name, "remapped_apps": remapped}
 
 
+# Coalescing window for container remaps. Tier-2 binds are fixed at container
+# creation, so every folder change costs a full recreate — mapping five folders
+# one at a time used to mean five recreates, five cold starts, five windows
+# where the app is down. Callers arriving inside this window all wait on the
+# SAME remap and get the same answer, so the cost is one recreate regardless.
+#
+# The window is short on purpose: a lone `folders add` should not feel laggy,
+# and a human clicking through a picker produces gaps well under a second.
+REMAP_QUIET_SECONDS = 1.5
+# Ceiling on how far a steady stream of additions can push the deadline out.
+# Without it, one mutation every second would defer the remap forever.
+REMAP_MAX_WAIT_SECONDS = 8.0
+
+
+class _RemapCoalescer:
+    """Collapse a burst of folder mutations into a single container recreate.
+
+    Deliberately NOT fire-and-forget: each caller awaits the shared result, so
+    the route can still honestly report which apps were remounted instead of
+    returning "scheduled, trust me". The contract callers see is unchanged —
+    only the number of container recreates drops.
+    """
+
+    def __init__(self) -> None:
+        self._future: asyncio.Future[list[str]] | None = None
+        self._deadline: float = 0.0
+        self._started: float = 0.0
+
+    async def request(self, run) -> list[str]:
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+
+        if self._future is not None and not self._future.done():
+            # Join the in-flight window and push its deadline back, but never
+            # past the ceiling measured from when the window opened.
+            self._deadline = min(now + REMAP_QUIET_SECONDS,
+                                 self._started + REMAP_MAX_WAIT_SECONDS)
+            return await asyncio.shield(self._future)
+
+        self._future = loop.create_future()
+        self._started = now
+        self._deadline = now + REMAP_QUIET_SECONDS
+        future = self._future
+        try:
+            while True:
+                remaining = self._deadline - loop.time()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(remaining)
+            result = await run()
+        except Exception as exc:  # noqa: BLE001 — surfaced to every waiter
+            if not future.done():
+                future.set_exception(exc)
+            raise
+        finally:
+            self._future = None
+        if not future.done():
+            future.set_result(result)
+        return result
+
+
+_coalescer = _RemapCoalescer()
+
+
 async def _remap_apps(app: FastAPI) -> list[str]:
     """Push the new folder set into every running container app that asked for it.
 
@@ -255,12 +320,15 @@ async def _remap_apps(app: FastAPI) -> list[str]:
     app started is invisible to it until the container is recreated. Doing that
     here is what makes the feature actually end-to-end — otherwise "map a
     folder" silently means "map a folder, then go restart the app yourself".
+
+    Coalesced (see ``_RemapCoalescer``) so a burst of mutations costs one
+    recreate, not one per folder.
     """
     runtime = getattr(app.state, "app_runtime", None)
     if runtime is None or not hasattr(runtime, "remap_folders"):
         return []
     try:
-        return await runtime.remap_folders()
+        return await _coalescer.request(runtime.remap_folders)
     except Exception:  # noqa: BLE001 — a failed remap must not fail the mapping
         log.exception("folders: remapping container apps failed")
         return []

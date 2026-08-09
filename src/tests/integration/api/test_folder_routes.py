@@ -163,3 +163,88 @@ def test_a_failing_remap_does_not_fail_the_mapping(ctx, monkeypatch):
     assert res.status_code == 200
     assert res.json()["remapped_apps"] == []
     assert [f["name"] for f in client.get("/api/folders").json()["folders"]] == ["docs"]
+
+
+# --- remap coalescing --------------------------------------------------------
+#
+# Every folder change costs a full container recreate (binds are fixed at
+# creation), so a burst of mutations used to mean a burst of recreates. These
+# pin that a burst collapses into ONE, without changing what a caller sees.
+
+
+def test_a_burst_of_mappings_causes_one_remap(ctx, monkeypatch):
+    import asyncio
+
+    from src.api import folders as folders_mod
+
+    # Shrink the window so the test isn't sleeping for real seconds.
+    monkeypatch.setattr(folders_mod, "REMAP_QUIET_SECONDS", 0.05)
+    monkeypatch.setattr(folders_mod, "REMAP_MAX_WAIT_SECONDS", 0.5)
+    monkeypatch.setattr(folders_mod, "_coalescer", folders_mod._RemapCoalescer())
+
+    calls = 0
+
+    async def counting_remap():
+        nonlocal calls
+        calls += 1
+        return ["kb"]
+
+    async def burst():
+        return await asyncio.gather(*[
+            folders_mod._coalescer.request(counting_remap) for _ in range(5)
+        ])
+
+    results = asyncio.run(burst())
+
+    assert calls == 1, "five concurrent mutations must produce one recreate"
+    # Every caller still gets the real answer, not a "scheduled" placeholder.
+    assert results == [["kb"]] * 5
+
+
+def test_a_later_mapping_gets_its_own_remap(ctx, monkeypatch):
+    """Coalescing must not swallow a change that arrives after the window."""
+    import asyncio
+
+    from src.api import folders as folders_mod
+
+    monkeypatch.setattr(folders_mod, "REMAP_QUIET_SECONDS", 0.01)
+    monkeypatch.setattr(folders_mod, "_coalescer", folders_mod._RemapCoalescer())
+
+    calls = 0
+
+    async def counting_remap():
+        nonlocal calls
+        calls += 1
+        return ["kb"]
+
+    async def sequential():
+        await folders_mod._coalescer.request(counting_remap)
+        await asyncio.sleep(0.05)
+        await folders_mod._coalescer.request(counting_remap)
+
+    asyncio.run(sequential())
+
+    assert calls == 2
+
+
+def test_a_failing_remap_reaches_every_waiter(ctx, monkeypatch):
+    import asyncio
+
+    from src.api import folders as folders_mod
+
+    monkeypatch.setattr(folders_mod, "REMAP_QUIET_SECONDS", 0.01)
+    monkeypatch.setattr(folders_mod, "_coalescer", folders_mod._RemapCoalescer())
+
+    async def boom():
+        raise RuntimeError("podman is down")
+
+    async def burst():
+        return await asyncio.gather(
+            *[folders_mod._coalescer.request(boom) for _ in range(3)],
+            return_exceptions=True,
+        )
+
+    results = asyncio.run(burst())
+
+    assert len(results) == 3
+    assert all(isinstance(r, RuntimeError) for r in results)
