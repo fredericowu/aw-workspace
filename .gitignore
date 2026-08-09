@@ -15,3 +15,20 @@ coverage/
 /apps/*
 !/apps/README.md
 /.*/
+
+# --- Agent-facing generated state (aw-workspace-cli agent sync) --------------
+# skills/ is the source of truth; the per-CLI dirs below are exact mirrors and
+# must never be committed or hand-edited. (The `/.*/` rule above already hides
+# them, but they're named explicitly so the intent survives a change to that
+# catch-all.)
+.claude/
+.cursor/
+.gemini/
+
+# Per-CLI mirrors of AGENTS.md — generated, not hand-edited. Edit AGENTS.md.
+CLAUDE.md
+GEMINI.md
+.github/copilot-instructions.md
+
+# Playwright MCP scratch output
+.playwright-mcp/
