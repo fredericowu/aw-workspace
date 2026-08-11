@@ -19,7 +19,14 @@ import os
 import sys
 
 # This script lives at <repo>/aw-workspace-cli (repo root, where src/ lives).
+# Agent-runner containers additionally bind-mount this same file a second
+# time at /usr/local/bin/aw-workspace-cli (a real copy, not a symlink, so
+# realpath(__file__) resolves to THAT path there, not back to the repo root)
+# so the bare command works on PATH from any cwd — fall back to the
+# well-known workspace root when that happens.
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
+if not os.path.isfile(os.path.join(BASE_DIR, "src", "cli", "discovery.py")):
+    BASE_DIR = "/opt/aw-workspace"
 sys.path.insert(0, BASE_DIR)
 
 from src.cli.discovery import discover_commands  # noqa: E402
