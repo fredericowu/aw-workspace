@@ -102,6 +102,16 @@ def apply_migrations(app_id: str, migrations_dir: str) -> list[str]:
         with open(path, "r", encoding="utf-8") as f:
             sql = f.read()
         with get_engine().begin() as conn:
+            # The engine's ``schema_translate_map`` only rewrites SQLAlchemy
+            # ``Table`` metadata, never text SQL (see ``db_tables.py``) — so an
+            # unqualified ``CREATE TABLE`` in a migration file would land in
+            # whatever ``search_path`` resolves to (``public``), NOT this
+            # workspace's schema. An app can't hard-qualify it either: the
+            # schema name is per-tenant and unknown at authoring time.
+            # ``SET LOCAL`` scopes the search_path to this transaction, so a
+            # migration file can write plain, portable, unqualified DDL — and
+            # a file that DOES qualify explicitly still works unchanged.
+            conn.execute(text(f'SET LOCAL search_path TO "{schema}"'))
             if sql.strip():
                 conn.execute(text(sql))
             conn.execute(
