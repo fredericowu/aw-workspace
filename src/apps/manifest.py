@@ -92,6 +92,16 @@ class Manifest:
         return list(self.contributes.get("skills", []))
 
     @property
+    def tasks(self) -> list[dict[str, Any]]:
+        """``contributes.tasks`` — scheduled tasks the app seeds on install.
+
+        Seeded, not owned: they are created once if a task of that name
+        doesn't exist and are never rewritten afterwards, so the user's own
+        edits always win. See ``src/apps/tasks.py``.
+        """
+        return list(self.contributes.get("tasks", []))
+
+    @property
     def reload_mcp_gateway_on_save(self) -> bool:
         """``contributes.mcp.reload_on_save`` — true for an app that ships
         its own root ``mcp.json`` (scanned directly by the MCP Gateway's
@@ -435,6 +445,32 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
     for skill in contributes.get("skills", []):
         if not isinstance(skill, dict) or not skill.get("id") or not skill.get("path"):
             raise ManifestError("each contributes.skills entry needs an 'id' and a 'path'")
+
+    tasks = contributes.get("tasks", [])
+    if tasks and "tasks:contribute" not in permissions:
+        raise ManifestError("contributes.tasks requires the 'tasks:contribute' permission")
+    if not isinstance(tasks, list):
+        raise ManifestError("contributes.tasks must be a list")
+    for task in tasks:
+        if not isinstance(task, dict) or not task.get("name"):
+            raise ManifestError("each contributes.tasks entry needs a 'name'")
+        # The name IS the identity of a contributed task (see
+        # ``src/apps/tasks.py``) — a blank or whitespace-only one would make
+        # every such task collide on the same empty key.
+        if not str(task["name"]).strip():
+            raise ManifestError("contributes.tasks[].name must not be blank")
+        task_type = task.get("type", "terminal")
+        if task_type not in ("terminal", "agentic_output"):
+            raise ManifestError(
+                f"contributes.tasks[].type must be 'terminal' or 'agentic_output' "
+                f"(got {task_type!r})"
+            )
+        if task_type == "agentic_output" and not task.get("command"):
+            raise ManifestError("an 'agentic_output' task needs a 'command'")
+        if task_type == "terminal" and not task.get("prompt"):
+            raise ManifestError("a 'terminal' task needs a 'prompt'")
+        if not isinstance(task.get("schedules", []), list):
+            raise ManifestError("contributes.tasks[].schedules must be a list")
 
     config_schema = data.get("config_schema", {})
     if not isinstance(config_schema, dict):

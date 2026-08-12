@@ -40,7 +40,9 @@ from src.apps.manifest import Manifest, load_manifest
 from src.apps.proxy import ContainerReverseProxy
 from src.apps.secret_store import SecretStore
 from src.apps.services import ServiceSupervisor
+from src.apps import tasks as tasks_mod
 from src.apps.skills import SkillError, SkillsRegistry
+from src.apps.tasks import TasksRegistry
 from src.apps.watchdog import WatchdogSupervisor
 
 log = logging.getLogger(__name__)
@@ -380,6 +382,7 @@ class AppRuntime:
         self.watchdog = WatchdogSupervisor()
         self.secret_store = SecretStore()
         self.skills = SkillsRegistry()
+        self.tasks = TasksRegistry()
         self._db_tables: Any = None  # lazy — only apps granted db:own-tables need it
 
     @property
@@ -566,6 +569,25 @@ class AppRuntime:
                 continue
             self.journal.record(slug, "skill:register", skill_id, {"dest_path": dest_path})
 
+    def _register_tasks(self, loaded: LoadedApp) -> None:
+        """Seed this app's ``contributes.tasks`` (create-if-absent, by name).
+
+        Two directions, because activation order isn't guaranteed: this app's
+        own declarations go out now (held if no provider is loaded yet), and
+        if THIS app is itself the provider, sweep every app already loaded.
+        See ``src/apps/tasks.py``.
+        """
+        slug = loaded.manifest.id
+        try:
+            self.tasks.register(self, slug, loaded.manifest.tasks)
+            plugin = getattr(loaded, "plugin", None)
+            if plugin is not None and callable(getattr(plugin, tasks_mod.PROVIDER_METHOD, None)):
+                seeded = self.tasks.sweep(self)
+                if seeded:
+                    log.info("apps: %s is the task provider, seeded %d task(s)", slug, seeded)
+        except Exception:  # noqa: BLE001 — seeding must never fail an install
+            log.exception("apps: task seeding failed for %s", slug)
+
     def _resolve_window(self, app: LoadedApp, entry: dict[str, Any]) -> dict[str, Any]:
         """Inline a declarative window's spec file into ``body.spec_data``.
 
@@ -656,6 +678,7 @@ class AppRuntime:
 
         self._apps[slug] = loaded
         self._register_skills(loaded)
+        self._register_tasks(loaded)
         self._invalidate_openapi()
         log.info("apps: loaded %s v%s (routes mounted=%s)",
                  slug, manifest.version, loaded.mount is not None)
@@ -903,6 +926,7 @@ class AppRuntime:
 
         self._apps[slug] = loaded
         self._register_skills(loaded)
+        self._register_tasks(loaded)
         self._invalidate_openapi()
         log.info("apps: loaded container app %s v%s (image=%s)",
                  slug, manifest.version, image)
