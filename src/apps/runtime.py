@@ -66,7 +66,21 @@ _CLI_HEALER_TASK_ID = "system-cli-health"
 # apps activated and rewrote their mcp.json (aw-app-whiteboard and
 # aw-app-presentations both went missing this way, 2026-08-12: 183 tools
 # instead of 209). Set to 0 to disable.
-DEFAULT_MCP_RESCAN_INTERVAL_S = float(os.environ.get("AW_APPS_MCP_RESCAN_INTERVAL_S", "300"))
+#
+# 60s, not the original 300s. The boot reload in routes.py cannot close this
+# on its own: it fires once the workspace's apps are up, but the gateway is a
+# CONTAINER this same boot restarts, and a gateway that comes up afterwards
+# scans while the workspace API is still booting, connects to nothing, and
+# serves 0 tools for every Tier-1 upstream until something reloads it. There
+# is no ordering between the two, so the honest fix is to converge fast:
+# 5 minutes of "Unknown tool" for show_diff/whiteboard/presentations is a real
+# outage for every agent, and a reload is differential and cheap (a no-op pass
+# is one HTTP call and a few hundred ms).
+#
+# The deeper fix belongs in aw-mcp-gateway — an upstream that fails to connect
+# during a scan should be retried, not left at zero tools until someone else
+# happens to reload it. Until that lands, this bounds the damage.
+DEFAULT_MCP_RESCAN_INTERVAL_S = float(os.environ.get("AW_APPS_MCP_RESCAN_INTERVAL_S", "60"))
 _MCP_RESCAN_TASK_ID = "mcp-gateway-rescan"
 
 # Cookie the central-identity JWT lands in (mirrors src.api.identity.COOKIE_NAME).
