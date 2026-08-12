@@ -94,6 +94,34 @@ ENV AW_PORT=9030 \
 # (see the venv RUN step's comment above).
 ENV PATH="/opt/aw-workspace/.aw-workspace/venv/bin:/opt/aw-workspace:/opt/aw-workspace/.aw-workspace/bin:${PATH}"
 
+# ...and the same three entries AGAIN, for login shells, because the ENV above
+# is not enough on its own: Debian's /etc/profile hard-ASSIGNS (not appends)
+#     PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games"
+# for every non-root user, then exports it — wiping the ENV inherited from the
+# image. Terminal sessions are exactly that case: terminal_manager.py spawns
+# `bash -lc '... exec bash -l'`, a login shell, so every terminal in the UI
+# came up WITHOUT the workspace on PATH and a bare `aw-workspace-cli` was
+# "command not found" (measured 2026-08-12; the note above about the
+# orchestrator's profile.d file being merely a "workaround" the ENV replaced
+# had it backwards — the two cover different shells and BOTH are needed).
+#
+# Idempotent + order-preserving: prepends in reverse so the final order matches
+# the ENV, and skips an entry already present so re-sourcing a profile (su -,
+# nested login shells) can't grow PATH without bound.
+RUN cat > /etc/profile.d/aw-path.sh <<'AWPATH' \
+    && chmod 0644 /etc/profile.d/aw-path.sh
+# Re-prepend the aw-workspace PATH entries that /etc/profile just wiped.
+# Managed by aw-workspace's Dockerfile — see the comment there before editing.
+for _aw_dir in /opt/aw-workspace/.aw-workspace/bin /opt/aw-workspace /opt/aw-workspace/.aw-workspace/venv/bin; do
+    case ":${PATH}:" in
+        *":${_aw_dir}:"*) ;;
+        *) PATH="${_aw_dir}:${PATH}" ;;
+    esac
+done
+unset _aw_dir
+export PATH
+AWPATH
+
 EXPOSE 9030
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
