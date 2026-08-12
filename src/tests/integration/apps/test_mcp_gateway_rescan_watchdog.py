@@ -63,8 +63,13 @@ def test_zero_interval_disables_the_watchdog(runtime):
 
 
 def test_first_tick_is_deferred_not_immediate(runtime, monkeypatch):
-    """Boot's coalesced reconcile reload already covers t=0; firing again
-    right away would just double the work on every restart."""
+    """Boot reloads explicitly at t=0 (see the boot-reload test below), so the
+    watchdog's own first tick belongs one interval later.
+
+    run_immediately=True would be actively worse than deferring: a boot-race
+    failure feeds the supervisor's exponential backoff
+    (min(interval * 2**n, 1800s)), pushing the retry out past the plain
+    interval it was meant to beat."""
     calls = []
 
     async def fake_reload(rt, **kwargs):
@@ -117,3 +122,34 @@ def test_reload_raises_for_the_watchdog_when_gateway_is_not_installed(runtime):
 
     with pytest.raises(RuntimeError, match="not installed"):
         _async(routes_mod._reload_mcp_gateway(runtime, raise_on_failure=True))
+
+
+def test_boot_reloads_the_gateway_once_the_inprocess_apps_have_written_theirs(
+        tmp_path, monkeypatch):
+    """A plain restart changes nothing, so reconcile fires no coalesced
+    reload -- and the gateway keeps a stale upstream set until the watchdog's
+    first tick a full interval later. Measured live 2026-08-12: aw-diff-tool,
+    aw-presentation and whiteboard were all missing from the gateway after a
+    restart, so every agent got "Unknown tool" for them until a manual reload.
+    """
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    calls = []
+
+    async def fake_reload(rt, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(routes_mod, "_reload_mcp_gateway", fake_reload)
+
+    app = FastAPI()
+    routes_mod.register_apps_routes(app)
+
+    async def go():
+        await routes_mod.reconcile_on_boot(app)
+        app.state.app_runtime.watchdog.cancel_all_for(_SYSTEM_APP_ID)
+
+    _async(go())
+
+    assert len(calls) == 1
+    # Best-effort: a gateway that is not listening yet must not turn a boot
+    # into a failure -- the watchdog still covers it on its own schedule.
+    assert calls[0].get("raise_on_failure") in (None, False)

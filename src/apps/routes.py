@@ -644,9 +644,25 @@ async def reconcile_on_boot(app: FastAPI) -> None:
     # lifecycle) gets caught while the process keeps running, not just on the
     # next full workspace recreation.
     app.state.app_runtime.start_system_cli_healer()
-    # Safety net under the install/uninstall/config-save reload hooks: at
-    # boot an already-running mcp-gateway may have scanned BEFORE the
+    # At boot an already-running mcp-gateway will have scanned BEFORE the
     # inprocess apps above activated and (re)wrote their own mcp.json, and
-    # nothing in that path is ordered. The reconcile that just ran fires a
-    # coalesced reload when it changed anything; this catches the rest.
+    # nothing in that path is ordered — so reload once, now that they have.
+    #
+    # The reconcile above only fires its coalesced reload if it CHANGED
+    # something, which a plain restart doesn't. Without this, the gateway sat
+    # on a stale upstream set until the watchdog's first tick a full interval
+    # (5 min) later, and every agent in that window got "Unknown tool" for
+    # anything a Tier-1 app provides. Measured live 2026-08-12 after a
+    # restart: aw-diff-tool, aw-presentation and whiteboard were all missing,
+    # and one reload brought back 3 upstreams / 237 tools.
+    #
+    # Best-effort on purpose (no raise_on_failure): if the gateway container
+    # isn't listening yet, the watchdog below still covers it on its normal
+    # schedule. Routing this through the watchdog with run_immediately=True
+    # instead would be worse — a boot-race failure feeds its exponential
+    # backoff (min(interval * 2**n, 1800s)), pushing the retry out to 10
+    # minutes, i.e. later than doing nothing.
+    await _reload_mcp_gateway(app.state.app_runtime)
+    # Safety net under the install/uninstall/config-save reload hooks and the
+    # boot reload above.
     app.state.app_runtime.start_mcp_gateway_rescan()
