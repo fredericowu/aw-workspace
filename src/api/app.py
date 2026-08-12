@@ -21,6 +21,7 @@ from src.api.db import create_all_tables, get_session, get_workspace_schema
 from src.api.components import register_component_routes
 from src.api.agent_routes import register_agent_routes, sync_on_boot
 from src.api.folders import register_folder_routes
+from src.api.marketplace import register_marketplace_routes
 from src.api.identity import _extract_token, decode_identity_jwt, require_identity
 from src.api.models import Setting
 from src.api.notifications import register_notification_routes
@@ -168,6 +169,12 @@ def create_app() -> FastAPI:
     # $AW_WORKSPACE_REPOS placeholder's general replacement. See
     # src/api/folders.py.
     register_folder_routes(app)
+
+    # Marketplace sources: user-managed list of marketplaces the catalog is
+    # merged from, including private ones (per-source credential in the
+    # secret store, bound to its host). Settings → Marketplace drives this.
+    # See src/api/marketplace.py.
+    register_marketplace_routes(app)
 
     # POST /api/agent/sync — the HTTP face of `aw-workspace-cli agent sync`,
     # so the SPA can re-run the fan-out without a terminal. See

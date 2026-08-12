@@ -110,6 +110,28 @@ def _safe_extract(tf: tarfile.TarFile, dest: str) -> None:
     tf.extractall(dest, members=safe_members, filter="data")
 
 
+def _download_headers(repo: str, url: str, token: str | None) -> dict[str, str]:
+    """Auth headers for the tarball download.
+
+    Precedence: an explicitly-passed ``token`` (a caller that already knows
+    which credential to use) → the credential of the marketplace source that
+    published this app (so a private app from a private marketplace installs,
+    not just lists) → the legacy global ``AW_APP_GIT_TOKEN``.
+    """
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    try:
+        from src.apps import catalog
+
+        headers = catalog.auth_headers_for_repo(repo, url)
+        if headers:
+            return headers
+    except Exception as e:  # noqa: BLE001 — never block an install on this
+        log.debug("apps: marketplace credential lookup failed for %s (%s)", repo, e)
+    env_token = os.environ.get("AW_APP_GIT_TOKEN")
+    return {"Authorization": f"Bearer {env_token}"} if env_token else {}
+
+
 def fetch_app_repo(repo: str, ref: str = "HEAD", *, slug: str,
                    token: str | None = None, dest: str | None = None) -> str:
     """Download ``repo``'s tarball at ``ref`` and extract it to ``dest``.
@@ -118,10 +140,9 @@ def fetch_app_repo(repo: str, ref: str = "HEAD", *, slug: str,
     extraction lands in a tmp dir first, then atomically swaps into place, so a
     re-fetch (e.g. after the source advanced) fully replaces the prior tree.
     """
-    token = token or os.environ.get("AW_APP_GIT_TOKEN") or None
     dest = dest or package_dir_for(slug)
     url = _tarball_url(repo, ref)
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    headers = _download_headers(repo, url, token)
 
     parent = os.path.dirname(dest) or "."
     os.makedirs(parent, exist_ok=True)

@@ -69,3 +69,44 @@ class AppInstall(SQLModel, table=True):
     config: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSONB))
     signed: bool = Field(default=False)
     enabled: bool = True
+
+
+class MarketplaceSource(SQLModel, table=True):
+    """One marketplace the catalog is merged from — user-managed, private-capable.
+
+    Replaces the ``AW_MARKETPLACE_SOURCES`` env var as the source of truth
+    (the env var stays as a seed/fallback, see ``src/apps/catalog.py``): a
+    user adds a marketplace from Settings, which has to survive a container
+    recreation and be editable without an ops-side env change.
+
+    **No credential is stored on this row.** ``auth_type``/``auth_host``
+    describe *how* to authenticate; the token itself lives encrypted in the
+    workspace secret store (``src/apps/secret_store.py``, namespace
+    ``_marketplace``, key = this row's ``id``). Keeping it out of the table
+    means the plain ``GET /api/marketplace/sources`` response — and any
+    future dump of this table — can never leak it.
+
+    ``auth_host`` is the anti-exfiltration control. A single global token
+    sent to every configured source means adding ``https://evil.example/
+    apps.json`` hands that host your GitHub PAT. The credential is therefore
+    bound to the host it belongs to and the header is only attached when the
+    request's host matches — same model as ``.netrc``/``git credential``.
+    """
+
+    __tablename__ = "marketplace_sources"  # type: ignore[assignment]
+
+    id: str = Field(primary_key=True)
+    name: str = Field(default="")
+    # Either ``owner/repo``/``owner/repo@ref`` or a full http(s) URL to the
+    # catalog JSON — the two shapes ``catalog._raw_url_for`` already accepts.
+    url: str
+    enabled: bool = Field(default=True)
+    # Merge order (ascending). Ties are broken by ``id`` so the merge is
+    # deterministic; first source wins on duplicate app ids.
+    priority: int = Field(default=100)
+    # "none" | "github_pat" | "bearer"
+    auth_type: str = Field(default="none")
+    # Host the credential may be sent to, e.g. "github.com". Empty when
+    # ``auth_type`` is "none".
+    auth_host: str = Field(default="")
+    created_at: Optional[float] = Field(default=None)
