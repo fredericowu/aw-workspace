@@ -144,3 +144,42 @@ def test_update_not_in_catalog_fails_via_status(tmp_path, monkeypatch):
         assert "not found in catalog" in s.json()["error"]
 
     _async(run())
+
+
+async def _delete(app, path):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        return await c.delete(path)
+
+
+def test_uninstall_can_remove_an_app_that_never_loaded(tmp_path, monkeypatch):
+    """A failed install still leaves a desired row, and reconcile retries it on
+    every pass forever. Guarding uninstall on `is_loaded` made exactly that
+    state unremovable — seen live 2026-08-12 as "app 'remote-screen' has
+    neither a repo to fetch nor an on-disk package_dir" on every boot.
+    """
+    cloud = FakeCloud([{"app_id": "ghost", "version": "1.0.0", "repo": None, "ref": "main",
+                        "granted_permissions": [], "config": {}, "state": "installed"}])
+    app, runtime, reconciler = _app(tmp_path, monkeypatch, cloud)
+
+    async def run():
+        assert not runtime.is_loaded("ghost")
+
+        r = await _delete(app, "/api/apps/ghost")
+        assert r.status_code == 200
+        assert r.json()["uninstalled"] is True
+        # The row is gone, so the next reconcile has nothing left to retry.
+        assert [row["app_id"] for row in cloud.list_desired()] == []
+
+    _async(run())
+
+
+def test_uninstall_of_a_genuinely_unknown_app_is_still_404(tmp_path, monkeypatch):
+    """Not loaded AND no row anywhere — nothing to remove, so don't pretend."""
+    app, runtime, reconciler = _app(tmp_path, monkeypatch, FakeCloud())
+
+    async def run():
+        r = await _delete(app, "/api/apps/nope")
+        assert r.status_code == 404
+
+    _async(run())

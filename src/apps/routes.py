@@ -277,9 +277,34 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             return {"app_id": slug, "status": "installed", "error": None, "summary": None}
         return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
 
+    def _has_desired_row(slug: str) -> bool:
+        """Is there a registry row for ``slug``, loaded or not?
+
+        An app that FAILS to install still has one, and that is the case this
+        exists for: reconcile retries it on every pass forever, logging the
+        same failure, with nothing the user can do about it. Seen live
+        2026-08-12 with two rows whose repo had gone away entirely — "app
+        'remote-screen' has neither a repo to fetch nor an on-disk
+        package_dir" on every boot.
+        """
+        for source in (reconciler.local, reconciler.cloud):
+            lister = getattr(source, "list", None) or getattr(source, "list_desired", None)
+            if lister is None or getattr(source, "configured", True) is False:
+                continue
+            try:
+                if any((row or {}).get("app_id") == slug for row in lister()):
+                    return True
+            except Exception:  # noqa: BLE001 — a source being down must not block the other
+                log.exception("apps: could not read desired state from %s", type(source).__name__)
+        return False
+
     @app.delete("/api/apps/{slug}")
     async def uninstall_app(slug: str, identity: dict = Depends(require_identity)):
-        if not runtime.is_loaded(slug):
+        # Not `is_loaded` alone: that made a broken install unremovable, which
+        # is precisely when you need to remove it. Reconciler.uninstall already
+        # tolerates an unloaded app — it drops the mirror + registry rows and
+        # the package dir either way.
+        if not runtime.is_loaded(slug) and not _has_desired_row(slug):
             return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
         summary = await reconciler.uninstall(slug)
         jobs.clear(slug)
