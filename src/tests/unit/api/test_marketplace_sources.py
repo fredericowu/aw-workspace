@@ -121,3 +121,43 @@ def test_describe_reports_only_whether_a_credential_exists(bound_source):
     assert out["has_credential"] is True
     assert "ghp_secret" not in str(out)
     assert "credential" not in out
+
+
+# --- registry credentials (private app images) -------------------------------
+
+
+@pytest.mark.parametrize("image,expected", [
+    ("ghcr.io/tekflox/aw-app-crispal:latest", "ghcr.io"),
+    ("tekflox/aw-app-crispal:latest", "docker.io"),   # Hub namespace, not a host
+    ("aw-app-crispal", "docker.io"),
+    ("localhost:5000/foo:1", "localhost:5000"),
+    ("registry.internal:5000/foo", "registry.internal:5000"),
+])
+def test_registry_host_parsing(image, expected):
+    from src.apps.containers import _registry_host
+    assert _registry_host(image) == expected
+
+
+def test_registry_credential_reuses_a_github_marketplace_token(monkeypatch):
+    row = MarketplaceSource(id="private", url="tekflox/aw-marketplace-private",
+                            enabled=True, auth_type="github_pat", auth_host="github.com")
+    monkeypatch.setattr(mp, "list_sources", lambda enabled_only=False: [row])
+    monkeypatch.setattr(mp._secrets, "get", lambda ns, key: "ghp_secret")
+    assert mp.registry_credential("ghcr.io") == ("x-access-token", "ghp_secret")
+
+
+def test_registry_credential_is_none_for_other_registries(monkeypatch):
+    row = MarketplaceSource(id="private", url="tekflox/x", enabled=True,
+                            auth_type="github_pat", auth_host="github.com")
+    monkeypatch.setattr(mp, "list_sources", lambda enabled_only=False: [row])
+    monkeypatch.setattr(mp._secrets, "get", lambda ns, key: "ghp_secret")
+    # A GitHub PAT is not a Docker Hub credential — don't send it there.
+    assert mp.registry_credential("docker.io") is None
+
+
+def test_registry_credential_is_none_without_a_github_source(monkeypatch):
+    row = MarketplaceSource(id="acme", url="https://acme.internal/apps.json",
+                            enabled=True, auth_type="bearer", auth_host="acme.internal")
+    monkeypatch.setattr(mp, "list_sources", lambda enabled_only=False: [row])
+    monkeypatch.setattr(mp._secrets, "get", lambda ns, key: "tok")
+    assert mp.registry_credential("ghcr.io") is None

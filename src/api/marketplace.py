@@ -277,6 +277,34 @@ def credential_for(source_id: str, url: str) -> tuple[str, str] | None:
     return ("Authorization", f"Bearer {token}")
 
 
+def registry_credential(registry_host: str) -> tuple[str, str] | None:
+    """Username/password for pulling an app image from ``registry_host``.
+
+    A private app published by a private marketplace also has a **private
+    container image**, and ``containers.py`` pulls with no auth at all — so
+    without this the app lists, installs, and then fails to start.
+
+    Rather than invent a second credential store, this reuses the
+    marketplace's own token: a GitHub PAT that can read a private repo can
+    also read that org's GHCR packages (``read:packages``), so the source
+    that published the app is exactly the right thing to authenticate its
+    image. Only GHCR is mapped this way; any other registry returns ``None``
+    until it has a credential type of its own.
+
+    Returns ``(username, token)`` — GHCR ignores the username, but the
+    docker SDK requires one.
+    """
+    if registry_host.lower() not in ("ghcr.io", "docker.pkg.github.com"):
+        return None
+    for row in list_sources(enabled_only=True):
+        if row.auth_type != "github_pat":
+            continue
+        token = _secrets.get(SECRETS_NS, row.id)
+        if token:
+            return ("x-access-token", token)
+    return None
+
+
 # --- routes ------------------------------------------------------------------
 
 

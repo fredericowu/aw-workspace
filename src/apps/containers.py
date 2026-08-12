@@ -33,6 +33,40 @@ class ContainerError(RuntimeError):
     pass
 
 
+def _registry_host(image: str) -> str:
+    """Registry an image reference points at, ``docker.io`` when implicit.
+
+    An image ref's first path segment is the registry only if it looks like
+    a host (contains a dot or a port, or is ``localhost``) — ``tekflox/foo``
+    is a Docker Hub namespace, ``ghcr.io/tekflox/foo`` is not.
+    """
+    head = image.split("/", 1)[0]
+    if "." in head or ":" in head or head == "localhost":
+        return head
+    return "docker.io"
+
+
+def _registry_auth(image: str) -> dict | None:
+    """Credentials for pulling ``image``, or None to pull anonymously.
+
+    A private app image (published alongside a private marketplace) can't be
+    pulled anonymously, and an unauthenticated pull fails in a way that looks
+    like "registry unreachable" — the app then silently starts from a stale
+    cached image, or not at all. See ``marketplace.registry_credential``.
+    """
+    try:
+        from src.api.marketplace import registry_credential
+
+        cred = registry_credential(_registry_host(image))
+    except Exception as e:  # noqa: BLE001 — never block a public pull on this
+        log.debug("apps: registry credential lookup failed for %s (%s)", image, e)
+        return None
+    if not cred:
+        return None
+    log.info("apps: using a marketplace credential to pull %s", image)
+    return {"username": cred[0], "password": cred[1]}
+
+
 def _parse_run_flags(run_flags: list[str] | None) -> dict:
     """Map a manifest's ``run_flags_needed`` CLI flags to ``docker`` SDK kwargs.
 
@@ -182,7 +216,7 @@ class ContainerSupervisor:
         # than-broken fallback (see ``src.apps.catalog.get_catalog``).
         try:
             log.info("apps: pulling image %s for %s", c.image, c.name)
-            client.images.pull(c.image)
+            client.images.pull(c.image, auth_config=_registry_auth(c.image))
         except Exception:  # noqa: BLE001 — registry unreachable, fall back to cache
             try:
                 client.images.get(c.image)
