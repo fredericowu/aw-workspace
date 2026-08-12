@@ -219,3 +219,33 @@ def test_ttl_cache_avoids_refetch_until_forced(monkeypatch):
 
     catalog_mod.get_catalog(force=True)
     assert calls["n"] == 2
+
+
+class TestIsMarketplaceApp:
+    """Catalog membership is the local half of the ``signed`` trust flag
+    (ADR Decision 4) — see routes.py's install path, where taking it from the
+    request body instead silently stripped ui:code from a CLI install."""
+
+    @pytest.fixture(autouse=True)
+    def _catalog(self, monkeypatch):
+        monkeypatch.setattr(catalog_mod.httpx, "get", lambda url, headers=None, timeout=None: _resp(
+            {"apps": [{"id": "diff-tool", "repo": "tekflox/aw-app-diff-tool"}]}))
+        catalog_mod.get_catalog(force=True)
+
+    def test_published_id_and_repo_pair_is_signed(self):
+        assert catalog_mod.is_marketplace_app("diff-tool", "tekflox/aw-app-diff-tool") is True
+
+    def test_repo_match_is_case_and_whitespace_insensitive(self):
+        assert catalog_mod.is_marketplace_app("diff-tool", " TekFlox/aw-app-Diff-Tool ") is True
+
+    def test_id_collision_under_a_different_repo_is_not_signed(self):
+        """A side-loaded app reusing a catalog app's id must not inherit its
+        trust — this is the whole reason both fields are compared."""
+        assert catalog_mod.is_marketplace_app("diff-tool", "attacker/aw-app-diff-tool") is False
+
+    def test_unknown_app_is_not_signed(self):
+        assert catalog_mod.is_marketplace_app("nope", "tekflox/aw-app-nope") is False
+
+    def test_sideload_without_a_repo_is_not_signed(self):
+        assert catalog_mod.is_marketplace_app("diff-tool", None) is False
+        assert catalog_mod.is_marketplace_app("", "tekflox/aw-app-diff-tool") is False

@@ -81,6 +81,33 @@ def _make_app_repo(tmp_path, slug="widget", version="1.0.0", dependencies=None,
     return str(src)
 
 
+def _make_app_repo_with_permissions(tmp_path, slug, version, permissions):
+    """Same shape as _make_app_repo, with the manifest's permission list under
+    test — the thing an update is supposed to re-read."""
+    import json
+    src = tmp_path / f"src_{slug}_{version}"
+    src.mkdir()
+    (src / "aw-app.json").write_text(json.dumps({
+        "manifest_version": 1,
+        "id": slug,
+        "name": slug,
+        "version": version,
+        "tier": "inprocess",
+        "runtime": {"entrypoint": "plugin:AppPlugin"},
+        "permissions": permissions,
+        "contributes": {"routes": [{"prefix": f"/api/apps/{slug}"}]},
+    }))
+    (src / "plugin.py").write_text(textwrap.dedent("""
+        from fastapi import FastAPI
+        class AppPlugin:
+            async def activate(self, ctx):
+                ctx.routes.register(FastAPI())
+            async def deactivate(self):
+                return None
+    """))
+    return str(src)
+
+
 class FakeCloud:
     """In-memory stand-in for the aw-backend cloud registry."""
 
@@ -209,8 +236,16 @@ def test_recreation_auto_reinstalls_from_registry(tmp_path, monkeypatch):
 def test_local_fallback_preserves_signed_component_grants(tmp_path, monkeypatch):
     """A signed component app must keep ``ui:code`` when boot reconcile falls
     back to the local mirror; otherwise the SPA downgrades it and never imports
-    the bundle."""
-    repo = _make_app_repo(tmp_path, slug="devctl")
+    the bundle.
+
+    The fixture declares ``ui:code`` in its manifest, as the real devctl does:
+    the manifest is what an app REQUESTS, and a grant can only narrow it. It
+    used to declare only ``routes:register`` while the spec asked for both,
+    which no real flow produces — the SPA and CLI send no grant at all, and the
+    cloud row mirrors back what the workspace derived from the manifest.
+    """
+    repo = _make_app_repo_with_permissions(
+        tmp_path, "devctl", "1.0.0", ["routes:register", "ui:code"])
     cloud = FakeCloud()
     host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
 
@@ -569,3 +604,63 @@ def test_reconciler_leaves_no_pending_reload_state_after_a_pass(tmp_path, monkey
     repo2 = _make_app_repo(tmp_path, "widget-mcp2", reload_mcp_gateway_on_save=True)
     _async(rc.install(AppSpec(app_id="widget-mcp2", repo=repo2, ref="main")))
     assert len(calls) == 1
+
+
+def test_update_grants_a_permission_the_new_manifest_added(tmp_path, monkeypatch):
+    """An update must re-read the NEW version's manifest for what to request.
+
+    Regression (aw-app-diff-tool, 2026-08-12): the request was taken from the
+    spec's carried grant — the *effective* result of the previous install — so
+    a permission first declared by the new version was never granted, and the
+    app silently degraded wherever it guarded on ctx.has().
+    """
+    v1 = _make_app_repo_with_permissions(tmp_path, "widget", "1.0.0", ["routes:register"])
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    _async(rc.install(AppSpec(app_id="widget", version="1.0.0", repo=v1, signed=True)))
+    assert rt.get("widget").granted_permissions == ["routes:register"]
+
+    v2 = _make_app_repo_with_permissions(
+        tmp_path, "widget", "2.0.0", ["routes:register", "fs:workspace-data"])
+    # Exactly what POST /api/apps/{slug}/update builds: the previous effective
+    # grant carried forward onto the new version's spec.
+    _async(rc.uninstall("widget", write_cloud=False))
+    _async(rc.install(AppSpec(
+        app_id="widget", version="2.0.0", repo=v2,
+        granted_permissions=["routes:register"], signed=True)))
+
+    assert "fs:workspace-data" in rt.get("widget").granted_permissions
+
+
+def test_update_drops_a_permission_the_new_manifest_removed(tmp_path, monkeypatch):
+    """The manifest is the whole request, so a withdrawn permission goes away
+    instead of being carried forever by the stored grant."""
+    v1 = _make_app_repo_with_permissions(
+        tmp_path, "widget", "1.0.0", ["routes:register", "fs:workspace-data"])
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+    _async(rc.install(AppSpec(app_id="widget", version="1.0.0", repo=v1, signed=True)))
+
+    v2 = _make_app_repo_with_permissions(tmp_path, "widget", "2.0.0", ["routes:register"])
+    _async(rc.uninstall("widget", write_cloud=False))
+    _async(rc.install(AppSpec(
+        app_id="widget", version="2.0.0", repo=v2,
+        granted_permissions=["routes:register", "fs:workspace-data"], signed=True)))
+
+    assert rt.get("widget").granted_permissions == ["routes:register"]
+
+
+def test_trust_filter_still_strips_high_risk_from_an_unsigned_app(tmp_path, monkeypatch):
+    """Re-reading the manifest widens what an app may ASK for, never what it
+    is granted — an unsigned app still loses ui:code."""
+    repo = _make_app_repo_with_permissions(
+        tmp_path, "widget", "1.0.0", ["routes:register", "ui:code"])
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    _async(rc.install(AppSpec(app_id="widget", version="1.0.0", repo=repo, signed=False)))
+
+    granted = rt.get("widget").granted_permissions
+    assert "routes:register" in granted
+    assert "ui:code" not in granted

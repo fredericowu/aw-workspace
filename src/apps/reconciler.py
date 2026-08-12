@@ -353,7 +353,28 @@ class Reconciler:
         spec.app_id = manifest.id
         if not spec.version:
             spec.version = manifest.version
-        granted_req = spec.granted_permissions or list(manifest.permissions)
+        # The REQUEST is always what this version's manifest declares — never
+        # the grant carried on the spec. That grant is the *effective* result
+        # of the last install (written back below, and mirrored to the cloud),
+        # so feeding it back in as the request pins an app to the permissions
+        # of the version it was first installed at: an update that declares a
+        # NEW permission never gets it, and the app degrades silently if it
+        # guards on ctx.has(). Hit on aw-app-diff-tool 2026-08-12, where a
+        # newly-declared fs:workspace-data stayed ungranted through
+        # `POST /api/apps/{slug}/update` (which explicitly preserves the old
+        # grant) — only a full uninstall+reinstall picked it up.
+        #
+        # Nothing narrows the manifest's set today: no consent screen exists,
+        # so every caller (SPA, CLI, cloud row) passes the manifest's list or
+        # nothing at all. When one does land, it needs its own field for what
+        # the user DENIED — a subtractive record survives an update, whereas
+        # this additive one cannot tell "user withheld it" from "the version
+        # installed never asked for it".
+        #
+        # Trust filtering is unaffected: runtime.load still strips high-risk
+        # capabilities from an unsigned app, so this widens what an app may
+        # ASK for, never what it is granted.
+        granted_req = list(manifest.permissions)
 
         deps_installed = await self._install_dependencies(
             manifest, write_cloud=write_cloud, stack=_dependency_stack or (manifest.id,))

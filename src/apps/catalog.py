@@ -343,6 +343,40 @@ def get_catalog(force: bool = False) -> dict[str, Any]:
     return {"apps": [], "error": "all catalog sources failed", "sources": specs}
 
 
+def is_marketplace_app(app_id: str, repo: str | None, force: bool = False) -> bool:
+    """True if ``app_id`` is published in a configured catalog under ``repo``.
+
+    The workspace-side twin of aw-backend's
+    ``src/api/marketplace_catalog.py::is_marketplace_app``, and the local
+    answer to the ``signed`` trust flag (ADR Decision 4): catalog membership
+    is a real, if lightweight, signal, because every entry lands there through
+    a reviewed PR merge plus the release pipeline's ``validate-apps-json``.
+    It is NOT full F8 content-hash pinning — it proves the id+repo pair is one
+    the catalog publishes, not that the installed bytes match what it did.
+
+    **Both must match.** An id collision with a different repo (a side-loaded
+    app reusing a marketplace app's id) is not signed — that check is the
+    whole point, so never relax it to an id-only lookup.
+
+    One deliberate divergence from the cloud twin: this reads the MERGED
+    catalog, so an app from a user-added private source counts as signed here
+    while the cloud (official catalog only) says otherwise. Where a cloud
+    registry is configured its answer wins on the next reconcile, which
+    re-derives trust and reinstalls on drift — so a private-source app can
+    flip back to unsigned there. Publishing to the official catalog is the way
+    to make it stick.
+    """
+    if not app_id:
+        return False
+    wanted = (repo or "").strip().lower()
+    for app in get_catalog(force=force).get("apps", []) or []:
+        if (app.get("id") or app.get("slug")) != app_id:
+            continue
+        if (app.get("repo") or "").strip().lower() == wanted:
+            return True
+    return False
+
+
 def clear_cache() -> None:
     _cache["data"] = None
     _cache["at"] = 0.0

@@ -36,7 +36,7 @@ from fastapi import Body, Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
 from src.api.identity import authorize_ws, require_identity
-from src.apps.catalog import get_catalog, list_tags
+from src.apps.catalog import get_catalog, is_marketplace_app, list_tags
 from src.apps.install_jobs import InstallJobs
 from src.apps.manifest import ManifestError, load_manifest
 from src.apps.reconciler import AppSpec, Reconciler
@@ -233,7 +233,21 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             ref=data.get("ref") or "HEAD",
             granted_permissions=data.get("granted_permissions") or [],
             config=data.get("config") or {},
-            signed=bool(data.get("signed", False)),
+            # DERIVED, never taken from the request body (ADR Decision 4 — the
+            # cloud registry has computed it from catalog membership since
+            # 2026-08-04, and this is the local twin of that rule).
+            #
+            # It used to be `bool(data.get("signed"))`, i.e. self-certified: a
+            # side-loaded app could assert its own trust, while a caller that
+            # simply didn't think to send the field got an UNSIGNED install of
+            # a first-party catalog app. The second half is what bit — the
+            # `aw-workspace-cli marketplace install` payload has no `signed`,
+            # so `ui:code` (high-risk) was refused by filter_grants and the
+            # app's entire frontend silently vanished: no window body, no nav
+            # row, no titlebar actions, while the window chrome still drew, so
+            # it read as a bug in the app. Hit for real on diff-tool,
+            # 2026-08-12.
+            signed=is_marketplace_app(app_id, repo),
             package_dir=package_dir if not repo else None,
         )
         write_cloud = bool(data.get("persist", True))
@@ -341,7 +355,9 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         """Update an installed app to the marketplace catalog's current version
         (ADR app-update-mechanism.md, Metade B). Resolves the app's catalog
         entry, writes a new ``desired`` row (version/ref from the catalog,
-        config/granted_permissions preserved from the current install) and
+        config preserved from the current install; the grant carried here is
+        the last effective one, and is re-derived from the NEW version's
+        manifest by ``Reconciler.install`` — see its ``granted_req``) and
         runs ``reconcile()`` in the BACKGROUND via the same job tracker as
         ``POST /api/apps/install`` — poll ``GET /api/apps/{slug}/install-status``
         for progress, same status contract as install."""
