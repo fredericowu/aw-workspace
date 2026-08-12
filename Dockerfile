@@ -10,8 +10,13 @@ ARG AW_WORKSPACE_VERSION=dev
 # sudo → the `ubuntu` user is unprivileged by default (see USER below); sudo
 # lets terminal sessions install packages / touch root-owned paths on demand
 # instead of everyone needing `docker exec -u root`. Frederico decision 2026-08-01.
+# unzip → apps ship release archives (terraform, awscli v2) and their
+# installers used to abort with "unsupported base image" on every boot for the
+# want of it. Those now fall back to python3's stdlib zipfile so they work on
+# any base, but a 200KB package is cheaper than every future app rediscovering
+# this — and `unzip` in a terminal is table stakes.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl build-essential libpq-dev procps git sudo \
+        curl build-essential libpq-dev procps git sudo unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # `ubuntu` user (UID/GID 1001, standard Ubuntu first-user convention) — this

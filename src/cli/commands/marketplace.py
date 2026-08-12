@@ -70,6 +70,12 @@ def _install(app_id: str, update: bool) -> int:
     if update:
         return _update_one(app_id)
 
+    # No `signed`: the server derives trust from marketplace-catalog membership
+    # (src/apps/catalog.py::is_marketplace_app) and ignores what a client
+    # claims. Do NOT "fix" a trust problem by adding it back here — the field
+    # was honoured once, and this payload's silence produced UNSIGNED installs
+    # of catalog apps, which cost them `ui:code` and with it every frontend
+    # contribution they make.
     payload = {
         "app_id": app_id,
         "repo": entry.get("repo"),
