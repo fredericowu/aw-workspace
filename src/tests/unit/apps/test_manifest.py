@@ -303,3 +303,22 @@ def test_config_visible_defaults_true():
     }))
     assert m.raw.get("config_visible") is None
     assert m.has_config is True
+
+
+def test_contributes_mcp_true_for_any_contributes_mcp_block():
+    """Broader than reload_mcp_gateway_on_save on purpose: codegraphcontext
+    and notion ship contributes.mcp WITHOUT reload_on_save, and installing or
+    removing them still changes what the gateway's app-scan finds."""
+    m = validate_manifest(_m(contributes={"mcp": {"provides": ["some_tool"]}}, permissions=[]))
+    assert m.contributes_mcp is True
+    assert m.reload_mcp_gateway_on_save is False
+
+
+def test_contributes_mcp_true_when_reload_on_save_declared():
+    m = validate_manifest(_m(contributes={"mcp": {"reload_on_save": True}}, permissions=[]))
+    assert m.contributes_mcp is True
+
+
+def test_contributes_mcp_false_without_an_mcp_block():
+    m = validate_manifest(_m(contributes={"routes": [{"prefix": "/api/apps/x"}]}, permissions=["routes:register"]))
+    assert m.contributes_mcp is False

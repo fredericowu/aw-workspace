@@ -53,8 +53,19 @@ DEFAULT_WORKSPACE_CONTAINER_DIR = "/opt/aw-workspace"
 # SLUG_RE requires slugs to start with a letter), so it's a safe sentinel key
 # for the runtime's own watchdog task.
 DEFAULT_CLI_HEAL_INTERVAL_S = float(os.environ.get("AW_APPS_CLI_HEAL_INTERVAL_S", "300"))
-_CLI_HEALER_APP_ID = "__system__"
+_SYSTEM_APP_ID = "__system__"
+_CLI_HEALER_APP_ID = _SYSTEM_APP_ID  # back-compat alias
 _CLI_HEALER_TASK_ID = "system-cli-health"
+
+# MCP-gateway rescan cadence. The install/uninstall/config-save hooks push a
+# reload the moment an app changes what the gateway's app-scan would find;
+# this is the safety net UNDER those hooks, for the paths no hook covers —
+# chiefly boot, where an already-running gateway scanned before the inprocess
+# apps activated and rewrote their mcp.json (aw-app-whiteboard and
+# aw-app-presentations both went missing this way, 2026-08-12: 183 tools
+# instead of 209). Set to 0 to disable.
+DEFAULT_MCP_RESCAN_INTERVAL_S = float(os.environ.get("AW_APPS_MCP_RESCAN_INTERVAL_S", "300"))
+_MCP_RESCAN_TASK_ID = "mcp-gateway-rescan"
 
 # Cookie the central-identity JWT lands in (mirrors src.api.identity.COOKIE_NAME).
 _ID_COOKIE = "aw_id_jwt"
@@ -421,6 +432,40 @@ class AppRuntime:
                             name, app_id)
             except Exception:
                 log.exception("apps: failed to heal system CLI %r for %s", name, app_id)
+
+    # ---- MCP gateway rescan ----------------------------------------------
+
+    def start_mcp_gateway_rescan(
+            self, interval_s: float = DEFAULT_MCP_RESCAN_INTERVAL_S) -> None:
+        """Start the runtime-owned periodic ``POST /reload`` against the
+        installed mcp-gateway app. Same shape and rationale as
+        ``start_system_cli_healer``: core runtime code, so no
+        ``watchdog:tasks`` grant is involved — and mcp-gateway is a
+        container-tier app with no in-process plugin, so it could not
+        register a watchdog task for itself even if it wanted to.
+
+        ``run_immediately=False``: boot already reloads via reconcile's
+        coalesced trigger, so the first tick belongs one interval later.
+        Idempotent; a non-positive interval disables the task entirely.
+        """
+        if interval_s <= 0:
+            log.info("apps: mcp-gateway rescan watchdog disabled (interval=%s)", interval_s)
+            return
+        if _MCP_RESCAN_TASK_ID in self.watchdog.task_ids_for(_SYSTEM_APP_ID):
+            return
+        self.watchdog.register(
+            _SYSTEM_APP_ID, _MCP_RESCAN_TASK_ID, self._rescan_mcp_gateway,
+            interval_s, run_immediately=False,
+        )
+
+    async def _rescan_mcp_gateway(self) -> None:
+        """One tick. Raises on failure so the supervisor's backoff and the
+        ``last_ok``/``last_error`` introspection in ``GET /api/apps/-/watchdog``
+        mean something — unlike the fire-and-forget call sites, a watchdog
+        that silently no-ops every 5 minutes is worse than no watchdog.
+        Deferred import: routes.py imports FROM this module."""
+        from src.apps.routes import _reload_mcp_gateway
+        await _reload_mcp_gateway(self, raise_on_failure=True)
 
     # ---- introspection --------------------------------------------------
 

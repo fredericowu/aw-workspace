@@ -19,6 +19,7 @@ import asyncio
 import shutil
 import sys
 import textwrap
+from pathlib import Path
 
 import httpx
 import pytest
@@ -452,3 +453,119 @@ def test_install_does_not_block_the_event_loop_during_fetch(tmp_path, monkeypatc
         )
 
     _async(run())
+
+
+# ---- MCP gateway reload triggers (install / uninstall / reconcile) --------
+#
+# The 2026-08-12 bug: the reload was gated on contributes.mcp.reload_on_save,
+# an opt-in flag, so codegraphcontext/notion (mcp.json, flag absent) and every
+# uninstall were silently skipped. The gate is now "does this app change what
+# the gateway's app-scan finds" — see Reconciler._app_touches_mcp.
+
+def _patch_reload(monkeypatch, sink):
+    async def fake_reload(runtime, **kwargs):
+        sink.append(runtime)
+    monkeypatch.setattr("src.apps.routes._reload_mcp_gateway", fake_reload)
+
+
+def test_install_reloads_gateway_for_mcp_json_on_disk_without_the_optin_flag(
+        tmp_path, monkeypatch):
+    """aw-app-browser / aw-app-code-server ship an mcp.json with no
+    contributes.mcp block at all — the manifest alone under-reports them."""
+    calls = []
+    _patch_reload(monkeypatch, calls)
+
+    repo = _make_app_repo(tmp_path, "widget-diskmcp", reload_mcp_gateway_on_save=False)
+    (Path(repo) / "mcp.json").write_text('{"mcpServers": {"widget": {"type": "http"}}}')
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    _async(rc.install(AppSpec(app_id="widget-diskmcp", repo=repo, ref="main")))
+
+    assert len(calls) == 1
+
+
+def test_uninstall_reloads_gateway_so_the_dead_upstream_gets_dropped(
+        tmp_path, monkeypatch):
+    calls = []
+    _patch_reload(monkeypatch, calls)
+
+    repo = _make_app_repo(tmp_path, "widget-mcp", reload_mcp_gateway_on_save=True)
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+    _async(rc.install(AppSpec(app_id="widget-mcp", repo=repo, ref="main")))
+    calls.clear()
+
+    _async(rc.uninstall("widget-mcp"))
+
+    assert len(calls) == 1
+
+
+def test_uninstall_does_not_reload_gateway_for_a_plain_app(tmp_path, monkeypatch):
+    calls = []
+    _patch_reload(monkeypatch, calls)
+
+    repo = _make_app_repo(tmp_path, "widget-plain", reload_mcp_gateway_on_save=False)
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+    _async(rc.install(AppSpec(app_id="widget-plain", repo=repo, ref="main")))
+    calls.clear()
+
+    _async(rc.uninstall("widget-plain"))
+
+    assert calls == []
+
+
+def test_reconcile_coalesces_many_app_installs_into_one_gateway_reload(
+        tmp_path, monkeypatch):
+    """Boot reconciles ~20 apps; each /reload re-dials every upstream, so the
+    per-app calls must collapse to one at the end of the pass."""
+    calls = []
+    _patch_reload(monkeypatch, calls)
+
+    repos = [_make_app_repo(tmp_path, f"widget-m{i}", reload_mcp_gateway_on_save=True)
+             for i in range(3)]
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    summary = _async(rc.reconcile([
+        {"app_id": f"widget-m{i}", "repo": repos[i], "ref": "main"} for i in range(3)
+    ]))
+
+    assert sorted(summary["installed"]) == ["widget-m0", "widget-m1", "widget-m2"]
+    assert len(calls) == 1
+    assert summary["mcp_gateway_reloaded"] is True
+
+
+def test_reconcile_does_not_reload_gateway_when_nothing_mcp_changed(
+        tmp_path, monkeypatch):
+    calls = []
+    _patch_reload(monkeypatch, calls)
+
+    repo = _make_app_repo(tmp_path, "widget-plain", reload_mcp_gateway_on_save=False)
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    summary = _async(rc.reconcile([{"app_id": "widget-plain", "repo": repo, "ref": "main"}]))
+
+    assert calls == []
+    assert summary["mcp_gateway_reloaded"] is False
+
+
+def test_reconciler_leaves_no_pending_reload_state_after_a_pass(tmp_path, monkeypatch):
+    """_pending_gateway_reload must return to None, or every later install()
+    would only ever mark a flag nobody flushes."""
+    calls = []
+    _patch_reload(monkeypatch, calls)
+
+    repo = _make_app_repo(tmp_path, "widget-mcp", reload_mcp_gateway_on_save=True)
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    _async(rc.reconcile([{"app_id": "widget-mcp", "repo": repo, "ref": "main"}]))
+    assert rc._pending_gateway_reload is None
+
+    calls.clear()
+    repo2 = _make_app_repo(tmp_path, "widget-mcp2", reload_mcp_gateway_on_save=True)
+    _async(rc.install(AppSpec(app_id="widget-mcp2", repo=repo2, ref="main")))
+    assert len(calls) == 1

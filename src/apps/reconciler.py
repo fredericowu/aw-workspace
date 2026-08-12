@@ -145,6 +145,37 @@ class Reconciler:
         self.local = local if local is not None else LocalMirror()
         self._fetch = fetch
         self._remove = remove
+        # Set while a reconcile() pass is running so the per-app install/
+        # uninstall calls inside it COALESCE into one gateway reload at the
+        # end instead of firing one HTTP rescan per app — a fresh workspace
+        # reconciles ~20 apps at boot, and each /reload re-dials every
+        # upstream. None = not in a pass (reload immediately).
+        self._pending_gateway_reload: bool | None = None
+
+    # ---- MCP gateway rescan triggers ---------------------------------------
+
+    def _app_touches_mcp(self, manifest, package_dir: str | None) -> bool:
+        """Would installing/removing this app change what the MCP Gateway's
+        app-scan finds? Manifest signal (``contributes.mcp``) OR an
+        ``mcp.json`` actually on disk in the package dir — aw-app-browser and
+        aw-app-code-server ship the file with no ``contributes.mcp`` block,
+        so the manifest alone under-reports."""
+        if manifest is not None and (manifest.contributes_mcp
+                                     or manifest.reload_mcp_gateway_on_save):
+            return True
+        if package_dir and os.path.isfile(os.path.join(package_dir, "mcp.json")):
+            return True
+        return False
+
+    async def _trigger_gateway_reload(self) -> None:
+        """Reload now, or mark it pending when inside a reconcile() pass.
+        Deferred import: routes.py imports FROM this module, so a top-level
+        import here would cycle."""
+        if self._pending_gateway_reload is not None:
+            self._pending_gateway_reload = True
+            return
+        from src.apps.routes import _reload_mcp_gateway
+        await _reload_mcp_gateway(self.runtime)
 
     # ---- resolve a package dir for a spec (fetch unless already on disk) ----
 
@@ -351,11 +382,10 @@ class Reconciler:
         # aw-app-whiteboard) only gets picked up by an ALREADY-RUNNING
         # mcp-gateway on its own next reload/restart — mcp-gateway's own
         # boot-time scan can't see a file that doesn't exist yet if this app
-        # gets installed/updated afterward. Deferred import: routes.py
-        # imports FROM this module, so a top-level import here would cycle.
-        if loaded is not None and loaded.manifest.reload_mcp_gateway_on_save:
-            from src.apps.routes import _reload_mcp_gateway
-            await _reload_mcp_gateway(self.runtime)
+        # gets installed/updated afterward. Gated on _app_touches_mcp, NOT
+        # on the narrower reload_on_save opt-in (see manifest.contributes_mcp).
+        if self._app_touches_mcp(loaded.manifest if loaded else manifest, package_dir):
+            await self._trigger_gateway_reload()
 
         return {"app_id": manifest.id, "version": spec.version,
                 "granted_permissions": effective, "package_dir": package_dir,
@@ -364,6 +394,14 @@ class Reconciler:
     async def uninstall(self, app_id: str, *, remove_repo: bool = True,
                         write_cloud: bool = True) -> dict[str, Any]:
         """Unload (drain + journal reverse) → drop mirror/registry rows → rm repo."""
+        # Probe BEFORE unloading: once the app is unloaded and its repo
+        # removed, both the manifest and the on-disk mcp.json are gone and
+        # there is no way left to tell whether the gateway needs a rescan.
+        loaded_before = self.runtime.get(app_id)
+        touched_mcp = self._app_touches_mcp(
+            loaded_before.manifest if loaded_before else None,
+            loaded_before.package_dir if loaded_before else None,
+        )
         if self.runtime.is_loaded(app_id):
             await self.runtime.unload(app_id)
         self.local.forget(app_id)
@@ -374,6 +412,14 @@ class Reconciler:
             except Exception:
                 log.exception("apps: uninstall of %s did not reach the cloud registry",
                               app_id)
+
+        # Drop the now-dead upstream from the gateway. reload() is
+        # differential, so this is what turns a removed mcp.json into a
+        # "removed" upstream instead of a stale entry that fails on every
+        # tools/call until something else happens to reload.
+        if touched_mcp:
+            await self._trigger_gateway_reload()
+
         return {"app_id": app_id, "uninstalled": True, "repo_removed": removed_repo}
 
     # ---- the reconcile itself ----------------------------------------------
@@ -405,6 +451,12 @@ class Reconciler:
         removed: list[str] = []
         upgraded: list[str] = []
         errors: list[dict[str, str]] = []
+
+        # Coalesce every gateway reload this pass would trigger into one at
+        # the end (see _pending_gateway_reload). Set even on the error paths
+        # below — an app that failed halfway may still have written its
+        # mcp.json before failing.
+        self._pending_gateway_reload = False
 
         # install missing (desired but not loaded) — don't re-write the desired
         # row we're converging TO. For apps present on both sides, a version
@@ -455,9 +507,18 @@ class Reconciler:
                 log.exception("apps: reconcile failed to uninstall %s", app_id)
                 errors.append({"app_id": app_id, "action": "uninstall", "error": str(e)})
 
+        # Fire the single coalesced reload. Clearing the flag FIRST makes
+        # _trigger_gateway_reload take its immediate path, and leaves the
+        # reconciler back in "not in a pass" state even if the reload raises.
+        wanted_reload = bool(self._pending_gateway_reload)
+        self._pending_gateway_reload = None
+        if wanted_reload:
+            await self._trigger_gateway_reload()
+
         result = {"source": source, "desired": sorted(desired_active),
                   "installed": installed, "upgraded": upgraded, "removed": removed,
-                  "errors": errors}
-        log.info("apps: reconciled (%s) — installed=%s upgraded=%s removed=%s errors=%d",
-                 source, installed, upgraded, removed, len(errors))
+                  "errors": errors, "mcp_gateway_reloaded": wanted_reload}
+        log.info("apps: reconciled (%s) — installed=%s upgraded=%s removed=%s errors=%d "
+                 "mcp_reload=%s",
+                 source, installed, upgraded, removed, len(errors), wanted_reload)
         return result

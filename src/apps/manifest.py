@@ -105,8 +105,35 @@ class Manifest:
 
         Distinct from ``contributes.mcp.provides`` (marketplace "what you
         get" tool list, see ``what_you_get``) — same ``contributes.mcp``
-        object, different sibling key, unrelated purposes."""
+        object, different sibling key, unrelated purposes.
+
+        NOTE: this is the narrow, opt-in signal. For deciding whether an
+        install/uninstall/update needs a gateway rescan, use
+        ``contributes_mcp`` instead — see its docstring for why an opt-in
+        flag is the wrong gate there."""
         return bool(self.contributes.get("mcp", {}).get("reload_on_save", False))
+
+    @property
+    def contributes_mcp(self) -> bool:
+        """Does this app put anything into the MCP Gateway's app-scan?
+
+        The gateway discovers upstreams by scanning ``apps/<slug>/mcp.json``
+        under ``AW_APP_SCAN_ROOTS``, so ANY app that ships or generates that
+        file changes the gateway's world when it is installed, uninstalled
+        or updated — whether or not it opted into
+        ``contributes.mcp.reload_on_save``.
+
+        Gating the install/uninstall reload on ``reload_on_save`` was the
+        2026-08-12 bug: whether the gateway must rescan is the GATEWAY's
+        concern, not something each app has to remember to declare.
+        codegraphcontext and notion both ship an mcp.json with
+        ``reload_on_save`` absent and were silently skipped.
+
+        Manifest-only signal — apps whose mcp.json exists on disk without a
+        ``contributes.mcp`` block (aw-app-browser, aw-app-code-server) are
+        caught by the on-disk check in ``Reconciler._app_touches_mcp``,
+        which layers a package-dir probe on top of this."""
+        return bool(self.contributes.get("mcp"))
 
     @property
     def frontend(self) -> dict[str, Any]:

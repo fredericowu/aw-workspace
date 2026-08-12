@@ -85,7 +85,8 @@ async def _apply_runtime_config(runtime: AppRuntime, loaded, previous: dict) -> 
         await asyncio.to_thread(runtime.containers.stop, app_id)
 
 
-async def _reload_mcp_gateway(runtime: AppRuntime) -> None:
+async def _reload_mcp_gateway(runtime: AppRuntime, *,
+                              raise_on_failure: bool = False) -> None:
     """POST /reload on the installed mcp-gateway app's OWN internal
     container address — never the public app-proxy route, so this never
     "hairpins" out through the edge/Caddy just to call back in.
@@ -97,10 +98,15 @@ async def _reload_mcp_gateway(runtime: AppRuntime) -> None:
     aw-workspace needing to know the gateway's own bearer secret, which
     lives only in that container's own config/gateway.json.
 
-    Best-effort: a missing/unreachable/not-yet-started gateway logs and
-    does not fail the config save that triggered it — the app's own config
-    change already landed either way, and the gateway will pick it up on
-    its own next reload/restart regardless.
+    Best-effort by default: a missing/unreachable/not-yet-started gateway
+    logs and does not fail the config save that triggered it — the app's own
+    config change already landed either way, and the gateway will pick it up
+    on its own next reload/restart regardless (the periodic rescan watchdog
+    in ``AppRuntime.start_mcp_gateway_rescan`` is exactly that safety net).
+
+    ``raise_on_failure=True`` inverts that for the watchdog itself, whose
+    whole job IS this call: it needs the failure to reach the supervisor's
+    backoff + ``last_error`` introspection rather than being swallowed.
 
     Retried a few times with backoff: ``is_loaded`` only means the
     gateway's CONTAINER was created (``containers.start()`` returned),
@@ -109,6 +115,8 @@ async def _reload_mcp_gateway(runtime: AppRuntime) -> None:
     silently connection-refused on the first attempt during the SAME
     reconcile pass that just installed it."""
     if not runtime.is_loaded("mcp-gateway"):
+        if raise_on_failure:
+            raise RuntimeError("mcp-gateway app is not installed")
         return
     import asyncio
 
@@ -121,13 +129,23 @@ async def _reload_mcp_gateway(runtime: AppRuntime) -> None:
                 resp = await client.post(f"{base_url}/reload",
                                          headers={"X-AW-Identity-Sub": "aw-workspace"})
                 resp.raise_for_status()
-            log.info("apps: mcp-gateway reload triggered — %s", resp.json())
+            payload = resp.json()
+            # Quiet on the steady state — the rescan watchdog runs every 5
+            # minutes and an unchanged reload is the normal case, so only a
+            # real diff is worth a log line.
+            if payload.get("added") or payload.get("removed") or payload.get("changed"):
+                log.info("apps: mcp-gateway reload triggered — %s", payload)
+            else:
+                log.debug("apps: mcp-gateway reload — no change (%s upstreams, %s tools)",
+                          len(payload.get("upstreams") or []), payload.get("tools"))
             return
         except Exception:
             if attempt < attempts:
                 await asyncio.sleep(1.0 * attempt)
             else:
                 log.exception("apps: failed to trigger mcp-gateway /reload after %d attempts", attempts)
+                if raise_on_failure:
+                    raise
 
 
 def register_apps_routes(app: FastAPI) -> AppRuntime:
@@ -310,7 +328,10 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         on_config_saved = getattr(loaded.plugin, "on_config_saved", None)
         if callable(on_config_saved):
             await on_config_saved(loaded.ctx)
-        if loaded.manifest.reload_mcp_gateway_on_save:
+        # Same broad gate install/uninstall use (Reconciler._app_touches_mcp):
+        # any app whose config change can rewrite its mcp.json, not just the
+        # ones that remembered to set contributes.mcp.reload_on_save.
+        if reconciler._app_touches_mcp(loaded.manifest, loaded.package_dir):
             await _reload_mcp_gateway(runtime)
 
         return _app_config_payload(loaded)
@@ -582,3 +603,9 @@ async def reconcile_on_boot(app: FastAPI) -> None:
     # lifecycle) gets caught while the process keeps running, not just on the
     # next full workspace recreation.
     app.state.app_runtime.start_system_cli_healer()
+    # Safety net under the install/uninstall/config-save reload hooks: at
+    # boot an already-running mcp-gateway may have scanned BEFORE the
+    # inprocess apps above activated and (re)wrote their own mcp.json, and
+    # nothing in that path is ordered. The reconcile that just ran fires a
+    # coalesced reload when it changed anything; this catches the rest.
+    app.state.app_runtime.start_mcp_gateway_rescan()
