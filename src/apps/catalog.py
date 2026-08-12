@@ -358,19 +358,22 @@ def is_marketplace_app(app_id: str, repo: str | None, force: bool = False) -> bo
     app reusing a marketplace app's id) is not signed — that check is the
     whole point, so never relax it to an id-only lookup.
 
-    One deliberate divergence from the cloud twin: this reads the MERGED
-    catalog, so an app from a user-added private source counts as signed here
-    while the cloud (official catalog only) says otherwise. Where a cloud
-    registry is configured its answer wins on the next reconcile, which
-    re-derives trust and reinstalls on drift — so a private-source app can
-    flip back to unsigned there. Publishing to the official catalog is the way
-    to make it stick.
+    Only the OFFICIAL source counts, not the merged catalog, because the cloud
+    twin reads that one repo alone. Answering more generously here would make
+    an app from a user-added private source signed locally and unsigned in the
+    cloud — and `Reconciler.reconcile` treats a trust difference as drift and
+    reinstalls, so the two would fight on every pass. Whether a private
+    marketplace can confer trust is a decision for the cloud registry to make
+    once, for both sides; it is not something to fork locally.
     """
     if not app_id:
         return False
     wanted = (repo or "").strip().lower()
+    official = f"{MARKETPLACE_REPO}@{MARKETPLACE_REF}"
     for app in get_catalog(force=force).get("apps", []) or []:
         if (app.get("id") or app.get("slug")) != app_id:
+            continue
+        if app.get("_source") != official:
             continue
         if (app.get("repo") or "").strip().lower() == wanted:
             return True

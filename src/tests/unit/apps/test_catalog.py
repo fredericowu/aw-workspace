@@ -228,8 +228,15 @@ class TestIsMarketplaceApp:
 
     @pytest.fixture(autouse=True)
     def _catalog(self, monkeypatch):
-        monkeypatch.setattr(catalog_mod.httpx, "get", lambda url, headers=None, timeout=None: _resp(
-            {"apps": [{"id": "diff-tool", "repo": "tekflox/aw-app-diff-tool"}]}))
+        def fake_get(url, headers=None, timeout=None):
+            if "aw-marketplace-private" in url:
+                return _resp({"apps": [{"id": "crispal", "repo": "tekflox/aw-app-crispal"}]})
+            return _resp({"apps": [{"id": "diff-tool", "repo": "tekflox/aw-app-diff-tool"}]})
+
+        monkeypatch.setenv(
+            "AW_MARKETPLACE_SOURCES",
+            "tekflox/aw-marketplace@master,tekflox/aw-marketplace-private@master")
+        monkeypatch.setattr(catalog_mod.httpx, "get", fake_get)
         catalog_mod.get_catalog(force=True)
 
     def test_published_id_and_repo_pair_is_signed(self):
@@ -249,3 +256,9 @@ class TestIsMarketplaceApp:
     def test_sideload_without_a_repo_is_not_signed(self):
         assert catalog_mod.is_marketplace_app("diff-tool", None) is False
         assert catalog_mod.is_marketplace_app("", "tekflox/aw-app-diff-tool") is False
+
+    def test_a_private_source_does_not_confer_trust(self):
+        """Only the official catalog counts — the cloud registry reads that one
+        repo alone, and disagreeing would make reconcile see permanent trust
+        drift and reinstall the app on every pass."""
+        assert catalog_mod.is_marketplace_app("crispal", "tekflox/aw-app-crispal") is False
