@@ -86,7 +86,8 @@ async def _apply_runtime_config(runtime: AppRuntime, loaded, previous: dict) -> 
 
 
 async def _reload_mcp_gateway(runtime: AppRuntime, *,
-                              raise_on_failure: bool = False) -> None:
+                              raise_on_failure: bool = False,
+                              attempts: int = 3) -> None:
     """POST /reload on the installed mcp-gateway app's OWN internal
     container address — never the public app-proxy route, so this never
     "hairpins" out through the edge/Caddy just to call back in.
@@ -122,7 +123,6 @@ async def _reload_mcp_gateway(runtime: AppRuntime, *,
 
     import httpx
     base_url = runtime.containers.base_url("mcp-gateway")
-    attempts = 3
     for attempt in range(1, attempts + 1):
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -141,7 +141,9 @@ async def _reload_mcp_gateway(runtime: AppRuntime, *,
             return
         except Exception:
             if attempt < attempts:
-                await asyncio.sleep(1.0 * attempt)
+                # Capped so a long budget (the boot caller's) stays a patient
+                # wait rather than an exponential one.
+                await asyncio.sleep(min(1.0 * attempt, 5.0))
             else:
                 log.exception("apps: failed to trigger mcp-gateway /reload after %d attempts", attempts)
                 if raise_on_failure:
@@ -656,13 +658,20 @@ async def reconcile_on_boot(app: FastAPI) -> None:
     # restart: aw-diff-tool, aw-presentation and whiteboard were all missing,
     # and one reload brought back 3 upstreams / 237 tools.
     #
-    # Best-effort on purpose (no raise_on_failure): if the gateway container
-    # isn't listening yet, the watchdog below still covers it on its normal
-    # schedule. Routing this through the watchdog with run_immediately=True
-    # instead would be worse — a boot-race failure feeds its exponential
-    # backoff (min(interval * 2**n, 1800s)), pushing the retry out to 10
-    # minutes, i.e. later than doing nothing.
-    await _reload_mcp_gateway(app.state.app_runtime)
+    # In the BACKGROUND with a long retry budget, because the thing we're
+    # waiting for is a container that this same boot has only just started:
+    # `is_loaded` means created, not listening, and it takes tens of seconds
+    # to serve. The default 3 attempts (~3s) always lost that race, and
+    # blocking boot until it won would hold up the workspace's own API for no
+    # good reason — so this rides alongside instead.
+    #
+    # Best-effort on purpose (no raise_on_failure): if the gateway never
+    # answers, the watchdog below still covers it on its normal schedule.
+    # Routing this through the watchdog with run_immediately=True instead
+    # would be worse — a boot-race failure feeds its exponential backoff
+    # (min(interval * 2**n, 1800s)), pushing the retry out to 10 minutes,
+    # i.e. later than doing nothing.
+    asyncio.ensure_future(_reload_mcp_gateway(app.state.app_runtime, attempts=20))
     # Safety net under the install/uninstall/config-save reload hooks and the
     # boot reload above.
     app.state.app_runtime.start_mcp_gateway_rescan()

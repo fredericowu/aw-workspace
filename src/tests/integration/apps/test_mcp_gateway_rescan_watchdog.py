@@ -153,3 +153,33 @@ def test_boot_reloads_the_gateway_once_the_inprocess_apps_have_written_theirs(
     # Best-effort: a gateway that is not listening yet must not turn a boot
     # into a failure -- the watchdog still covers it on its own schedule.
     assert calls[0].get("raise_on_failure") in (None, False)
+    # And patient: the gateway container was started by this same boot, so
+    # the default ~3s budget always lost that race.
+    assert calls[0].get("attempts", 3) > 3
+
+
+def test_boot_reload_does_not_block_the_workspace_coming_up(tmp_path, monkeypatch):
+    """It waits on a container this boot just started, which takes tens of
+    seconds to listen — boot must not be held behind that."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    started = asyncio.Event()
+    released = asyncio.Event()
+
+    async def slow_reload(rt, **kwargs):
+        started.set()
+        await released.wait()
+
+    monkeypatch.setattr(routes_mod, "_reload_mcp_gateway", slow_reload)
+
+    app = FastAPI()
+    routes_mod.register_apps_routes(app)
+
+    async def go():
+        await asyncio.wait_for(routes_mod.reconcile_on_boot(app), timeout=2.0)
+        await asyncio.sleep(0.05)
+        assert started.is_set(), "reload should have been kicked off"
+        released.set()
+        await asyncio.sleep(0)
+        app.state.app_runtime.watchdog.cancel_all_for(_SYSTEM_APP_ID)
+
+    _async(go())
