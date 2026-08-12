@@ -72,6 +72,7 @@ class _FakeImages:
     def __init__(self, present: bool = True, pull_delay: float = 0.0) -> None:
         self.present = present
         self.pulled: list[str] = []
+        self.pulled_auth: list[dict | None] = []
         # A real blocking sleep (not asyncio.sleep) — simulates docker-py's
         # actual synchronous network I/O for the event-loop-blocking regression
         # test below. 0 by default so every other test is unaffected.
@@ -82,10 +83,14 @@ class _FakeImages:
             raise ImageNotFound(image)
         return object()
 
-    def pull(self, image: str) -> None:
+    # `auth_config` mirrors docker-py's real signature — ContainerSupervisor
+    # passes the publishing marketplace's credential there (266d930). Recorded
+    # rather than ignored so a test can assert the pull was authenticated.
+    def pull(self, image: str, auth_config: dict | None = None) -> None:
         if self.pull_delay:
             time.sleep(self.pull_delay)
         self.pulled.append(image)
+        self.pulled_auth.append(auth_config)
         self.present = True
 
 
