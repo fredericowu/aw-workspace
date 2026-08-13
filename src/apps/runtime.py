@@ -943,7 +943,9 @@ class AppRuntime:
         port = rt.get("port")
         resources = rt.get("resources") or {}
         run_flags = rt.get("run_flags_needed") or rt.get("run_flags") or []
-        env = rt.get("env") or {}
+        # Resolve ${config.x} / ${env.X} so a container app's own settings
+        # actually reach it — see containers.expand_env.
+        env = expand_env(rt.get("env") or {}, config)
         volumes = self._container_volumes(manifest, package_dir)
 
         ctx = AppContext(
