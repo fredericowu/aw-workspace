@@ -28,7 +28,6 @@ def _app_with(*paths: str) -> FastAPI:
     "/config",
     "/install-status",
     "/versions",
-    "/settings",
     "/update",
 ])
 def test_reserved_paths_are_detected(path):
@@ -56,3 +55,30 @@ def test_conflicts_are_reported_together():
     fixing them one round-trip at a time is the slow version of this bug."""
     found = RoutesFacade._reserved_conflicts(_app_with("/ui/a", "/hosts", "/config"))
     assert sorted(found) == ["/config", "/ui/a"]
+
+
+def test_the_reserved_set_is_read_off_core_s_own_routes():
+    """Hand-maintained, it drifted in both directions at once — claiming
+    /settings and /uninstall (core serves neither; uninstall is DELETE on the
+    bare slug) while missing /version. Refusing /settings took git, aws,
+    google-cloud and notion out of a live workspace on 2026-08-13."""
+    class _Runtime:
+        host = _app_with()
+
+    _Runtime.host.get("/api/apps/{slug}/config")(lambda: {})
+    _Runtime.host.get("/api/apps/{slug}/ui/{path:path}")(lambda: {})
+
+    reserved = RoutesFacade._reserved_prefixes(_Runtime())
+    assert set(reserved) == {"/config", "/ui"}
+
+
+def test_settings_is_not_reserved():
+    """`POST /api/apps/<slug>/settings` is a real convention: the SPA posts to
+    /config first and falls back to /settings on 404 (AppConfigBody.jsx).
+    Core does not serve it, so an app owning it shadows nothing."""
+    class _Runtime:
+        host = _app_with()
+
+    _Runtime.host.get("/api/apps/{slug}/config")(lambda: {})
+    reserved = RoutesFacade._reserved_prefixes(_Runtime())
+    assert RoutesFacade._reserved_conflicts(_app_with("/settings"), reserved) == []

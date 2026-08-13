@@ -69,19 +69,47 @@ class RoutesFacade(_Facade):
     action so uninstall can reverse it.
     """
 
-    #: Path prefixes CORE already serves under ``/api/apps/<slug>/``. Core's
-    #: routes are matched BEFORE an app's ``Mount``, so anything an app
-    #: declares here is unreachable — the caller gets core's response instead.
-    #: See ``src/apps/routes.py`` for the owners.
+    #: Fallback only. The real list is COMPUTED from the routes core actually
+    #: registered — see :meth:`_reserved_prefixes`. A hand-maintained copy of a
+    #: truth you can read directly always drifts, and this one drifted in both
+    #: directions at once: it claimed ``/settings`` and ``/uninstall``, which
+    #: core does not serve (uninstall is ``DELETE`` on the bare slug), while
+    #: missing ``/version``, which it does. Refusing ``/settings`` took four
+    #: shipped apps — git, aws, google-cloud, notion — out of a live workspace
+    #: on 2026-08-13; ``POST /api/apps/<slug>/settings`` is a real convention
+    #: the SPA falls back to when ``/config`` 404s (AppConfigBody.jsx).
     RESERVED_PREFIXES = ("/ui", "/config", "/install-status", "/versions",
-                         "/settings", "/uninstall", "/update")
+                         "/version", "/update")
+
+    @staticmethod
+    def _reserved_prefixes(runtime) -> tuple[str, ...]:
+        """The ``/api/apps/<slug>/…`` sub-paths core has actually registered.
+
+        Read off the host app's own router, so this cannot disagree with
+        reality — add or remove a core route and the reserved set follows.
+        """
+        host = getattr(runtime, "host", None)
+        marker = "/api/apps/{slug}"
+        found: set[str] = set()
+        for route in getattr(host, "routes", []) or []:
+            path = getattr(route, "path", "")
+            if not path.startswith(marker + "/"):
+                continue
+            sub = path[len(marker):]
+            # First segment only: /ui/{path:path} reserves /ui, not the whole
+            # parameterised path.
+            first = sub.split("/")[1].split("{")[0]
+            if first:
+                found.add("/" + first)
+        return tuple(sorted(found)) or RoutesFacade.RESERVED_PREFIXES
 
     def __init__(self, ctx: "AppContext") -> None:
         super().__init__(ctx)
         self._registered = False
 
     @classmethod
-    def _reserved_conflicts(cls, subapp: "FastAPI") -> list[str]:
+    def _reserved_conflicts(cls, subapp: "FastAPI",
+                            reserved: tuple[str, ...] | None = None) -> list[str]:
         """Mount-relative paths in ``subapp`` that core already owns.
 
         Silent shadowing is the worst failure shape this framework has: every
@@ -97,7 +125,7 @@ class RoutesFacade(_Facade):
             path = getattr(route, "path", "")
             if not path:
                 continue
-            for prefix in cls.RESERVED_PREFIXES:
+            for prefix in (reserved or cls.RESERVED_PREFIXES):
                 # Match on a SEGMENT boundary, never a raw string prefix:
                 # "/configuration-wizard" is not "/config", and refusing it
                 # would be a false positive that blocks a legitimate install.
@@ -110,7 +138,8 @@ class RoutesFacade(_Facade):
         self._ctx._enforce("routes:register")
         if self._registered:
             raise RuntimeError(f"app {self._ctx.app_id!r} already registered a routes sub-app")
-        conflicts = self._reserved_conflicts(subapp)
+        reserved = self._reserved_prefixes(self._ctx._runtime)
+        conflicts = self._reserved_conflicts(subapp, reserved)
         if conflicts:
             # Refuse rather than warn: a mounted-but-shadowed route is a
             # feature the developer believes shipped. Failing the install is
@@ -119,7 +148,7 @@ class RoutesFacade(_Facade):
                 f"app {self._ctx.app_id!r} declares route(s) under a path core "
                 f"already serves at /api/apps/<slug>/: {', '.join(sorted(conflicts))}. "
                 f"Core wins the match, so these would be unreachable. Reserved: "
-                f"{', '.join(self.RESERVED_PREFIXES)} — use e.g. /panel/... instead."
+                f"{', '.join(reserved)} — use e.g. /panel/... instead."
             )
         self._ctx._runtime._mount(self._ctx.app_id, subapp)
         self._registered = True
