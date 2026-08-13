@@ -14,6 +14,16 @@ DESCRIPTION = "Install or update apps from the marketplace catalog"
 _POLL_INTERVAL = 1.0
 _POLL_TIMEOUT = 180.0
 
+# Always force a fresh fetch of the merged catalog. The server caches it behind
+# an in-memory TTL (``src/apps/catalog.py::get_catalog``), so a CLI install run
+# right after a release can resolve the PREVIOUS version and still report
+# "installed" — a silent no-op that reads as success. A refresh costs one fetch
+# per configured source; a human typing this command wants the current catalog.
+_CATALOG_PATH = "/api/apps/-/catalog?refresh=true"
+# Refreshing hits every marketplace source over the network — the default 30s
+# is tight when one of them is slow.
+_CATALOG_TIMEOUT = 60.0
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -53,11 +63,9 @@ def run(args: list[str]) -> int:
 
 
 def _catalog_entry(app_id: str) -> dict | None:
-    status, body = local_client.request("GET", "/api/apps/-/catalog")
-    if status != 200:
-        print(f"error: could not load the marketplace catalog ({status}): {body}")
+    apps = _catalog_apps()
+    if apps is None:
         return None
-    apps = (body or {}).get("apps", []) if isinstance(body, dict) else []
     return next((a for a in apps if (a.get("id") or a.get("slug")) == app_id), None)
 
 
@@ -116,8 +124,10 @@ def _installed_apps() -> list[dict] | None:
 
 
 def _catalog_apps() -> list[dict] | None:
-    """The full marketplace catalog listing, or ``None`` on failure."""
-    status, body = local_client.request("GET", "/api/apps/-/catalog")
+    """The full marketplace catalog listing, or ``None`` on failure.
+
+    Always fetched with ``refresh=true`` — see ``_CATALOG_PATH``."""
+    status, body = local_client.request("GET", _CATALOG_PATH, timeout=_CATALOG_TIMEOUT)
     if status != 200:
         print(f"error: could not load the marketplace catalog ({status}): {body}")
         return None
