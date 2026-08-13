@@ -189,12 +189,72 @@ def _codex_list() -> dict[str, dict]:
     return {}
 
 
+def _codex_config_path() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")) / "config.toml"
+
+
+_CODEX_HEADER_TABLE = "[mcp_servers.{name}.http_headers]"
+
+
+def _codex_write_http_headers(name: str, headers: dict) -> None:
+    """Persist ``headers`` for an HTTP server as a Codex ``http_headers`` table.
+
+    ``codex mcp add`` has NO ``--header`` flag (checked against codex-cli
+    0.147.0): its HTTP options are ``--url``, ``--bearer-token-env-var``,
+    ``--oauth-client-id`` and ``--oauth-resource``. Passing ``--header``
+    aborted the add outright, which is why ``aw-gateway`` — the one entry
+    that carries an Authorization header — was the only server that never
+    reached Codex, on every single sync.
+
+    Codex *does* support the headers, just not from the CLI: an
+    ``[mcp_servers.<name>.http_headers]`` sub-table is read back by
+    ``codex mcp get`` (value masked), and is the exact equivalent of
+    ``.mcp.json``'s ``headers``. So we let ``codex mcp add`` create the entry
+    and append the sub-table ourselves — the same "the CLI can't express it,
+    write the config directly" concession ``sync_gemini_mcp`` already makes.
+
+    ``bearer_token_env_var`` was the alternative and is deliberately not used:
+    it stores the NAME of an environment variable, so it would only work if
+    that variable were also exported into every shell Codex runs in — a
+    second thing to keep in sync, failing as a 401 at tool-call time rather
+    than here, which is precisely this workspace's usual failure mode.
+
+    Idempotent: any existing table for this server is dropped first, so a
+    re-sync cannot produce a duplicate key and leave the file unparseable.
+    """
+    path = _codex_config_path()
+    if not path.is_file():
+        return
+    header_line = _CODEX_HEADER_TABLE.format(name=name)
+    kept, skipping = [], False
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped == header_line:
+            skipping = True
+            continue
+        # Any following table header ends the block we're dropping.
+        if skipping and stripped.startswith("["):
+            skipping = False
+        if not skipping:
+            kept.append(line)
+
+    while kept and not kept[-1].strip():
+        kept.pop()
+    kept += ["", header_line]
+    for key, value in headers.items():
+        # TOML basic string: backslashes and quotes are the only escapes a
+        # header value can realistically need.
+        escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+        kept.append(f'{key} = "{escaped}"')
+    path.write_text("\n".join(kept) + "\n")
+
+
 def _codex_add(name: str, cfg: dict) -> ServerSyncResult:
     """Register one server with Codex, HTTP and stdio shapes alike."""
+    headers = {}
     if cfg.get("type") == "http" or cfg.get("url"):
         cmd = ["codex", "mcp", "add", name, "--url", str(cfg.get("url", ""))]
-        for header, value in (cfg.get("headers") or {}).items():
-            cmd += ["--header", f"{header}: {value}"]
+        headers = cfg.get("headers") or {}
     else:
         cmd = ["codex", "mcp", "add", name]
         for key, value in (cfg.get("env") or {}).items():
@@ -205,6 +265,8 @@ def _codex_add(name: str, cfg: dict) -> ServerSyncResult:
         if proc.returncode != 0:
             return ServerSyncResult(name=name, action="add", success=False,
                                     error=(proc.stderr or proc.stdout).strip()[:300])
+        if headers:
+            _codex_write_http_headers(name, headers)
     except (OSError, subprocess.SubprocessError) as exc:
         return ServerSyncResult(name=name, action="add", success=False, error=str(exc))
     return ServerSyncResult(name=name, action="add")

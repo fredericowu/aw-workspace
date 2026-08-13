@@ -148,6 +148,67 @@ def test_codex_skips_cleanly_when_the_cli_is_absent(workspace, monkeypatch):
     assert "not installed" in results[0].error
 
 
+def test_codex_add_never_passes_the_unsupported_header_flag(workspace, monkeypatch):
+    """`codex mcp add` has no --header (codex-cli 0.147.0). Passing it aborted
+    the add, so aw-gateway — the only entry with an Authorization header —
+    never reached Codex on any sync."""
+    calls = []
+    monkeypatch.setattr(agent_sync.subprocess, "run",
+                        lambda cmd, **kw: calls.append(cmd) or _ok())
+    monkeypatch.setattr(agent_sync, "_codex_write_http_headers", lambda *a: None)
+
+    agent_sync._codex_add("aw-gateway", {
+        "type": "http", "url": "http://gw:9200/mcp",
+        "headers": {"Authorization": "Bearer tok"},
+    })
+
+    assert "--header" not in calls[0]
+    assert calls[0][:5] == ["codex", "mcp", "add", "aw-gateway", "--url"]
+
+
+def test_codex_headers_land_in_config_as_an_http_headers_table(tmp_path, monkeypatch):
+    """The headers still have to arrive — via the sub-table codex DOES read."""
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    cfg = codex_home / "config.toml"
+    cfg.write_text('[mcp_servers.aw-gateway]\nurl = "http://gw:9200/mcp"\n')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    agent_sync._codex_write_http_headers("aw-gateway", {"Authorization": "Bearer tok"})
+
+    body = cfg.read_text()
+    assert "[mcp_servers.aw-gateway.http_headers]" in body
+    assert 'Authorization = "Bearer tok"' in body
+
+
+def test_codex_header_table_is_rewritten_not_duplicated(tmp_path, monkeypatch):
+    """A duplicate table would make config.toml unparseable and take every
+    other MCP server down with it, so a re-sync must replace, not append."""
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    cfg = codex_home / "config.toml"
+    cfg.write_text('[mcp_servers.aw-gateway]\nurl = "http://gw:9200/mcp"\n')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    agent_sync._codex_write_http_headers("aw-gateway", {"Authorization": "Bearer old"})
+    agent_sync._codex_write_http_headers("aw-gateway", {"Authorization": "Bearer new"})
+
+    body = cfg.read_text()
+    assert body.count("[mcp_servers.aw-gateway.http_headers]") == 1
+    assert "Bearer old" not in body
+    assert 'Authorization = "Bearer new"' in body
+    # The entry codex mcp add wrote must survive the rewrite.
+    assert 'url = "http://gw:9200/mcp"' in body
+
+
+def _ok():
+    class _P:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+    return _P()
+
+
 def test_sync_all_runs_every_step(workspace, monkeypatch):
     monkeypatch.setattr(agent_sync.shutil, "which", lambda _: None)
 
