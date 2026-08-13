@@ -46,6 +46,39 @@ from src.apps.runtime import AppRuntime
 log = logging.getLogger(__name__)
 
 
+
+def _config_for_install(app_id: str, data: dict, runtime, reconciler) -> dict:
+    """Config to install ``app_id`` with: the caller's if it sent one,
+    otherwise whatever is already on record for that app.
+
+    An install must never be a way to LOSE configuration. Looks at the
+    running app first, then the local mirror (which survives an app whose
+    install failed halfway and left nothing loaded — exactly the case that
+    made this necessary). Only a genuinely new app starts empty.
+    """
+    incoming = data.get("config")
+    if isinstance(incoming, dict) and incoming:
+        return incoming
+
+    loaded = runtime.get(app_id)
+    if loaded is not None and getattr(loaded, "config", None):
+        return dict(loaded.config)
+
+    try:
+        for row in reconciler.local.list():
+            if (row.get("app_id") or row.get("id")) == app_id:
+                cfg = row.get("config")
+                if isinstance(cfg, dict) and cfg:
+                    log.info("apps: install of %s inherited the config already on "
+                             "record (the request carried none)", app_id)
+                    return dict(cfg)
+    except Exception:
+        log.exception("apps: could not read the stored config for %s — "
+                      "installing with an empty one", app_id)
+    return {}
+
+
+
 def _app_config_payload(loaded) -> dict:
     config = loaded.manifest.config_with_defaults(loaded.config)
     return {
@@ -84,11 +117,33 @@ async def _apply_runtime_config(runtime: AppRuntime, loaded, previous: dict) -> 
     # on the old value until something else happens to restart it.
     declared_env = (loaded.manifest.runtime or {}).get("env") or {}
     new_env = expand_env(declared_env, loaded.config)
-    if new_env != expand_env(declared_env, previous):
+    # Sidecars read the SAME config (runtime.sidecars[].env supports the
+    # identical ${config.x} placeholders), so a save that only recreated the
+    # app's own container left them running on the old values — and for
+    # aw-app-crispal the setting that matters most, site_url, is consumed by
+    # a sidecar and by nothing else, so the save appeared to do nothing at all.
+    sidecar_envs: list[tuple[str, dict]] = []
+    for spec in loaded.manifest.sidecars:
+        key = runtime.containers.sidecar_key(app_id, str(spec.get("name") or ""))
+        declared = spec.get("env") or {}
+        after = expand_env(declared, loaded.config)
+        if after != expand_env(declared, previous):
+            sidecar_envs.append((key, after))
+
+    if new_env != expand_env(declared_env, previous) or sidecar_envs:
+        restart = bool(loaded.config.get("auto_start", True))
+        # Sidecars first, and unconditionally before the app: the app dials
+        # them on startup, so recreating them underneath a running app is
+        # what the ordering in _load_container already avoids.
+        for key, env in sidecar_envs:
+            changed = await asyncio.to_thread(runtime.containers.update_env, key, env)
+            if changed and restart:
+                log.info("apps: %s config changed sidecar %s env — restarting", app_id, key)
+                await asyncio.to_thread(runtime.containers.start, key)
         changed = await asyncio.to_thread(runtime.containers.update_env, app_id, new_env)
         # Only restart what was already meant to be running — a config save
         # must not start a container the user had deliberately stopped.
-        if changed and bool(loaded.config.get("auto_start", True)):
+        if changed and restart:
             log.info("apps: %s config changed its container env — restarting", app_id)
             await asyncio.to_thread(runtime.containers.start, app_id)
         return
@@ -252,7 +307,23 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             repo=repo,
             ref=data.get("ref") or "HEAD",
             granted_permissions=data.get("granted_permissions") or [],
-            config=data.get("config") or {},
+            # Inherit the config already on record unless the caller sends one.
+            #
+            # This used to be `data.get("config") or {}`, i.e. whatever the
+            # request body happened to carry — so ANY caller that simply
+            # didn't think to send it silently WIPED the app's configuration,
+            # locally and (write_cloud defaults on) in the cloud registry too.
+            # `aw-workspace-cli marketplace install` sends no config, so
+            # reinstalling a configured app — the documented recovery when an
+            # install fails halfway — erased it. Hit for real on crispal
+            # 2026-08-13: a failed fetch left the app uninstalled, the
+            # marketplace reinstall cleared ap_gallery_base/ap_token, and the
+            # gallery tools went back to "connection refused" with nothing in
+            # any log to say the config had been dropped.
+            #
+            # Exactly the shape of the `signed` bug documented just below —
+            # an absent field read as an assertion instead of as silence.
+            config=_config_for_install(app_id, data, runtime, reconciler),
             # DERIVED, never taken from the request body (ADR Decision 4 — the
             # cloud registry has computed it from catalog membership since
             # 2026-08-04, and this is the local twin of that rule).
