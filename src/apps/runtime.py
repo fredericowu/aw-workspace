@@ -34,7 +34,7 @@ from src.apps.fetch import apps_root
 from src.apps.base import AppContext, Plugin
 from src.apps.capabilities import filter_grants
 from src.apps.commands import CommandInstaller
-from src.apps.containers import ContainerError, ContainerSupervisor
+from src.apps.containers import ContainerError, ContainerSupervisor, expand_env
 from src.apps.journal import ActionJournal
 from src.apps.manifest import Manifest, load_manifest
 from src.apps.proxy import ContainerReverseProxy

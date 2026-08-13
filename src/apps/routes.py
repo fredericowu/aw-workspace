@@ -40,6 +40,7 @@ from src.apps.catalog import get_catalog, is_marketplace_app, list_tags
 from src.apps.install_jobs import InstallJobs
 from src.apps.manifest import ManifestError, load_manifest
 from src.apps.reconciler import AppSpec, Reconciler
+from src.apps.containers import expand_env
 from src.apps.runtime import AppRuntime
 
 log = logging.getLogger(__name__)
@@ -75,6 +76,23 @@ async def _apply_runtime_config(runtime: AppRuntime, loaded, previous: dict) -> 
     app_id = loaded.manifest.id
     if loaded.manifest.tier != "container":
         return
+
+    # Config that feeds the container's environment (${config.x} in
+    # runtime.env) only reaches the process at container-creation time, so a
+    # save that changes it has to recreate the container. Without this the
+    # user edits a setting, the panel says saved, and the app keeps running
+    # on the old value until something else happens to restart it.
+    declared_env = (loaded.manifest.runtime or {}).get("env") or {}
+    new_env = expand_env(declared_env, loaded.config)
+    if new_env != expand_env(declared_env, previous):
+        changed = await asyncio.to_thread(runtime.containers.update_env, app_id, new_env)
+        # Only restart what was already meant to be running — a config save
+        # must not start a container the user had deliberately stopped.
+        if changed and bool(loaded.config.get("auto_start", True)):
+            log.info("apps: %s config changed its container env — restarting", app_id)
+            await asyncio.to_thread(runtime.containers.start, app_id)
+        return
+
     before = bool(previous.get("auto_start", True))
     after = bool(loaded.config.get("auto_start", True))
     if before == after:

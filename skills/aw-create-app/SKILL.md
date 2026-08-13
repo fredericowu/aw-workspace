@@ -104,6 +104,44 @@ instead of building your own auth — see `docs/app-workspace-api-auth.md`
 for the full pattern and a worked example
 (`tekflox/aw-app-whiteboard`'s `mcp_server/`).
 
+### Getting config into a **container** app (`runtime.env` placeholders)
+
+A Tier-2 app can't read `ctx.config` — it's a separate process. Its settings
+reach it as environment variables, declared in `runtime.env`:
+
+```json
+"runtime": {
+  "image": "ghcr.io/you/aw-app-foo:latest",
+  "env": {
+    "FOO_PORT": "9410",
+    "FOO_API_URL": "${config.api_url}",
+    "FOO_BACKEND": "${env.AW_BACKEND_URL}"
+  }
+}
+```
+
+Two whole-value placeholder forms:
+
+* `${config.<key>}` — a value from your own `config_schema`. This is what
+  makes a settings field actually do something for a container app.
+* `${env.<VAR>}` — a variable from the workspace process, for values the
+  workspace owns and the user shouldn't have to retype.
+
+Rules worth knowing before you rely on them:
+
+* **An unresolved placeholder omits the variable entirely** — it does not
+  pass an empty string. So your image's own `ENV` default stays in force
+  until the user actually configures something. Design your defaults on that
+  assumption.
+* **Placeholders are whole-value only.** `"prefix-${config.x}"` is left
+  literal, so a `$` inside a password or DSN is never mangled.
+* **Saving config restarts the container** when the expanded environment
+  changed — but only if `auto_start` is on, so a save never revives a
+  container the user stopped.
+
+Without this, a container app's `config_schema` is decorative: the panel
+saves the value and nothing carries it into the process.
+
 ### Reacting to a settings save (`on_config_saved`)
 
 `POST /api/apps/<id>/config` updates `ctx.config` and, if your plugin

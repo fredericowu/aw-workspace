@@ -23,14 +23,62 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shlex
 import socket
+from typing import Any
 
 log = logging.getLogger(__name__)
 
 
 class ContainerError(RuntimeError):
     pass
+
+
+_ENV_PLACEHOLDER = re.compile(r"^\$\{(config|env)\.([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+
+def expand_env(env: dict[str, Any] | None, config: dict[str, Any] | None) -> dict[str, str]:
+    """Resolve ``runtime.env`` placeholders against an app's config.
+
+    A container app's ``config_schema`` was previously write-only in
+    practice: the user could fill in a field and nothing carried it into the
+    container, because ``runtime.env`` was passed through verbatim. Every
+    such app had to be started by hand with the right ``-e`` flags — which
+    is exactly what a manifest is supposed to remove.
+
+    Two placeholder forms, both whole-value (never interpolated into a larger
+    string, so a literal ``$`` in a value is never mangled):
+
+    * ``${config.<key>}`` — the app's own saved config value. This is the
+      one that makes a ``config_schema`` field actually do something.
+    * ``${env.<VAR>}``    — a variable from the workspace process, for
+      values the workspace owns and the user shouldn't retype (its backend
+      URL, its host token).
+
+    **An unresolved placeholder drops the variable entirely** rather than
+    passing an empty string. That matters: images legitimately set their own
+    ``ENV`` defaults, and injecting ``FOO=""`` would silently override a
+    working default with nothing. Absent means "not configured", which is
+    what the image's own fallback is for.
+    """
+    out: dict[str, str] = {}
+    config = config or {}
+    for key, raw in (env or {}).items():
+        if not isinstance(raw, str):
+            out[key] = str(raw)
+            continue
+        match = _ENV_PLACEHOLDER.match(raw.strip())
+        if not match:
+            out[key] = raw
+            continue
+        kind, name = match.groups()
+        value = config.get(name) if kind == "config" else os.environ.get(name)
+        if value is None or value == "":
+            log.debug("apps: env %s unresolved (%s) — leaving it unset", key, raw)
+            continue
+        out[key] = str(value)
+    return out
 
 
 def _registry_host(image: str) -> str:
@@ -193,6 +241,21 @@ class ContainerSupervisor:
         only this one field.
         """
         self._require(app_id).volumes = volumes
+
+    def update_env(self, app_id: str, env: dict[str, str]) -> bool:
+        """Point a registered container at a new environment. True if changed.
+
+        A container's environment is fixed at creation, so this only updates
+        the registered spec — the caller restarts to make it take effect.
+        Split that way because the caller already knows whether the app
+        should be running at all (``auto_start``), and a config save must not
+        silently start a container the user had stopped.
+        """
+        c = self._require(app_id)
+        if c.env == env:
+            return False
+        c.env = dict(env)
+        return True
 
     def start(self, app_id: str) -> dict:
         c = self._require(app_id)
