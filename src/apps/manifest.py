@@ -33,6 +33,14 @@ DEFAULT_PUBLISHER = "TekFlox"
 RESOURCE_LEVELS = {"low", "medium", "high"}
 DEFAULT_RESOURCE_ESTIMATE = {"cpu": "low", "memory": "-", "disk": "-"}
 
+#: Task types an app may declare in ``contributes.tasks``. Mirrors the types
+#: ``aw-app-tasks``'s manager actually dispatches (``manager.py``'s run_task);
+#: anything outside this set would be seeded into its table and then silently
+#: skipped at fire time. ``agent_prompt`` is the one that hands the prompt to
+#: an Agents Platform agent, which is what an app shipping both an agent
+#: (``contributes.agents``) and the schedule that drives it needs.
+CONTRIBUTED_TASK_TYPES = ("terminal", "agentic_output", "agent_prompt")
+
 
 class ManifestError(ValueError):
     """Raised when an ``aw-app.json`` fails v1 validation."""
@@ -444,6 +452,23 @@ def _validate_contributed_agents(
                     raise ManifestError(
                         f"contributes.agents.{kind}[{slug!r}] needs a {required!r}"
                     )
+            # ``mcp_servers`` names MCP servers by reference — the provider
+            # resolves each name against the workspace's own .mcp.json at seed
+            # time. It exists so a manifest never has to carry the gateway's
+            # bearer token, so the one thing to enforce is that it stays a
+            # list of names: anything richer is someone starting to inline the
+            # credential this indirection exists to keep out of a public
+            # artefact.
+            refs = entry.get("mcp_servers")
+            if refs is not None:
+                if not isinstance(refs, list) or not all(
+                    isinstance(n, str) and n.strip() for n in refs
+                ):
+                    raise ManifestError(
+                        f"contributes.agents.{kind}[{slug!r}].mcp_servers must be "
+                        "a list of MCP server names (the provider resolves each "
+                        "name locally — credentials must not appear in a manifest)"
+                    )
 
 
 def _validate_contributed_repos(
@@ -632,15 +657,27 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
         if not str(task["name"]).strip():
             raise ManifestError("contributes.tasks[].name must not be blank")
         task_type = task.get("type", "terminal")
-        if task_type not in ("terminal", "agentic_output"):
+        if task_type not in CONTRIBUTED_TASK_TYPES:
             raise ManifestError(
-                f"contributes.tasks[].type must be 'terminal' or 'agentic_output' "
+                f"contributes.tasks[].type must be one of "
+                f"{', '.join(repr(t) for t in CONTRIBUTED_TASK_TYPES)} "
                 f"(got {task_type!r})"
             )
         if task_type == "agentic_output" and not task.get("command"):
             raise ManifestError("an 'agentic_output' task needs a 'command'")
         if task_type == "terminal" and not task.get("prompt"):
             raise ManifestError("a 'terminal' task needs a 'prompt'")
+        # An 'agent_prompt' task dispatches to an Agents Platform agent, so it
+        # needs both the prompt to send and the slug to send it to. Validating
+        # the slug's presence here (rather than letting the tasks app create a
+        # task that can never fire) keeps the failure at install time, where
+        # there is someone to read it — an unroutable schedule that only fails
+        # at 03:00 is exactly the silent degradation this workspace is prone to.
+        if task_type == "agent_prompt":
+            if not task.get("prompt"):
+                raise ManifestError("an 'agent_prompt' task needs a 'prompt'")
+            if not str(task.get("agent_slug") or "").strip():
+                raise ManifestError("an 'agent_prompt' task needs an 'agent_slug'")
         if not isinstance(task.get("schedules", []), list):
             raise ManifestError("contributes.tasks[].schedules must be a list")
 

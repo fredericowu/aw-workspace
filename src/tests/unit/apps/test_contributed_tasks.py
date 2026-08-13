@@ -69,9 +69,39 @@ def test_terminal_needs_a_prompt():
 
 
 def test_unknown_type_is_rejected():
-    with pytest.raises(ManifestError, match="must be 'terminal' or 'agentic_output'"):
+    with pytest.raises(ManifestError, match="must be one of"):
         validate_manifest(_manifest(contributes={"tasks": [
             {"name": "X", "type": "cron", "command": "echo"}]}))
+
+
+def test_valid_agent_prompt_task_is_accepted():
+    m = validate_manifest(_manifest(contributes={"tasks": [{
+        "name": "Daily audit", "type": "agent_prompt",
+        "agent_slug": "system-analyst", "prompt": "Run the audit.",
+        "schedules": [{"kind": "daily", "time": "06:00"}],
+    }]}))
+    assert m.tasks[0]["agent_slug"] == "system-analyst"
+
+
+def test_agent_prompt_needs_a_prompt():
+    with pytest.raises(ManifestError, match="needs a 'prompt'"):
+        validate_manifest(_manifest(contributes={"tasks": [
+            {"name": "X", "type": "agent_prompt", "agent_slug": "sa"}]}))
+
+
+def test_agent_prompt_needs_an_agent_slug():
+    # Without a slug the task seeds fine and then silently never dispatches —
+    # fail at install time instead, where someone is watching.
+    with pytest.raises(ManifestError, match="needs an 'agent_slug'"):
+        validate_manifest(_manifest(contributes={"tasks": [
+            {"name": "X", "type": "agent_prompt", "prompt": "go"}]}))
+
+
+def test_agent_prompt_blank_agent_slug_is_rejected():
+    with pytest.raises(ManifestError, match="needs an 'agent_slug'"):
+        validate_manifest(_manifest(contributes={"tasks": [
+            {"name": "X", "type": "agent_prompt", "prompt": "go",
+             "agent_slug": "   "}]}))
 
 
 def test_an_app_declaring_no_tasks_has_an_empty_list():
