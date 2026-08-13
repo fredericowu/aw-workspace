@@ -155,20 +155,26 @@ class _Container:
     def __init__(self, app_id: str, image: str, port: int,
                  run_flags: list[str] | None, resources: dict | None,
                  env: dict | None, network: str | None,
-                 volumes: dict[str, dict] | None = None) -> None:
+                 volumes: dict[str, dict] | None = None,
+                 container_name: str | None = None) -> None:
         self.app_id = app_id
         self.image = image
-        self.port = int(port)
+        # 0 for a sidecar with nothing to expose — a database is dialled by
+        # its siblings on the podman network, never reverse-proxied.
+        self.port = int(port or 0)
         self.run_flags = list(run_flags or [])
         self.resources = dict(resources or {})
         self.env = dict(env or {})
         self.network = network
         self.volumes = dict(volumes or {})
+        self._name = container_name
         self.container_id: str | None = None
 
     @property
     def name(self) -> str:
-        return f"aw-app-{self.app_id}"
+        # A sidecar passes its own name (``aw-app-crispal-db``); the app's
+        # own container derives it, and its registry key has no ":" in it.
+        return self._name or f"aw-app-{self.app_id}"
 
 
 class ContainerSupervisor:
@@ -214,21 +220,57 @@ class ContainerSupervisor:
     def register(self, app_id: str, image: str, port: int,
                  run_flags: list[str] | None = None, resources: dict | None = None,
                  env: dict | None = None, autostart: bool = False,
-                 volumes: dict[str, dict] | None = None) -> None:
+                 volumes: dict[str, dict] | None = None,
+                 container_name: str | None = None) -> None:
         if app_id in self._containers:
             raise ContainerError(f"container already registered for {app_id!r}")
         if not image:
             raise ContainerError(f"app {app_id!r} tier=container requires runtime.image")
-        if not port:
+        # A sidecar (registered as "<app>:<name>", see register_sidecar) may
+        # legitimately expose nothing; the app's own container may not.
+        if not port and ":" not in app_id:
             raise ContainerError(f"app {app_id!r} tier=container requires runtime.port")
         # Validate run flags up front so a bad manifest fails at register, not run.
         _parse_run_flags(run_flags)
-        c = _Container(app_id, image, port, run_flags, resources, env, self._network, volumes)
+        c = _Container(app_id, image, port, run_flags, resources, env, self._network,
+                       volumes, container_name)
         self._containers[app_id] = c
         log.info("apps: registered container %s (image=%s port=%s network=%s)",
                  c.name, image, port, self._network)
         if autostart:
             self.start(app_id)
+
+    @staticmethod
+    def sidecar_key(app_id: str, name: str) -> str:
+        """Registry key for a sidecar — ``"<app_id>:<name>"``.
+
+        Namespaced so a sidecar can never collide with (or be mistaken for) an
+        app's own registration, and so ``stop_all_for`` can find every
+        companion of an app by prefix on uninstall.
+        """
+        return f"{app_id}:{name}"
+
+    def register_sidecar(self, app_id: str, name: str, image: str,
+                         port: int | None = None, run_flags: list[str] | None = None,
+                         resources: dict | None = None, env: dict | None = None,
+                         volumes: dict[str, dict] | None = None) -> str:
+        """Register a companion container of ``app_id``. Returns its key.
+
+        The container is named ``aw-app-<app_id>-<name>``, which is also the
+        hostname siblings resolve it by on the shared podman network — so a
+        WordPress sidecar reaches its database at ``aw-app-crispal-db``
+        without anything having to discover an IP.
+        """
+        key = self.sidecar_key(app_id, name)
+        self.register(key, image, port or 0, run_flags=run_flags, resources=resources,
+                      env=env, volumes=volumes,
+                      container_name=f"aw-app-{app_id}-{name}")
+        return key
+
+    def sidecar_keys(self, app_id: str) -> list[str]:
+        """Registered sidecar keys of ``app_id``, in declaration-stable order."""
+        prefix = f"{app_id}:"
+        return sorted(k for k in self._containers if k.startswith(prefix))
 
     def set_volumes(self, app_id: str, volumes: dict[str, dict]) -> None:
         """Replace the bind set the NEXT ``start()`` will create the container with.
@@ -340,7 +382,7 @@ class ContainerSupervisor:
             # this shared network already resolve it by (aardvark-dns), same
             # mechanism as AW_WORKSPACE_HOST above, just the other direction.
             kwargs["environment"]["AW_APP_SELF_HOST"] = c.name
-        else:
+        elif c.port:
             # No shared network → publish the port so the proxy host can reach it.
             kwargs["ports"] = {f"{c.port}/tcp": c.port}
 
@@ -393,7 +435,18 @@ class ContainerSupervisor:
         return f"http://{host}:{c.port}"
 
     def stop_all_for(self, app_id: str) -> None:
-        """Stop + remove + drop the app's container (uninstall reverse replay)."""
+        """Stop + remove + drop the app's container AND every sidecar of it.
+
+        Sidecars go first: the app is the thing that talks to them, and
+        leaving an orphaned database running after its app is gone is exactly
+        the residue the uninstall replay exists to prevent.
+        """
+        for key in self.sidecar_keys(app_id):
+            try:
+                self.stop(key)
+            except Exception:
+                log.exception("apps: failed to stop sidecar %s on uninstall", key)
+            self._containers.pop(key, None)
         if app_id not in self._containers:
             return
         try:

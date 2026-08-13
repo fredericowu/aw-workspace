@@ -41,8 +41,10 @@ from src.apps.proxy import ContainerReverseProxy
 from src.apps.secret_store import SecretStore
 from src.apps.services import ServiceSupervisor
 from src.apps import agents as agents_mod
+from src.apps import repos as repos_mod
 from src.apps import tasks as tasks_mod
 from src.apps.agents import AgentsRegistry
+from src.apps.repos import RepoError, ReposRegistry
 from src.apps.skills import SkillError, SkillsRegistry
 from src.apps.tasks import TasksRegistry
 from src.apps.watchdog import WatchdogSupervisor
@@ -400,6 +402,7 @@ class AppRuntime:
         self.skills = SkillsRegistry()
         self.tasks = TasksRegistry()
         self.agents = AgentsRegistry()
+        self.repos = ReposRegistry()
         self._db_tables: Any = None  # lazy — only apps granted db:own-tables need it
 
     @property
@@ -648,6 +651,26 @@ class AppRuntime:
         except Exception:  # noqa: BLE001 — seeding must never fail an install
             log.exception("apps: task seeding failed for %s", slug)
 
+    async def _register_repos(self, manifest: Manifest) -> None:
+        """Clone this app's ``contributes.repos`` (clone-once, by directory name).
+
+        Off the event loop: a first clone of a real repo takes minutes and
+        would otherwise freeze every request, WS and terminal in the workspace
+        for its duration. Never fatal — see ``src/apps/repos.py``; the one
+        place a missing checkout DOES fail loudly is a ``$AW_WORKSPACE_REPO``
+        volume that has nothing to bind.
+        """
+        specs = manifest.repos
+        if not specs:
+            return
+        try:
+            created = await asyncio.to_thread(self.repos.register, manifest.id, specs)
+        except Exception:  # noqa: BLE001 — cloning must never fail an install
+            log.exception("apps: repo cloning failed for %s", manifest.id)
+            return
+        if created:
+            log.info("apps: %s cloned %d repo(s): %s", manifest.id, len(created), created)
+
     def _register_agents(self, loaded: LoadedApp) -> None:
         """Seed this app's ``contributes.agents`` (create-if-absent, by slug).
 
@@ -757,6 +780,7 @@ class AppRuntime:
         self._register_skills(loaded)
         self._register_tasks(loaded)
         self._register_agents(loaded)
+        await self._register_repos(manifest)
         self._invalidate_openapi()
         log.info("apps: loaded %s v%s (routes mounted=%s)",
                  slug, manifest.version, loaded.mount is not None)
@@ -967,6 +991,10 @@ class AppRuntime:
         # Resolve ${config.x} / ${env.X} so a container app's own settings
         # actually reach it — see containers.expand_env.
         env = expand_env(rt.get("env") or {}, config)
+        # Before volumes, not after: a $AW_WORKSPACE_REPO bind refuses to
+        # mount a checkout that isn't there, and for an app that declares the
+        # repo itself this is the step that puts it there.
+        await self._register_repos(manifest)
         volumes = self._container_volumes(manifest, package_dir)
 
         ctx = AppContext(
@@ -984,8 +1012,14 @@ class AppRuntime:
             volumes=volumes)
         self.journal.record(slug, "container:register", image,
                             {"port": port, "run_flags": run_flags, "resources": resources})
+        # Companion containers, before the app's own: aw-app-crispal's MCP
+        # dials the WordPress/MySQL pair as soon as it comes up, and starting
+        # them after it would make every boot's first tool call fail.
+        self._register_sidecars(manifest, package_dir, config)
         try:
             if config.get("auto_start", True):
+                for key in self.containers.sidecar_keys(slug):
+                    await asyncio.to_thread(self.containers.start, key)
                 # Blocking docker/podman API call (image pull + container run) —
                 # offloaded to a thread so it can't freeze the workspace's single
                 # asyncio event loop (every other request/WS/terminal) for
@@ -1008,10 +1042,43 @@ class AppRuntime:
         self._register_skills(loaded)
         self._register_tasks(loaded)
         self._register_agents(loaded)
+        # (repos were cloned before the volume resolution above)
         self._invalidate_openapi()
         log.info("apps: loaded container app %s v%s (image=%s)",
                  slug, manifest.version, image)
         return manifest
+
+    def _register_sidecars(self, manifest: Manifest, package_dir: str,
+                           config: dict[str, Any]) -> None:
+        """Register every ``runtime.sidecars`` entry of a Tier-2 app.
+
+        Each gets the app's own placeholder vocabulary for volumes and the
+        same ``${config.x}`` expansion for env, so a sidecar's database
+        password comes from the app's settings rather than being frozen into
+        the manifest. Registration only — ``_load_container`` starts them.
+
+        A sidecar that fails to register is fatal, unlike a skill or a seeded
+        task: the app was declared to need it, and an aw-app-crispal whose
+        MySQL never came up is a WordPress serving a database-connection
+        error, not a degraded-but-useful app.
+        """
+        slug = manifest.id
+        for spec in manifest.sidecars:
+            name = str(spec.get("name") or "").strip()
+            volumes = self._container_volumes(
+                manifest, package_dir, declared=spec.get("volumes") or [])
+            key = self.containers.register_sidecar(
+                slug, name,
+                image=str(spec.get("image") or ""),
+                port=spec.get("port"),
+                run_flags=spec.get("run_flags") or [],
+                resources=spec.get("resources") or {},
+                env=expand_env(spec.get("env") or {}, config),
+                volumes=volumes,
+            )
+            self.journal.record(slug, "container:register", spec.get("image"),
+                                {"sidecar": name, "key": key})
+            log.info("apps: registered sidecar %s for %s", key, slug)
 
     def _container_host_bind_path(self, container_path: str) -> str:
         """Translate workspace-internal paths to the host bind-mount path.
@@ -1045,8 +1112,15 @@ class AppRuntime:
             return real_path
         return os.path.realpath(os.path.join(host_root, rel))
 
-    def _container_volumes(self, manifest: Manifest, package_dir: str) -> dict[str, dict]:
+    def _container_volumes(self, manifest: Manifest, package_dir: str,
+                           declared: list[dict] | None = None) -> dict[str, dict]:
         """Resolve package-relative ``runtime.volumes`` into Docker binds.
+
+        ``declared`` overrides which list is resolved, so a sidecar
+        (``runtime.sidecars[].volumes``) gets the identical placeholder
+        vocabulary and the identical escape checks as the app's own container
+        — the whole point of declaring companions in the manifest instead of
+        letting an app shell out to podman itself.
 
         Shape:
 
@@ -1107,7 +1181,8 @@ class AppRuntime:
         """
         binds: dict[str, dict] = {}
         package_root = os.path.realpath(package_dir)
-        for raw in manifest.runtime.get("volumes") or []:
+        entries = declared if declared is not None else (manifest.runtime.get("volumes") or [])
+        for raw in entries:
             if not isinstance(raw, dict):
                 raise ContainerError(
                     f"app {manifest.id!r} runtime.volumes entries must be objects")
@@ -1146,6 +1221,45 @@ class AppRuntime:
                 host_path = self._container_host_bind_path(paths.repos_dir())
                 binds[host_path] = {"bind": target, "mode": mode}
                 continue
+            if source.startswith("$AW_WORKSPACE_REPO:"):
+                # ONE repo out of repos/, by name, at the declared mode — the
+                # counterpart of contributes.repos (src/apps/repos.py). An app
+                # that declares the checkout is usually the app that has to
+                # SERVE it: aw-app-crispal mounts repos/crispal as the
+                # WordPress document root, and WordPress writes there (uploads,
+                # cache, plugin updates), so $AW_WORKSPACE_REPOS — read-only by
+                # design, and the whole tree at that — cannot express it.
+                # Naming one repo keeps the blast radius to the checkout the
+                # app already declared rather than every repo the user has.
+                # "$AW_WORKSPACE_REPO:<name>[/sub/path]" — the optional subpath
+                # is what makes this usable at all for a real checkout: the
+                # WordPress document root is repos/crispal/sapatariacrispal.com/
+                # public_html, and two plugin dirs are mounted from elsewhere
+                # in the same tree.
+                ref = source.split(":", 1)[1].strip().strip("/")
+                repo_name, _, subpath = ref.partition("/")
+                if "repos:contribute" not in manifest.permissions:
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_WORKSPACE_REPO volume requires the "
+                        f"'repos:contribute' permission declared in its manifest")
+                try:
+                    repo_root = repos_mod.resolve_dest(repo_name)
+                except RepoError as e:
+                    raise ContainerError(f"app {manifest.id!r} {source}: {e}") from e
+                repo_path = os.path.realpath(os.path.join(repo_root, subpath))
+                if repo_path != repo_root and not repo_path.startswith(repo_root + os.sep):
+                    raise ContainerError(
+                        f"app {manifest.id!r} {source}: subpath escapes repos/{repo_name}")
+                # No mkdir: an empty directory bind-mounted as a document root
+                # looks like a working install serving nothing. Fail loudly so
+                # the missing clone is visible at install time instead.
+                if not os.path.isdir(repo_path):
+                    raise ContainerError(
+                        f"app {manifest.id!r} {source}: {ref} is not checked "
+                        f"out — declare it in contributes.repos or clone it first")
+                host_path = self._container_host_bind_path(repo_path)
+                binds[host_path] = {"bind": target, "mode": mode}
+                continue
             if source == "$AW_MCP_JSON":
                 if mode != "rw":
                     raise ContainerError(
@@ -1164,7 +1278,7 @@ class AppRuntime:
                 host_path = self._container_host_bind_path(mcp_json_path)
                 binds[host_path] = {"bind": target, "mode": mode}
                 continue
-            if source == "$AW_APP_DATA":
+            if source == "$AW_APP_DATA" or source.startswith("$AW_APP_DATA/"):
                 if mode != "rw":
                     raise ContainerError(
                         f"app {manifest.id!r} $AW_APP_DATA volume must be read-write")
@@ -1172,7 +1286,16 @@ class AppRuntime:
                     raise ContainerError(
                         f"app {manifest.id!r} $AW_APP_DATA volume requires the "
                         f"'fs:workspace-data' permission declared in its manifest")
-                data_dir = os.path.join(paths.workspace_home(), "data", manifest.id)
+                # A trailing subpath carves the app's data dir into per-purpose
+                # slices, which an app with more than one stateful container
+                # needs: aw-app-crispal's MySQL owns data/crispal/mysql and must
+                # not be handed the same directory its MCP keeps a sqlite queue in.
+                data_root = os.path.join(paths.workspace_home(), "data", manifest.id)
+                subpath = source[len("$AW_APP_DATA"):].strip("/")
+                data_dir = os.path.realpath(os.path.join(data_root, subpath))
+                if data_dir != data_root and not data_dir.startswith(data_root + os.sep):
+                    raise ContainerError(
+                        f"app {manifest.id!r} {source}: subpath escapes the app data dir")
                 os.makedirs(data_dir, exist_ok=True)
                 host_path = self._container_host_bind_path(data_dir)
                 binds[host_path] = {"bind": target, "mode": mode}
@@ -1234,6 +1357,16 @@ class AppRuntime:
             if not (local_path == package_root or local_path.startswith(package_root + os.sep)):
                 raise ContainerError(
                     f"app {manifest.id!r} volume source escapes the package dir")
+            # A package-relative source may be a single FILE, not a directory:
+            # a config drop-in (php.ini, my.cnf, an apache vhost) shipped in
+            # the package and mounted read-only at an exact path inside the
+            # image. Blindly mkdir'ing that path replaces the file with an
+            # empty directory and the container silently starts with the
+            # image's default config instead.
+            if os.path.isfile(local_path):
+                binds[self._container_host_bind_path(local_path)] = {
+                    "bind": target, "mode": mode}
+                continue
             # mkdir BEFORE translating to the host bind-mount path — a
             # Tier-2 install (host podman socket, AW_WORKSPACE_HOST_DIR set)
             # runs this process inside the workspace container, which only

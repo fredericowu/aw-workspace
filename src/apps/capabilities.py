@@ -37,6 +37,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "notifications:send": {"risk": "low", "desc": "fire a notification via the workspace notification engine"},
     "tasks:contribute":  {"risk": "low",  "desc": "seed scheduled tasks on install (created once, never updated afterwards)"},
     "agents:contribute": {"risk": "low",  "desc": "seed Agents Platform agents/models/configs/groups on install (created once, never updated afterwards)"},
+    "repos:contribute":  {"risk": "low",  "desc": "clone declared git repositories into the workspace's repos/ dir on install (cloned once, never re-pulled)"},
     "containers:manage": {"risk": "high", "desc": "run/manage sidecar containers"},
     "ui:code":           {"risk": "high", "desc": "load the app's JS bundle into the SPA context"},
     "mcp:register-gateway": {"risk": "high", "desc": "mount the workspace's root .mcp.json (read/write, single file) to register this app's own MCP endpoint"},

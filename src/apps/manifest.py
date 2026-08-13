@@ -103,6 +103,30 @@ class Manifest:
         return list(self.contributes.get("tasks", []))
 
     @property
+    def repos(self) -> list[dict[str, Any]]:
+        """``contributes.repos`` — git checkouts the app clones into ``repos/``.
+
+        Cloned once if ``repos/<name>`` is absent and never touched again
+        afterwards — a working tree is the user's, not the app's. See
+        ``src/apps/repos.py``.
+        """
+        return list(self.contributes.get("repos", []))
+
+    @property
+    def sidecars(self) -> list[dict[str, Any]]:
+        """``runtime.sidecars`` — extra containers this app's stack needs.
+
+        A Tier-2 app is one image plus, sometimes, the companion services it
+        cannot function without: aw-app-crispal is an MCP server *and* the
+        WordPress + MySQL pair that serves the store's DEV clone. Declaring
+        them here keeps the whole stack in one manifest with one lifecycle,
+        instead of the monolith's arrangement where the app and its database
+        were two hand-maintained entries in a global config file. Gated
+        behind ``containers:manage``. See ``src/apps/containers.py``.
+        """
+        return list(self.runtime.get("sidecars", []))
+
+    @property
     def agents(self) -> dict[str, Any]:
         """``contributes.agents`` — Agents Platform objects the app seeds.
 
@@ -422,6 +446,80 @@ def _validate_contributed_agents(
                     )
 
 
+def _validate_contributed_repos(
+    contributes: dict[str, Any], permissions: list[str]
+) -> None:
+    """Validate ``contributes.repos`` — a list of ``{name, url}`` checkouts.
+
+    ``name`` is both the identity and the directory under ``repos/``, so it
+    is constrained to a plain directory name here: an app must not be able to
+    pick where in the filesystem core writes (``src/apps/repos.py`` refuses
+    the same shapes again at clone time, since a manifest is not the only way
+    a spec can reach it).
+    """
+    declared = contributes.get("repos")
+    if declared is None:
+        return
+    if "repos:contribute" not in permissions:
+        raise ManifestError("contributes.repos requires the 'repos:contribute' permission")
+    if not isinstance(declared, list):
+        raise ManifestError("contributes.repos must be a list")
+    for entry in declared:
+        if not isinstance(entry, dict):
+            raise ManifestError("each contributes.repos entry must be an object")
+        name = str(entry.get("name") or "").strip()
+        url = str(entry.get("url") or "").strip()
+        if not name or not url:
+            raise ManifestError("each contributes.repos entry needs a 'name' and a 'url'")
+        if "/" in name or "\\" in name or name in (".", ".."):
+            raise ManifestError(
+                f"contributes.repos[].name {name!r} must be a plain directory name"
+            )
+        depth = entry.get("depth")
+        if depth is not None and (
+            not isinstance(depth, int) or isinstance(depth, bool) or depth <= 0
+        ):
+            raise ManifestError("contributes.repos[].depth must be a positive integer")
+
+
+def _validate_sidecars(runtime: dict[str, Any], permissions: list[str]) -> None:
+    """Validate ``runtime.sidecars`` — companion containers of a Tier-2 app.
+
+    Each needs a ``name`` (namespaced into ``aw-app-<app>-<name>``, so the
+    same plain-directory-name constraint applies for a predictable DNS name)
+    and an ``image``. ``port`` is optional: a database sidecar has nothing to
+    expose to the workspace, only to its siblings on the podman network.
+    """
+    declared = runtime.get("sidecars")
+    if declared is None:
+        return
+    if "containers:manage" not in permissions:
+        raise ManifestError("runtime.sidecars requires the 'containers:manage' permission")
+    if not isinstance(declared, list):
+        raise ManifestError("runtime.sidecars must be a list")
+    seen: set[str] = set()
+    for entry in declared:
+        if not isinstance(entry, dict):
+            raise ManifestError("each runtime.sidecars entry must be an object")
+        name = str(entry.get("name") or "").strip()
+        if not name or not SLUG_RE.match(name):
+            raise ManifestError(
+                "each runtime.sidecars entry needs a lowercase alphanumeric-with-dashes 'name'"
+            )
+        if name in seen:
+            raise ManifestError(f"duplicate runtime.sidecars name {name!r}")
+        seen.add(name)
+        if not str(entry.get("image") or "").strip():
+            raise ManifestError(f"runtime.sidecars[{name!r}] needs an 'image'")
+        port = entry.get("port")
+        if port is not None and (
+            not isinstance(port, int) or isinstance(port, bool) or port <= 0
+        ):
+            raise ManifestError(
+                f"runtime.sidecars[{name!r}].port must be a positive integer"
+            )
+
+
 def validate_manifest(data: dict[str, Any]) -> Manifest:
     """Validate a parsed manifest dict against the v1 schema; return a Manifest.
 
@@ -547,6 +645,8 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
             raise ManifestError("contributes.tasks[].schedules must be a list")
 
     _validate_contributed_agents(contributes, permissions)
+    _validate_contributed_repos(contributes, permissions)
+    _validate_sidecars(runtime, permissions)
 
     config_schema = data.get("config_schema", {})
     if not isinstance(config_schema, dict):
