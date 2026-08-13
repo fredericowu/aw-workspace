@@ -68,6 +68,38 @@ Two tiers:
 }
 ```
 
+### `description` is product copy, not architecture notes
+
+`description` is the only sentence most people ever read about your app —
+it's the marketplace card and the Apps grid tile. **An app is a product.**
+Write it for the person deciding whether to install: what it does for them,
+benefit first, in plain language. Same for `name` — a product name, not a
+module name.
+
+Keep internal architecture out of it. No ADR or decision numbers, no
+capability slugs (`commands:install`), no route shapes, no
+"component-mode frontend bundle", no porting/migration history. A builder
+looking for those reads README.md and this skill; on the card they're noise
+that answers none of the reader's actual question.
+
+This template's own description used to fail that test:
+
+> ~~TEMPLATE — a minimal, fully working decoupled app: installs one trivial
+> CLI (`hello`, …) through the gated commands:install facade, contributes a
+> backend sub-app (GET /hello + app-local WS /ws/echo under the app
+> namespace) and a component-mode frontend bundle, and runs standalone too
+> (ADR Decision 4/6).~~
+
+Every clause is true and none of it is for the reader. What it says now
+leads with what you get:
+
+> TEMPLATE — the fastest way to start a new aw-workspace app. Install it and
+> you have a working app on day one: a `hello` CLI that prints a
+> configurable greeting, its own window, and an HTTP + WebSocket backend …
+
+Rule of thumb: if a sentence would only make sense to someone who has read
+this skill, it belongs in README.md instead.
+
 `config_schema` is **optional** — omit it entirely if your app has no config
 at all. Add it when there's a real knob to expose:
 
@@ -605,6 +637,45 @@ required dependency for exactly this reason — see that repo's manifest.
   (public, tokenless raw-GET). Ship `.github/workflows/release.yml` (see this
   repo) to cut versioned releases; the catalog references the repo.
 
+### Test through the marketplace, not through a sideload
+
+`POST /api/apps/install {package_dir}` exists and works, and it is the wrong
+way to validate an app that is already in the catalog. **The cloud registry is
+the source of truth and the reconciler converges to it**, so a sideload wins
+for a few minutes and then loses — without logging anything a caller sees:
+
+- Sideload v0.3.0 while the catalog says v0.2.1 → `version_changed` → the
+  reconciler uninstalls yours and reinstalls the catalog copy. Pinning
+  `version` to match only defers the problem to the next drift.
+- Pin a version the catalog does not have *yet* — the raw catalog lags the
+  sync PR merge by ~5 min — and the reconciler can remove the app outright.
+  Observed 2026-08-13: every route 404, every MCP tool gone from the gateway,
+  `install-status` reporting "not installed", while `apps/<slug>/` still sat
+  on disk looking perfectly installed.
+- The gateway's app-scan globs `apps/<slug>/mcp.json`. A `package_dir`
+  pointing at `repos/aw-app-<name>` activates the app and serves its routes
+  while contributing **zero** MCP tools, because the scan never looks there.
+  If you must sideload, stage into `apps/<slug>/` first.
+- Most of what actually breaks lives on the marketplace path anyway: release
+  CI, the catalog sync PR, tag resolution, and grant derivation from catalog
+  membership (`signed`, which gates `ui:code` — a denied `ui:code` silently
+  removes your entire frontend). A sideload exercises none of it.
+
+So the loop is: commit → push → release CI tags → merge the `chore(sync)` PR
+in `tekflox/aw-marketplace` → wait until `GET /api/apps/-/catalog` (the
+workspace's own view, not GitHub's) serves the new version → then
+`aw-workspace-cli marketplace install <slug> --update`.
+
+Two things to check after **any** install, marketplace included:
+
+- **Did `ctx.config` survive?** A reinstall restored an app's secret-store
+  token but silently dropped two of its four config keys, and every route kept
+  answering 200. `doctor` did not flag it. Re-POST `/config` and verify.
+- **Reload the MCP gateway.** An app that was down while the gateway scanned
+  keeps serving zero tools until the gateway restarts — the upstream entry in
+  the merged `mcp.json` is present and correct, it is just a dead connection.
+  `aw-workspace-cli restart mcp-gateway`, then count the tools.
+
 ### First push after `gh repo create tekflox/aw-app-<name> --private --source=. --push`
 
 The release CI will fail on the very first push with `Secret
@@ -651,4 +722,9 @@ needs touching.
    a frontend; `tests/standalone_test.sh` green.
 5. Push to `github.com/tekflox/aw-app-<name>`; wire `release.yml`; add to the
    marketplace catalog.
-6. Install and confirm the card shows in the Apps grid and opens.
+6. Install **via the marketplace** (`aw-workspace-cli marketplace install
+   <slug>`, once the catalog serves your version — §10) and confirm the card
+   shows in the Apps grid and opens. Sideloading is for an app that is not in
+   the catalog yet; anything else the reconciler quietly reverts.
+7. Re-check `ctx.config` and reload `mcp-gateway` after the install — both
+   have been silently lost across a reinstall (§10).
