@@ -519,6 +519,22 @@ class AppRuntime:
             fe = app.manifest.frontend
             if fe:
                 bundle = fe.get("bundle")
+                # A declared bundle the package doesn't actually ship is a
+                # phantom: the SPA import()s the announced URL and takes a 404
+                # (+ a console error) on EVERY page load, for as long as the app
+                # stays installed. There's no build step at install time — the
+                # compiled bundle is committed by the app (see aw-app-diff-tool's
+                # .gitignore), so a missing file means a packaging bug in that
+                # app, not a transient state. Found live 2026-08-12 on the
+                # `hello` template app, whose ui/dist is gitignored. Announce
+                # only what can be served; the rest of the contribution
+                # (windows, nav, settings) is unaffected.
+                if bundle and not self._bundle_exists(app, bundle):
+                    log.warning(
+                        "apps: %s declares frontend bundle %r but the package "
+                        "has no ui/dist/%s — not announcing it",
+                        slug, bundle, os.path.basename(str(bundle)))
+                    bundle = None
                 frontend.append({
                     "app": slug,
                     "mode": fe.get("mode", "iframe"),
@@ -537,6 +553,18 @@ class AppRuntime:
                 })
         return {"windows": windows, "nav": nav, "settings": settings,
                 "frontend": frontend}
+
+    @staticmethod
+    def _bundle_exists(app: LoadedApp, bundle: str) -> bool:
+        """Is the declared frontend bundle actually in the package?
+
+        Resolved exactly like ``GET /api/apps/{slug}/ui/{path}`` serves it
+        (basename under the package's ``ui/dist``), so "announced" and
+        "servable" can't drift apart.
+        """
+        target = os.path.join(app.package_dir, "ui", "dist",
+                              os.path.basename(str(bundle)))
+        return os.path.isfile(target)
 
     def skills_index(self) -> list[dict[str, Any]]:
         """Index of every ``contributes.skills`` entry for ``GET /api/apps/-/skills``.
