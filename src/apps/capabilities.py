@@ -36,6 +36,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "secrets:own":       {"risk": "low",  "desc": "request the app's own secrets"},
     "notifications:send": {"risk": "low", "desc": "fire a notification via the workspace notification engine"},
     "tasks:contribute":  {"risk": "low",  "desc": "seed scheduled tasks on install (created once, never updated afterwards)"},
+    "agents:contribute": {"risk": "low",  "desc": "seed Agents Platform agents/models/configs/groups on install (created once, never updated afterwards)"},
     "containers:manage": {"risk": "high", "desc": "run/manage sidecar containers"},
     "ui:code":           {"risk": "high", "desc": "load the app's JS bundle into the SPA context"},
     "mcp:register-gateway": {"risk": "high", "desc": "mount the workspace's root .mcp.json (read/write, single file) to register this app's own MCP endpoint"},

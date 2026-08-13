@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.apps.agents import KINDS as AGENT_KINDS
 from src.apps.capabilities import is_valid_capability
 
 # slug rule (ADR Decision 8): the namespace key for routes/tables/commands/...
@@ -100,6 +101,20 @@ class Manifest:
         edits always win. See ``src/apps/tasks.py``.
         """
         return list(self.contributes.get("tasks", []))
+
+    @property
+    def agents(self) -> dict[str, Any]:
+        """``contributes.agents`` — Agents Platform objects the app seeds.
+
+        An object of four ordered lists (``models``, ``agent_configs``,
+        ``groups``, ``agents``) with the same seeded-not-owned rule tasks
+        use: created once if that slug is free, never rewritten, never
+        removed on uninstall. See ``src/apps/agents.py``.
+        """
+        declared = self.contributes.get("agents")
+        if not isinstance(declared, dict):
+            return {}
+        return {kind: list(declared.get(kind, []) or []) for kind in AGENT_KINDS}
 
     @property
     def reload_mcp_gateway_on_save(self) -> bool:
@@ -348,6 +363,65 @@ class Manifest:
                 "skills": skills}
 
 
+#: Required fields per ``contributes.agents`` kind, beyond the slug every
+#: entry needs. Kept narrow on purpose — Agents Platform validates the rest,
+#: and duplicating its schema here would mean a manifest that this workspace
+#: rejects for a field the platform has since made optional.
+AGENT_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "models": ("provider", "model_id"),
+    "agent_configs": ("name",),
+    "groups": ("name",),
+    "agents": ("name",),
+}
+
+
+def _validate_contributed_agents(
+    contributes: dict[str, Any], permissions: list[str]
+) -> None:
+    """Validate ``contributes.agents`` — an object of four ordered lists.
+
+    The slug is the identity of a seeded object (``src/apps/agents.py``), so
+    a missing or blank one is rejected here rather than becoming a silent
+    duplicate later: every such entry would collide on the same empty key.
+    """
+    declared = contributes.get("agents")
+    if declared is None:
+        return
+    if "agents:contribute" not in permissions:
+        raise ManifestError("contributes.agents requires the 'agents:contribute' permission")
+    if not isinstance(declared, dict):
+        raise ManifestError(
+            "contributes.agents must be an object with "
+            f"{', '.join(AGENT_KINDS)} lists"
+        )
+    unknown = set(declared) - set(AGENT_KINDS)
+    if unknown:
+        raise ManifestError(
+            f"unknown contributes.agents key(s) {sorted(unknown)} "
+            f"(expected any of {list(AGENT_KINDS)})"
+        )
+    for kind in AGENT_KINDS:
+        entries = declared.get(kind, [])
+        if not isinstance(entries, list):
+            raise ManifestError(f"contributes.agents.{kind} must be a list")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ManifestError(f"each contributes.agents.{kind} entry must be an object")
+            slug = str(entry.get("slug") or "").strip()
+            if not slug:
+                raise ManifestError(f"each contributes.agents.{kind} entry needs a 'slug'")
+            if not SLUG_RE.match(slug):
+                raise ManifestError(
+                    f"contributes.agents.{kind}[].slug {slug!r} must be lowercase "
+                    "alphanumeric with dashes"
+                )
+            for required in AGENT_REQUIRED_FIELDS[kind]:
+                if not str(entry.get(required) or "").strip():
+                    raise ManifestError(
+                        f"contributes.agents.{kind}[{slug!r}] needs a {required!r}"
+                    )
+
+
 def validate_manifest(data: dict[str, Any]) -> Manifest:
     """Validate a parsed manifest dict against the v1 schema; return a Manifest.
 
@@ -471,6 +545,8 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
             raise ManifestError("a 'terminal' task needs a 'prompt'")
         if not isinstance(task.get("schedules", []), list):
             raise ManifestError("contributes.tasks[].schedules must be a list")
+
+    _validate_contributed_agents(contributes, permissions)
 
     config_schema = data.get("config_schema", {})
     if not isinstance(config_schema, dict):

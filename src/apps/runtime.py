@@ -40,7 +40,9 @@ from src.apps.manifest import Manifest, load_manifest
 from src.apps.proxy import ContainerReverseProxy
 from src.apps.secret_store import SecretStore
 from src.apps.services import ServiceSupervisor
+from src.apps import agents as agents_mod
 from src.apps import tasks as tasks_mod
+from src.apps.agents import AgentsRegistry
 from src.apps.skills import SkillError, SkillsRegistry
 from src.apps.tasks import TasksRegistry
 from src.apps.watchdog import WatchdogSupervisor
@@ -397,6 +399,7 @@ class AppRuntime:
         self.secret_store = SecretStore()
         self.skills = SkillsRegistry()
         self.tasks = TasksRegistry()
+        self.agents = AgentsRegistry()
         self._db_tables: Any = None  # lazy — only apps granted db:own-tables need it
 
     @property
@@ -645,6 +648,23 @@ class AppRuntime:
         except Exception:  # noqa: BLE001 — seeding must never fail an install
             log.exception("apps: task seeding failed for %s", slug)
 
+    def _register_agents(self, loaded: LoadedApp) -> None:
+        """Seed this app's ``contributes.agents`` (create-if-absent, by slug).
+
+        Same two directions as ``_register_tasks``, for the same reason —
+        activation order isn't guaranteed. See ``src/apps/agents.py``.
+        """
+        slug = loaded.manifest.id
+        try:
+            self.agents.register(self, slug, loaded.manifest.agents, loaded.package_dir)
+            plugin = getattr(loaded, "plugin", None)
+            if plugin is not None and callable(getattr(plugin, agents_mod.PROVIDER_METHOD, None)):
+                seeded = self.agents.sweep(self)
+                if any(seeded.values()):
+                    log.info("apps: %s is the agent provider, seeded %s", slug, seeded)
+        except Exception:  # noqa: BLE001 — seeding must never fail an install
+            log.exception("apps: agent seeding failed for %s", slug)
+
     def _resolve_window(self, app: LoadedApp, entry: dict[str, Any]) -> dict[str, Any]:
         """Inline a declarative window's spec file into ``body.spec_data``.
 
@@ -736,6 +756,7 @@ class AppRuntime:
         self._apps[slug] = loaded
         self._register_skills(loaded)
         self._register_tasks(loaded)
+        self._register_agents(loaded)
         self._invalidate_openapi()
         log.info("apps: loaded %s v%s (routes mounted=%s)",
                  slug, manifest.version, loaded.mount is not None)
@@ -986,6 +1007,7 @@ class AppRuntime:
         self._apps[slug] = loaded
         self._register_skills(loaded)
         self._register_tasks(loaded)
+        self._register_agents(loaded)
         self._invalidate_openapi()
         log.info("apps: loaded container app %s v%s (image=%s)",
                  slug, manifest.version, image)
