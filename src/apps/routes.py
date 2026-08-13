@@ -104,6 +104,31 @@ def _coerce_config(schema: dict, incoming: dict) -> dict:
     return config
 
 
+def _merge_config(previous: dict, incoming: dict) -> dict:
+    """Fold ``incoming`` over ``previous``, so a PARTIAL save keeps the keys
+    it did not mention.
+
+    Saving used to replace the config wholesale: whatever the request carried
+    became the whole config, and every key it omitted was dropped. That reads
+    as "set these" but behaves as "the config is now exactly this", and the
+    difference is invisible until something stops working. It cost real time
+    twice on 2026-08-13 — writing four new crispal keys silently erased the
+    four already there, and the gallery tools went back to "connection
+    refused" with nothing to say why.
+
+    An explicit ``None`` still REMOVES a key, so clearing a setting stays
+    possible; a UI that posts the whole form is unaffected, since every key
+    it manages is present either way.
+    """
+    merged = dict(previous or {})
+    for key, value in (incoming or {}).items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    return merged
+
+
 async def _apply_runtime_config(runtime: AppRuntime, loaded, previous: dict) -> None:
     """Apply framework-owned config to already-loaded runtime state."""
     app_id = loaded.manifest.id
@@ -418,7 +443,8 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         schema = loaded.manifest.effective_config_schema
         previous = loaded.manifest.config_with_defaults(loaded.config)
         incoming = data.get("config") if isinstance(data.get("config"), dict) else data
-        loaded.config = loaded.manifest.config_with_defaults(_coerce_config(schema, incoming or {}))
+        merged = _merge_config(loaded.config or {}, incoming or {})
+        loaded.config = loaded.manifest.config_with_defaults(_coerce_config(schema, merged))
         loaded.ctx.config = dict(loaded.config)
 
         update_config = getattr(reconciler.local, "update_config", None)
