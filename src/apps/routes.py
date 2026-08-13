@@ -427,7 +427,19 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                     return
 
                 catalog_version = catalog_entry.get("version") or ""
-                if catalog_version and catalog_version == loaded.manifest.version:
+                catalog_repo = catalog_entry.get("repo")
+
+                # Same version is NOT automatically nothing to do: the install
+                # can still be at the wrong TRUST level, and trust decides
+                # whether high-risk capabilities (`ui:code` above all) were
+                # granted. A side-loaded app carries the version its manifest
+                # declares, so side-loading the very version the catalog
+                # publishes — the normal end of a dev loop, since CI bumped
+                # the manifest — lands exactly here, and short-circuiting left
+                # the app unsigned with no way to update out of it.
+                trust_is_stale = loaded.signed != is_marketplace_app(slug, catalog_repo)
+                if catalog_version and catalog_version == loaded.manifest.version \
+                        and not trust_is_stale:
                     jobs.mark_installed(
                         slug,
                         {"app_id": slug, "status": "no-op", "version": loaded.manifest.version},
@@ -437,11 +449,32 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 spec = AppSpec(
                     app_id=slug,
                     version=catalog_version,
-                    repo=catalog_entry.get("repo"),
+                    repo=catalog_repo,
                     ref=catalog_entry.get("ref") or "HEAD",
                     granted_permissions=loaded.granted_permissions,
                     config=loaded.config,
-                    signed=loaded.signed,
+                    # DERIVED from the catalog entry we just resolved, exactly
+                    # like the install route — NOT carried over from the
+                    # install this one replaces.
+                    #
+                    # It used to be `signed=loaded.signed`, which made trust
+                    # sticky: an app that was ever installed unsigned stayed
+                    # unsigned through every future update, because this is
+                    # the only path that rewrites the spec. Side-loading is
+                    # the normal way to test an app change (`aw-workspace-cli
+                    # sideload`, unsigned by construction — no repo, so
+                    # `is_marketplace_app` is false), so the whole dev loop
+                    # ended in an app permanently missing `ui:code`: no window
+                    # body, no nav row, no titlebar actions, while the chrome
+                    # still drew. The only escape was a full uninstall +
+                    # install, which also wipes the app's config. Hit for real
+                    # on `tasks`, 2026-08-13.
+                    #
+                    # We are updating TO a catalog version here — the app is
+                    # about to be re-fetched from `catalog_repo` — so catalog
+                    # membership is the right question to ask, and asking it
+                    # again is what makes trust self-healing.
+                    signed=is_marketplace_app(slug, catalog_repo),
                 )
                 if reconciler.cloud.configured:
                     try:
