@@ -135,6 +135,23 @@ class Manifest:
         return list(self.runtime.get("sidecars", []))
 
     @property
+    def ui_sidecar(self) -> str:
+        """``runtime.ui_sidecar`` — the sidecar that serves this app's UI.
+
+        A Tier-2 app is reverse-proxied at its own subdomain
+        (``<slug>.app.<workspace>…``), which is what a ``managed_app`` window
+        and the Apps grid both open. That proxy targets the app's own
+        container, which is right when the app IS its UI — and wrong for
+        aw-app-crispal, whose container is a headless MCP server while the
+        thing a human wants to look at is the WordPress sidecar next to it.
+
+        Naming the sidecar here re-points the proxy, and nothing else moves:
+        the MCP is dialled container-to-container by name
+        (``http://aw-app-crispal:9410/mcp``), never through this route.
+        """
+        return str(self.runtime.get("ui_sidecar", "") or "")
+
+    @property
     def agents(self) -> dict[str, Any]:
         """``contributes.agents`` — Agents Platform objects the app seeds.
 
@@ -542,6 +559,28 @@ def _validate_sidecars(runtime: dict[str, Any], permissions: list[str]) -> None:
         ):
             raise ManifestError(
                 f"runtime.sidecars[{name!r}].port must be a positive integer"
+            )
+
+    ui_sidecar = runtime.get("ui_sidecar")
+    if ui_sidecar is None:
+        return
+    if not isinstance(ui_sidecar, str) or not ui_sidecar.strip():
+        raise ManifestError("runtime.ui_sidecar must be a non-empty string")
+    ui_sidecar = ui_sidecar.strip()
+    if ui_sidecar not in seen:
+        raise ManifestError(
+            f"runtime.ui_sidecar {ui_sidecar!r} names no declared sidecar "
+            f"(have {sorted(seen)})"
+        )
+    # The proxy has to have somewhere to connect TO. A sidecar with no port
+    # is one nothing outside its own network reaches (a database), and
+    # pointing the app's public subdomain at it would mount a proxy to
+    # port 0 — a 502 on every request, with a manifest that read as correct.
+    for entry in declared:
+        if str(entry.get("name") or "").strip() == ui_sidecar and not entry.get("port"):
+            raise ManifestError(
+                f"runtime.ui_sidecar {ui_sidecar!r} must declare a 'port' — "
+                f"it is what the app's reverse proxy connects to"
             )
 
 

@@ -1034,7 +1034,16 @@ class AppRuntime:
                 # asyncio event loop (every other request/WS/terminal) for
                 # however long the pull takes. Reported live 2026-08-05.
                 await asyncio.to_thread(self.containers.start, slug)
-            proxy = ContainerReverseProxy(self.containers.base_url(slug))
+            # runtime.ui_sidecar re-points this app's route (and therefore its
+            # subdomain, its Apps-grid tile and any managed_app window) at a
+            # sidecar. For aw-app-crispal the app container is a headless MCP
+            # server and the UI is the WordPress next to it; without this the
+            # window opened an MCP endpoint and rendered nothing a human wants.
+            target = manifest.ui_sidecar
+            proxy_key = (
+                self.containers.sidecar_key(slug, target) if target else slug
+            )
+            proxy = ContainerReverseProxy(self.containers.base_url(proxy_key))
             self._attach_mount(loaded, proxy)
         except Exception:
             # residue-free failed load: drop the Mount + stop the container +
