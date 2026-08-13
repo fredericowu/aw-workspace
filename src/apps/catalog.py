@@ -144,6 +144,33 @@ def _raw_url_for(source: str) -> str:
     return f"https://raw.githubusercontent.com/{owner_repo}/{ref}/{CATALOG_PATH}"
 
 
+def _api_url_for(source: str) -> str | None:
+    """The GitHub **API** contents URL for a source's ``apps.json``, or
+    ``None`` when the spec isn't an ``owner/repo[@ref]`` GitHub reference
+    (a full-URL source points at an arbitrary host that has no such API).
+
+    Preferred over ``_raw_url_for`` purely for freshness:
+    ``raw.githubusercontent.com`` serves ``max-age=300`` from a CDN that
+    strips the query string from its cache key — a ``?cb=<random>``
+    cache-buster measurably returns ``x-cache: HIT`` — so a just-released
+    version can stay invisible for ~5 minutes with no way to hurry it. The
+    API serves the same bytes at ``s-maxage=60``.
+    """
+    if source.startswith("http://") or source.startswith("https://"):
+        return None
+    owner_repo, _, ref = source.partition("@")
+    owner, sep, repo = owner_repo.partition("/")
+    if not (owner and sep and repo) or "/" in repo:
+        return None
+    return (f"https://api.github.com/repos/{owner_repo}/contents/{CATALOG_PATH}"
+            f"?ref={ref or 'master'}")
+
+
+# Returns the file's bytes as-is instead of the base64 JSON envelope, so the
+# API and raw responses parse through the exact same path.
+GITHUB_RAW_MEDIA_TYPE = "application/vnd.github.raw"
+
+
 def _is_github_host(host: str) -> bool:
     """Whether the legacy *global* ``AW_APP_GIT_TOKEN`` may go to ``host``.
 
@@ -185,16 +212,53 @@ def _auth_headers(url: str, source_id: str = "") -> dict[str, str]:
 
 
 def fetch_source(source: str, source_id: str = "", timeout: float = 15.0) -> list[dict[str, Any]]:
-    """Raw-GET one source's ``apps.json`` and return its ``apps`` list.
+    """GET one source's ``apps.json`` and return its ``apps`` list.
+
+    Tries the GitHub API first (``s-maxage=60``) and falls back to the raw
+    URL (``max-age=300``) on any failure, so this can only be fresher than
+    it was, never less available: the API is rate limited (60 requests/hour
+    unauthenticated, 5000 with a token) and covers only ``owner/repo``
+    specs, which makes raw the necessary backstop. Deliberately ONE API call
+    per source per refresh — per-app manifests stay on raw
+    (``_fetch_app_manifest``), where 25-plus fetches per refresh would burn
+    an unauthenticated hourly budget in two runs and leave the catalog worse
+    off than the CDN lag it set out to fix.
 
     Raises on transport/HTTP/parse failure — the caller decides whether to
     skip this source or fall back to a cache. Also used directly by the
-    "test this source" route so a bad token reports itself.
+    "test this source" route so a bad token reports itself: a credential
+    that can't read a private repo fails BOTH fetches, so the raw error
+    still surfaces.
     """
+    api_url = _api_url_for(source)
+    if api_url is not None:
+        try:
+            return _parse_catalog(
+                _get_catalog_text(api_url, source_id, timeout,
+                                  accept=GITHUB_RAW_MEDIA_TYPE),
+                source,
+            )
+        except Exception as e:  # noqa: BLE001 — raw is the backstop for every API failure
+            log.warning("apps: catalog API fetch failed for %s (%s) — falling back to raw",
+                        source, e)
+
     url = _raw_url_for(source)
-    resp = httpx.get(url, headers=_auth_headers(url, source_id), timeout=timeout)
+    return _parse_catalog(_get_catalog_text(url, source_id, timeout), source)
+
+
+def _get_catalog_text(url: str, source_id: str, timeout: float,
+                      accept: str | None = None) -> str:
+    """GET ``url`` with this source's own credential; return the body text."""
+    headers = _auth_headers(url, source_id)
+    if accept:
+        headers = {**headers, "Accept": accept}
+    resp = httpx.get(url, headers=headers, timeout=timeout)
     resp.raise_for_status()
-    data = json.loads(resp.text)
+    return resp.text
+
+
+def _parse_catalog(text: str, source: str) -> list[dict[str, Any]]:
+    data = json.loads(text)
     if not isinstance(data, dict) or not isinstance(data.get("apps"), list):
         raise ValueError(f"catalog apps.json missing an 'apps' array (source={source})")
     return data["apps"]
