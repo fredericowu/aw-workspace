@@ -108,3 +108,139 @@ def test_system_cli_install_is_idempotent_across_reloads(tmp_path, monkeypatch):
         await rt.unload("clitool")
 
     _async(run())
+
+
+# ---- health: "present" is not "works" ---------------------------------------
+#
+# The bug this exists for: a /usr/bin/git with an empty /usr/lib/git-core is on
+# PATH and prints a version, while every https:// operation fails. The healer
+# judged health with shutil.which, saw "present", and never healed — and the
+# app's own installer guard made the same assumption, so neither layer could
+# catch the other (2026-08-12).
+
+from src.apps.commands import CommandInstaller  # noqa: E402
+
+
+def _installer(tmp_path):
+    inst = CommandInstaller()
+    inst.record_system_cli("demo", "bash", str(tmp_path), "scripts/install.sh")
+    return inst
+
+
+def test_a_cli_that_runs_is_healthy(tmp_path):
+    inst = _installer(tmp_path)
+    healthy, reason = inst.check_system_cli("demo", "bash")
+    assert healthy is True and reason == ""
+
+
+def test_a_cli_that_is_present_but_broken_is_unhealthy(tmp_path):
+    """The regression: on PATH, so the old `which` check called it healthy."""
+    inst = CommandInstaller()
+    inst.record_system_cli("demo", "bash", str(tmp_path), "scripts/install.sh",
+                           verify="bash -c 'exit 3'")
+
+    healthy, reason = inst.check_system_cli("demo", "bash")
+    assert healthy is False
+    assert "exit 3" in reason
+    assert ("demo", "bash") in inst.missing_system_clis()
+
+
+def test_a_missing_cli_says_so_without_running_anything(tmp_path):
+    inst = CommandInstaller()
+    inst.record_system_cli("demo", "definitely-not-a-real-binary", str(tmp_path),
+                           "scripts/install.sh")
+    healthy, reason = inst.check_system_cli("demo", "definitely-not-a-real-binary")
+    assert healthy is False and reason == "not on PATH"
+
+
+def test_verify_false_opts_back_down_to_a_presence_check(tmp_path):
+    """For a CLI with no meaningful version flag. Explicit in the app's own
+    code rather than the silent default for everything."""
+    inst = CommandInstaller()
+    inst.record_system_cli("demo", "bash", str(tmp_path), "scripts/install.sh",
+                           verify=False)
+    assert inst.check_system_cli("demo", "bash")[0] is True
+
+
+def test_a_hanging_verify_does_not_wedge_the_healer(tmp_path, monkeypatch):
+    inst = CommandInstaller()
+    monkeypatch.setattr(CommandInstaller, "VERIFY_TIMEOUT", 0.3)
+    inst.record_system_cli("demo", "bash", str(tmp_path), "scripts/install.sh",
+                           verify="sleep 5")
+    healthy, reason = inst.check_system_cli("demo", "bash")
+    assert healthy is False and "timed out" in reason
+
+
+def test_heal_failures_are_state_not_just_a_log_line(tmp_path):
+    """A permanently failing heal used to be a log line repeated every pass —
+    65 times in one boot — and nothing else."""
+    inst = _installer(tmp_path)
+    inst.record_heal_result("demo", "bash", "apt lock permission denied")
+    inst.record_heal_result("demo", "bash", "apt lock permission denied")
+
+    row = next(r for r in inst.system_cli_report() if r["cli"] == "bash")
+    assert row["heal_failures"] == 2
+    assert "apt lock" in row["last_heal_error"]
+
+    inst.record_heal_result("demo", "bash", None)
+    row = next(r for r in inst.system_cli_report() if r["cli"] == "bash")
+    assert row["heal_failures"] == 0 and row["last_heal_error"] is None
+
+
+# ---- GET /api/apps/-/doctor -------------------------------------------------
+#
+# Lives here, not in test_f5_endpoints.py, because that module skips unless the
+# sibling aw-app-* repos happen to be checked out next to this one — and a test
+# guarding a silent-degradation report must not itself be silently skipped.
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+from src.api.identity import require_identity  # noqa: E402
+from src.apps.routes import register_apps_routes  # noqa: E402
+
+
+def _doctor_client():
+    app = FastAPI()
+    runtime = register_apps_routes(app)
+    app.dependency_overrides[require_identity] = lambda: {"sub": "test"}
+    return runtime, TestClient(app)
+
+
+def test_doctor_reports_a_present_but_broken_cli():
+    """`status` and `/api/apps` both pass while a CLI is unusable — that gap is
+    exactly what this endpoint exists to close."""
+    runtime, client = _doctor_client()
+    runtime.commands.record_system_cli("demo", "bash", "/tmp", "scripts/i.sh",
+                                       verify="bash -c 'exit 4'")
+
+    body = client.get("/api/apps/-/doctor").json()
+    assert body["ok"] is False
+    unhealthy = body["system_clis"]["unhealthy"]
+    assert [u["cli"] for u in unhealthy] == ["bash"]
+    assert "exit 4" in unhealthy[0]["reason"]
+    # Present-but-broken is the whole point: the path is reported so the
+    # difference from "not installed" is obvious.
+    assert unhealthy[0]["path"]
+
+
+def test_doctor_is_ok_when_nothing_is_degraded():
+    _runtime, client = _doctor_client()
+    assert client.get("/api/apps/-/doctor").json()["ok"] is True
+
+
+def test_an_explicit_verify_is_the_sole_authority(tmp_path):
+    """nvm is a shell function sourced from ~/.nvm/nvm.sh — `which` can never
+    find it. A PATH precondition would call it broken forever while the healer
+    re-ran a perfectly good installer on every pass."""
+    inst = CommandInstaller()
+    marker = tmp_path / "nvm.sh"
+    marker.write_text("# nvm\n")
+    inst.record_system_cli("essentials", "nvm", str(tmp_path), "scripts/install_nvm.sh",
+                           verify=f'test -s "{marker}"')
+
+    assert inst.check_system_cli("essentials", "nvm") == (True, "")
+    assert ("essentials", "nvm") not in inst.missing_system_clis()
+
+    marker.unlink()
+    healthy, reason = inst.check_system_cli("essentials", "nvm")
+    assert healthy is False and "verify failed" in reason

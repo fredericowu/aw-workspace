@@ -29,9 +29,25 @@ workspace is recreated. ``record_system_cli``/``missing_system_clis``/``heal``
 back a generic, per-app-code-free fix: every ``install_system_cli`` call
 auto-registers itself here, and ``AppRuntime.start_system_cli_healer`` (one
 runtime-owned periodic task, not gated by any app's ``watchdog:tasks``
-permission) re-runs an app's own installer script whenever ``command -v
-<name>`` goes missing — the installer IS the app's heal logic, so no app needs
-to write or register anything extra.
+permission) re-runs an app's own installer script whenever a CLI stops being
+healthy — the installer IS the app's heal logic, so no app needs to write or
+register anything extra.
+
+**Present is not healthy.** Health used to mean ``shutil.which(name) is not
+None``. That is a proxy, and it lied: a ``/usr/bin/git`` with an EMPTY
+``/usr/lib/git-core`` (no package behind it) is on PATH and prints a version
+while every ``https://`` operation dies with "git: 'remote-https' is not a git
+command". The healer saw "present", never healed, and nvm — which installs
+itself by cloning over HTTPS — took node, npm, npx, yarn and pnpm down with
+it, surfacing as four unrelated failures in a different app entirely
+(2026-08-12).
+
+Worse, the app's own installer guard made the SAME assumption, so neither
+layer could catch the other. So health is now a command that has to succeed:
+``verify`` from the manifest entry, or ``<name> --version`` by default. An app
+whose CLI has no meaningful version flag passes ``verify=False`` to opt back
+down to a presence check, which keeps that decision explicit and visible in
+its manifest instead of being the silent default for everything.
 """
 from __future__ import annotations
 
@@ -39,6 +55,7 @@ import logging
 import os
 import shutil
 import subprocess
+from typing import Any
 
 from src.apps import paths
 
@@ -70,6 +87,14 @@ class CommandInstaller:
         # (app_id, cli_name) -> (package_dir, installer_script) for every
         # install_system_cli call, so the healer can re-run the right script.
         self._system_clis: dict[tuple[str, str], tuple[str, str]] = {}
+        # (app_id, cli_name) -> verify spec: a shell command to run, or False
+        # to fall back to a presence check. See the module docstring.
+        self._verify: dict[tuple[str, str], str | bool | None] = {}
+        # (app_id, cli_name) -> last heal outcome. A heal that keeps failing
+        # used to be a log line repeated every pass and nothing else — 65
+        # times in a single boot, seen by no one. Now it is state something
+        # can report (`aw-workspace-cli doctor`, GET /api/apps/-/doctor).
+        self._heal_state: dict[tuple[str, str], dict[str, Any]] = {}
 
     # ---- system CLIs (installer scripts) --------------------------------
 
@@ -80,11 +105,17 @@ class CommandInstaller:
         return self._run(package_dir, script, what="revert")
 
     def record_system_cli(self, app_id: str, name: str, package_dir: str,
-                           installer: str) -> None:
+                           installer: str,
+                           verify: str | bool | None = None) -> None:
         """Track a CLI an app installed so the healer can re-check/re-run it
         later. Called by ``CommandsFacade.install_system_cli`` — apps never
-        call this directly."""
+        call this directly.
+
+        ``verify``: a shell command proving the CLI WORKS, ``None`` for the
+        default (``<name> --version``), or ``False`` for presence-only.
+        """
         self._system_clis[(app_id, name)] = (package_dir, installer)
+        self._verify[(app_id, name)] = verify
 
     def forget_system_clis_for(self, app_id: str) -> None:
         """Drop everything tracked for an app on uninstall — an uninstalled
@@ -92,9 +123,79 @@ class CommandInstaller:
         for key in [k for k in self._system_clis if k[0] == app_id]:
             del self._system_clis[key]
 
+    VERIFY_TIMEOUT = 20.0
+
+    def check_system_cli(self, app_id: str, name: str) -> tuple[bool, str]:
+        """``(healthy, reason)`` for one tracked CLI. Reason is "" when healthy.
+
+        An explicit ``verify`` command is the SOLE authority — no PATH check
+        first. Not every CLI is a binary: ``nvm`` is a shell function sourced
+        from ``~/.nvm/nvm.sh``, so ``which`` can never find it, and a PATH
+        precondition would report it broken forever while the healer re-ran a
+        perfectly good installer on every pass.
+
+        Without an explicit verify, presence comes first — a missing binary
+        needs no subprocess to diagnose — and then ``<name> --version``, which
+        is what makes this a health check rather than the ``which`` proxy it
+        replaces.
+        """
+        verify = self._verify.get((app_id, name))
+        explicit = isinstance(verify, str) and verify.strip()
+
+        if not explicit:
+            if shutil.which(name) is None:
+                return False, "not on PATH"
+            if verify is False:
+                return True, ""
+
+        command = verify if explicit else f"{name} --version"
+        try:
+            proc = subprocess.run(
+                ["bash", "-c", command], capture_output=True, text=True,
+                timeout=self.VERIFY_TIMEOUT, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"verify timed out after {self.VERIFY_TIMEOUT:.0f}s: {command}"
+        except Exception as exc:  # noqa: BLE001 — a broken verify must not crash the healer
+            return False, f"verify could not run ({exc}): {command}"
+        if proc.returncode != 0:
+            detail = (proc.stderr.strip() or proc.stdout.strip() or "").splitlines()
+            return False, f"verify failed (exit {proc.returncode}): {detail[0] if detail else command}"
+        return True, ""
+
     def missing_system_clis(self) -> list[tuple[str, str]]:
-        """``(app_id, name)`` pairs for every tracked CLI no longer on PATH."""
-        return [key for key in self._system_clis if shutil.which(key[1]) is None]
+        """``(app_id, name)`` pairs for every tracked CLI that is not healthy.
+
+        Named "missing" for history; a CLI that is present but broken belongs
+        here too, and is exactly the case the name used to hide.
+        """
+        return [key for key in self._system_clis if not self.check_system_cli(*key)[0]]
+
+    def system_cli_report(self) -> list[dict[str, Any]]:
+        """Every tracked CLI with its health and last heal outcome — the raw
+        material for the doctor endpoint."""
+        report: list[dict[str, Any]] = []
+        for (app_id, name) in sorted(self._system_clis):
+            healthy, reason = self.check_system_cli(app_id, name)
+            state = self._heal_state.get((app_id, name), {})
+            report.append({
+                "app": app_id, "cli": name, "healthy": healthy,
+                "reason": reason,
+                "path": shutil.which(name),
+                "heal_failures": state.get("consecutive_failures", 0),
+                "last_heal_error": state.get("last_error"),
+            })
+        return report
+
+    def record_heal_result(self, app_id: str, name: str, error: str | None) -> None:
+        state = self._heal_state.setdefault(
+            (app_id, name), {"consecutive_failures": 0, "last_error": None})
+        if error is None:
+            state["consecutive_failures"] = 0
+            state["last_error"] = None
+        else:
+            state["consecutive_failures"] += 1
+            state["last_error"] = error
 
     def heal(self, app_id: str, name: str) -> str:
         """Re-run the app's own installer for one missing CLI (idempotent —

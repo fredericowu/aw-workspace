@@ -445,10 +445,25 @@ class AppRuntime:
         for app_id, name in self.commands.missing_system_clis():
             try:
                 await asyncio.to_thread(self.commands.heal, app_id, name)
-                log.warning("apps: healed missing system CLI %r for %s (was gone, reinstalled)",
-                            name, app_id)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 — one bad CLI must not stop the rest
+                # Recorded, not just logged. This used to be a log line and
+                # nothing else, repeated every pass — 65 times in one boot for
+                # four CLIs that were never coming back — so a permanently
+                # broken install was invisible to everything except someone
+                # reading the container log. `doctor` reads this state.
+                self.commands.record_heal_result(app_id, name, str(exc))
                 log.exception("apps: failed to heal system CLI %r for %s", name, app_id)
+                continue
+            healthy, reason = self.commands.check_system_cli(app_id, name)
+            # An installer that exits 0 is not proof either: it can succeed and
+            # still leave the CLI unusable. Only the health check settles it.
+            self.commands.record_heal_result(app_id, name, None if healthy else reason)
+            if healthy:
+                log.warning("apps: healed system CLI %r for %s (was unhealthy, reinstalled)",
+                            name, app_id)
+            else:
+                log.warning("apps: installer for %r (%s) exited 0 but the CLI is still "
+                            "unhealthy: %s", name, app_id, reason)
 
     # ---- MCP gateway rescan ----------------------------------------------
 

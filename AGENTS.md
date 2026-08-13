@@ -130,6 +130,7 @@ only prints a pointer.
 
 ```bash
 aw-workspace-cli status                     # health + components + mapped folders
+aw-workspace-cli doctor                     # what is SILENTLY degraded (see below)
 aw-workspace-cli apps [<slug>] [--json]
 aw-workspace-cli start|stop|restart <app>   # by bare app slug, not docker:aw-<app>
 aw-workspace-cli logs <app> [-f]
@@ -142,6 +143,25 @@ aw-workspace-cli test [pytest args...]
 Commands are auto-discovered from `src/cli/commands/*.py` **and** from each
 installed app's `commands/` dir, so an app ships its own CLI surface with no
 change to this repo.
+
+### `doctor` — run it before concluding something is fine
+
+This workspace's failure mode is **silent degradation**, not crashes. It can
+be green on `status` and `/api/health` while a system CLI is present but
+broken, an app's entire frontend was refused (a denied `ui:code` removes every
+window body, nav row and titlebar action — the window chrome still draws, so
+it reads as a bug in the app), or the MCP gateway serves none of an app's
+tools. All three were live on 2026-08-12 and none appeared anywhere but a
+container log, repeated every heal pass, seen by no one.
+
+```bash
+aw-workspace-cli doctor        # exits non-zero if anything is degraded
+```
+
+So: when something behaves strangely, run this **before** debugging the thing
+in front of you — the cause is often an unrelated component that is quietly
+broken. Symptoms land far from causes here: a `git` that could not fetch over
+HTTPS surfaced as four unrelated CLI failures attributed to a different app.
 
 ## Mapped folders — point at any directory
 

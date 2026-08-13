@@ -69,14 +69,58 @@ class RoutesFacade(_Facade):
     action so uninstall can reverse it.
     """
 
+    #: Path prefixes CORE already serves under ``/api/apps/<slug>/``. Core's
+    #: routes are matched BEFORE an app's ``Mount``, so anything an app
+    #: declares here is unreachable — the caller gets core's response instead.
+    #: See ``src/apps/routes.py`` for the owners.
+    RESERVED_PREFIXES = ("/ui", "/config", "/install-status", "/versions",
+                         "/settings", "/uninstall", "/update")
+
     def __init__(self, ctx: "AppContext") -> None:
         super().__init__(ctx)
         self._registered = False
+
+    @classmethod
+    def _reserved_conflicts(cls, subapp: "FastAPI") -> list[str]:
+        """Mount-relative paths in ``subapp`` that core already owns.
+
+        Silent shadowing is the worst failure shape this framework has: every
+        other route on the same sub-app answers normally, so it reads as a bug
+        in the app, and it CANNOT be reproduced with
+        ``TestClient(build_routes(...))`` because that mounts the sub-app with
+        no core router in front of it. Only a real install surfaces it. Found
+        the hard way on aw-app-tunnel + aw-app-remote-screen (2026-08-13),
+        whose settings pages sat under ``/ui/`` and 404'd.
+        """
+        conflicts = []
+        for route in getattr(subapp, "routes", []):
+            path = getattr(route, "path", "")
+            if not path:
+                continue
+            for prefix in cls.RESERVED_PREFIXES:
+                # Match on a SEGMENT boundary, never a raw string prefix:
+                # "/configuration-wizard" is not "/config", and refusing it
+                # would be a false positive that blocks a legitimate install.
+                if path == prefix or path.startswith(prefix + "/"):
+                    conflicts.append(path)
+                    break
+        return conflicts
 
     def register(self, subapp: "FastAPI") -> None:
         self._ctx._enforce("routes:register")
         if self._registered:
             raise RuntimeError(f"app {self._ctx.app_id!r} already registered a routes sub-app")
+        conflicts = self._reserved_conflicts(subapp)
+        if conflicts:
+            # Refuse rather than warn: a mounted-but-shadowed route is a
+            # feature the developer believes shipped. Failing the install is
+            # noisy, but it is noise at the only moment anyone is looking.
+            raise RuntimeError(
+                f"app {self._ctx.app_id!r} declares route(s) under a path core "
+                f"already serves at /api/apps/<slug>/: {', '.join(sorted(conflicts))}. "
+                f"Core wins the match, so these would be unreachable. Reserved: "
+                f"{', '.join(self.RESERVED_PREFIXES)} — use e.g. /panel/... instead."
+            )
         self._ctx._runtime._mount(self._ctx.app_id, subapp)
         self._registered = True
 
@@ -112,12 +156,22 @@ class CommandsFacade(_Facade):
         return {"command": name, "installed": True, "bin_path": shim_path}
 
     def install_system_cli(self, name: str, installer: str,
-                           uninstall: str | None = None) -> dict[str, Any]:
+                           uninstall: str | None = None,
+                           verify: str | bool | None = None) -> dict[str, Any]:
+        """``verify`` decides what "installed" MEANS for this CLI.
+
+        A shell command that must exit 0 to call the CLI healthy; ``None``
+        (default) runs ``<name> --version``; ``False`` falls back to a
+        presence check. Pass a command whenever presence can lie about
+        working — see ``src/apps/commands.py`` for the git case that made
+        this necessary — and prefer ``False`` over a check you know is
+        meaningless, so the weakening is explicit rather than the default.
+        """
         self._ctx._enforce("commands:install")
         output = self._ctx._runtime.commands.run_installer(
             self._ctx.package_dir, installer)
         self._ctx._runtime.commands.record_system_cli(
-            self._ctx.app_id, name, self._ctx.package_dir, installer)
+            self._ctx.app_id, name, self._ctx.package_dir, installer, verify=verify)
         self._ctx._runtime.journal.record(
             self._ctx.app_id, "system_cli:install", name, {"installer": installer})
         # The app's revert script is app-level (one uninstall.sh reverses every

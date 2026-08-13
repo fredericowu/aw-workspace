@@ -37,15 +37,36 @@ import uuid as _uuid_mod
 logger = logging.getLogger("terminal")
 
 
+# PTY children this module forked, so the SIGCHLD handler reaps ONLY those.
+_OWN_CHILD_PIDS: set[int] = set()
+
+
 def _reap_children(signum, frame):
-    """SIGCHLD handler — reap all zombie children without blocking."""
-    while True:
+    """SIGCHLD handler — reap this module's OWN zombie PTY children.
+
+    It used to call ``os.waitpid(-1, WNOHANG)`` in a loop, which reaps ANY
+    child of this process — including one ``subprocess.run`` is waiting on.
+    When the handler wins that race, ``Popen.wait()`` gets ``ECHILD`` and
+    Python reports **returncode 0**: a failed command silently becomes a
+    successful one, process-wide, for anything importing this module.
+
+    That is not theoretical here. ``src/apps/commands.py`` runs every app's
+    installer through ``subprocess.run`` and decides "installed" from its exit
+    code, so this handler could turn a failing installer into a clean install
+    — the exact silent-success failure mode the CLI health check exists to
+    catch. Found 2026-08-12 via a test that started passing when it should
+    have failed, in the same process as the terminal tests.
+
+    So: only pids this module forked, and never the ``-1`` wildcard.
+    """
+    for pid in list(_OWN_CHILD_PIDS):
         try:
-            pid, _ = os.waitpid(-1, os.WNOHANG)
-            if pid == 0:
-                break
+            reaped, _ = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
-            break
+            _OWN_CHILD_PIDS.discard(pid)  # already reaped elsewhere
+            continue
+        if reaped:
+            _OWN_CHILD_PIDS.discard(pid)
 
 
 signal.signal(signal.SIGCHLD, _reap_children)
@@ -239,6 +260,9 @@ class TerminalSession:
             os.waitpid(self.pid, os.WNOHANG)
         except ChildProcessError:
             pass
+        # Whether or not that reaped it, this pid is no longer ours to reap —
+        # leaving it in the set would have the handler poll a dead pid forever.
+        _OWN_CHILD_PIDS.discard(self.pid)
 
 
 class TerminalManager:
@@ -279,6 +303,11 @@ class TerminalManager:
                 os.environ.setdefault("HOME", os.path.expanduser("~") or "/root")
             os.execvp(cmd_parts[0], cmd_parts)
         else:
+            # Register before anything can block: the SIGCHLD handler reaps
+            # only pids in this set, so a child missing from it leaks as a
+            # zombie (and one that shouldn't be there steals another
+            # component's exit status — see _reap_children).
+            _OWN_CHILD_PIDS.add(pid)
             os.close(slave_fd)
             flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
             fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)

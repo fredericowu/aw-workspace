@@ -563,6 +563,63 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         crashing the app."""
         return {"tasks": runtime.watchdog.snapshot()}
 
+    @app.get("/api/apps/-/doctor")
+    async def doctor(identity: dict = Depends(require_identity)):
+        """Everything that can be SILENTLY degraded, in one place.
+
+        `GET /api/apps` answers "is it installed", `/api/health` answers "is
+        the server up" — and a workspace can pass both while its CLIs are
+        broken, an app's whole frontend is missing, and the MCP gateway serves
+        none of its tools. Every one of those happened on 2026-08-12, none of
+        them showed anywhere but a container log nobody reads.
+
+        Three checks, each comparing what was DECLARED against what is
+        actually true:
+
+        * ``system_clis`` — declared vs passing their verify command.
+        * ``permissions`` — requested in the manifest vs granted (a refused
+          high-risk capability silently removes an app's entire frontend, so
+          this is the one that reads as "the app is broken").
+        * ``mcp`` — apps contributing tools vs upstreams the gateway serves.
+        """
+        clis = runtime.commands.system_cli_report()
+
+        permissions = []
+        for slug in runtime.loaded_slugs():
+            loaded = runtime.get(slug)
+            if loaded is None:
+                continue
+            requested = list(loaded.manifest.permissions)
+            granted = set(loaded.granted_permissions)
+            refused = [p for p in requested if p not in granted]
+            if refused:
+                permissions.append({
+                    "app": slug, "refused": refused, "signed": loaded.signed,
+                    "reason": "unsigned app — high-risk capabilities are not granted"
+                              if not loaded.signed else "not granted",
+                })
+
+        mcp_apps = sorted(
+            slug for slug in runtime.loaded_slugs()
+            if os.path.isfile(os.path.join(runtime.get(slug).package_dir, "mcp.json"))
+        ) if runtime.loaded_slugs() else []
+
+        unhealthy = [c for c in clis if not c["healthy"]]
+        return {
+            "ok": not unhealthy and not permissions,
+            "system_clis": {
+                "total": len(clis),
+                "unhealthy": unhealthy,
+            },
+            "permissions": permissions,
+            "mcp": {
+                "apps_contributing_tools": mcp_apps,
+                "note": "compare with the gateway's own upstream list "
+                        "(POST /reload returns it) — an upstream that failed to "
+                        "connect serves zero tools until something reloads it",
+            },
+        }
+
     @app.get("/api/apps/-/catalog")
     async def catalog(identity: dict = Depends(require_identity),
                       refresh: bool = False):

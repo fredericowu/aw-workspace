@@ -224,3 +224,32 @@ def test_created_session_reports_real_agent_session_id():
             mgr.remove(session.id)
 
     asyncio.run(run())
+
+
+@pytest.mark.integration
+def test_sigchld_handler_does_not_steal_another_component_s_exit_status():
+    """The handler used to reap ANY child (`waitpid(-1)`), including one
+    `subprocess.run` was waiting on — Popen.wait() then got ECHILD and Python
+    reported **returncode 0**, turning a failed command into a successful one
+    process-wide. src/apps/commands.py decides "installed" from exactly that
+    exit code, so a failing app installer could read as a clean install.
+    """
+    import subprocess
+
+    from src.api.terminal_manager import TerminalManager
+
+    async def run():
+        mgr = TerminalManager()
+        session = mgr.create(name="reaper", command="sleep 5", session_type="terminal")
+        try:
+            session.start_reader(asyncio.get_running_loop())
+            await asyncio.sleep(0.3)
+            # A command that must be seen to fail, while a PTY child is alive
+            # and SIGCHLD is firing.
+            for _ in range(5):
+                proc = subprocess.run(["bash", "-c", "exit 7"], capture_output=True)
+                assert proc.returncode == 7, "SIGCHLD handler stole the exit status"
+        finally:
+            mgr.remove(session.id)
+
+    asyncio.run(run())
