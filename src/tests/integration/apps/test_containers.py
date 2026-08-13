@@ -1036,3 +1036,62 @@ def test_container_app_refused_when_engine_unavailable(tmp_path):
         assert not rt.is_loaded("browser")
 
     _async(run())
+
+
+def test_runtime_mounts_workspace_skills_read_only(tmp_path, monkeypatch):
+    """load_skill in the kb app reads $KB_SKILLS_DIR off its own filesystem,
+    but no placeholder ever mounted the workspace skills tree — so it failed
+    for EVERY skill, including correctly installed and indexed ones, and the
+    agents whose entire system prompt is "call load_skill and follow it" ran
+    with no instructions while still reporting success."""
+    container_root = tmp_path / "workspace"
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(container_root))
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage", "fs:workspace-data"],
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_WORKSPACE_SKILLS", "target": "/app/skills", "mode": "ro"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+
+        await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data"],
+                      signed=True)
+
+        skills = container_root / "skills"
+        assert skills.is_dir()
+        assert fake.run_calls[-1]["volumes"] == {
+            str(skills.resolve()): {"bind": "/app/skills", "mode": "ro"}
+        }
+
+    _async(run())
+
+
+def test_runtime_rejects_writable_workspace_skills_mount(tmp_path, monkeypatch):
+    """The skill corpus is owned by `agent sync`, not by a container."""
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "workspace"))
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage", "fs:workspace-data"],
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_WORKSPACE_SKILLS", "target": "/app/skills", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+        with pytest.raises(Exception):
+            await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data"],
+                          signed=True)
+
+    _async(run())

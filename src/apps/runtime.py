@@ -988,6 +988,15 @@ class AppRuntime:
         port = rt.get("port")
         resources = rt.get("resources") or {}
         run_flags = rt.get("run_flags_needed") or rt.get("run_flags") or []
+        # Apply the schema's own defaults BEFORE anything reads this config.
+        # What arrives here is the stored desired state, which only carries
+        # keys somebody explicitly saved — so a `default` declared in
+        # config_schema reached the settings UI (routes.py applies it there)
+        # and reached nothing else. expand_env drops an unresolved
+        # ${config.x} entirely, so a documented default silently became an
+        # unset variable in the container: aw-app-crispal's WordPress got no
+        # CRISPAL_SITE_URL at all and canonical-redirected every request.
+        config = manifest.config_with_defaults(config)
         # Resolve ${config.x} / ${env.X} so a container app's own settings
         # actually reach it — see containers.expand_env.
         env = expand_env(rt.get("env") or {}, config)
@@ -1178,6 +1187,14 @@ class AppRuntime:
         ``/opt/aw-workspace/.aw-workspace/knowledge_base`` rather than buried
         inside its own private data dir. Reuses ``fs:workspace-data`` rather
         than a new capability since only the kb app is expected to declare it.
+
+        ``$AW_WORKSPACE_SKILLS`` mounts ``paths.skills_dir()`` read-only — the
+        workspace's top-level ``skills/`` tree, holding this repo's own skills
+        AND every installed app's contributed ones. Read-only because a
+        container has no business editing the skill corpus; ``agent sync``
+        owns that tree. Added because ``load_skill`` in the kb app read a path
+        no volume ever provided, so it failed for every skill (see the note at
+        the placeholder's handler below).
         """
         binds: dict[str, dict] = {}
         package_root = os.path.realpath(package_dir)
@@ -1318,6 +1335,27 @@ class AppRuntime:
                 kb_dir = os.path.join(paths.workspace_home(), "knowledge_base")
                 os.makedirs(kb_dir, exist_ok=True)
                 host_path = self._container_host_bind_path(kb_dir)
+                binds[host_path] = {"bind": target, "mode": mode}
+                continue
+            if source == "$AW_WORKSPACE_SKILLS":
+                if mode != "ro":
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_WORKSPACE_SKILLS volume must be read-only")
+                # paths.skills_dir() — the workspace's top-level skills/ tree,
+                # which is where BOTH this repo's own skills and every app's
+                # contributed skills land (see the copy in _activate).
+                #
+                # Added 2026-08-13: the kb app's load_skill reads
+                # $KB_SKILLS_DIR (default /app/skills) off its own filesystem,
+                # but nothing ever mounted the workspace skills tree into a
+                # container, so load_skill failed for EVERY skill — including
+                # ones that were correctly installed and indexed. Agents whose
+                # whole system prompt is "call load_skill and follow it" were
+                # therefore running with no instructions at all, and said
+                # nothing about it.
+                skills = paths.skills_dir()
+                os.makedirs(skills, exist_ok=True)
+                host_path = self._container_host_bind_path(skills)
                 binds[host_path] = {"bind": target, "mode": mode}
                 continue
             if source == "$AW_WORKSPACE_FOLDERS":
