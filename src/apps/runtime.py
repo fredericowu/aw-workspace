@@ -743,6 +743,7 @@ class AppRuntime:
             log.warning("apps: refused high-risk caps %s for unsigned app %s", refused, slug)
         cfg = config or {}
 
+        self._install_pip_requires(manifest)
         plugin, module_prefix = self._import_plugin(manifest, package_dir)
         ctx = AppContext(
             runtime=self, app_id=slug, version=manifest.version,
@@ -1484,6 +1485,66 @@ class AppRuntime:
         return remapped
 
     # ---- import isolation ----------------------------------------------
+
+    def _install_pip_requires(self, manifest: Manifest) -> None:
+        """Install ``runtime.pip_requires`` into this process's environment.
+
+        A Tier-1 app is imported into the workspace process, so its deps must
+        live in the workspace's own environment — an app cannot install them
+        for itself before its own module is importable. Nine installed apps
+        declared this key and nothing read it, so the declaration was
+        decoration: aw-app-tasks' croniter and aw-app-presentations' playwright
+        were both absent in a fresh workspace while the manifest said otherwise.
+        The failure is silent in the worst way — the app loads, only the feature
+        that needs the dep is dead, and it reports a missing package rather than
+        a missing install step.
+
+        Idempotent via a marker keyed on the requirement list, so this costs one
+        pip subprocess the first time an app's deps change and nothing after —
+        important because this runs on every app load, i.e. on every boot.
+
+        Failures are logged, not raised: pip cannot reach the index on an
+        offline host, and half this workspace works fine without any given
+        optional dep. The subsequent import raises on its own if the dep was
+        genuinely required, which is a better error than one from here.
+        """
+        reqs = manifest.pip_requires
+        if not reqs:
+            return
+        import hashlib
+        import subprocess
+
+        key = hashlib.sha256("\n".join(sorted(set(reqs))).encode()).hexdigest()[:16]
+        marker_dir = os.path.join(paths.workspace_home(), "pip-requires")
+        marker = os.path.join(marker_dir, f"{manifest.id}.{key}")
+        if os.path.exists(marker):
+            return
+
+        log.info("apps: installing pip_requires for %s: %s", manifest.id, reqs)
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet", *reqs],
+                capture_output=True, text=True, timeout=600,
+            )
+        except Exception as exc:  # noqa: BLE001 — never block a load on this
+            log.warning("apps: pip_requires install failed for %s: %s", manifest.id, exc)
+            return
+        if proc.returncode != 0:
+            log.warning("apps: pip_requires install failed for %s (exit %s): %s",
+                        manifest.id, proc.returncode, (proc.stderr or "")[-500:])
+            return
+
+        os.makedirs(marker_dir, exist_ok=True)
+        # Drop stale markers for this app so a changed list doesn't accumulate.
+        for old in os.listdir(marker_dir):
+            if old.startswith(f"{manifest.id}.") and old != os.path.basename(marker):
+                try:
+                    os.remove(os.path.join(marker_dir, old))
+                except OSError:
+                    pass
+        with open(marker, "w") as fh:
+            fh.write("\n".join(sorted(set(reqs))))
+        log.info("apps: pip_requires satisfied for %s", manifest.id)
 
     def _import_plugin(self, manifest: Manifest, package_dir: str) -> tuple[Plugin, str]:
         """Load the entrypoint under a synthetic ``aw_apps.<slug>`` namespace.

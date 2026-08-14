@@ -121,6 +121,23 @@ class Manifest:
         return list(self.contributes.get("repos", []))
 
     @property
+    def pip_requires(self) -> list[str]:
+        """``runtime.pip_requires`` — Python deps a Tier-1 app needs importable.
+
+        A Tier-1 app runs *in this process*, so anything it imports has to be in
+        the workspace's own environment. Nine installed apps declare this key
+        and, until 2026-08-14, nothing in core ever read it — the manifests were
+        documentation. Apps worked only when their deps happened to already be
+        present, which is why aw-app-tasks' cron scheduling (croniter) and
+        aw-app-presentations' PNG export (playwright) were both dead on arrival
+        in a fresh workspace while looking correctly declared.
+
+        Tier-2 apps ship their deps in their own image; this is ignored for
+        them. See ``AppRuntime._install_pip_requires``.
+        """
+        return [str(r) for r in (self.runtime.get("pip_requires") or []) if str(r).strip()]
+
+    @property
     def sidecars(self) -> list[dict[str, Any]]:
         """``runtime.sidecars`` — extra containers this app's stack needs.
 
