@@ -8,21 +8,30 @@ coder) shipped its skill and then relied on somebody opening the Agents
 Platform UI and hand-creating four rows in the right order. Nothing in the
 install told them to, and nothing told them when they got it wrong.
 
-The declaration is one object with four ordered lists::
+The declaration is one object with five ordered lists::
 
     "contributes": {
       "agents": {
         "models":        [ { "slug": ..., "provider": ..., "model_id": ... } ],
         "agent_configs": [ { "slug": ..., "name": ... } ],
         "groups":        [ { "slug": ..., "name": ... } ],
-        "agents":        [ { "slug": ..., "name": ..., "model_slug": ... } ]
+        "agents":        [ { "slug": ..., "name": ..., "model_slug": ... } ],
+        "agent_flows":   [ { "slug": ..., "name": ..., "graph": {...} } ]
       }
     }
 
 The order of the keys is the order they are created in, and it is not
 cosmetic: an Agent references a model, an agent config and a group by slug,
-so all three have to exist first. The provider creates them in exactly this
+so all three have to exist first, and an AgentFlow's graph references agents
+by slug, so it comes after them. The provider creates them in exactly this
 sequence — an app only has to declare, never to sequence.
+
+An Agents Flow is a *topology* graph, not an execution DAG: it says which
+agents may hand off to which, starting from a ``source`` node (the inbound
+channel). When ``enabled``, every agent appearing as a node in it gets the
+flow context injected at dispatch time. A team of agents is only a team
+once something says how they connect, which is why an app that ships the
+agents ships the flow too.
 
 Seed-once semantics
 -------------------
@@ -95,8 +104,10 @@ log = logging.getLogger(__name__)
 
 PROVIDER_METHOD = "register_contributed_agents"
 
-#: The four kinds, in creation order — agents reference the other three.
-KINDS = ("models", "agent_configs", "groups", "agents")
+#: The five kinds, in creation order. An agent references a model, a config
+#: and a group by slug; an agent flow references agents by slug — so flows
+#: come last, after everything they can point at exists.
+KINDS = ("models", "agent_configs", "groups", "agents", "agent_flows")
 
 #: ``<field>_file`` sugar: a path relative to the package dir whose contents
 #: become ``<field>``. Long prompts don't belong inside JSON.

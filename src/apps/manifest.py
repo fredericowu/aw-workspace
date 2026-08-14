@@ -172,10 +172,11 @@ class Manifest:
     def agents(self) -> dict[str, Any]:
         """``contributes.agents`` — Agents Platform objects the app seeds.
 
-        An object of four ordered lists (``models``, ``agent_configs``,
-        ``groups``, ``agents``) with the same seeded-not-owned rule tasks
-        use: created once if that slug is free, never rewritten, never
-        removed on uninstall. See ``src/apps/agents.py``.
+        An object of five ordered lists (``models``, ``agent_configs``,
+        ``groups``, ``agents``, ``agent_flows``) with the same
+        seeded-not-owned rule tasks use: created once if that slug is free,
+        never rewritten, never removed on uninstall. See
+        ``src/apps/agents.py``.
         """
         declared = self.contributes.get("agents")
         if not isinstance(declared, dict):
@@ -438,13 +439,14 @@ AGENT_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "agent_configs": ("name",),
     "groups": ("name",),
     "agents": ("name",),
+    "agent_flows": ("name",),
 }
 
 
 def _validate_contributed_agents(
     contributes: dict[str, Any], permissions: list[str]
 ) -> None:
-    """Validate ``contributes.agents`` — an object of four ordered lists.
+    """Validate ``contributes.agents`` — an object of five ordered lists.
 
     The slug is the identity of a seeded object (``src/apps/agents.py``), so
     a missing or blank one is rejected here rather than becoming a silent

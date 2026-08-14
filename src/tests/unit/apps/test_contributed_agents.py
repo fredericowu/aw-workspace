@@ -9,7 +9,7 @@ once precisely so it can honour it.
 """
 import pytest
 
-from src.apps.agents import AgentsRegistry, resolve_file_fields
+from src.apps.agents import KINDS, AgentsRegistry, resolve_file_fields
 from src.apps.manifest import ManifestError, validate_manifest
 
 
@@ -43,9 +43,20 @@ def test_a_full_declaration_is_accepted():
         groups=[{"slug": "reviewers", "name": "Reviewers"}],
         agents=[{"slug": "sec-reviewer", "name": "Security Reviewer",
                  "model_slug": "sonnet", "group_slug": "reviewers"}],
+        agent_flows=[{"slug": "sec-flow", "name": "Security Flow",
+                      "enabled": True, "graph": {"nodes": [], "edges": []}}],
     )))
     assert m.agents["models"][0]["slug"] == "sonnet"
     assert m.agents["agents"][0]["group_slug"] == "reviewers"
+    assert m.agents["agent_flows"][0]["enabled"] is True
+
+
+def test_an_agent_flow_needs_a_name():
+    # The flow is what turns a set of agents into a team; an unnamed one is
+    # unpickable in the UI that draws it.
+    with pytest.raises(ManifestError, match="name"):
+        validate_manifest(_manifest(
+            contributes=_agents(agent_flows=[{"slug": "sec-flow"}])))
 
 
 def test_agents_require_the_capability():
@@ -155,7 +166,10 @@ class FakeProvider:
 
     def register_contributed_agents(self, app_id, spec):
         created = {}
-        for kind in ("models", "agent_configs", "groups", "agents"):
+        # Driven by KINDS, not a copy of it: the real provider seeds every
+        # kind the contract defines, so a kind added to the contract must
+        # show up here without anyone remembering to edit this double.
+        for kind in KINDS:
             for entry in spec.get(kind) or []:
                 self.order.append((kind, entry["slug"]))
                 bucket = self.store.setdefault(kind, {})
@@ -191,6 +205,9 @@ SPEC = {
     "agents": [{"slug": "sec-reviewer", "name": "Security Reviewer",
                 "model_slug": "sonnet", "agent_config_slug": "rev-cfg",
                 "group_slug": "reviewers"}],
+    "agent_flows": [{"slug": "sec-flow", "name": "Security Flow",
+                     "graph": {"nodes": [{"id": "a", "type": "agent",
+                                          "agent_slug": "sec-reviewer"}]}}],
 }
 
 
@@ -198,17 +215,19 @@ def test_creates_every_declared_object():
     provider = FakeProvider()
     rt = FakeRuntime({"runners": FakeLoaded({}, provider)})
     created = AgentsRegistry().register(rt, "sec", SPEC)
-    assert created == {"models": 1, "agent_configs": 1, "groups": 1, "agents": 1}
+    assert created == {"models": 1, "agent_configs": 1, "groups": 1,
+                       "agents": 1, "agent_flows": 1}
 
 
 def test_the_agent_is_created_after_what_it_references():
     # A wrong order doesn't error — it produces an agent pointing at three
-    # slugs that don't exist yet. So the order itself is the assertion.
+    # slugs that don't exist yet, or a flow whose graph names agents that
+    # aren't there. So the order itself is the assertion.
     provider = FakeProvider()
     rt = FakeRuntime({"runners": FakeLoaded({}, provider)})
     AgentsRegistry().register(rt, "sec", SPEC)
     assert [kind for kind, _ in provider.order] == [
-        "models", "agent_configs", "groups", "agents"]
+        "models", "agent_configs", "groups", "agents", "agent_flows"]
 
 
 def test_an_existing_slug_is_left_untouched():
