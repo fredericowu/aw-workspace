@@ -41,3 +41,16 @@ GEMINI.md
 
 # Playwright MCP scratch output
 .playwright-mcp/
+
+# Root dot-FILES. The `/.*/` rule above only covers dot-directories, so these
+# sat untracked-but-not-ignored — which meant `git status` showed credentials
+# as pending work and a `git add -A` would have committed them. Found
+# 2026-08-14: .git-credentials (a GitHub token) and .bash_history were both
+# sitting there, and .mcp.json carries the MCP gateway bearer token that
+# installed apps write into it at boot.
+/.git-credentials
+/.gitconfig
+/.bash_history
+/.claude.json
+/.mcp.json
+/.cgcignore

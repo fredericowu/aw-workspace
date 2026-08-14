@@ -19,6 +19,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl build-essential libpq-dev procps git sudo unzip \
     && rm -rf /var/lib/apt/lists/*
 
+# Headless-Chromium shared libraries. This image has no GUI stack, so a
+# Chromium downloaded at runtime (`playwright install chromium`, which
+# aw-app-presentations does lazily on its first PNG export) lands fine and then
+# dies on launch with "Target page, context or browser has been closed" — an
+# error that names nothing. `ldd` on the binary told the real story: 17 "not
+# found" entries. Found 2026-08-14 when export was fixed end-to-end.
+#
+# Baked into the image rather than left to the app's `--with-deps`, which
+# apt-installs at runtime: that costs ~30s on the first export of every fresh
+# workspace, needs sudo from an unprivileged process, and silently depends on
+# the container having a working apt index — three ways to fail for something
+# that is the same on every build. The app keeps its runtime install as the
+# fallback for workspaces still on an older image.
+#
+# Package names verified against this exact base (Debian 13 trixie) rather than
+# copied from playwright's docs — libasound2 in particular is libasound2t64 on
+# some releases, and one wrong name fails the whole image build.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+        libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+        libgbm1 libpango-1.0-0 libcairo2 libasound2 libglib2.0-0 \
+        libdbus-1-3 libatspi2.0-0 libxcb1 libx11-6 libxext6 libxi6 \
+        fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
 # `ubuntu` user (UID/GID 1001, standard Ubuntu first-user convention) — this
 # is now the container's DEFAULT user (see `USER ubuntu` below), not just an
 # opt-in option. Every process (the app itself, `docker exec`/terminal
