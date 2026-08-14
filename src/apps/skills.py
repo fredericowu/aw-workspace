@@ -37,7 +37,7 @@ from src.apps import paths
 
 log = logging.getLogger(__name__)
 
-_OWNER_MARKER = ".aw-app-id"
+OWNER_MARKER = ".aw-app-id"
 
 
 class SkillError(RuntimeError):
@@ -92,14 +92,14 @@ class SkillsRegistry:
         elif os.path.exists(dest_path):
             raise SkillError(f"skills index entry {dest_path!r} already exists and is not a directory")
         shutil.copytree(skill_dir, dest_path)
-        with open(os.path.join(dest_path, _OWNER_MARKER), "w") as f:
+        with open(os.path.join(dest_path, OWNER_MARKER), "w") as f:
             f.write(app_id)
         return dest_path
 
     @staticmethod
     def _read_owner(dest_path: str) -> str:
         try:
-            with open(os.path.join(dest_path, _OWNER_MARKER)) as f:
+            with open(os.path.join(dest_path, OWNER_MARKER)) as f:
                 return f.read().strip()
         except OSError:
             return ""

@@ -8,6 +8,7 @@ this the hard way; these tests pin it.
 from __future__ import annotations
 
 import json
+import shutil
 
 import pytest
 
@@ -84,6 +85,78 @@ def test_list_skills_reads_frontmatter(workspace):
         {"name": "aw-demo", "description": "A demo skill",
          "path": str(workspace / "skills" / "aw-demo" / "SKILL.md")},
     ]
+
+
+# --- skills/ is generated from two sources -----------------------------------
+#
+# skills/ is gitignored and rebuilt: native-skills/ is committed here, app
+# skills are copied in by src/apps/skills.py. The rule that keeps the two from
+# eating each other is the .aw-app-id marker — without it, the first sync after
+# boot deletes every installed app's skill, and nothing reports it.
+
+
+@pytest.fixture()
+def two_source_workspace(tmp_path, monkeypatch):
+    """``native-skills/aw-native`` committed + ``skills/aw-from-app`` app-owned."""
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path))
+
+    native = tmp_path / "native-skills" / "aw-native"
+    native.mkdir(parents=True)
+    (native / "SKILL.md").write_text("---\nname: aw-native\n---\nnative body\n")
+
+    from_app = tmp_path / "skills" / "aw-from-app"
+    from_app.mkdir(parents=True)
+    (from_app / "SKILL.md").write_text("---\nname: aw-from-app\n---\napp body\n")
+    (from_app / skills_sync.OWNER_MARKER).write_text("some-app")
+
+    return tmp_path
+
+
+def test_native_skill_is_materialized_into_skills(two_source_workspace):
+    skills_sync.sync_all()
+
+    assert (two_source_workspace / "skills" / "aw-native" / "SKILL.md").exists()
+    for target in skills_sync.targets():
+        assert (target / "aw-native" / "SKILL.md").read_text().endswith("native body\n")
+
+
+def test_app_owned_skill_survives_a_sync(two_source_workspace):
+    """The regression this split could cause: skills/ is an exact mirror, and an
+    app's skill has no counterpart in native-skills/. Deleting on that basis
+    would wipe every installed app's skill on the first boot sync."""
+    skills_sync.sync_all()
+
+    assert (two_source_workspace / "skills" / "aw-from-app" / "SKILL.md").exists()
+    # ...and it reaches the agents, exactly like a native one.
+    for target in skills_sync.targets():
+        assert (target / "aw-from-app" / "SKILL.md").read_text().endswith("app body\n")
+
+
+def test_stale_native_skill_is_deleted_but_app_skills_are_untouched(two_source_workspace):
+    skills_sync.sync_all()
+    shutil.rmtree(two_source_workspace / "native-skills" / "aw-native")
+
+    result = skills_sync.materialize()
+
+    assert result.deleted == ["aw-native/SKILL.md"]
+    assert not (two_source_workspace / "skills" / "aw-native").exists()
+    assert (two_source_workspace / "skills" / "aw-from-app" / "SKILL.md").exists()
+
+
+def test_generated_marker_warns_in_skills_but_is_not_mirrored(two_source_workspace):
+    skills_sync.sync_all()
+
+    marker = two_source_workspace / "skills" / skills_sync.GENERATED_MARKER
+    assert "GENERATED" in marker.read_text()
+    for target in skills_sync.targets():
+        assert not (target / skills_sync.GENERATED_MARKER).exists()
+
+
+def test_materialize_is_idempotent(two_source_workspace):
+    skills_sync.materialize()
+    result = skills_sync.materialize()
+
+    assert not result.changed
 
 
 # --- AGENTS.md ---------------------------------------------------------------

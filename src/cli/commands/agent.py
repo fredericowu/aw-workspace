@@ -185,10 +185,12 @@ def _status() -> int:
     from src.libs import skills_sync
 
     print("Sources (edit these):")
-    print(f"  skills/     {skills_sync.source_dir()}")
-    print(f"  AGENTS.md   {agent_sync.agents_md_source()}")
-    print(f"  .mcp.json   {agent_sync.mcp_source()}")
+    print(f"  native-skills/  {skills_sync.native_source_dir()}")
+    print("  app skills      each installed app's contributes.skills")
+    print(f"  AGENTS.md       {agent_sync.agents_md_source()}")
+    print(f"  .mcp.json       {agent_sync.mcp_source()}")
     print("\nGenerated mirrors (never hand-edit — gitignored):")
+    print(f"  skills   → {skills_sync.source_dir()}  (merge of both sources above)")
     for t in skills_sync.targets():
         print(f"  skills   → {t}")
     for t in agent_sync.agents_md_targets():

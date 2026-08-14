@@ -24,10 +24,21 @@ coverage/
 !/.github/
 
 # --- Agent-facing generated state (aw-workspace-cli agent sync) --------------
-# skills/ is the source of truth; the per-CLI dirs below are exact mirrors and
-# must never be committed or hand-edited. (The `/.*/` rule above already hides
-# them, but they're named explicitly so the intent survives a change to that
-# catch-all.)
+# native-skills/ is the source of truth for the skills THIS repo owns. Every
+# directory below is generated and must never be committed or hand-edited:
+#
+#   skills/      merge of native-skills/ + every installed app's
+#                contributes.skills. It is what agents and containers actually
+#                read (Codex reads it raw, the kb app's load_skill reads it
+#                raw, and app containers bind-mount it), so it has to hold
+#                everything — but nothing in it is authored here.
+#   .claude/ …   per-CLI mirrors of skills/, one copy per agent CLI.
+#
+# skills/ holds app-contributed skills that only exist once their app is
+# installed, so committing it would put a workspace's app roster into this
+# repo's history. (The `/.*/` rule above already hides the dot-dirs, but
+# they're named explicitly so the intent survives a change to that catch-all.)
+/skills/
 .claude/
 .cursor/
 .gemini/
