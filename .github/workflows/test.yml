@@ -34,11 +34,18 @@ jobs:
       - name: Test suite (in a python:3.12-slim container)
         run: |
           "$PODMAN" run --rm -v "$PWD:/repo:ro" -w /repo python:3.12-slim \
-            sh -c "pip install -q -r requirements.txt pytest pytest-asyncio && \
+            sh -c "apt-get -qq update && apt-get -qq install -y --no-install-recommends git >/dev/null && \
+                   pip install -q -r requirements.txt pytest pytest-asyncio && \
                    python3 -m pytest src/tests \
                      --ignore=src/tests/integration/apps/test_f5_endpoints.py \
                      --ignore=src/tests/integration/apps/test_real_apps.py \
                      -k 'not test_pty_shell_runs_and_echoes' -v"
+          # git: python:3.12-slim ships without it, so the four
+          # test_contributed_repos.py tests — which init a local origin and
+          # clone it, because contributes.repos IS a git feature — died on
+          # FileNotFoundError: 'git' and had been red on master. Installing it
+          # is the honest fix; skipping when git is absent would have made CI
+          # green by dropping the only coverage that feature has.
           # --ignore x2: both load repos/aw-app-git as a real fixture (REPOS =
           # <this repo>/repos/aw-app-git — gitignored runtime state per this
           # repo's own .gitignore, not something CI checks out). Needs an
