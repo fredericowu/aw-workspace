@@ -104,6 +104,33 @@ def test_agent_prompt_blank_agent_slug_is_rejected():
              "agent_slug": "   "}]}))
 
 
+def test_agentic_output_needs_an_agent_slug():
+    # Same reasoning as agent_prompt: _run_agentic_output bails on a missing
+    # slug *before* running the command, so the schedule fires nightly and
+    # does nothing. aw-app-crispal's "Arvin History Cleanup" shipped exactly
+    # this shape and never once ran (2026-08-15).
+    with pytest.raises(ManifestError, match="needs an 'agent_slug'"):
+        validate_manifest(_manifest(contributes={"tasks": [
+            {"name": "X", "type": "agentic_output", "command": "echo"}]}))
+
+
+def test_agentic_output_blank_agent_slug_is_rejected():
+    with pytest.raises(ManifestError, match="needs an 'agent_slug'"):
+        validate_manifest(_manifest(contributes={"tasks": [
+            {"name": "X", "type": "agentic_output", "command": "echo",
+             "agent_slug": "  "}]}))
+
+
+def test_valid_agentic_output_task_is_accepted():
+    m = validate_manifest(_manifest(contributes={"tasks": [{
+        "name": "Nightly cleanup", "type": "agentic_output",
+        "command": "docker exec aw-app-x python -m x.cleanup",
+        "agent_slug": "telegram-sonnet", "notify_exit_codes": "1",
+        "schedules": [{"kind": "cron", "expr": "0 3 * * *"}],
+    }]}))
+    assert m.tasks[0]["agent_slug"] == "telegram-sonnet"
+
+
 def test_an_app_declaring_no_tasks_has_an_empty_list():
     assert validate_manifest(_manifest()).tasks == []
 

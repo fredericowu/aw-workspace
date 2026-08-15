@@ -734,8 +734,17 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
         if task_type == "agent_prompt":
             if not task.get("prompt"):
                 raise ManifestError("an 'agent_prompt' task needs a 'prompt'")
+        # 'agentic_output' dispatches to an agent too — only on a notable exit
+        # code, but through the identical path (manager.py::_run_agentic_output
+        # bails with "no agent_slug configured" *before* running the command).
+        # This check used to cover 'agent_prompt' alone, so aw-app-crispal's
+        # "Arvin History Cleanup" seeded a row with agent_slug NULL and every
+        # fire died on that guard, never running the cleanup (2026-08-15).
+        # aw-app-tasks rejects the same shape over its REST API — a task the
+        # user cannot create by hand must not be reachable by seeding either.
+        if task_type in ("agent_prompt", "agentic_output"):
             if not str(task.get("agent_slug") or "").strip():
-                raise ManifestError("an 'agent_prompt' task needs an 'agent_slug'")
+                raise ManifestError(f"an '{task_type}' task needs an 'agent_slug'")
         if not isinstance(task.get("schedules", []), list):
             raise ManifestError("contributes.tasks[].schedules must be a list")
 
