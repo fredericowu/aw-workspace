@@ -79,6 +79,51 @@ class DbTables:
                 if stmt.strip().lower().startswith("select") \
                 else conn.execute(text(stmt), params or {})
 
+    def execute_multi(self, app_id: str, sql: str, names: list[str],
+                      params: dict | None = None):
+        """Like ``execute`` but for a statement spanning several of the app's
+        own tables — ``{table:app__<slug>__foo}`` per reference.
+
+        ``execute`` above validates exactly one table name, which makes a join
+        (or a VIEW defined over several tables) inexpressible: an app with more
+        than one table would have to stitch rows together in Python and lose
+        every set-based guarantee the database gives it. Each name in ``names``
+        goes through the same ``_validate`` prefix check, so the multi-table
+        form widens what an app can *say*, never which tables it can reach.
+        """
+        for name in names:
+            _validate(app_id, name)
+        stmt = sql
+        for name in names:
+            stmt = stmt.replace("{table:%s}" % name, self._qualified(name))
+        if "{table:" in stmt:
+            raise DbTableError(
+                "unresolved {table:...} placeholder — every table referenced "
+                "must be listed in names")
+        with get_engine().begin() as conn:
+            result = conn.execute(text(stmt), params or {})
+            return result.fetchall() if result.returns_rows else result
+
+    def session(self, app_id: str, metadata=None):
+        """A SQLAlchemy ``Session`` on this workspace's engine, for apps that
+        model their tables declaratively instead of in SQL strings.
+
+        The engine already carries ``schema_translate_map={None: <workspace
+        schema>}`` (see ``src.api.db``), so schema-less ORM models land in this
+        workspace's schema exactly like core's own — the F2 isolation primitive
+        holds without the app doing anything. ``metadata`` (an app's
+        ``Base.metadata``) is prefix-validated up front, which is what keeps
+        Decision 8 true on this path: an app cannot map a model onto a core or
+        foreign table and reach it through the ORM.
+
+        Callers own the session lifecycle (``with ctx.db.session(md) as s:``).
+        """
+        if metadata is not None:
+            for name in metadata.tables:
+                _validate(app_id, name)
+        from sqlalchemy.orm import Session as _Session
+        return _Session(get_engine())
+
     def drop(self, app_id: str, name: str) -> None:
         """Drop an app's table. NOT called automatically by the runtime
         anymore (see module docstring) — reserved for a future explicit

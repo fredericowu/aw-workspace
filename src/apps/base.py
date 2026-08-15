@@ -266,6 +266,22 @@ class DbFacade(_Facade):
         return self._ctx._runtime.db_tables.execute(
             self._ctx.app_id, name, sql, params)
 
+    def execute_multi(self, sql: str, names: list[str],
+                      params: dict[str, Any] | None = None):
+        """Multi-table statement — ``{table:app__<slug>__foo}`` per reference,
+        every name prefix-validated. Lets an app join its own tables (or define
+        a VIEW over them) instead of stitching rows in Python."""
+        self._ctx._enforce("db:own-tables")
+        return self._ctx._runtime.db_tables.execute_multi(
+            self._ctx.app_id, sql, names, params)
+
+    def session(self, metadata: Any = None):
+        """SQLAlchemy ``Session`` on this workspace's (schema-mapped) engine,
+        for apps that model their own tables declaratively. ``metadata`` is
+        prefix-validated so the ORM path enforces Decision 8 like the SQL one."""
+        self._ctx._enforce("db:own-tables")
+        return self._ctx._runtime.db_tables.session(self._ctx.app_id, metadata)
+
 
 class WatchdogFacade(_Facade):
     """``ctx.watchdog`` — register in-process periodic (watchdog) tasks.
