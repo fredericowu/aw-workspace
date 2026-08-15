@@ -30,6 +30,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from src.apps import config_store
 from src.apps import fetch as fetch_mod
 from src.apps.manifest import load_manifest
 from src.apps.registry_client import CloudRegistry
@@ -353,6 +354,19 @@ class Reconciler:
         spec.app_id = manifest.id
         if not spec.version:
             spec.version = manifest.version
+        # Nothing on this path carries config unless a caller supplied it: a
+        # marketplace-catalog row has none, a dependency row has none, and a
+        # fresh install after a delete has none — so without this the app
+        # comes up on schema defaults alone and that emptiness is then
+        # written back over the cloud row below, making the loss permanent.
+        # Restore-on-empty only: a spec that DOES carry config is stating an
+        # intent the snapshot must not override.
+        if not spec.config:
+            restored = config_store.load(manifest.id)
+            if restored:
+                log.info("apps: restored %d saved config value(s) for %s",
+                         len(restored), manifest.id)
+                spec.config = restored
         # The REQUEST is always what this version's manifest declares — never
         # the grant carried on the spec. That grant is the *effective* result
         # of the last install (written back below, and mirrored to the cloud),
@@ -388,6 +402,11 @@ class Reconciler:
         spec.granted_permissions = effective
 
         self.local.upsert(spec, package_dir)
+        # Refresh the snapshot from whatever this install actually resolved,
+        # so an app configured before this mechanism existed is protected by
+        # the first reconcile that loads it, not only by its next config save.
+        # No-ops when spec.config is empty, so it can never blank a good file.
+        config_store.save(manifest.id, spec.config)
         if write_cloud and self.cloud.configured:
             try:
                 await asyncio.to_thread(
@@ -423,6 +442,19 @@ class Reconciler:
             loaded_before.manifest if loaded_before else None,
             loaded_before.package_dir if loaded_before else None,
         )
+        # Snapshot the settings BEFORE anything drops them. forget() deletes
+        # the mirror row and delete_desired() deletes the cloud row, so after
+        # this point the app's config exists nowhere — which is how a
+        # delete+install (the routine way to force a rebuilt image) silently
+        # reset aw-app-crispal to schema defaults and killed the Arvin bridge
+        # for a day. install() reads this back. See config_store.py.
+        if loaded_before is not None:
+            config_store.save(app_id, loaded_before.config)
+        else:
+            for row in self.local.list():
+                if row.get("app_id") == app_id:
+                    config_store.save(app_id, row.get("config"))
+                    break
         if self.runtime.is_loaded(app_id):
             await self.runtime.unload(app_id)
         self.local.forget(app_id)

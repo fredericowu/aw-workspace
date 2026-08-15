@@ -36,6 +36,7 @@ from fastapi import Body, Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
 from src.api.identity import authorize_ws, require_identity
+from src.apps import config_store
 from src.apps.catalog import get_catalog, is_marketplace_app, list_tags
 from src.apps.install_jobs import InstallJobs
 from src.apps.manifest import ManifestError, load_manifest
@@ -415,7 +416,8 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         return False
 
     @app.delete("/api/apps/{slug}")
-    async def uninstall_app(slug: str, identity: dict = Depends(require_identity)):
+    async def uninstall_app(slug: str, purge_config: bool = False,
+                            identity: dict = Depends(require_identity)):
         # Not `is_loaded` alone: that made a broken install unremovable, which
         # is precisely when you need to remove it. Reconciler.uninstall already
         # tolerates an unloaded app — it drops the mirror + registry rows and
@@ -423,6 +425,13 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         if not runtime.is_loaded(slug) and not _has_desired_row(slug):
             return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
         summary = await reconciler.uninstall(slug)
+        # Uninstall keeps the app's settings (and its $AW_APP_DATA dir) on
+        # purpose — a delete + install is how an image gets rebuilt here, not
+        # a statement that the configuration is unwanted. Throwing the
+        # settings away needs saying so.
+        summary["config_kept"] = not purge_config
+        if purge_config:
+            summary["config_purged"] = config_store.purge(slug)
         jobs.clear(slug)
         return summary
 
@@ -446,6 +455,12 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         merged = _merge_config(loaded.config or {}, incoming or {})
         loaded.config = loaded.manifest.config_with_defaults(_coerce_config(schema, merged))
         loaded.ctx.config = dict(loaded.config)
+
+        # Keep the durable snapshot current, so an uninstall + install (or a
+        # reconcile that resolves this app from a config-less catalog row)
+        # brings these values back instead of schema defaults. See
+        # src/apps/config_store.py.
+        config_store.save(slug, loaded.config)
 
         update_config = getattr(reconciler.local, "update_config", None)
         if callable(update_config):
