@@ -99,6 +99,32 @@ def expand_env(env: dict[str, Any] | None, config: dict[str, Any] | None,
     what the image's own fallback is for.
     """
     out: dict[str, str] = {}
+    for key, raw in (env or {}).items():
+        if not isinstance(raw, str):
+            out[key] = str(raw)
+            continue
+        value = expand_value(raw, config, app_id)
+        if value is None:
+            log.debug("apps: env %s unresolved (%s) — leaving it unset", key, raw)
+            continue
+        out[key] = value
+    return out
+
+
+def expand_value(raw: str, config: dict[str, Any] | None,
+                 app_id: str = "") -> str | None:
+    """Resolve ONE placeholder-shaped string. ``None`` means unresolved.
+
+    Split out of :func:`expand_env` so the same placeholder grammar can be
+    applied outside ``runtime.env`` — see ``src/apps/mcp_template.py``, which
+    walks an app's ``mcp.template.json`` with it. Keeping one implementation
+    matters more than the indirection costs: an app author who learns
+    ``${config.x|env.Y}`` in a manifest should not find a second, subtly
+    different dialect one file over.
+
+    A string with no placeholder is returned unchanged (never ``None``) —
+    only a placeholder whose every source is empty resolves to ``None``.
+    """
     config = config or {}
 
     def resolve(kind: str, name: str) -> Any:
@@ -110,28 +136,21 @@ def expand_env(env: dict[str, Any] | None, config: dict[str, Any] | None,
             return app_public_url(app_id) if name == "url" else None
         return None
 
-    for key, raw in (env or {}).items():
-        if not isinstance(raw, str):
-            out[key] = str(raw)
-            continue
-        stripped = raw.strip()
-        chain = _ENV_PLACEHOLDER_CHAIN.match(stripped)
-        if chain:
-            sources = [s.split(".", 1) for s in chain.group(1).split("|")]
-        else:
-            match = _ENV_PLACEHOLDER.match(stripped)
-            if not match:
-                out[key] = raw
-                continue
-            sources = [list(match.groups())]
-        for kind, name in sources:
-            value = resolve(kind, name)
-            if value is not None and value != "":
-                out[key] = str(value)
-                break
-        else:
-            log.debug("apps: env %s unresolved (%s) — leaving it unset", key, raw)
-    return out
+    stripped = raw.strip()
+    chain = _ENV_PLACEHOLDER_CHAIN.match(stripped)
+    if chain:
+        sources = [s.split(".", 1) for s in chain.group(1).split("|")]
+    else:
+        match = _ENV_PLACEHOLDER.match(stripped)
+        if not match:
+            return raw
+        sources = [list(match.groups())]
+
+    for kind, name in sources:
+        value = resolve(kind, name)
+        if value is not None and value != "":
+            return str(value)
+    return None
 
 
 def _registry_host(image: str) -> str:

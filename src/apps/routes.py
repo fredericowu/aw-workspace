@@ -499,6 +499,11 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         on_config_saved = getattr(loaded.plugin, "on_config_saved", None)
         if callable(on_config_saved):
             await on_config_saved(loaded.ctx)
+        # A Tier-2 app has no plugin and therefore no on_config_saved, so the
+        # hook above can't be what re-renders its mcp.json — this is. Pasting
+        # a token into the settings form has to take effect on save, not on
+        # the next workspace boot.
+        runtime._render_mcp_template(loaded)
         # Same broad gate install/uninstall use (Reconciler._app_touches_mcp):
         # any app whose config change can rewrite its mcp.json, not just the
         # ones that remembered to set contributes.mcp.reload_on_save.

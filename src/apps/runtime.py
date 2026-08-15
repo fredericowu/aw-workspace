@@ -41,6 +41,7 @@ from src.apps.proxy import ContainerReverseProxy
 from src.apps.secret_store import SecretStore
 from src.apps.services import ServiceSupervisor
 from src.apps import agents as agents_mod
+from src.apps import mcp_template
 from src.apps import repos as repos_mod
 from src.apps import tasks as tasks_mod
 from src.apps.agents import AgentsRegistry
@@ -611,6 +612,28 @@ class AppRuntime:
                 })
         return out
 
+    def _render_mcp_template(self, loaded: LoadedApp) -> bool:
+        """Regenerate ``mcp.json`` from ``mcp.template.json`` + saved config.
+
+        Runs on EVERY activation, which is the whole point: an app update
+        replaces the package dir, and the next activation renders the
+        credential back in from ``config_store`` — see
+        ``src/apps/mcp_template.py`` for why a hand-edited ``mcp.json`` could
+        not survive one.
+
+        Never fatal. An app whose MCP surface fails to render is an app with
+        fewer tools; refusing to load it would take its window and routes down
+        too, for a file the gateway is free to ignore.
+        """
+        try:
+            rendered = mcp_template.render(
+                loaded.package_dir, loaded.config, loaded.manifest.id)
+        except Exception:
+            log.exception("apps: failed to render mcp.json for %s",
+                          loaded.manifest.id)
+            return False
+        return rendered is not None
+
     def _register_skills(self, loaded: LoadedApp) -> None:
         """Copy each ``contributes.skills`` entry into the shared skills index.
 
@@ -778,6 +801,7 @@ class AppRuntime:
             self._apply_migrations(manifest, package_dir)
 
         self._apps[slug] = loaded
+        self._render_mcp_template(loaded)
         self._register_skills(loaded)
         self._register_tasks(loaded)
         self._register_agents(loaded)
@@ -1068,6 +1092,7 @@ class AppRuntime:
             raise
 
         self._apps[slug] = loaded
+        self._render_mcp_template(loaded)
         self._register_skills(loaded)
         self._register_tasks(loaded)
         self._register_agents(loaded)

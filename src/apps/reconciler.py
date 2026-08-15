@@ -32,6 +32,7 @@ from typing import Any, Callable
 
 from src.apps import config_store
 from src.apps import fetch as fetch_mod
+from src.apps import mcp_template
 from src.apps.manifest import load_manifest
 from src.apps.registry_client import CloudRegistry
 from src.apps.runtime import AppRuntime
@@ -160,11 +161,20 @@ class Reconciler:
         app-scan finds? Manifest signal (``contributes.mcp``) OR an
         ``mcp.json`` actually on disk in the package dir — aw-app-browser and
         aw-app-code-server ship the file with no ``contributes.mcp`` block,
-        so the manifest alone under-reports."""
+        so the manifest alone under-reports.
+
+        ``mcp.template.json`` counts too. It is checked separately rather than
+        relying on the rendered ``mcp.json`` sitting next to it, because on a
+        FIRST install the reconciler asks this before the app has activated —
+        so the rendered file does not exist yet and the gateway would never be
+        told to rescan (src/apps/mcp_template.py)."""
         if manifest is not None and (manifest.contributes_mcp
                                      or manifest.reload_mcp_gateway_on_save):
             return True
-        if package_dir and os.path.isfile(os.path.join(package_dir, "mcp.json")):
+        if package_dir and (
+            os.path.isfile(os.path.join(package_dir, "mcp.json"))
+            or os.path.isfile(os.path.join(package_dir, mcp_template.TEMPLATE_NAME))
+        ):
             return True
         return False
 
