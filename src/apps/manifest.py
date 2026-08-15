@@ -41,6 +41,32 @@ DEFAULT_RESOURCE_ESTIMATE = {"cpu": "low", "memory": "-", "disk": "-"}
 #: (``contributes.agents``) and the schedule that drives it needs.
 CONTRIBUTED_TASK_TYPES = ("terminal", "agentic_output", "agent_prompt")
 
+#: Generators a ``config_schema`` field may request via ``x-generate``, for a
+#: secret the app owns BOTH ends of — a database password it sets and then
+#: connects with, a token it mints and then checks. ``default`` can only hold a
+#: literal, so without this an app ships one baked-in credential for every
+#: install everywhere (aw-app-crispal's ``db_password: "crispalpass"``).
+#:
+#: Not for a SHARED secret. aw-app-crispal's ap_inject_secret is validated by
+#: Agents Platform against ITS own env, so a locally minted value simply fails
+#: auth — that one has to be copied, or rotated on both sides at once.
+CONFIG_GENERATORS = ("urlsafe32", "urlsafe64", "hex32", "uuid4")
+
+
+def _generate_value(kind: str) -> str:
+    import secrets as _secrets
+    import uuid as _uuid
+
+    if kind == "urlsafe32":
+        return _secrets.token_urlsafe(32)
+    if kind == "urlsafe64":
+        return _secrets.token_urlsafe(64)
+    if kind == "hex32":
+        return _secrets.token_hex(32)
+    if kind == "uuid4":
+        return str(_uuid.uuid4())
+    raise ValueError(f"unknown x-generate kind {kind!r}")
+
 
 class ManifestError(ValueError):
     """Raised when an ``aw-app.json`` fails v1 validation."""
@@ -359,6 +385,32 @@ class Manifest:
             schema["properties"] = props
             schema["required"] = required
         return schema
+
+    def generated_config(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Values to mint for ``x-generate`` fields that have none yet.
+
+        Returns only the NEW keys, so a caller can tell whether anything was
+        minted (and log it) without diffing. Empty when there is nothing to do.
+
+        Generate-when-empty, never regenerate: a fresh value on every install
+        would rotate the MySQL password out from under an existing datadir,
+        which then refuses to open. The minted value is persisted like any
+        other setting (mirror + cloud + the config_store snapshot), so it is
+        stable from then on.
+
+        This exists because ``default`` can only be a literal, so an app that
+        wants a per-install secret has no way to say so: aw-app-crispal ships
+        ``db_password: "crispalpass"`` in its manifest, which means every
+        install of it anywhere has the same MySQL password.
+        """
+        out: dict[str, Any] = {}
+        current = dict(config or {})
+        for key, spec in (self.effective_config_schema.get("properties") or {}).items():
+            kind = spec.get("x-generate") if isinstance(spec, dict) else None
+            if not kind or current.get(key):
+                continue
+            out[key] = _generate_value(kind)
+        return out
 
     def config_with_defaults(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
         """Merge config_schema defaults with persisted config."""
@@ -755,6 +807,22 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
     config_schema = data.get("config_schema", {})
     if not isinstance(config_schema, dict):
         raise ManifestError("config_schema must be an object")
+    for key, spec in (config_schema.get("properties") or {}).items():
+        if not isinstance(spec, dict) or "x-generate" not in spec:
+            continue
+        kind = spec.get("x-generate")
+        if kind not in CONFIG_GENERATORS:
+            raise ManifestError(
+                f"config_schema.{key}.x-generate must be one of "
+                f"{', '.join(repr(g) for g in CONFIG_GENERATORS)} (got {kind!r})")
+        # A literal default would win on first install and the generator would
+        # then never fire (it only mints when the value is empty) — so the app
+        # would silently keep shipping the same baked-in credential it was
+        # trying to stop shipping.
+        if "default" in spec:
+            raise ManifestError(
+                f"config_schema.{key} cannot set both 'default' and "
+                f"'x-generate' — the default would always win")
 
     publisher = data.get("publisher", DEFAULT_PUBLISHER)
     if not isinstance(publisher, str) or not publisher.strip():

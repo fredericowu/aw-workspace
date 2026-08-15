@@ -367,6 +367,13 @@ class Reconciler:
                 log.info("apps: restored %d saved config value(s) for %s",
                          len(restored), manifest.id)
                 spec.config = restored
+        # Mint any x-generate secret that still has no value — AFTER the
+        # restore above, so a reinstall reuses the value the app already has
+        # rather than rotating a database password out from under its datadir.
+        minted = manifest.generated_config(spec.config)
+        if minted:
+            log.info("apps: generated %s for %s", ", ".join(sorted(minted)), manifest.id)
+            spec.config = {**spec.config, **minted}
         # The REQUEST is always what this version's manifest declares — never
         # the grant carried on the spec. That grant is the *effective* result
         # of the last install (written back below, and mirrored to the cloud),
@@ -432,8 +439,14 @@ class Reconciler:
                 "dependencies_installed": deps_installed}
 
     async def uninstall(self, app_id: str, *, remove_repo: bool = True,
-                        write_cloud: bool = True) -> dict[str, Any]:
-        """Unload (drain + journal reverse) → drop mirror/registry rows → rm repo."""
+                        write_cloud: bool = True,
+                        purge_secrets: bool = True) -> dict[str, Any]:
+        """Unload (drain + journal reverse) → drop mirror/registry rows → rm repo.
+
+        ``purge_secrets=False`` is what the upgrade path passes: an upgrade is
+        uninstall + install, and an app's ``ctx.secrets`` namespace must not be
+        emptied just because its version moved.
+        """
         # Probe BEFORE unloading: once the app is unloaded and its repo
         # removed, both the manifest and the on-disk mcp.json are gone and
         # there is no way left to tell whether the gateway needs a rescan.
@@ -456,7 +469,7 @@ class Reconciler:
                     config_store.save(app_id, row.get("config"))
                     break
         if self.runtime.is_loaded(app_id):
-            await self.runtime.unload(app_id)
+            await self.runtime.unload(app_id, purge_secrets=purge_secrets)
         self.local.forget(app_id)
         removed_repo = await asyncio.to_thread(self._remove, app_id) if remove_repo else False
         if write_cloud and self.cloud.configured:
@@ -542,7 +555,8 @@ class Reconciler:
             )
             if version_changed or trust_changed:
                 try:
-                    await self.uninstall(app_id, write_cloud=False)
+                    await self.uninstall(app_id, write_cloud=False,
+                                         purge_secrets=False)
                     await self.install(spec, write_cloud=False)
                     upgraded.append(app_id)
                 except Exception as e:  # noqa: BLE001

@@ -787,10 +787,17 @@ class AppRuntime:
                  slug, manifest.version, loaded.mount is not None)
         return manifest
 
-    async def unload(self, slug: str, drain_timeout: float | None = None) -> None:
+    async def unload(self, slug: str, drain_timeout: float | None = None,
+                     purge_secrets: bool = True) -> None:
         """Hot-unregister an app: unmount → drain → deactivate → unimport.
 
         Reverses every journaled side effect; leaves no residue.
+
+        ``purge_secrets=False`` keeps the app's ``ctx.secrets`` namespace.
+        An *upgrade* is implemented as unload + load, so purging
+        unconditionally meant every version bump silently threw away whatever
+        the app had stored there — the same shape as the config wipe fixed in
+        3a37efb, one store over. Only a real uninstall purges.
         """
         loaded = self._apps.get(slug)
         if loaded is None:
@@ -843,12 +850,15 @@ class AppRuntime:
             except Exception:
                 log.exception("apps: revert of %s %s failed for %s",
                               entry.kind, entry.target, slug)
-        # Purge the app's secret namespace unconditionally (no residue even if a
-        # secret was written in a prior process whose in-memory journal is gone).
-        try:
-            self.secret_store.purge(slug)
-        except Exception:
-            log.exception("apps: purging secrets for %s failed", slug)
+        # Purge the app's secret namespace (no residue even if a secret was
+        # written in a prior process whose in-memory journal is gone) — but
+        # not when this unload is one half of an upgrade, which would delete
+        # the app's own stored secrets on every version bump.
+        if purge_secrets:
+            try:
+                self.secret_store.purge(slug)
+            except Exception:
+                log.exception("apps: purging secrets for %s failed", slug)
 
         # An uninstalled app's CLI is gone on purpose — stop the healer from
         # trying to resurrect it (system_cli:revert-hook already ran above).
