@@ -142,7 +142,7 @@ async def _apply_runtime_config(runtime: AppRuntime, loaded, previous: dict) -> 
     # user edits a setting, the panel says saved, and the app keeps running
     # on the old value until something else happens to restart it.
     declared_env = (loaded.manifest.runtime or {}).get("env") or {}
-    new_env = expand_env(declared_env, loaded.config)
+    new_env = expand_env(declared_env, loaded.config, app_id)
     # Sidecars read the SAME config (runtime.sidecars[].env supports the
     # identical ${config.x} placeholders), so a save that only recreated the
     # app's own container left them running on the old values — and for
@@ -152,11 +152,11 @@ async def _apply_runtime_config(runtime: AppRuntime, loaded, previous: dict) -> 
     for spec in loaded.manifest.sidecars:
         key = runtime.containers.sidecar_key(app_id, str(spec.get("name") or ""))
         declared = spec.get("env") or {}
-        after = expand_env(declared, loaded.config)
-        if after != expand_env(declared, previous):
+        after = expand_env(declared, loaded.config, app_id)
+        if after != expand_env(declared, previous, app_id):
             sidecar_envs.append((key, after))
 
-    if new_env != expand_env(declared_env, previous) or sidecar_envs:
+    if new_env != expand_env(declared_env, previous, app_id) or sidecar_envs:
         restart = bool(loaded.config.get("auto_start", True))
         # Sidecars first, and unconditionally before the app: the app dials
         # them on startup, so recreating them underneath a running app is

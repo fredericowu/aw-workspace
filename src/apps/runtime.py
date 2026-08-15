@@ -1010,7 +1010,7 @@ class AppRuntime:
         config = manifest.config_with_defaults(config)
         # Resolve ${config.x} / ${env.X} so a container app's own settings
         # actually reach it — see containers.expand_env.
-        env = expand_env(rt.get("env") or {}, config)
+        env = expand_env(rt.get("env") or {}, config, manifest.id)
         # Before volumes, not after: a $AW_WORKSPACE_REPO bind refuses to
         # mount a checkout that isn't there, and for an app that declares the
         # repo itself this is the step that puts it there.
@@ -1102,7 +1102,7 @@ class AppRuntime:
                 port=spec.get("port"),
                 run_flags=spec.get("run_flags") or [],
                 resources=spec.get("resources") or {},
-                env=expand_env(spec.get("env") or {}, config),
+                env=expand_env(spec.get("env") or {}, config, manifest.id),
                 volumes=volumes,
             )
             self.journal.record(slug, "container:register", spec.get("image"),

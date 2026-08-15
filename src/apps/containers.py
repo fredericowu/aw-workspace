@@ -35,10 +35,40 @@ class ContainerError(RuntimeError):
     pass
 
 
-_ENV_PLACEHOLDER = re.compile(r"^\$\{(config|env)\.([A-Za-z_][A-Za-z0-9_]*)\}$")
+_ENV_PLACEHOLDER = re.compile(r"^\$\{(config|env|app)\.([A-Za-z_][A-Za-z0-9_.]*)\}$")
+#: ``${a.b|c.d}`` — try each source left to right, first non-empty wins.
+_ENV_PLACEHOLDER_CHAIN = re.compile(
+    r"^\$\{((?:config|env|app)\.[A-Za-z_][A-Za-z0-9_.]*"
+    r"(?:\|(?:config|env|app)\.[A-Za-z_][A-Za-z0-9_.]*)+)\}$")
 
 
-def expand_env(env: dict[str, Any] | None, config: dict[str, Any] | None) -> dict[str, str]:
+def app_public_url(app_id: str) -> str:
+    """This app's own external URL, e.g. ``https://crispal.app.aw.workspace...``.
+
+    Composed, not stored. A standalone app served through the tunnel edge sits
+    at ``<app_id>.app.<slug>.<base_domain>``, mirroring the API's
+    ``api.<slug>.<base_domain>`` (see src/api/workspace_url.py).
+
+    This exists because the alternative — a config value someone types in —
+    cannot have a sensible manifest default: the URL contains the workspace
+    slug, so any literal is right for exactly one workspace and wrong
+    everywhere else. aw-app-crispal shipped
+    ``site_url: "http://aw-app-crispal-wordpress:10002"`` as its default,
+    which is the CONTAINER hostname; when the app's config was reset to
+    schema defaults (2026-08-14) WordPress began emitting every asset URL
+    against a host no browser can reach, and the storefront rendered with no
+    CSS and no jQuery. Derived beats stored: nothing to lose on a reinstall.
+    """
+    from src.api import workspace_url
+
+    slug = os.environ.get(workspace_url.SLUG_ENV_VAR, "").strip()
+    if not slug or not app_id:
+        return ""
+    return f"https://{app_id}.app.{slug}.{workspace_url.base_domain()}"
+
+
+def expand_env(env: dict[str, Any] | None, config: dict[str, Any] | None,
+               app_id: str = "") -> dict[str, str]:
     """Resolve ``runtime.env`` placeholders against an app's config.
 
     A container app's ``config_schema`` was previously write-only in
@@ -55,6 +85,12 @@ def expand_env(env: dict[str, Any] | None, config: dict[str, Any] | None) -> dic
     * ``${env.<VAR>}``    — a variable from the workspace process, for
       values the workspace owns and the user shouldn't retype (its backend
       URL, its host token).
+    * ``${app.url}``      — this app's own external URL, composed from the
+      workspace slug and base domain (see :func:`app_public_url`).
+
+    Sources can be chained with ``|`` and the first non-empty one wins:
+    ``${config.site_url|app.url}`` lets a user override the derived URL
+    without forcing every install to store one.
 
     **An unresolved placeholder drops the variable entirely** rather than
     passing an empty string. That matters: images legitimately set their own
@@ -64,20 +100,37 @@ def expand_env(env: dict[str, Any] | None, config: dict[str, Any] | None) -> dic
     """
     out: dict[str, str] = {}
     config = config or {}
+
+    def resolve(kind: str, name: str) -> Any:
+        if kind == "config":
+            return config.get(name)
+        if kind == "env":
+            return os.environ.get(name)
+        if kind == "app":
+            return app_public_url(app_id) if name == "url" else None
+        return None
+
     for key, raw in (env or {}).items():
         if not isinstance(raw, str):
             out[key] = str(raw)
             continue
-        match = _ENV_PLACEHOLDER.match(raw.strip())
-        if not match:
-            out[key] = raw
-            continue
-        kind, name = match.groups()
-        value = config.get(name) if kind == "config" else os.environ.get(name)
-        if value is None or value == "":
+        stripped = raw.strip()
+        chain = _ENV_PLACEHOLDER_CHAIN.match(stripped)
+        if chain:
+            sources = [s.split(".", 1) for s in chain.group(1).split("|")]
+        else:
+            match = _ENV_PLACEHOLDER.match(stripped)
+            if not match:
+                out[key] = raw
+                continue
+            sources = [list(match.groups())]
+        for kind, name in sources:
+            value = resolve(kind, name)
+            if value is not None and value != "":
+                out[key] = str(value)
+                break
+        else:
             log.debug("apps: env %s unresolved (%s) — leaving it unset", key, raw)
-            continue
-        out[key] = str(value)
     return out
 
 

@@ -75,3 +75,40 @@ def test_mixed_manifest_resolves_each_key_independently(monkeypatch):
         "REMOTE_AGENT_URL": "https://ap.example",
         "WS": "aw",
     }
+
+
+# --- ${app.url} and source chaining ------------------------------------------
+# A URL containing the workspace slug can have no sensible manifest default, so
+# it is derived rather than stored — see containers.app_public_url.
+
+
+def test_app_url_is_composed_from_the_workspace_slug(monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE", "aw")
+    monkeypatch.setenv("AW_WORKSPACE_BASE_DOMAIN", "workspace.aw.tekflox.com")
+    assert expand_env({"SITE": "${app.url}"}, {}, "crispal") == {
+        "SITE": "https://crispal.app.aw.workspace.aw.tekflox.com"}
+
+
+def test_app_url_is_dropped_when_the_workspace_slug_is_unknown(monkeypatch):
+    monkeypatch.delenv("AW_WORKSPACE", raising=False)
+    assert expand_env({"SITE": "${app.url}"}, {}, "crispal") == {}
+
+
+def test_an_explicit_config_value_wins_over_the_derived_url(monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE", "aw")
+    monkeypatch.setenv("AW_WORKSPACE_BASE_DOMAIN", "workspace.aw.tekflox.com")
+    env = expand_env({"SITE": "${config.site_url|app.url}"},
+                     {"site_url": "https://sapatariacrispal.com"}, "crispal")
+    assert env == {"SITE": "https://sapatariacrispal.com"}
+
+
+def test_the_chain_falls_through_an_empty_config_value(monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE", "aw")
+    monkeypatch.setenv("AW_WORKSPACE_BASE_DOMAIN", "workspace.aw.tekflox.com")
+    env = expand_env({"SITE": "${config.site_url|app.url}"}, {"site_url": ""}, "crispal")
+    assert env == {"SITE": "https://crispal.app.aw.workspace.aw.tekflox.com"}
+
+
+def test_a_chain_with_nothing_resolvable_drops_the_variable(monkeypatch):
+    monkeypatch.delenv("AW_WORKSPACE", raising=False)
+    assert expand_env({"SITE": "${config.nope|app.url}"}, {}, "crispal") == {}
