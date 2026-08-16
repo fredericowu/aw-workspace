@@ -128,3 +128,55 @@ class TestRequiresWorkspace:
         install on a workspace too old for it."""
         from src.apps.manifest import _parse_version
         assert _parse_version("0.1.7") < _parse_version("0.1.63")
+
+
+class TestManifestSchemaTracksTheCatalog:
+    """A THIRD place the capability list lives: the app-manifest JSON schema in
+    aw-marketplace, whose `permissions` pattern is a hardcoded regex.
+
+    It went stale twice over without anyone noticing — missing `repos:contribute`
+    (shipped long ago) and then `fs:workspace-read`. The symptom is an app's
+    release failing with
+
+        'fs:workspace-read' does not match '^(routes:register|db:own-tables|...)$'
+
+    which reads as a bad manifest rather than a stale schema, in a repo nobody
+    was looking at. This test is the tripwire.
+    """
+
+    def _schema_pattern(self):
+        import json
+        import os
+        import pytest
+        import src.apps.capabilities as caps
+        root = os.path.abspath(caps.__file__).split(os.sep + "src" + os.sep)[0]
+        path = os.path.join(root, "repos", "aw-marketplace",
+                            "schemas", "aw-app.schema.json")
+        if not os.path.isfile(path):
+            pytest.skip("aw-marketplace not checked out here")
+        with open(path) as f:
+            schema = json.load(f)
+        return schema["properties"]["permissions"]["items"]["pattern"]
+
+    def test_every_catalog_capability_is_accepted_by_the_schema(self):
+        import re
+        from src.apps.capabilities import CATALOG
+        pattern = re.compile(self._schema_pattern())
+        missing = [c for c in CATALOG if not pattern.fullmatch(c)]
+        assert not missing, (
+            f"the manifest schema would reject {missing} — regenerate it from "
+            f"this catalog, or an app declaring one cannot be released"
+        )
+
+    def test_parameterised_capabilities_are_accepted(self):
+        import re
+        pattern = re.compile(self._schema_pattern())
+        for cap in ("ui:slots:core.nav.workspace", "config:extend:some-app"):
+            assert pattern.fullmatch(cap), cap
+
+    def test_schema_rejects_something_that_is_not_a_capability(self):
+        """A pattern so loose it accepts anything is not a check."""
+        import re
+        pattern = re.compile(self._schema_pattern())
+        assert not pattern.fullmatch("fs:read-everything")
+        assert not pattern.fullmatch("")
