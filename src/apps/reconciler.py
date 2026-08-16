@@ -412,8 +412,25 @@ class Reconciler:
 
         # runtime.load enforces the F2 grant filter (trust tier) itself and
         # returns the manifest; capture the *effective* grant for the mirror.
-        await self.runtime.load(package_dir, granted_permissions=granted_req,
-                                config=spec.config, signed=spec.signed)
+        #
+        # A load that raises PART WAY through has usually already journaled
+        # some side effects — a registered container above all. Leaving those
+        # behind makes the next attempt fail with "container already
+        # registered for 'x'", so the app is not merely down, it is *stuck*
+        # down: install says "already installed", update says "not installed".
+        # Hit for real on aw-app-crispal, 2026-08-16. unload() replays the
+        # journal, which is exactly the cleanup owed here.
+        try:
+            await self.runtime.load(package_dir, granted_permissions=granted_req,
+                                    config=spec.config, signed=spec.signed)
+        except Exception:
+            log.exception("apps: load of %s failed — reverting its side effects "
+                          "so a retry starts clean", manifest.id)
+            try:
+                await self.runtime.unload(manifest.id)
+            except Exception:
+                log.exception("apps: could not revert the failed load of %s", manifest.id)
+            raise
         loaded = self.runtime.get(manifest.id)
         effective = loaded.granted_permissions if loaded else granted_req
         spec.granted_permissions = effective
@@ -564,6 +581,16 @@ class Reconciler:
                 or set(loaded.granted_permissions) != set(spec.granted_permissions)
             )
             if version_changed or trust_changed:
+                # What we would put back. Read BEFORE the uninstall, which
+                # forgets the row. `package_dir` is carried so a rollback reuses
+                # the code already on disk instead of re-fetching a version the
+                # network may no longer serve — the moment a rollback matters
+                # most is the moment fetching is least trustworthy.
+                previous_row = next(
+                    (r for r in self.local.list() if r.get("app_id") == app_id), None)
+                previous = AppSpec.from_row(previous_row) if previous_row else None
+                if previous is not None and loaded and loaded.package_dir:
+                    previous.package_dir = loaded.package_dir
                 try:
                     await self.uninstall(app_id, write_cloud=False,
                                          purge_secrets=False)
@@ -572,6 +599,21 @@ class Reconciler:
                 except Exception as e:  # noqa: BLE001
                     log.exception("apps: reconcile failed to upgrade %s", app_id)
                     errors.append({"app_id": app_id, "action": "upgrade", "error": str(e)})
+                    # An upgrade is uninstall + install, so a failed install
+                    # leaves the app DOWN — not on its previous version, which
+                    # is what "the update failed" sounds like it means. Put the
+                    # old one back. Best-effort by necessity: if the previous
+                    # package dir is gone too there is nothing to restore, and
+                    # the error above is already recorded either way.
+                    if previous is not None and previous.package_dir:
+                        try:
+                            await self.install(previous, write_cloud=False)
+                            log.warning("apps: %s rolled back to %s after a failed "
+                                        "upgrade", app_id, running_version or "?")
+                            errors[-1]["rolled_back_to"] = running_version or "?"
+                        except Exception:
+                            log.exception("apps: %s could not be rolled back and is "
+                                          "now DOWN", app_id)
 
         # uninstall extra (loaded but not desired) — converge actual to desired;
         # leave the (absent) desired row alone.

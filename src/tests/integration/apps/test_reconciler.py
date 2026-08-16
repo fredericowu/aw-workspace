@@ -664,3 +664,72 @@ def test_trust_filter_still_strips_high_risk_from_an_unsigned_app(tmp_path, monk
     granted = rt.get("widget").granted_permissions
     assert "routes:register" in granted
     assert "ui:code" not in granted
+
+
+# ---------------------------------------------------------------------------
+# A failed update must not leave the app down — both halves of that, measured
+# on aw-app-crispal on 2026-08-16.
+# ---------------------------------------------------------------------------
+
+def test_a_failed_load_reverts_its_own_side_effects(tmp_path, monkeypatch):
+    """A load that raises part way has usually already journaled something —
+    a registered container above all. Left behind, the next attempt fails with
+    "container already registered", so the app is not merely down, it is STUCK
+    down: install says "already installed", update says "not installed"."""
+    repo = _make_app_repo(tmp_path)
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    reverted = []
+    real_unload = rt.unload
+
+    async def boom(*a, **kw):
+        raise RuntimeError("load blew up half way")
+
+    async def spy_unload(slug):
+        reverted.append(slug)
+        return await real_unload(slug)
+
+    monkeypatch.setattr(rt, "load", boom)
+    monkeypatch.setattr(rt, "unload", spy_unload)
+
+    async def run():
+        with pytest.raises(RuntimeError, match="blew up"):
+            await rc.install(AppSpec(app_id="widget", repo=repo, ref="main"))
+        assert reverted == ["widget"], "the failed load left its side effects behind"
+
+    _async(run())
+
+
+def test_a_failed_upgrade_rolls_back_to_the_running_version(tmp_path, monkeypatch):
+    """An upgrade is uninstall + install, so a failed install leaves NOTHING
+    running — not the previous version, which is what "the update failed"
+    sounds like it means."""
+    repo = _make_app_repo(tmp_path, version="1.0.0")
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    async def run():
+        await rc.install(AppSpec(app_id="widget", repo=repo, ref="main"))
+        assert rt.is_loaded("widget")
+
+        # the catalog now wants 2.0.0, and installing it fails
+        cloud.put_desired("widget", version="2.0.0", repo=repo, ref="main")
+        real_install = rc.install
+        calls = {"n": 0}
+
+        async def flaky_install(spec, **kw):
+            calls["n"] += 1
+            if spec.version == "2.0.0":
+                raise RuntimeError("the new version does not come up")
+            return await real_install(spec, **kw)
+
+        monkeypatch.setattr(rc, "install", flaky_install)
+        summary = await rc.reconcile()
+
+        assert rt.is_loaded("widget"), "the app was left down after a failed upgrade"
+        err = next(e for e in summary["errors"] if e["app_id"] == "widget")
+        assert err["action"] == "upgrade"
+        assert err.get("rolled_back_to") == "1.0.0", err
+
+    _async(run())
