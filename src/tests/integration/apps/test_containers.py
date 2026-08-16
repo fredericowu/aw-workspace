@@ -753,7 +753,7 @@ def test_runtime_mounts_workspace_repos_read_only(tmp_path, monkeypatch):
     monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(container_root))
     pkg = _write_container_app(
         tmp_path,
-        perms=["containers:manage", "fs:workspace-data"],
+        perms=["containers:manage", "fs:workspace-data", "fs:workspace-read"],
         runtime_extra={
             "volumes": [
                 {"source": "$AW_WORKSPACE_REPOS", "target": "/workspace-repos", "mode": "ro"}
@@ -766,7 +766,7 @@ def test_runtime_mounts_workspace_repos_read_only(tmp_path, monkeypatch):
         rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
         rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
 
-        await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data"],
+        await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data", "fs:workspace-read"],
                       signed=True)
 
         repos_dir = container_root / "repos"
@@ -1048,7 +1048,7 @@ def test_runtime_mounts_workspace_skills_read_only(tmp_path, monkeypatch):
     monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(container_root))
     pkg = _write_container_app(
         tmp_path,
-        perms=["containers:manage", "fs:workspace-data"],
+        perms=["containers:manage", "fs:workspace-data", "fs:workspace-read"],
         runtime_extra={
             "volumes": [
                 {"source": "$AW_WORKSPACE_SKILLS", "target": "/app/skills", "mode": "ro"}
@@ -1061,7 +1061,7 @@ def test_runtime_mounts_workspace_skills_read_only(tmp_path, monkeypatch):
         rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
         rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
 
-        await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data"],
+        await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data", "fs:workspace-read"],
                       signed=True)
 
         skills = container_root / "skills"
@@ -1095,3 +1095,28 @@ def test_runtime_rejects_writable_workspace_skills_mount(tmp_path, monkeypatch):
                           signed=True)
 
     _async(run())
+
+
+def test_workspace_repos_volume_refused_without_the_capability(tmp_path, monkeypatch):
+    """The whole point of the 2026-08-16 gate: mounting the user's entire
+    checkout tree must be something a manifest has to ask for out loud."""
+    container_root = tmp_path / "workspace"
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(container_root))
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage"],
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_WORKSPACE_REPOS", "target": "/workspace-repos", "mode": "ro"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+        with pytest.raises(Exception, match="fs:workspace-read"):
+            await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
+
+    asyncio.run(run())

@@ -33,6 +33,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "watchdog:tasks":    {"risk": "low",  "desc": "register in-process periodic (watchdog) tasks"},
     "net:outbound":      {"risk": "low",  "desc": "make outbound HTTP from Tier-1 code"},
     "fs:workspace-data": {"risk": "low",  "desc": "read/write under the app's own data dir"},
+    "fs:workspace-read": {"risk": "low",  "desc": "read the workspace tree outside the app's own data dir (repos/, skills/)"},
     "secrets:own":       {"risk": "low",  "desc": "request the app's own secrets"},
     "notifications:send": {"risk": "low", "desc": "fire a notification via the workspace notification engine"},
     "tasks:contribute":  {"risk": "low",  "desc": "seed scheduled tasks on install (created once, never updated afterwards)"},

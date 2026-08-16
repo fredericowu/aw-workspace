@@ -1272,6 +1272,17 @@ class AppRuntime:
                 if mode != "ro":
                     raise ContainerError(
                         f"app {manifest.id!r} $AW_WORKSPACE_REPOS volume must be read-only")
+                # Read-only is not the same as ungated: this is the user's
+                # entire checkout tree — every repo, including private ones and
+                # whatever credentials a .env in one of them happens to hold.
+                # $AW_APP_DATA, $AW_KB_DIR and $AW_WORKSPACE_FOLDERS all demand
+                # a capability for far less; this one demanded nothing until
+                # 2026-08-16, so an app could mount the lot while its manifest
+                # said it touched no filesystem at all.
+                if "fs:workspace-read" not in manifest.permissions:
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_WORKSPACE_REPOS volume requires the "
+                        f"'fs:workspace-read' permission declared in its manifest")
                 # paths.repos_dir() — /opt/aw-workspace/repos, where a user/agent
                 # working from a workspace terminal clones repos for general
                 # dev work (git app's watchdog scans it too). Read-only so an
@@ -1383,6 +1394,10 @@ class AppRuntime:
                 binds[host_path] = {"bind": target, "mode": mode}
                 continue
             if source == "$AW_WORKSPACE_SKILLS":
+                if "fs:workspace-read" not in manifest.permissions:
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_WORKSPACE_SKILLS volume requires the "
+                        f"'fs:workspace-read' permission declared in its manifest")
                 if mode != "ro":
                     raise ContainerError(
                         f"app {manifest.id!r} $AW_WORKSPACE_SKILLS volume must be read-only")

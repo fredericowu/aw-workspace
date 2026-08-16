@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -32,6 +33,8 @@ DEFAULT_PUBLISHER = "TekFlox"
 # just installs a CLI; nothing runs in memory). See manifest schema notes.
 RESOURCE_LEVELS = {"low", "medium", "high"}
 DEFAULT_RESOURCE_ESTIMATE = {"cpu": "low", "memory": "-", "disk": "-"}
+
+log = logging.getLogger(__name__)
 
 #: Task types an app may declare in ``contributes.tasks``. Mirrors the types
 #: ``aw-app-tasks``'s manager actually dispatches (``manager.py``'s run_task);
@@ -595,6 +598,63 @@ def _validate_contributed_repos(
             raise ManifestError("contributes.repos[].depth must be a positive integer")
 
 
+
+def _validate_requires_workspace(runtime: dict) -> None:
+    """``runtime.requires_workspace`` — the minimum aw-workspace this app needs.
+
+    Until this existed, an app had no way to say it depended on a core feature.
+    ``dependencies`` only expresses other apps, so an app built against a
+    capability added last week installed cleanly on a workspace from last month
+    and then failed somewhere deep in a request — reading as a bug in the app
+    rather than a version mismatch. aw-app-architecture hit exactly that with
+    ``ctx.db.session`` and had to hand-roll a check in its own ``bind()``.
+
+    Compared against ``AW_WORKSPACE_VERSION`` (what ``/api/health`` reports).
+    When that is unset — a dev checkout, a test — the requirement is recorded
+    and NOT enforced: refusing every install on a machine that simply doesn't
+    stamp a version would be worse than the problem. Only a version that is
+    present AND older fails.
+    """
+    raw = runtime.get("requires_workspace")
+    if raw is None:
+        return
+    if not isinstance(raw, str) or not raw.strip():
+        raise ManifestError("runtime.requires_workspace must be a non-empty version string")
+    required = _parse_version(raw)
+    if required is None:
+        raise ManifestError(
+            f"runtime.requires_workspace {raw!r} is not a version like '0.1.63' or 'v0.1.63'")
+
+    current_raw = os.environ.get("AW_WORKSPACE_VERSION", "").strip()
+    current = _parse_version(current_raw)
+    if current is None:
+        log.info(
+            "apps: requires_workspace %s not checked — AW_WORKSPACE_VERSION is %r",
+            raw, current_raw)
+        return
+    if current < required:
+        raise ManifestError(
+            f"this app needs aw-workspace >= {raw}, but this workspace is "
+            f"{current_raw} — update the workspace, or install an older version "
+            f"of the app")
+
+
+def _parse_version(value: str) -> tuple[int, ...] | None:
+    """``v0.1.63`` / ``0.1.63`` -> ``(0, 1, 63)``. None if it isn't one.
+
+    Deliberately not semver-complete: these are plain dotted integers with an
+    optional leading ``v``, which is every version this project has ever
+    stamped. A pre-release suffix would need a real parser, and inventing a
+    half-correct one is how comparisons start quietly going the wrong way.
+    """
+    if not value:
+        return None
+    cleaned = value.lstrip("vV").strip()
+    parts = cleaned.split(".")
+    if not all(p.isdigit() for p in parts) or not parts:
+        return None
+    return tuple(int(p) for p in parts)
+
 def _validate_sidecars(runtime: dict[str, Any], permissions: list[str]) -> None:
     """Validate ``runtime.sidecars`` — companion containers of a Tier-2 app.
 
@@ -803,6 +863,7 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
     _validate_contributed_agents(contributes, permissions)
     _validate_contributed_repos(contributes, permissions)
     _validate_sidecars(runtime, permissions)
+    _validate_requires_workspace(runtime)
 
     config_schema = data.get("config_schema", {})
     if not isinstance(config_schema, dict):
