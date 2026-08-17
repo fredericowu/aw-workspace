@@ -5,12 +5,20 @@ description: >-
   (./aw-workspace-cli at the repo root, on PATH via the repo root itself) —
   auto-discovered commands under src/cli/commands/, the marketplace
   install/update command, the update workspace|remote-host command, and the
-  local-CLI auth mechanism that lets it call this workspace's own
+  workspace API key auth mechanism that lets it call this workspace's own
   identity-gated API. Use whenever you're asked to add a new aw-workspace-cli
   command, or to install/update an app or trigger a workspace/remote-host
   update from a terminal inside the workspace. Note: the root-level `./aw` in
   this repo is a DEPRECATED stub that only prints a pointer here — it is not
   the monolith's `./aw` and does not run any of these commands.
+last_updated: 2026-08-17
+last_update_note: >-
+  Corrected the "Auth" section — it described the old file-based
+  X-AW-Local-Cli-Token mechanism, which was removed 2026-08-08 and replaced
+  by the AW_WORKSPACE_API_KEY / X-Api-Key shared secret
+  (src/api/workspace_api_key.py). Found by aw-autoskill scanning 4 sessions
+  that hand-rolled curl+X-Api-Key boilerplate instead of using
+  local_client.request().
 ---
 
 # aw-workspace's own CLI
@@ -131,27 +139,45 @@ Install/update is async server-side (the fetch + system-CLI `apt install`
 step can take 30-60s) — the CLI's polling loop is what turns that into a
 synchronous-feeling command.
 
-### Auth — the local-CLI token
+### Auth — the workspace API key
+
+*Updated 2026-08-17: the old file-based `X-AW-Local-Cli-Token` /
+`get_or_create_cli_token()` mechanism this section used to describe was
+removed (deployed 2026-08-08) — nothing in `src/` references it anymore.
+Verified against `src/api/workspace_api_key.py` and `src/cli/local_client.py`
+directly, not from memory.*
 
 The SPA authenticates with a browser-issued `aw_id_jwt`
-(`src/api/identity.py`'s `require_identity`), which a terminal CLI has no
-way to hold. `require_identity` also accepts a **local-CLI secret**:
+(`src/api/identity.py`'s `require_identity`), which a terminal CLI (or a
+sibling process like an external MCP server) has no way to hold. Instead
+there's a single **workspace-wide API key**:
 
-- Generated on first use at `<workspace_home>/cli-token` (`~/.aw-workspace/
-  cli-token` by default, mode `0600`) — `src/apps/paths.py`'s
-  `get_or_create_cli_token()`.
-- Sent as the `X-AW-Local-Cli-Token` header (`src/apps/paths.LOCAL_CLI_HEADER`).
+- Minted on first use (`src/api/workspace_api_key.py`'s
+  `get_or_create_workspace_api_key()`), stored in the `settings` KV table
+  (survives container recreation as long as Postgres does), and mirrored to
+  `<AW_WORKSPACE_HOME>/.env` as `AW_WORKSPACE_API_KEY` so any process with no
+  DB access — `aw-workspace-cli`, an agent-runner container, an external
+  MCP — can read it straight from the file.
+- Sent as the `X-Api-Key` header (`src/api/workspace_api_key.HEADER_NAME`).
 - `require_identity` checks this header **before** falling back to the real
-  JWT check — a match returns `{"sub": "local-cli", "local_cli": True}`.
+  JWT check (`_workspace_api_key_authorized`, checked via constant-time
+  compare) — a match authenticates the request without a browser session.
+- This is the same key an agent-runner container uses to reach the workspace
+  server through the tunnel edge's `X-Api-Key` carve-out when loopback isn't
+  reachable — see `runner-workspace-reachability` in auto-memory.
 
-This only proves "same machine/filesystem as the server", not "is a real
-user" — anyone who can read a 0600 file inside the container already has
-that level of access. It is intentionally **not** wired into `update.py`
-(below), which needs real per-user, cross-workspace auth.
+This proves "holds the shared workspace secret", not "is a specific real
+user" — anyone who can read `.env` inside the container already has that
+level of access. It is intentionally **not** wired into `update.py` (below),
+which needs real per-user, cross-workspace auth.
 
-If you add a new `aw-workspace-cli` command that needs to call this
-workspace's own API, reuse `src/cli/local_client.py`'s `request(method, path,
-json_body=None)` — it already attaches the token header.
+If you add a new `aw-workspace-cli` command — or any ad hoc script — that
+needs to call this workspace's own API, reuse `src/cli/local_client.py`'s
+`request(method, path, json_body=None)`; it already resolves the right base
+URL (loopback vs. the tunnel URL) and attaches the `X-Api-Key` header. Don't
+hand-roll a `curl -H "X-Api-Key: ..."` by grepping `.env` yourself — that
+duplicates exactly what `local_client.request()` already does correctly,
+including the loopback/tunnel fallback.
 
 ## `aw-workspace-cli update <workspace|remote-host>`
 
@@ -177,8 +203,8 @@ aw-workspace-cli update workspace
 already uses to reach aw-backend (see `.env.example`,
 `src/apps/registry_client.py`) — no new config needed beyond the token.
 
-**Do not** reuse the local-CLI token for this command. It only proves local
-filesystem access to one workspace container; aw-backend's per-user,
+**Do not** reuse the workspace API key for this command. It only proves
+possession of one workspace's shared secret; aw-backend's per-user,
 per-workspace-role checks (`Identity.require_role`) need a real identity.
 
 ## PATH
@@ -194,8 +220,8 @@ bare `aw`; harmless, since it only prints a pointer to this skill.)
 
 ## Testing without a live server
 
-`identity.py`'s local-CLI bypass and `src/apps/catalog.py`'s `get_catalog()`
+`identity.py`'s `X-Api-Key` bypass and `src/apps/catalog.py`'s `get_catalog()`
 can both be exercised without a running Postgres — `get_catalog()` is a
 filesystem/HTTP cache, and the auth dependency is pure. A `FastAPI` +
 `TestClient` app with just `require_identity` wired onto a stub route is
-enough to check the token header logic when iterating on this.
+enough to check the header logic when iterating on this.
