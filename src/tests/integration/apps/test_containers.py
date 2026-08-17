@@ -30,6 +30,34 @@ from src.apps.routes import register_apps_routes
 from src.apps.runtime import AppRuntime
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_container_env(monkeypatch):
+    """These tests drive a FAKE docker client, so every condition they exercise
+    has to come from the test — not from the machine running it.
+
+    ContainerSupervisor falls back to AW_CONTAINER_NETWORK / _PROXY_HOST when
+    the caller passes none, so on a workspace that actually runs app containers
+    on a podman network, five of these failed asserting the no-network URL
+    (`http://127.0.0.1:9222` vs `http://aw-app-browser:9222`) — the very case
+    their own comment says they are testing. The failure was invisible outside
+    the workspace container, which is the only place that env is set.
+    """
+    monkeypatch.delenv("AW_CONTAINER_NETWORK", raising=False)
+    monkeypatch.delenv("AW_CONTAINER_PROXY_HOST", raising=False)
+    # Same reason, one layer down: the volume tests set AW_WORKSPACE_CONTAINER_DIR
+    # to a tmp tree, and _container_host_bind_path translates that to the HOST
+    # side via AW_WORKSPACE_HOST_DIR. With the real one set, the assertion got
+    # /home/aw-remote-host/aw-workspace/repos instead of the tmp path it built.
+    # A test that owns the container root has to own the host root as well.
+    monkeypatch.delenv("AW_WORKSPACE_HOST_DIR", raising=False)
+    # And the socket, for the same reason: with a real one in the environment,
+    # _container_host_bind_path REFUSES to fall back to the container path
+    # ("bind mounts must be translated") — correct in production, but these
+    # tests hand the supervisor socket="/dev/null" explicitly, so the ambient
+    # one is not theirs to inherit.
+    monkeypatch.delenv("AW_CONTAINER_SOCKET", raising=False)
+
+
 def _async(coro):
     return asyncio.run(coro)
 

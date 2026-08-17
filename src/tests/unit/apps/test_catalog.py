@@ -13,6 +13,14 @@ from src.apps import catalog as catalog_mod
 @pytest.fixture(autouse=True)
 def _isolated_catalog(tmp_path, monkeypatch):
     monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    # ...and from the sources the RUNNING workspace has configured. db_sources()
+    # reads Postgres, so without this these tests assert against whatever the
+    # live registry happens to hold: on a workspace pointed at
+    # tekflox/aw-marketplace-private, six of them failed while asserting the
+    # public default. A unit test about "the default when nothing is
+    # configured" must supply that condition, not inherit it — and the failure
+    # was invisible outside the workspace container, which has the DB.
+    monkeypatch.setattr(catalog_mod, "db_sources", lambda: [])
     catalog_mod.clear_cache()
     yield
     catalog_mod.clear_cache()

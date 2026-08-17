@@ -143,6 +143,18 @@ def test_boot_reloads_the_gateway_once_the_inprocess_apps_have_written_theirs(
     app = FastAPI()
     routes_mod.register_apps_routes(app)
 
+    # Stub the reconcile itself. This test is about the reload that fires
+    # AFTER it, and reconcile() talks to the cloud registry and can install
+    # and start real containers. Run inside a workspace that has apps and a
+    # reachable registry, it did exactly that: the test took longer than the
+    # runner's 300s budget and was recorded as a failure, while in a bare
+    # container it finished in under a second. An integration test may not
+    # inherit the machine's app set.
+    async def fake_reconcile():
+        return {"installed": [], "removed": [], "unchanged": []}
+
+    monkeypatch.setattr(app.state.app_reconciler, "reconcile", fake_reconcile)
+
     async def go():
         await routes_mod.reconcile_on_boot(app)
         app.state.app_runtime.watchdog.cancel_all_for(_SYSTEM_APP_ID)
@@ -173,6 +185,15 @@ def test_boot_reload_does_not_block_the_workspace_coming_up(tmp_path, monkeypatc
 
     app = FastAPI()
     routes_mod.register_apps_routes(app)
+
+    # The 2s budget below measures ONE thing: that boot does not wait on the
+    # gateway reload. A real reconcile() — cloud registry, container installs —
+    # blows it for reasons that have nothing to do with what is being asserted,
+    # which is exactly what happened inside a populated workspace.
+    async def fake_reconcile():
+        return {"installed": [], "removed": [], "unchanged": []}
+
+    monkeypatch.setattr(app.state.app_reconciler, "reconcile", fake_reconcile)
 
     async def go():
         await asyncio.wait_for(routes_mod.reconcile_on_boot(app), timeout=2.0)
