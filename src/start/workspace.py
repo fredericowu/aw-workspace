@@ -105,6 +105,16 @@ def _reexec_into_venv():
     rather than the base image's site-packages. Idempotent via a sentinel env
     var so the exec'd child never loops; a no-op when already running under
     the venv interpreter (e.g. an older image whose CMD is still `python`).
+
+    "Already under the venv" is decided by ``sys.prefix``, NOT by comparing the
+    interpreter paths. ``python -m venv`` links ``venv/bin/python3`` straight at
+    the base interpreter, so ``realpath`` collapses both sides to
+    ``/usr/local/bin/python3`` and a path comparison reports "already there"
+    while ``sys.path`` still points at the base image's site-packages. The
+    re-exec was then skipped and boot died on ``import uvicorn`` — which is
+    exactly what every fresh BYOD provision hit (2026-08-17, bare-metal): a
+    seeded venv that is complete and correct, and a process that never enters
+    it. ``sys.prefix`` is what actually distinguishes the two environments.
     """
     import os
     import sys
@@ -114,10 +124,13 @@ def _reexec_into_venv():
     if os.environ.get("AW_VENV_REEXEC") == "1":
         return
 
-    venv_python = os.path.join(workspace_home(), "venv", "bin", "python")
+    venv_dir = os.path.join(workspace_home(), "venv")
+    venv_python = os.path.join(venv_dir, "bin", "python")
+    # exists() follows symlinks, so this also covers the dangling-link case the
+    # base-python CMD exists for: nothing to hand off to, keep booting.
     if not os.path.exists(venv_python):
         return
-    if os.path.realpath(venv_python) == os.path.realpath(sys.executable):
+    if os.path.realpath(sys.prefix) == os.path.realpath(venv_dir):
         return
 
     os.environ["AW_VENV_REEXEC"] = "1"

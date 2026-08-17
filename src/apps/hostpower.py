@@ -190,6 +190,19 @@ def resolve(
         )
 
     available = set(host_grants(env))
+    # A host that granted `privileged` granted every device and capability
+    # there is, so it satisfies any narrower request by definition. Without
+    # this, granting the MOST powerful thing refused an app that asked for
+    # less — "I enabled everything and the app still won't install" (found
+    # live on bare-metal, 2026-08-17).
+    #
+    # The app still only receives what it ASKED for: an app wanting kvm+tun
+    # gets kvm+tun, not --privileged. The host's grant is a ceiling, not a
+    # floor, and there is no reason to hand out more isolation loss than the
+    # manifest declared it needs.
+    if "privileged" in available:
+        available.update(GRANULAR)
+
     missing_host = [name for name in wanted if name not in available]
     if missing_host:
         offered = ", ".join(sorted(available)) or "nothing"

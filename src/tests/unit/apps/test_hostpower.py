@@ -99,6 +99,34 @@ class TestResolveTheThreeLegs:
         assert "--host-power=kvm,tun" in message
         assert "aw-app-windows" in message
 
+    def test_host_privileged_satisfies_a_narrower_request(self):
+        """A host that granted `privileged` granted every device there is.
+        Refusing an app that asks for less made granting the MOST powerful
+        thing the one setting under which the app would not install."""
+        granted = hostpower.resolve(
+            "aw-app-windows", ["kvm", "tun"], self.PERMS,
+            {hostpower.ENV_VAR: "privileged"})
+        # ...and it gets what it ASKED for, not --privileged: the host's grant
+        # is a ceiling, not a floor.
+        assert granted == ("kvm", "tun")
+        assert hostpower.docker_kwargs(granted) == {
+            "devices": ["/dev/kvm:/dev/kvm:rwm", "/dev/net/tun:/dev/net/tun:rwm"],
+            "cap_add": ["NET_ADMIN"],
+        }
+
+    def test_host_privileged_still_needs_the_app_capability(self):
+        """The host leg being maximal does not waive the capability leg."""
+        with pytest.raises(HostPowerError, match="missing the matching permission"):
+            hostpower.resolve("app", ["kvm"], [],
+                              {hostpower.ENV_VAR: "privileged"})
+
+    def test_granular_host_grant_does_not_imply_privileged(self):
+        """The implication is one-way. `all` must never satisfy an app that
+        explicitly asked to lose isolation."""
+        with pytest.raises(HostPowerError, match="has not granted"):
+            hostpower.resolve("app", ["privileged"], ["host:privileged"],
+                              {hostpower.ENV_VAR: "kvm,tun,fuse,binder"})
+
     def test_privileged_needs_its_own_capability_not_a_device_one(self):
         with pytest.raises(HostPowerError, match="host:privileged"):
             hostpower.resolve("app", ["privileged"], self.PERMS,
