@@ -126,6 +126,36 @@ class Manifest:
         return [w for w in self.windows if w.get("id") not in settings_window_ids]
 
     @property
+    def doctor_checks(self) -> list[dict[str, Any]]:
+        """``contributes.doctor`` — self-checks this app offers to ``doctor``.
+
+        ``[{"label": "Test dependencies", "route": "/provision/check"}]``. The
+        route is mount-relative (the app's own ``/api/apps/<slug>`` surface) and
+        must answer ``{"ok": bool, ...}``; anything else it returns is shown as
+        detail.
+
+        This exists because ``doctor`` is the one place this workspace looks
+        for silent degradation, and its checks were hard-coded in core — so a
+        decoupled app had no way to be part of the answer. Core knowing about
+        one app's provisioning state by name would invert the whole point of
+        the framework; an app declaring "ask me this" does not.
+
+        Entries missing a route, or naming an absolute/dotted path, are dropped
+        rather than raising: a bad doctor entry must never stop an app loading,
+        because the thing it would break is the tool you reach for when things
+        are broken.
+        """
+        out = []
+        for entry in self.contributes.get("doctor", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            route = str(entry.get("route") or "")
+            if not route.startswith("/") or ".." in route:
+                continue
+            out.append({"label": str(entry.get("label") or route), "route": route})
+        return out
+
+    @property
     def skills(self) -> list[dict[str, Any]]:
         return list(self.contributes.get("skills", []))
 

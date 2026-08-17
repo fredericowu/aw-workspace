@@ -180,3 +180,58 @@ class TestManifestSchemaTracksTheCatalog:
         pattern = re.compile(self._schema_pattern())
         assert not pattern.fullmatch("fs:read-everything")
         assert not pattern.fullmatch("")
+
+
+class TestAppContributedDoctorChecks:
+    """`doctor` is the one place this workspace looks for silent degradation,
+    and its checks were hard-coded in core — so a decoupled app had no way to
+    be part of the answer. Core knowing one app's provisioning state by name
+    would invert the framework; an app declaring "ask me this" does not."""
+
+    def _m(self, contributes):
+        from src.apps.manifest import Manifest
+        return Manifest(id="x", name="X", version="1.0.0", tier="inprocess",
+                        contributes=contributes)
+
+    def test_a_declared_check_is_exposed(self):
+        m = self._m({"doctor": [{"label": "Test deps", "route": "/provision/check"}]})
+        assert m.doctor_checks == [{"label": "Test deps", "route": "/provision/check"}]
+
+    def test_the_route_doubles_as_the_label(self):
+        m = self._m({"doctor": [{"route": "/check"}]})
+        assert m.doctor_checks[0]["label"] == "/check"
+
+    def test_a_bad_entry_is_dropped_not_raised(self):
+        """A malformed doctor entry must never stop an app loading — the thing
+        it would break is the tool you reach for when things are broken."""
+        m = self._m({"doctor": [
+            {"label": "no route"},
+            {"route": "relative/path"},
+            {"route": "/ok/../../etc"},
+            "not-a-dict",
+            {"route": "/fine"},
+        ]})
+        assert [c["route"] for c in m.doctor_checks] == ["/fine"]
+
+    def test_no_declaration_means_no_checks(self):
+        assert self._m({}).doctor_checks == []
+
+    def test_a_broken_check_reports_as_failing_not_absent(self):
+        """Swallowing the error would make doctor green BECAUSE a check is
+        broken — the worst possible failure mode here."""
+        source = open("src/apps/routes.py").read()
+        fn = source[source.index("async def _app_doctor_checks("):
+                    source.index("\ndef register_app_routes(")
+                    if "\ndef register_app_routes(" in source else len(source)]
+        assert '"ok": False' in fn
+        assert "except Exception" in fn
+        assert "_DOCTOR_CHECK_TIMEOUT_S" in fn
+
+    def test_a_failing_app_check_makes_the_whole_report_not_ok(self):
+        source = open("src/apps/routes.py").read()
+        assert "failing_app_checks = [c for c in app_checks if not c[\"ok\"]]" in source
+        assert "not unhealthy and not permissions and not failing_app_checks" in source
+
+    def test_the_cli_counts_app_checks_as_problems(self):
+        source = open("src/cli/commands/doctor.py").read()
+        assert "problems += _app_checks(" in source

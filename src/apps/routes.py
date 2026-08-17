@@ -49,6 +49,58 @@ log = logging.getLogger(__name__)
 
 
 
+#: A doctor check that hangs must not hang doctor.
+_DOCTOR_CHECK_TIMEOUT_S = 20.0
+
+
+async def _app_doctor_checks(runtime) -> list[dict]:
+    """Ask every loaded app the self-checks it declared in ``contributes.doctor``.
+
+    Called in-process against the app's own mounted ASGI app rather than over
+    HTTP: core is already inside the trust boundary, and going out through the
+    tunnel to ask itself a question would make ``doctor`` fail for the same
+    reasons it exists to diagnose.
+
+    An app that raises, times out or answers something unreadable is reported
+    as a FAILING check, not skipped. "The app could not tell us" is exactly the
+    silent degradation this command is for, and swallowing it would make doctor
+    green because a check is broken — the worst possible failure mode for the
+    tool you reach for when things are broken.
+    """
+    import httpx
+
+    out: list[dict] = []
+    for slug in runtime.loaded_slugs():
+        loaded = runtime.get(slug)
+        if loaded is None:
+            continue
+        checks = loaded.manifest.doctor_checks
+        if not checks:
+            continue
+        inner = getattr(loaded.drainable, "app", None)
+        for check in checks:
+            row = {"app": slug, "label": check["label"], "route": check["route"]}
+            if inner is None:
+                out.append({**row, "ok": False,
+                            "detail": "app declares a doctor check but mounted no routes"})
+                continue
+            try:
+                transport = httpx.ASGITransport(app=inner)
+                async with httpx.AsyncClient(transport=transport,
+                                             base_url="http://app") as client:
+                    resp = await client.get(check["route"], timeout=_DOCTOR_CHECK_TIMEOUT_S)
+                body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                if resp.status_code != 200:
+                    out.append({**row, "ok": False,
+                                "detail": f"HTTP {resp.status_code} from {check['route']}"})
+                    continue
+                out.append({**row, "ok": bool(body.get("ok")), "detail": body})
+            except Exception as exc:                       # noqa: BLE001
+                out.append({**row, "ok": False,
+                            "detail": f"{type(exc).__name__}: {exc}"})
+    return out
+
+
 def _config_for_install(app_id: str, data: dict, runtime, reconciler) -> dict:
     """Config to install ``app_id`` with: the caller's if it sent one,
     otherwise whatever is already on record for that app.
@@ -792,9 +844,13 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         # elevated grant for an app that was uninstalled months ago.
         unused = sorted(g for g in host_offers if g not in claimed)
 
+        app_checks = await _app_doctor_checks(runtime)
+
         unhealthy = [c for c in clis if not c["healthy"]]
+        failing_app_checks = [c for c in app_checks if not c["ok"]]
         return {
-            "ok": not unhealthy and not permissions,
+            "ok": not unhealthy and not permissions and not failing_app_checks,
+            "app_checks": app_checks,
             "system_clis": {
                 "total": len(clis),
                 "unhealthy": unhealthy,

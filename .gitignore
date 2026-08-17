@@ -72,3 +72,7 @@ GEMINI.md
 # directory from disk rather than from git — so tracking it only means every
 # scan dirties the repo.
 docs/architecture/
+
+# Core dumps — a crashed process leaves a multi-GB file at the repo root and
+# `git add -A` will happily commit it.
+core.[0-9]*

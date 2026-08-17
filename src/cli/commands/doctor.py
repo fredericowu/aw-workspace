@@ -42,6 +42,7 @@ def run(args: list[str]) -> int:
     problems = 0
     problems += _system_clis(report.get("system_clis") or {})
     problems += _permissions(report.get("permissions") or [])
+    problems += _app_checks(report.get("app_checks") or [])
     _host_power(report.get("host_power") or {})
     _mcp(report.get("mcp") or {})
 
@@ -86,6 +87,35 @@ def _permissions(rows: list) -> int:
             print("      ui:code refused means this app contributes NO frontend: "
                   "no window body, no nav row, no titlebar actions")
     return len(rows)
+
+
+def _app_checks(rows: list) -> int:
+    """Self-checks the installed apps declared (``contributes.doctor``).
+
+    Core cannot know what "degraded" means for an app it was never built
+    against — an app whose test dependencies were never provisioned looks
+    perfectly installed from out here. So the app answers for itself, and this
+    just renders the answer.
+    """
+    if not rows:
+        return 0
+    print()
+    bad = [r for r in rows if not r.get("ok")]
+    if not bad:
+        print(f"App self-checks — {len(rows)} passing "
+              f"({', '.join(sorted({r['app'] for r in rows}))})")
+        return 0
+    print(f"App self-checks — {len(bad)} of {len(rows)} reporting a problem")
+    for row in bad:
+        detail = row.get("detail")
+        if isinstance(detail, dict):
+            pending = detail.get("pending") or []
+            summary = (f"{len(pending)} pending: {', '.join(map(str, pending[:6]))}"
+                       + ("…" if len(pending) > 6 else "")) if pending else "not ok"
+        else:
+            summary = str(detail)
+        print(f"  ✗ {row['app']}: {row['label']} — {summary}")
+    return len(bad)
 
 
 def _host_power(section: dict) -> None:
