@@ -177,21 +177,33 @@ deprecated stub in this repo, see `AGENTS.md`.)
 Even on a run that found zero opportunities, deliver a short summary via the
 same deterministic callback every other daily task in this workspace uses —
 `kanban_manager.send_report()`, reached over the workspace's docker bridge
-gateway, unauthenticated by design (internal-only endpoint):
+gateway, unauthenticated by design (internal-only endpoint). Same pattern as
+`aw-system-analyst` and `aw-kb-curator` — **the payload fields are `title`
+and `text`, not `summary`** (an earlier version of this skill used `summary`
+and it silently produced an empty message body — the endpoint doesn't
+validate unknown field names, it just treats a missing `text` as blank).
+Build the JSON with `python3 -c` rather than hand-quoting so embedded
+newlines/quotes in the summary don't break the request:
 
 ```bash
-curl -s -X POST http://172.18.0.1:10014/api/telegram/report \
-  -H "Content-Type: application/json" \
-  -d '{
-    "title": "aw-autoskill daily",
-    "summary": "<2-4 sentences: sessions analyzed, opportunities found, skills created/updated, or \"nothing new since last run\">"
-  }'
+curl -s -m 15 -X POST http://172.18.0.1:10014/api/telegram/report \
+  -H 'Content-Type: application/json' \
+  -d "$(python3 -c '
+import json, sys
+print(json.dumps({"title": sys.argv[1], "text": sys.argv[2]}))
+' "aw-autoskill — $(date +%Y-%m-%d)" "$YOUR_SUMMARY_TEXT")"
 ```
 
-If the curl fails (non-2xx or connection error), say so explicitly in your
-final agent output — do not silently retry in a loop, and do not treat a
-failed *notification* as a failed *run*: the skill analysis and any skill
-writes already happened and are still valid.
+`$YOUR_SUMMARY_TEXT` is 2-4 sentences: sessions analyzed, opportunities
+found, skills created/updated, or "nothing new since last run".
+
+The call returns `{"ok": true, "sent": N}` on success, where `N` is how many
+sysadmin recipients got it. If `N` is 0, or the response includes a nonzero
+`failed` count, or the call errors/times out — **say so explicitly in this
+run's own final output** (don't retry in a loop, one attempt then move on).
+Do not treat a failed *notification* as a failed *run*: the skill analysis
+and any skill writes already happened and are still valid regardless of
+whether the report was delivered.
 
 ---
 
