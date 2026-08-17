@@ -24,7 +24,23 @@ import redis as sync_redis
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
-REDIS_URL = os.environ.get("AW_TEST_REDIS_URL", "redis://127.0.0.1:6379/0")
+def _redis_url() -> str:
+    """The Redis this environment actually has, most explicit first.
+
+    It defaulted straight to redis://127.0.0.1:6379/0, which is right for local
+    dev and wrong for a managed workspace, where the companion listens as its
+    own host (AW_REDIS_URL=redis://aw-remote-host-redis:6379/0 here, alive and
+    answering PING). So this suite had been skipping on every run: green,
+    reporting nothing, testing nothing.
+    """
+    for var in ("AW_TEST_REDIS_URL", "AW_WORKSPACE_REDIS_URL", "AW_REDIS_URL"):
+        url = os.environ.get(var)
+        if url:
+            return url
+    return "redis://127.0.0.1:6379/0"
+
+
+REDIS_URL = _redis_url()
 WORKSPACE = f"f5b-test-{uuid.uuid4().hex[:8]}"
 
 
