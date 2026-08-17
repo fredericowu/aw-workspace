@@ -181,6 +181,24 @@ class Manifest:
         return list(self.runtime.get("sidecars", []))
 
     @property
+    def host_power(self) -> list[str]:
+        """``runtime.host_power`` — elevated host access this app cannot fake.
+
+        A guest VM is the case core could not express before: without
+        ``/dev/kvm`` QEMU falls back to software emulation and aw-app-windows
+        is unusably slow, and without ``/dev/net/tun`` the guest has no NIC at
+        all. Neither is reachable from an unprivileged container, and
+        ``containers.py`` used to reject the whole idea outright.
+
+        Declaring it here is only the app's half. It also needs the matching
+        ``host:*`` permission AND the BYOD host's own ``--host-power`` opt-in,
+        and a missing leg fails the install rather than starting a degraded
+        container. See :mod:`src.apps.hostpower`.
+        """
+        from src.apps.hostpower import expand
+        return list(expand(self.runtime.get("host_power") or []))
+
+    @property
     def ui_sidecar(self) -> str:
         """``runtime.ui_sidecar`` — the sidecar that serves this app's UI.
 
@@ -655,6 +673,57 @@ def _parse_version(value: str) -> tuple[int, ...] | None:
         return None
     return tuple(int(p) for p in parts)
 
+def _validate_host_power(runtime: dict[str, Any], tier: str,
+                         permissions: list[str]) -> None:
+    """``runtime.host_power`` — shape + the two legs checkable at validate time.
+
+    The third leg (does THIS host offer it?) is deliberately not checked here:
+    a manifest is validated when it is authored and released, not only where
+    it installs, and failing validation on a laptop with no ``/dev/kvm`` would
+    make the app unreleasable rather than uninstallable-here. The host check
+    happens at load, in :func:`src.apps.hostpower.resolve`.
+    """
+    from src.apps.hostpower import HostPowerError, expand, required_capabilities
+
+    # Not wired for sidecars yet. Accepting the key and ignoring it would put
+    # a companion container up without the device it asked for while the
+    # manifest read as correct — the exact failure this whole feature exists
+    # to make impossible. Refuse it instead, and say so.
+    for spec in runtime.get("sidecars") or []:
+        if isinstance(spec, dict) and spec.get("host_power"):
+            raise ManifestError(
+                f"runtime.sidecars[{spec.get('name')!r}].host_power is not "
+                f"supported — only an app's own container can be elevated today"
+            )
+
+    declared = runtime.get("host_power")
+    if declared is None:
+        return
+    if not isinstance(declared, list) or not all(isinstance(g, str) for g in declared):
+        raise ManifestError("runtime.host_power must be a list of grant-name strings")
+    try:
+        grants = expand(declared)
+    except HostPowerError as exc:
+        raise ManifestError(f"runtime.host_power: {exc}") from exc
+    if not grants:
+        return
+    # Only a Tier-2 app HAS a container to elevate. A Tier-1 app runs inside
+    # the workspace process and already has exactly the workspace's own
+    # access — granting it "kvm" would be a manifest key that reads as a
+    # privilege and changes nothing, which is worse than an error.
+    if tier != "container":
+        raise ManifestError(
+            "runtime.host_power only applies to tier=container apps — a Tier-1 "
+            "app runs in the workspace process and cannot be elevated separately"
+        )
+    missing = [c for c in required_capabilities(grants) if c not in permissions]
+    if missing:
+        raise ManifestError(
+            f"runtime.host_power {list(grants)} requires the "
+            f"{sorted(missing)} permission(s)"
+        )
+
+
 def _validate_sidecars(runtime: dict[str, Any], permissions: list[str]) -> None:
     """Validate ``runtime.sidecars`` — companion containers of a Tier-2 app.
 
@@ -863,6 +932,7 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
     _validate_contributed_agents(contributes, permissions)
     _validate_contributed_repos(contributes, permissions)
     _validate_sidecars(runtime, permissions)
+    _validate_host_power(runtime, tier, permissions)
     _validate_requires_workspace(runtime)
 
     config_schema = data.get("config_schema", {})

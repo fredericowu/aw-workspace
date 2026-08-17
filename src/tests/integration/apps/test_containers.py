@@ -1120,3 +1120,58 @@ def test_workspace_repos_volume_refused_without_the_capability(tmp_path, monkeyp
             await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
 
     asyncio.run(run())
+
+
+# ---- host power (elevated device access) -------------------------------------
+
+def test_no_host_power_leaves_the_run_call_unelevated():
+    """The path every app installed today takes. It must stay exactly what it
+    was before host_power existed: no privilege, no devices, no added caps."""
+    fake = _FakeDocker()
+    sup = ContainerSupervisor(socket="/dev/null", client=fake)
+    sup.register("app", "img", 8080)
+    sup.start("app")
+
+    call = fake.run_calls[-1]
+    assert call["privileged"] is False
+    assert "devices" not in call
+    assert "cap_add" not in call
+
+
+def test_granted_host_power_reaches_the_run_call():
+    """A QEMU guest without /dev/kvm falls back to software emulation and is
+    unusably slow — the whole point is that the device actually lands."""
+    fake = _FakeDocker()
+    sup = ContainerSupervisor(socket="/dev/null", client=fake)
+    sup.register("windows", "dockurr/windows", 8006, host_power=("kvm", "tun"))
+    sup.start("windows")
+
+    call = fake.run_calls[-1]
+    assert call["devices"] == ["/dev/kvm:/dev/kvm:rwm", "/dev/net/tun:/dev/net/tun:rwm"]
+    assert call["cap_add"] == ["NET_ADMIN"]
+    assert call["privileged"] is False
+
+
+def test_privileged_host_power_sets_the_flag_and_nothing_else():
+    fake = _FakeDocker()
+    sup = ContainerSupervisor(socket="/dev/null", client=fake)
+    sup.register("app", "img", 8080, host_power=("privileged",))
+    sup.start("app")
+
+    call = fake.run_calls[-1]
+    assert call["privileged"] is True
+    assert "devices" not in call
+
+
+def test_privileged_run_flag_still_rejected_and_points_at_host_power():
+    """run_flags carries none of host_power's checks — no capability match, no
+    host opt-in — so honouring --privileged there would route around both."""
+    sup = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
+    with pytest.raises(ContainerError, match="runtime.host_power"):
+        sup.register("app", "img", 8080, run_flags=["--privileged"])
+
+
+def test_unknown_host_power_grant_fails_at_register():
+    sup = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
+    with pytest.raises(Exception, match="unknown host power grant"):
+        sup.register("app", "img", 8080, host_power=("gpu",))

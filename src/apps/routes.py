@@ -37,6 +37,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from src.api.identity import authorize_ws, require_identity
 from src.apps import config_store
+from src.apps import hostpower
 from src.apps.catalog import get_catalog, is_marketplace_app, list_tags
 from src.apps.install_jobs import InstallJobs
 from src.apps.manifest import ManifestError, load_manifest
@@ -749,6 +750,12 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
           high-risk capability silently removes an app's entire frontend, so
           this is the one that reads as "the app is broken").
         * ``mcp`` — apps contributing tools vs upstreams the gateway serves.
+        * ``host_power`` — what the BYOD host opted into vs what each loaded
+          app was actually granted. An app whose grant is empty while its
+          manifest asks for one cannot be loaded at all (the load raises), so
+          what this catches is the subtler shape: a host that granted power
+          nothing is using, and — once ``all`` is in play — a host offering
+          less than it was asked for.
         """
         clis = runtime.commands.system_cli_report()
 
@@ -772,6 +779,19 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             if os.path.isfile(os.path.join(runtime.get(slug).package_dir, "mcp.json"))
         ) if runtime.loaded_slugs() else []
 
+        host_offers = hostpower.host_grants()
+        host_apps = []
+        for slug in runtime.loaded_slugs():
+            loaded = runtime.get(slug)
+            if loaded is None or not loaded.manifest.host_power:
+                continue
+            host_apps.append({"app": slug, "grants": list(loaded.manifest.host_power)})
+        claimed = {g for row in host_apps for g in row["grants"]}
+        # Not a "problem" (it breaks nothing), but it is the one thing about
+        # this feature nobody can see otherwise: a machine still carrying an
+        # elevated grant for an app that was uninstalled months ago.
+        unused = sorted(g for g in host_offers if g not in claimed)
+
         unhealthy = [c for c in clis if not c["healthy"]]
         return {
             "ok": not unhealthy and not permissions,
@@ -780,6 +800,12 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 "unhealthy": unhealthy,
             },
             "permissions": permissions,
+            "host_power": {
+                "host_offers": list(host_offers),
+                "summary": hostpower.describe(host_offers),
+                "apps": host_apps,
+                "unused": unused,
+            },
             "mcp": {
                 "apps_contributing_tools": mcp_apps,
                 "note": "compare with the gateway's own upstream list "

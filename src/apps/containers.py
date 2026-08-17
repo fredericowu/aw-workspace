@@ -14,7 +14,15 @@ keyed by ``app_id``. The supervisor pulls the image if missing, applies the
 manifest's ``run_flags`` (e.g. ``--shm-size=1g``) and ``resources`` (mem/cpu),
 and — so the workspace can reach it — attaches it to the shared podman network
 (``AW_CONTAINER_NETWORK``) and addresses it by name, mirroring how the workspace
-already reaches its postgres/redis siblings. No ``--privileged``, ever.
+already reaches its postgres/redis siblings.
+
+Elevated device access (``/dev/kvm`` for a guest VM, ``/dev/net/tun`` for its
+NIC) is NOT expressible as a run flag and never has been — ``--privileged`` is
+rejected here whatever asks for it. It goes through ``runtime.host_power``
+instead, which additionally requires a matching high-risk capability and the
+BYOD host's own opt-in; see :mod:`src.apps.hostpower`. A container with no
+resolved grant is created exactly as before: ``privileged=False``, no devices,
+no added capabilities.
 
 Registration is JOURNALED by the runtime so uninstall stops + removes the
 container (reverse replay) — no orphan containers survive an uninstall.
@@ -27,6 +35,8 @@ import re
 import shlex
 import socket
 from typing import Any
+
+from src.apps import hostpower
 
 log = logging.getLogger(__name__)
 
@@ -194,12 +204,20 @@ def _parse_run_flags(run_flags: list[str] | None) -> dict:
     is rejected outright (Tier-2 trust rule). An unknown flag raises rather than
     being silently dropped, so a manifest can't quietly ask for something the
     supervisor won't honor.
+
+    ``--privileged`` stays rejected here even now that ``runtime.host_power``
+    exists, because this channel carries none of that one's checks: a run flag
+    is not matched against a capability and not matched against the host's
+    opt-in, so honouring it would be a way around both.
     """
     kwargs: dict = {}
     for flag in run_flags or []:
         name, _, value = flag.partition("=")
         if name in ("--privileged",):
-            raise ContainerError("run flag --privileged is not allowed for Tier-2 apps")
+            raise ContainerError(
+                "run flag --privileged is not allowed for Tier-2 apps — declare "
+                "runtime.host_power: [\"privileged\"] plus the 'host:privileged' "
+                "permission instead, which also requires the host's own opt-in")
         if name == "--shm-size":
             if not value:
                 raise ContainerError("--shm-size requires a value (e.g. --shm-size=1g)")
@@ -228,7 +246,8 @@ class _Container:
                  run_flags: list[str] | None, resources: dict | None,
                  env: dict | None, network: str | None,
                  volumes: dict[str, dict] | None = None,
-                 container_name: str | None = None) -> None:
+                 container_name: str | None = None,
+                 host_power: tuple[str, ...] | None = None) -> None:
         self.app_id = app_id
         self.image = image
         # 0 for a sidecar with nothing to expose — a database is dialled by
@@ -239,6 +258,10 @@ class _Container:
         self.env = dict(env or {})
         self.network = network
         self.volumes = dict(volumes or {})
+        # Already resolved against the app's permissions AND this host's
+        # opt-in by the caller (src.apps.runtime) — this is the granted set,
+        # not the requested one, so nothing here re-decides policy.
+        self.host_power = tuple(host_power or ())
         self._name = container_name
         self.container_id: str | None = None
 
@@ -293,7 +316,8 @@ class ContainerSupervisor:
                  run_flags: list[str] | None = None, resources: dict | None = None,
                  env: dict | None = None, autostart: bool = False,
                  volumes: dict[str, dict] | None = None,
-                 container_name: str | None = None) -> None:
+                 container_name: str | None = None,
+                 host_power: tuple[str, ...] | None = None) -> None:
         if app_id in self._containers:
             raise ContainerError(f"container already registered for {app_id!r}")
         if not image:
@@ -304,11 +328,21 @@ class ContainerSupervisor:
             raise ContainerError(f"app {app_id!r} tier=container requires runtime.port")
         # Validate run flags up front so a bad manifest fails at register, not run.
         _parse_run_flags(run_flags)
+        # Same for the grant names. The caller has already decided WHETHER this
+        # app may have them; this only rejects a name that maps to no grant, so
+        # a typo fails here instead of at start() — or worse, silently, if some
+        # later refactor stops passing them to docker at all.
+        host_power = hostpower.expand(host_power)
         c = _Container(app_id, image, port, run_flags, resources, env, self._network,
-                       volumes, container_name)
+                       volumes, container_name, host_power)
         self._containers[app_id] = c
         log.info("apps: registered container %s (image=%s port=%s network=%s)",
                  c.name, image, port, self._network)
+        if c.host_power:
+            # Loud on purpose: this is the one line in the log that says a
+            # container on this machine is no longer fully contained.
+            log.warning("apps: %s granted elevated host power: %s",
+                        c.name, hostpower.describe(c.host_power))
         if autostart:
             self.start(app_id)
 
@@ -408,7 +442,9 @@ class ContainerSupervisor:
             "detach": True,
             "environment": c.env,
             "volumes": c.volumes,
-            # never --privileged; drop nothing extra but don't grant caps either
+            # Default stays exactly as it was: no privilege, no devices, no
+            # added capabilities. Only an app that cleared all three
+            # host_power legs overrides this, below.
             "privileged": False,
             # Root cause of "it should come back up on its own but doesn't":
             # without a restart policy, podman/docker never restarts this
@@ -424,6 +460,7 @@ class ContainerSupervisor:
         }
         kwargs.update(_parse_run_flags(c.run_flags))
         kwargs.update(_resource_kwargs(c.resources))
+        kwargs.update(hostpower.docker_kwargs(c.host_power))
         # This workspace's own slug (AW_WORKSPACE, set by whatever launched
         # this process) — apps that need to namespace something by workspace
         # identity (e.g. aw-mcp-gateway prefixing its published tool names)

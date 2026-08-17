@@ -29,6 +29,7 @@ from starlette.types import Receive, Scope, Send
 
 import types
 
+from src.apps import hostpower
 from src.apps import paths
 from src.apps.fetch import apps_root
 from src.apps.base import AppContext, Plugin
@@ -1051,11 +1052,21 @@ class AppRuntime:
             signed=signed, module_prefix="",
         )
 
+        # Elevated host access, if this app asked for any. Resolved HERE, not
+        # in the supervisor, because this is the only place that holds all
+        # three inputs at once: the manifest's request, the app's granted
+        # capabilities, and the host's own AW_HOST_POWER opt-in. A missing leg
+        # raises and the load fails — deliberately louder than starting a
+        # container that comes up without the device it needs, which surfaces
+        # as "the app is broken" with the real cause nowhere in sight.
+        host_power = hostpower.resolve(slug, manifest.host_power, granted)
+
         self.containers.register(
             slug, image, port, run_flags=run_flags, resources=resources, env=env,
-            volumes=volumes)
+            volumes=volumes, host_power=host_power)
         self.journal.record(slug, "container:register", image,
-                            {"port": port, "run_flags": run_flags, "resources": resources})
+                            {"port": port, "run_flags": run_flags, "resources": resources,
+                             "host_power": list(host_power)})
         # Companion containers, before the app's own: aw-app-crispal's MCP
         # dials the WordPress/MySQL pair as soon as it comes up, and starting
         # them after it would make every boot's first tool call fail.

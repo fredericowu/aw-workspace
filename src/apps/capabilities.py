@@ -42,6 +42,11 @@ CATALOG: dict[str, dict[str, str]] = {
     "containers:manage": {"risk": "high", "desc": "run/manage sidecar containers"},
     "ui:code":           {"risk": "high", "desc": "load the app's JS bundle into the SPA context"},
     "mcp:register-gateway": {"risk": "high", "desc": "mount the workspace's root .mcp.json (read/write, single file) to register this app's own MCP endpoint"},
+    "host:device-kvm":    {"risk": "high", "desc": "pass /dev/kvm into the app's container — hardware virtualisation for a guest VM"},
+    "host:device-tun":    {"risk": "high", "desc": "pass /dev/net/tun + NET_ADMIN into the app's container — a guest's own virtual NIC"},
+    "host:device-fuse":   {"risk": "high", "desc": "pass /dev/fuse + SYS_ADMIN into the app's container — FUSE mounts"},
+    "host:device-binder": {"risk": "high", "desc": "pass the Android binder devices into the app's container — a redroid/Android guest"},
+    "host:privileged":    {"risk": "high", "desc": "run the app's container --privileged — every device and capability, no isolation"},
 }
 
 # parameterised capabilities: prefix -> risk. The argument after the prefix is

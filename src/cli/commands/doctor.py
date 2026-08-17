@@ -42,6 +42,7 @@ def run(args: list[str]) -> int:
     problems = 0
     problems += _system_clis(report.get("system_clis") or {})
     problems += _permissions(report.get("permissions") or [])
+    _host_power(report.get("host_power") or {})
     _mcp(report.get("mcp") or {})
 
     print()
@@ -85,6 +86,33 @@ def _permissions(rows: list) -> int:
             print("      ui:code refused means this app contributes NO frontend: "
                   "no window body, no nav row, no titlebar actions")
     return len(rows)
+
+
+def _host_power(section: dict) -> None:
+    """Elevated host access — what this machine granted, and who is using it.
+
+    Not counted as a problem: an app that asked for a grant this host does not
+    offer fails to LOAD, so it shows up under refused permissions or simply
+    isn't running. What this adds is the part that is otherwise invisible from
+    inside the workspace — that the machine is carrying an elevated grant at
+    all, and whether anything still needs it.
+    """
+    offers = section.get("host_offers") or []
+    print()
+    print(f"Host power — {section.get('summary', 'unknown')}")
+    if not offers:
+        print("      no app on this workspace can reach a host device")
+        return
+    for row in section.get("apps") or []:
+        print(f"  • {row['app']}: {', '.join(row['grants'])}")
+    unused = section.get("unused") or []
+    if unused:
+        # A grant outliving the app that needed it is the residue case: the
+        # machine stays elevated and nothing on it reads as different.
+        print(f"  ! granted but unused by any loaded app: {', '.join(unused)}")
+        print("      drop it from --host-power on the host if nothing needs it")
+    if "privileged" in offers:
+        print("  ! this host runs app containers WITHOUT isolation (--privileged)")
 
 
 def _mcp(section: dict) -> None:
