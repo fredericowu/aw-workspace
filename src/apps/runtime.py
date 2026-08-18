@@ -19,6 +19,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -161,6 +162,42 @@ def _default_verify_ws(scope: Scope) -> dict | None:
     return decode_identity_jwt(token) if token else None
 
 
+# A presentation share link is the one app route whose credential is a
+# query-string token that is NOT an identity JWT, so _default_verify_http
+# above can only ever fail it: `share_presentation` mints an opaque UUID and
+# only aw-app-presentations' own `validate_share_token` can judge it. The
+# recipient opens the URL in a browser carrying no cookie and no X-Api-Key —
+# they are usually not a workspace user at all — so this guard 401ed every
+# share link before the app ever saw one (confirmed 2026-08-18: the URL
+# returned {"detail":"unauthorized"} from here once aw-backend's tunnel edge
+# was made to forward it).
+#
+# Matched against the FULL request path on purpose: that pins the exemption
+# to this one app's mount, where a mount-relative match would also exempt any
+# other app that happened to serve /presentations/<id>/html. GET only, and
+# only with a non-empty token — the rest of the app's REST surface, and this
+# same path without a token, keep the normal identity requirement. The app
+# still 403s an unknown or expired token, so this widens nothing on its own;
+# it only lets the request reach the gate that can actually decide.
+_SHARE_LINK_PATH_RE = re.compile(
+    r"^/api/apps/presentations/presentations/[^/]+/html$"
+)
+
+
+def _is_presentation_share_link(scope: Scope) -> bool:
+    """True for ``GET /api/apps/presentations/presentations/<id>/html?token=``."""
+    if scope.get("type") != "http":
+        return False
+    if (scope.get("method") or "").upper() != "GET":
+        return False
+    if not _SHARE_LINK_PATH_RE.match(scope.get("path", "/") or "/"):
+        return False
+    from urllib.parse import parse_qs
+
+    qs = parse_qs((scope.get("query_string") or b"").decode("latin-1"))
+    return any(v.strip() for v in qs.get("token", []))
+
+
 def _local_paths_for(loaded: "LoadedApp") -> list[str]:
     """Mount-relative ``local_paths`` an app is allowed to bypass auth on.
 
@@ -248,7 +285,7 @@ class IdentityGuard:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         stype = scope["type"]
         if stype == "http":
-            if self._local_bypass(scope):
+            if self._local_bypass(scope) or _is_presentation_share_link(scope):
                 await self.app(scope, receive, send)
                 return
             if not self._requires_auth():

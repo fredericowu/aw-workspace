@@ -207,6 +207,97 @@ def test_local_paths_bypass_does_not_apply_to_non_loopback_callers(local_bypass_
     assert client.post("/api/apps/guarded/eval").status_code == 401
 
 
+_SHARE_PLUGIN = """
+    from fastapi import FastAPI, Request
+
+    class AppPlugin:
+        async def activate(self, ctx):
+            api = FastAPI()
+
+            @api.get("/presentations/{pres_id}/html")
+            async def html(pres_id: str, request: Request):
+                # Stands in for the real route's validate_share_token: the APP
+                # is what judges the token, the guard only has to let it in.
+                if request.query_params.get("token") != "good-share-token":
+                    return JSONResponse({"detail": "forbidden"}, status_code=403)
+                return HTMLResponse("<html>slides</html>")
+
+            @api.get("/presentations")
+            async def index():
+                return {"presentations": []}
+
+            ctx.routes.register(api)
+
+        async def deactivate(self):
+            return None
+"""
+
+
+@pytest.fixture()
+def presentations_app(tmp_path, monkeypatch):
+    # No valid identity exists at all here — a share-link recipient is often
+    # not a workspace user, which is the whole point of the carve-out.
+    monkeypatch.setattr(identity, "decode_identity_jwt", lambda tok: None)
+    pkg = tmp_path / "presentations"
+    pkg.mkdir()
+    (pkg / "aw-app.json").write_text(textwrap.dedent("""
+    {
+      "manifest_version": 1,
+      "id": "presentations",
+      "name": "presentations",
+      "version": "1.0.0",
+      "tier": "inprocess",
+      "runtime": {"entrypoint": "plugin:AppPlugin"},
+      "permissions": ["routes:register"],
+      "contributes": {"routes": [{"prefix": "/api/apps/presentations"}]}
+    }
+    """))
+    (pkg / "plugin.py").write_text(
+        "from fastapi.responses import HTMLResponse, JSONResponse\n"
+        + textwrap.dedent(_SHARE_PLUGIN)
+    )
+    app = FastAPI()
+    rt = AppRuntime(app, guard_identity=True)
+    asyncio.run(rt.load(str(pkg), granted_permissions=["routes:register"]))
+    return app
+
+
+def test_share_link_reaches_the_app_without_any_identity(presentations_app):
+    # The bug this exists for: a share link's credential is an opaque UUID in
+    # the query string, not an identity JWT, so the guard could only ever 401
+    # it — and did, for every link share_presentation ever handed out.
+    client = TestClient(presentations_app)
+    r = client.get(
+        "/api/apps/presentations/presentations/deck-1/html?token=good-share-token")
+    assert r.status_code == 200
+    assert r.text == "<html>slides</html>"
+
+
+def test_bad_share_token_is_403ed_by_the_app_not_401ed_by_the_guard(presentations_app):
+    # The guard delegates; it does not validate. A token it lets through that
+    # the app rejects must surface the APP's 403, never a guard 401 — that
+    # distinction is what keeps the carve-out from being a hole.
+    client = TestClient(presentations_app)
+    r = client.get(
+        "/api/apps/presentations/presentations/deck-1/html?token=made-up")
+    assert r.status_code == 403
+
+
+def test_share_link_carve_out_needs_a_non_empty_token(presentations_app):
+    client = TestClient(presentations_app)
+    assert client.get(
+        "/api/apps/presentations/presentations/deck-1/html").status_code == 401
+    assert client.get(
+        "/api/apps/presentations/presentations/deck-1/html?token=").status_code == 401
+
+
+def test_share_link_carve_out_does_not_widen_the_rest_of_the_app(presentations_app):
+    # A token on any OTHER route of the same app buys nothing.
+    client = TestClient(presentations_app)
+    assert client.get(
+        "/api/apps/presentations/presentations?token=good-share-token").status_code == 401
+
+
 def test_valid_workspace_api_key_authenticates_app_routes(guarded_app, monkeypatch):
     # A workspace API key lets an external app/MCP call ANY installed app's
     # routes without a browser-issued JWT — same guard, second credential.
