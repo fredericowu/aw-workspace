@@ -32,6 +32,7 @@ import os
 import shutil
 import tarfile
 import tempfile
+import time
 from urllib.parse import urlsplit
 
 import httpx
@@ -132,13 +133,24 @@ def _download_headers(repo: str, url: str, token: str | None) -> dict[str, str]:
     return {"Authorization": f"Bearer {env_token}"} if env_token else {}
 
 
+_DOWNLOAD_ATTEMPTS = 3
+
+
 def fetch_app_repo(repo: str, ref: str = "HEAD", *, slug: str,
                    token: str | None = None, dest: str | None = None) -> str:
     """Download ``repo``'s tarball at ``ref`` and extract it to ``dest``.
 
     Returns the package dir (containing the app's ``aw-app.json``). Idempotent:
-    extraction lands in a tmp dir first, then atomically swaps into place, so a
-    re-fetch (e.g. after the source advanced) fully replaces the prior tree.
+    download and extraction land in a sibling tmp dir first, and ``dest`` is
+    only ever touched afterwards, via two ``os.replace`` calls (POSIX rename,
+    atomic on the same filesystem — both the tmp dir and ``dest.old`` are
+    created next to ``dest`` for exactly this reason) — the existing ``dest``
+    is renamed to ``dest.old`` and the new tree renamed into ``dest``'s place.
+    If the second replace fails, ``dest.old`` is renamed straight back so a
+    failed re-fetch never leaves ``dest`` missing or half-written. The
+    download itself retries with backoff before any of this starts, since a
+    transport failure (e.g. a proxy/tunnel cutting the connection) is the
+    common way this gets interrupted.
     """
     dest = dest or package_dir_for(slug)
     url = _tarball_url(repo, ref)
@@ -149,14 +161,23 @@ def fetch_app_repo(repo: str, ref: str = "HEAD", *, slug: str,
 
     with tempfile.TemporaryDirectory(dir=parent, prefix=f".{slug}.fetch-") as tmp_dir:
         archive_path = os.path.join(tmp_dir, "repo.tar.gz")
-        try:
-            with httpx.stream("GET", url, headers=headers, follow_redirects=True, timeout=60.0) as resp:
-                resp.raise_for_status()
-                with open(archive_path, "wb") as f:
-                    for chunk in resp.iter_bytes():
-                        f.write(chunk)
-        except httpx.HTTPError as e:
-            raise FetchError(f"download of {url} failed: {e}") from e
+        for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+            try:
+                with httpx.stream("GET", url, headers=headers, follow_redirects=True, timeout=60.0) as resp:
+                    resp.raise_for_status()
+                    with open(archive_path, "wb") as f:
+                        for chunk in resp.iter_bytes():
+                            f.write(chunk)
+                break
+            except httpx.TransportError as e:
+                if attempt == _DOWNLOAD_ATTEMPTS:
+                    raise FetchError(f"download of {url} failed after {attempt} attempts: {e}") from e
+                delay = 2 ** (attempt - 1)
+                log.warning("apps: download of %s failed (attempt %d/%d), retrying in %ds: %s",
+                            url, attempt, _DOWNLOAD_ATTEMPTS, delay, e)
+                time.sleep(delay)
+            except httpx.HTTPError as e:
+                raise FetchError(f"download of {url} failed: {e}") from e
 
         extract_dir = os.path.join(tmp_dir, "extracted")
         try:
@@ -165,9 +186,24 @@ def fetch_app_repo(repo: str, ref: str = "HEAD", *, slug: str,
         except tarfile.TarError as e:
             raise FetchError(f"extraction of {url} failed: {e}") from e
 
+        dest_old = dest + ".old"
+        if os.path.exists(dest_old):
+            shutil.rmtree(dest_old)
+
+        swapped_old = False
         if os.path.exists(dest):
-            shutil.rmtree(dest)
-        shutil.move(extract_dir, dest)
+            os.replace(dest, dest_old)
+            swapped_old = True
+        try:
+            os.replace(extract_dir, dest)
+        except OSError as e:
+            if swapped_old:
+                os.replace(dest_old, dest)
+                log.error("apps: swap into %s failed (%s); restored previous install", dest, e)
+            raise FetchError(f"swap into {dest} failed: {e}") from e
+
+        if swapped_old:
+            shutil.rmtree(dest_old)
 
     log.info("apps: fetched %s@%s into %s", repo, ref, dest)
     return dest
