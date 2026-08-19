@@ -17,6 +17,7 @@ import textwrap
 
 from fastapi import FastAPI
 
+from src.apps.containers import ContainerError
 from src.apps.journal import ActionJournal
 from src.apps.runtime import AppRuntime
 
@@ -283,13 +284,41 @@ def _fake_async_client(handler):
 
 
 def test_mcp_gateway_status_not_installed():
+    """Absent gateway == no container registered for it.
+
+    Deliberately NOT ``is_loaded``: that only tracks apps with an in-process
+    plugin, and mcp-gateway is ``tier: container``, so is_loaded() is False for
+    a gateway that is installed and serving. Gating on it made doctor print
+    "not installed — nothing to check" and return 0 against a live gateway with
+    two dead upstreams (2026-08-19).
+    """
     class _NoGateway:
-        def is_loaded(self, slug):
-            return False
+        class containers:
+            @staticmethod
+            def base_url(app_id):
+                raise ContainerError(f"no container registered for {app_id!r}")
 
     status = _async(routes_mod._mcp_gateway_status(_NoGateway(), expect_tools=True))
     assert status["reachable"] is None
     assert status["degraded"] is False
+
+
+def test_mcp_gateway_status_checks_a_container_tier_gateway(monkeypatch):
+    """The regression guard: a gateway with NO in-process plugin (the real
+    shape) must still be checked, not skipped as "not installed"."""
+    monkeypatch.setattr("httpx.AsyncClient", _fake_async_client(
+        lambda: {"local_upstreams": ["kb"], "tools": 0}))
+
+    class _ContainerOnly:
+        """No is_loaded at all — mirrors a pure container-tier app."""
+        class containers:
+            @staticmethod
+            def base_url(app_id):
+                return "http://aw-app-mcp-gateway:9200"
+
+    status = _async(routes_mod._mcp_gateway_status(_ContainerOnly(), expect_tools=True))
+    assert status["reachable"] is True
+    assert status["degraded"] is True, "zero tools must count as a problem"
 
 
 def test_mcp_gateway_status_unreachable_counts_as_degraded(monkeypatch):

@@ -42,7 +42,7 @@ from src.apps.catalog import get_catalog, is_marketplace_app, list_tags
 from src.apps.install_jobs import InstallJobs
 from src.apps.manifest import ManifestError, load_manifest
 from src.apps.reconciler import AppSpec, Reconciler
-from src.apps.containers import expand_env
+from src.apps.containers import ContainerError, expand_env
 from src.apps.runtime import AppRuntime
 
 log = logging.getLogger(__name__)
@@ -326,11 +326,20 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
     gateway's total tool count well above zero. ``expect_tools`` alone (no
     ``expected``) still catches the coarser total-collapse case.
     """
-    if not runtime.is_loaded("mcp-gateway"):
+    # NOT ``runtime.is_loaded``: that tracks apps with an in-process plugin, and
+    # mcp-gateway is ``tier: container`` — it has none, so is_loaded() is False
+    # for a gateway that is installed, running and serving 600+ tools. Gating on
+    # it reintroduced exactly the bug this function exists to kill: doctor
+    # printed "mcp-gateway app is not installed — nothing to check" and returned
+    # 0 while two upstreams were dead (seen live 2026-08-19, right after the
+    # first fix shipped). The container registry is the predicate that answers
+    # "is this app actually here" for both tiers.
+    import httpx
+    try:
+        base_url = runtime.containers.base_url("mcp-gateway")
+    except ContainerError:
         return {"reachable": None, "degraded": False,
                 "note": "mcp-gateway app is not installed"}
-    import httpx
-    base_url = runtime.containers.base_url("mcp-gateway")
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(f"{base_url}/healthz")
