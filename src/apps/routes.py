@@ -302,7 +302,8 @@ async def _reload_mcp_gateway(runtime: AppRuntime, *,
                     raise
 
 
-async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool) -> dict:
+async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
+                              expected: dict[str, str] | None = None) -> dict:
     """What the gateway itself reports serving, for doctor's ``mcp`` section.
 
     Before this, ``mcp.apps_contributing_tools`` only listed apps that ship an
@@ -311,17 +312,19 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool) -> dic
     tools (confirmed live 2026-08-19: two upstreams were dead and doctor's
     exit code owed entirely to an unrelated architecture self-check). This
     calls the gateway's own unauthenticated ``GET /healthz`` — cheap, no
-    admin token needed — and folds unreachable/zero-tools into ``degraded``
-    so it actually counts as a problem.
+    admin token needed — and folds unreachable/zero-tools/dead-upstreams into
+    ``degraded`` so it actually counts as a problem.
 
-    Deliberately does NOT try to match individual app slugs against
-    individual upstream names: a gateway upstream is named after the
-    ``mcpServers`` key inside that app's own ``mcp.json``, not the app's
-    slug (see ``aw-mcp-gateway``'s ``config.scan_app_mcp_servers``), and
-    guessing a normalization between the two would just trade one
-    false-green for a different false-red. The two checks here — gateway
-    reachable, and serving >0 tools when apps expect it to — are the
-    unambiguous ones.
+    ``expected`` maps upstream/server name -> owning app slug, i.e. the
+    ``mcpServers`` keys read straight out of each app's own ``mcp.json`` —
+    NOT a guess normalized from the app's slug (a gateway upstream is named
+    after that key, which does not match the app slug 1:1; see
+    ``aw-mcp-gateway``'s ``config.scan_app_mcp_servers``). Reading the real
+    name from the source of truth lets this flag a SPECIFIC dead upstream by
+    name, which a bare ``tools == 0`` aggregate count cannot: the 2026-08-19
+    incident had exactly two dead upstreams while everything else kept the
+    gateway's total tool count well above zero. ``expect_tools`` alone (no
+    ``expected``) still catches the coarser total-collapse case.
     """
     if not runtime.is_loaded("mcp-gateway"):
         return {"reachable": None, "degraded": False,
@@ -339,17 +342,31 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool) -> dic
                 "note": f"gateway unreachable at {base_url}/healthz: {e}"}
     tools = payload.get("tools", 0)
     upstreams = payload.get("local_upstreams") or []
-    degraded = expect_tools and tools == 0
+    live = set(upstreams)
+    dead = sorted(
+        ({"server": name, "app": app} for name, app in (expected or {}).items()
+         if name not in live),
+        key=lambda d: (d["app"], d["server"]),
+    )
+    degraded = bool(dead) or (expect_tools and tools == 0)
+    if dead:
+        note = ("%d upstream(s) declared but not live in the gateway: %s" %
+                (len(dead), ", ".join(f"{d['server']} ({d['app']})" for d in dead)))
+    elif degraded:
+        note = ("gateway reachable but serving ZERO tools despite apps "
+                 "declaring mcp.json — at least one upstream is dead")
+    elif expected:
+        note = "gateway reachable; every declared upstream is live"
+    else:
+        note = ("gateway reachable; compare local_upstreams against apps_contributing_tools "
+                 "for per-app drift (names don't match 1:1 — see docstring)")
     return {
         "reachable": True,
         "tools": tools,
         "local_upstreams": upstreams,
+        "dead_upstreams": dead,
         "degraded": degraded,
-        "note": ("gateway reachable but serving ZERO tools despite apps "
-                  "declaring mcp.json — at least one upstream is dead")
-                 if degraded else
-                 "gateway reachable; compare local_upstreams against apps_contributing_tools "
-                 "for per-app drift (names don't match 1:1 — see docstring)",
+        "note": note,
     }
 
 
@@ -882,7 +899,25 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             if os.path.isfile(os.path.join(runtime.get(slug).package_dir, "mcp.json"))
         ) if runtime.loaded_slugs() else []
 
-        mcp_status = await _mcp_gateway_status(runtime, expect_tools=bool(mcp_apps))
+        # Server name -> owning app slug, read from each app's own mcp.json
+        # (not guessed from the slug — see _mcp_gateway_status's docstring)
+        # so a specific dead upstream can be named, not just inferred from a
+        # zero total.
+        mcp_expected: dict[str, str] = {}
+        for slug in mcp_apps:
+            loaded = runtime.get(slug)
+            try:
+                with open(os.path.join(loaded.package_dir, "mcp.json"), encoding="utf-8") as f:
+                    doc = json.load(f)
+            except (OSError, ValueError):
+                continue
+            for name, spec in (doc.get("mcpServers") or {}).items():
+                if isinstance(spec, dict) and spec.get("enabled") is False:
+                    continue
+                mcp_expected[name] = slug
+
+        mcp_status = await _mcp_gateway_status(
+            runtime, expect_tools=bool(mcp_apps), expected=mcp_expected)
 
         host_offers = hostpower.host_grants()
         host_apps = []

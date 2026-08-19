@@ -303,6 +303,34 @@ def test_mcp_gateway_status_unreachable_counts_as_degraded(monkeypatch):
     assert status["degraded"] is True
 
 
+def test_mcp_gateway_status_flags_a_specific_dead_upstream(monkeypatch):
+    """The actual 2026-08-19 shape: the gateway is reachable and its aggregate
+    tool count is well above zero (everything else works), but one declared
+    upstream never registered. A bare ``tools == 0`` check would miss this
+    entirely — only naming the missing upstream catches it."""
+    monkeypatch.setattr("httpx.AsyncClient", _fake_async_client(
+        lambda: {"local_upstreams": ["kb", "notion"], "tools": 120}))
+
+    status = _async(routes_mod._mcp_gateway_status(
+        _FakeMcpRuntime(), expect_tools=True,
+        expected={"kb": "kb", "notion": "notion", "arvin": "aw-crispal"}))
+
+    assert status["reachable"] is True
+    assert status["degraded"] is True
+    assert status["dead_upstreams"] == [{"server": "arvin", "app": "aw-crispal"}]
+
+
+def test_mcp_gateway_status_ok_when_every_declared_upstream_is_live(monkeypatch):
+    monkeypatch.setattr("httpx.AsyncClient", _fake_async_client(
+        lambda: {"local_upstreams": ["kb"], "tools": 40}))
+
+    status = _async(routes_mod._mcp_gateway_status(
+        _FakeMcpRuntime(), expect_tools=True, expected={"kb": "kb"}))
+
+    assert status["degraded"] is False
+    assert status["dead_upstreams"] == []
+
+
 def test_mcp_gateway_status_zero_tools_while_apps_expect_them_is_degraded(monkeypatch):
     monkeypatch.setattr("httpx.AsyncClient",
                          _fake_async_client(lambda: {"tools": 0, "local_upstreams": []}))

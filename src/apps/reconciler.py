@@ -582,18 +582,33 @@ class Reconciler:
             )
             if version_changed or trust_changed:
                 # What we would put back. Read BEFORE the uninstall, which
-                # forgets the row. `package_dir` is carried so a rollback reuses
-                # the code already on disk instead of re-fetching a version the
-                # network may no longer serve — the moment a rollback matters
-                # most is the moment fetching is least trustworthy.
+                # forgets the row. NOTE this does NOT skip a re-fetch: below,
+                # `previous.package_dir` is set, but `_resolve_package_dir`
+                # checks `spec.repo` first, and `previous.repo` is always
+                # populated from the local mirror row — so `install(previous)`
+                # re-fetches over the network at the previous `ref` every
+                # time. If the network can't serve that ref — the exact
+                # moment a rollback is needed most — this "rollback" fails
+                # too. `package_dir` is carried here but currently unused;
+                # making it actually skip the re-fetch needs a dedicated
+                # resolve path, not a priority-order change to
+                # `_resolve_package_dir` (that method's callers, e.g. a
+                # normal install, must always re-fetch to pick up updates
+                # even when a stale `package_dir` already exists on disk).
                 previous_row = next(
                     (r for r in self.local.list() if r.get("app_id") == app_id), None)
                 previous = AppSpec.from_row(previous_row) if previous_row else None
                 if previous is not None and loaded and loaded.package_dir:
                     previous.package_dir = loaded.package_dir
                 try:
+                    # remove_repo=False: an upgrade must not delete the
+                    # running version's tree before the new one has actually
+                    # landed. install() below fetches straight into this same
+                    # `dest`; thanks to fetch_app_repo's atomic rename-swap
+                    # (fixed together with this comment, 2026-08-19), a fetch
+                    # failure now leaves `dest` untouched instead of gone.
                     await self.uninstall(app_id, write_cloud=False,
-                                         purge_secrets=False)
+                                         purge_secrets=False, remove_repo=False)
                     await self.install(spec, write_cloud=False)
                     upgraded.append(app_id)
                 except Exception as e:  # noqa: BLE001
@@ -602,9 +617,11 @@ class Reconciler:
                     # An upgrade is uninstall + install, so a failed install
                     # leaves the app DOWN — not on its previous version, which
                     # is what "the update failed" sounds like it means. Put the
-                    # old one back. Best-effort by necessity: if the previous
-                    # package dir is gone too there is nothing to restore, and
-                    # the error above is already recorded either way.
+                    # old one back. Still re-fetches (see the note above), so
+                    # this is genuinely best-effort: if the network can't
+                    # serve `previous`'s ref either, this also fails — but
+                    # remove_repo=False means the pre-upgrade tree was never
+                    # deleted, so nothing is lost even when both attempts do.
                     if previous is not None and previous.package_dir:
                         try:
                             await self.install(previous, write_cloud=False)
