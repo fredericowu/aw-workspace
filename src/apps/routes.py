@@ -302,6 +302,57 @@ async def _reload_mcp_gateway(runtime: AppRuntime, *,
                     raise
 
 
+async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool) -> dict:
+    """What the gateway itself reports serving, for doctor's ``mcp`` section.
+
+    Before this, ``mcp.apps_contributing_tools`` only listed apps that ship an
+    ``mcp.json`` — a pure presence check that can never fail, so ``doctor``
+    could exit 0 while the gateway itself was unreachable or serving zero
+    tools (confirmed live 2026-08-19: two upstreams were dead and doctor's
+    exit code owed entirely to an unrelated architecture self-check). This
+    calls the gateway's own unauthenticated ``GET /healthz`` — cheap, no
+    admin token needed — and folds unreachable/zero-tools into ``degraded``
+    so it actually counts as a problem.
+
+    Deliberately does NOT try to match individual app slugs against
+    individual upstream names: a gateway upstream is named after the
+    ``mcpServers`` key inside that app's own ``mcp.json``, not the app's
+    slug (see ``aw-mcp-gateway``'s ``config.scan_app_mcp_servers``), and
+    guessing a normalization between the two would just trade one
+    false-green for a different false-red. The two checks here — gateway
+    reachable, and serving >0 tools when apps expect it to — are the
+    unambiguous ones.
+    """
+    if not runtime.is_loaded("mcp-gateway"):
+        return {"reachable": None, "degraded": False,
+                "note": "mcp-gateway app is not installed"}
+    import httpx
+    base_url = runtime.containers.base_url("mcp-gateway")
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{base_url}/healthz")
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception as e:  # noqa: BLE001 — the failure itself IS the finding
+        log.warning("apps: doctor could not reach mcp-gateway /healthz: %s", e)
+        return {"reachable": False, "degraded": True,
+                "note": f"gateway unreachable at {base_url}/healthz: {e}"}
+    tools = payload.get("tools", 0)
+    upstreams = payload.get("local_upstreams") or []
+    degraded = expect_tools and tools == 0
+    return {
+        "reachable": True,
+        "tools": tools,
+        "local_upstreams": upstreams,
+        "degraded": degraded,
+        "note": ("gateway reachable but serving ZERO tools despite apps "
+                  "declaring mcp.json — at least one upstream is dead")
+                 if degraded else
+                 "gateway reachable; compare local_upstreams against apps_contributing_tools "
+                 "for per-app drift (names don't match 1:1 — see docstring)",
+    }
+
+
 def register_apps_routes(app: FastAPI) -> AppRuntime:
     """Wire the plugin runtime + management routes onto ``app``.
 
@@ -831,6 +882,8 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             if os.path.isfile(os.path.join(runtime.get(slug).package_dir, "mcp.json"))
         ) if runtime.loaded_slugs() else []
 
+        mcp_status = await _mcp_gateway_status(runtime, expect_tools=bool(mcp_apps))
+
         host_offers = hostpower.host_grants()
         host_apps = []
         for slug in runtime.loaded_slugs():
@@ -849,7 +902,8 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         unhealthy = [c for c in clis if not c["healthy"]]
         failing_app_checks = [c for c in app_checks if not c["ok"]]
         return {
-            "ok": not unhealthy and not permissions and not failing_app_checks,
+            "ok": (not unhealthy and not permissions and not failing_app_checks
+                   and not mcp_status["degraded"]),
             "app_checks": app_checks,
             "system_clis": {
                 "total": len(clis),
@@ -864,9 +918,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             },
             "mcp": {
                 "apps_contributing_tools": mcp_apps,
-                "note": "compare with the gateway's own upstream list "
-                        "(POST /reload returns it) — an upstream that failed to "
-                        "connect serves zero tools until something reloads it",
+                **mcp_status,
             },
         }
 

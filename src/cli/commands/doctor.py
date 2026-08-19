@@ -44,7 +44,7 @@ def run(args: list[str]) -> int:
     problems += _permissions(report.get("permissions") or [])
     problems += _app_checks(report.get("app_checks") or [])
     _host_power(report.get("host_power") or {})
-    _mcp(report.get("mcp") or {})
+    problems += _mcp(report.get("mcp") or {})
 
     print()
     if problems:
@@ -145,9 +145,23 @@ def _host_power(section: dict) -> None:
         print("  ! this host runs app containers WITHOUT isolation (--privileged)")
 
 
-def _mcp(section: dict) -> None:
+def _mcp(section: dict) -> int:
     apps = section.get("apps_contributing_tools") or []
     print()
     print(f"MCP — {len(apps)} app(s) contributing tools: {', '.join(apps) or '(none)'}")
+    reachable = section.get("reachable")
+    if reachable is None:
+        print("      mcp-gateway app is not installed — nothing to check")
+        return 0
+    if not reachable:
+        print(f"  ✗ gateway unreachable: {section.get('note', '')}")
+        return 1
+    tools = section.get("tools", 0)
+    upstreams = section.get("local_upstreams") or []
+    print(f"      gateway reachable — {tools} tool(s) across {len(upstreams)} upstream(s)")
+    if section.get("degraded"):
+        print(f"  ✗ {section.get('note', 'gateway is serving zero tools')}")
+        return 1
     print("      an upstream the gateway failed to connect to serves zero tools")
     print("      until a reload; the runtime re-checks every 60s")
+    return 0

@@ -228,6 +228,99 @@ def test_doctor_is_ok_when_nothing_is_degraded():
     assert client.get("/api/apps/-/doctor").json()["ok"] is True
 
 
+# ---- mcp section: presence-check was never able to fail -------------------
+#
+# `mcp.apps_contributing_tools` used to be the ENTIRE mcp section: a list of
+# apps that ship an mcp.json, with no check that the gateway actually serves
+# anything for them. Confirmed live 2026-08-19: two gateway upstreams were
+# dead, serving zero tools, and `doctor` exited 1 only because of an
+# unrelated architecture self-check — the mcp section itself could not have
+# failed no matter how broken the gateway was. `_mcp_gateway_status` below
+# is what closes that gap; these tests exercise it directly, the same way
+# `test_reload_mcp_gateway_retries_a_just_created_container_not_ready_yet`
+# exercises `_reload_mcp_gateway` against a fake runtime.
+
+from src.apps import routes as routes_mod  # noqa: E402
+
+
+class _FakeMcpRuntime:
+    """Minimal stand-in exposing exactly what _mcp_gateway_status touches."""
+
+    def is_loaded(self, slug):
+        return slug == "mcp-gateway"
+
+    class containers:
+        @staticmethod
+        def base_url(slug):
+            return "http://fake-gateway:9200"
+
+
+def _fake_async_client(handler):
+    class _FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return _FakeResponse(handler())
+
+    return _FakeAsyncClient
+
+
+def test_mcp_gateway_status_not_installed():
+    class _NoGateway:
+        def is_loaded(self, slug):
+            return False
+
+    status = _async(routes_mod._mcp_gateway_status(_NoGateway(), expect_tools=True))
+    assert status["reachable"] is None
+    assert status["degraded"] is False
+
+
+def test_mcp_gateway_status_unreachable_counts_as_degraded(monkeypatch):
+    class _Boom:
+        def __init__(self, *a, **k):
+            raise ConnectionRefusedError("gateway not listening")
+
+    monkeypatch.setattr("httpx.AsyncClient", _Boom)
+    status = _async(routes_mod._mcp_gateway_status(_FakeMcpRuntime(), expect_tools=True))
+    assert status["reachable"] is False
+    assert status["degraded"] is True
+
+
+def test_mcp_gateway_status_zero_tools_while_apps_expect_them_is_degraded(monkeypatch):
+    monkeypatch.setattr("httpx.AsyncClient",
+                         _fake_async_client(lambda: {"tools": 0, "local_upstreams": []}))
+    status = _async(routes_mod._mcp_gateway_status(_FakeMcpRuntime(), expect_tools=True))
+    assert status["reachable"] is True
+    assert status["degraded"] is True
+
+
+def test_mcp_gateway_status_healthy_is_not_degraded(monkeypatch):
+    monkeypatch.setattr("httpx.AsyncClient",
+                         _fake_async_client(lambda: {"tools": 209, "local_upstreams": ["crispal", "kanban"]}))
+    status = _async(routes_mod._mcp_gateway_status(_FakeMcpRuntime(), expect_tools=True))
+    assert status["reachable"] is True
+    assert status["degraded"] is False
+    assert status["tools"] == 209
+
+
+
 def test_an_explicit_verify_is_the_sole_authority(tmp_path):
     """nvm is a shell function sourced from ~/.nvm/nvm.sh — `which` can never
     find it. A PATH precondition would call it broken forever while the healer
