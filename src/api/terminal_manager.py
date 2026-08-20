@@ -256,13 +256,23 @@ class TerminalSession:
             os.kill(self.pid, signal.SIGTERM)
         except OSError:
             pass
+        # SIGTERM went out microseconds ago, so this WNOHANG almost always
+        # answers "not dead yet" (0). Discarding the pid on that answer is what
+        # leaked every closed terminal: the real SIGCHLD lands a moment later,
+        # _reap_children no longer recognises the pid, and the shell stays
+        # <defunct> for the life of the container — 25 of them by the time this
+        # was found, on 2026-08-20. A pid stops being ours only once waitpid
+        # confirms it is gone; until then keep tracking it, and let the handler
+        # discard it when it collects (or when it gets ECHILD).
         try:
-            os.waitpid(self.pid, os.WNOHANG)
+            reaped, _ = os.waitpid(self.pid, os.WNOHANG)
         except ChildProcessError:
+            _OWN_CHILD_PIDS.discard(self.pid)  # already reaped elsewhere
+        except OSError:
             pass
-        # Whether or not that reaped it, this pid is no longer ours to reap —
-        # leaving it in the set would have the handler poll a dead pid forever.
-        _OWN_CHILD_PIDS.discard(self.pid)
+        else:
+            if reaped:
+                _OWN_CHILD_PIDS.discard(self.pid)
 
 
 class TerminalManager:

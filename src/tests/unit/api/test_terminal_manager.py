@@ -253,3 +253,65 @@ def test_sigchld_handler_does_not_steal_another_component_s_exit_status():
             mgr.remove(session.id)
 
     asyncio.run(run())
+
+
+def _proc_state(pid: int) -> str | None:
+    """State letter from /proc/<pid>/stat, or None once the pid is gone.
+
+    The comm field can contain spaces and parentheses, so split after the last
+    ')' rather than on whitespace.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            raw = fh.read().decode("utf-8", "replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    return raw[raw.rindex(")") + 2].strip() or None
+
+
+@pytest.mark.integration
+def test_closed_terminal_does_not_leak_a_defunct_shell():
+    """Closing a terminal must actually reap its shell.
+
+    ``kill()`` used to ``waitpid(WNOHANG)`` microseconds after sending SIGTERM
+    — which all but always answers "not dead yet" — and then drop the pid from
+    ``_OWN_CHILD_PIDS`` regardless of that answer. The real SIGCHLD landed a
+    moment later, ``_reap_children`` no longer recognised the pid, and the
+    shell stayed ``<defunct>`` for the life of the container. Found 2026-08-20
+    with 25 leaked shells in a workspace up 2.7 days.
+    """
+    import time
+
+    from src.api import terminal_manager as tm
+
+    async def run():
+        # The shell ignores both the SIGHUP from closing the PTY master and the
+        # SIGTERM kill() sends, so it is guaranteed to still be alive when
+        # kill()'s WNOHANG runs — which is exactly the race a shell that is
+        # merely *slow* to exit loses in production. Without it the child
+        # usually dies fast enough to be collected right there and the leak
+        # hides.
+        mgr = TerminalManager()
+        session = mgr.create(name="reap", command="trap '' TERM HUP; sleep 3")
+        pid = session.pid
+        session.start_reader(asyncio.get_running_loop())
+        await asyncio.sleep(0.5)
+        assert pid in tm._OWN_CHILD_PIDS, "PTY child was never registered"
+        assert _proc_state(pid) not in (None, "Z")
+
+        mgr.remove(session.id)  # -> session.kill()
+        assert _proc_state(pid) not in (None, "Z"), "shell died before the race could happen"
+
+        # The shell outlives its `sleep 3`, so poll well past that: the pid must
+        # leave the process table entirely. Stopping at "not a zombie *yet*"
+        # is what let the buggy version pass — at that point it was still
+        # running, not reaped.
+        deadline = time.time() + 20
+        while time.time() < deadline and _proc_state(pid) is not None:
+            await asyncio.sleep(0.2)
+
+        state = _proc_state(pid)
+        assert state is None, f"shell {pid} never reaped (state={state!r})"
+        assert pid not in tm._OWN_CHILD_PIDS, f"pid {pid} still tracked"
+
+    asyncio.run(run())
