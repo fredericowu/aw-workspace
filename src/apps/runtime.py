@@ -585,8 +585,9 @@ class AppRuntime:
                 # stays installed. There's no build step at install time — the
                 # compiled bundle is committed by the app (see aw-app-diff-tool's
                 # .gitignore), so a missing file means a packaging bug in that
-                # app, not a transient state. Found live 2026-08-12 on the
-                # `hello` template app, whose ui/dist is gitignored. Announce
+                # app, not a transient state. Found live 2026-08-12 on App
+                # Template, which shipped a release with no ui/dist at all
+                # (it commits the bundle today). Announce
                 # only what can be served; the rest of the contribution
                 # (windows, nav, settings) is unaffected.
                 if bundle and not self._bundle_exists(app, bundle):

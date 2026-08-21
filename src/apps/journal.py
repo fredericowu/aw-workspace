@@ -21,7 +21,7 @@ class JournalEntry:
     seq: int
     app_id: str
     kind: str  # e.g. "route:mount"
-    target: str  # human-readable target, e.g. "/api/apps/hello"
+    target: str  # human-readable target, e.g. "/api/apps/aw-app-template"
     payload: dict[str, Any] = field(default_factory=dict)
 
 
