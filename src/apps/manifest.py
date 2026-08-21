@@ -538,6 +538,7 @@ class Manifest:
 #: and duplicating its schema here would mean a manifest that this workspace
 #: rejects for a field the platform has since made optional.
 AGENT_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "targets": ("name",),
     "models": ("provider", "model_id"),
     "agent_configs": ("name",),
     "groups": ("name",),

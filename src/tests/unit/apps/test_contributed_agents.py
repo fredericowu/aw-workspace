@@ -37,6 +37,7 @@ def _agents(**kinds):
 
 def test_a_full_declaration_is_accepted():
     m = validate_manifest(_manifest(contributes=_agents(
+        targets=[{"slug": "system-investigations", "name": "System Investigations"}],
         models=[{"slug": "sonnet", "provider": "anthropic",
                  "model_id": "claude-sonnet-5"}],
         agent_configs=[{"slug": "reviewer-cfg", "name": "Reviewer Config"}],
@@ -46,9 +47,16 @@ def test_a_full_declaration_is_accepted():
         agent_flows=[{"slug": "sec-flow", "name": "Security Flow",
                       "enabled": True, "graph": {"nodes": [], "edges": []}}],
     )))
+    assert m.agents["targets"][0]["slug"] == "system-investigations"
     assert m.agents["models"][0]["slug"] == "sonnet"
     assert m.agents["agents"][0]["group_slug"] == "reviewers"
     assert m.agents["agent_flows"][0]["enabled"] is True
+
+
+def test_a_target_needs_a_name():
+    with pytest.raises(ManifestError, match="needs a 'name'"):
+        validate_manifest(_manifest(contributes=_agents(
+            targets=[{"slug": "nameless"}])))
 
 
 def test_an_agent_flow_needs_a_name():
@@ -199,6 +207,7 @@ class FakeRuntime:
 
 
 SPEC = {
+    "targets": [{"slug": "system-investigations", "name": "System Investigations"}],
     "models": [{"slug": "sonnet", "provider": "anthropic", "model_id": "claude-sonnet-5"}],
     "agent_configs": [{"slug": "rev-cfg", "name": "Reviewer Config"}],
     "groups": [{"slug": "reviewers", "name": "Reviewers"}],
@@ -215,19 +224,20 @@ def test_creates_every_declared_object():
     provider = FakeProvider()
     rt = FakeRuntime({"runners": FakeLoaded({}, provider)})
     created = AgentsRegistry().register(rt, "sec", SPEC)
-    assert created == {"models": 1, "agent_configs": 1, "groups": 1,
-                       "agents": 1, "agent_flows": 1}
+    assert created == {"targets": 1, "models": 1, "agent_configs": 1,
+                       "groups": 1, "agents": 1, "agent_flows": 1}
 
 
 def test_the_agent_is_created_after_what_it_references():
     # A wrong order doesn't error — it produces an agent pointing at three
     # slugs that don't exist yet, or a flow whose graph names agents that
-    # aren't there. So the order itself is the assertion.
+    # aren't there. So the order itself is the assertion. ``targets`` has no
+    # such reference in either direction, so it goes first.
     provider = FakeProvider()
     rt = FakeRuntime({"runners": FakeLoaded({}, provider)})
     AgentsRegistry().register(rt, "sec", SPEC)
     assert [kind for kind, _ in provider.order] == [
-        "models", "agent_configs", "groups", "agents", "agent_flows"]
+        "targets", "models", "agent_configs", "groups", "agents", "agent_flows"]
 
 
 def test_an_existing_slug_is_left_untouched():
