@@ -53,9 +53,10 @@ def _write_frontend_app(tmp_path, slug, bundle, ship_bundle):
 
 
 def test_bundle_is_announced_only_when_the_package_ships_it(tmp_path, monkeypatch):
-    """Found live 2026-08-12: the `hello` template app declares
+    """Found live 2026-08-12: the App Template app declares
     ui/dist/template.js, which its repo gitignores and its release never
-    builds — so every dashboard load fetched /api/apps/hello/ui/template.js
+    builds — so every dashboard load fetched
+    /api/apps/aw-app-template/ui/template.js
     and got a 404. The rest of the app's contribution must survive; only the
     unservable URL is withheld."""
     monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
