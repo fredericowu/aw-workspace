@@ -1266,6 +1266,18 @@ class AppRuntime:
         a new capability, since the blast radius is the same: an app's own
         namespaced slice, nothing else's.
 
+        ``$AW_WORKSPACE_ROOT`` mounts ``paths.workspace_root()``
+        (``/opt/aw-workspace``) read-only — the whole tree, not one subtree:
+        ``repos/`` and ``skills/`` and ``.aw-workspace/`` (secrets, the
+        workspace ``.env``, every app's data dir) at once. Deliberately the
+        last resort of this vocabulary, for the one app whose job IS to show
+        the user their own workspace — aw-app-code-server, whose window is a
+        VS Code rooted at it. An app that needs a single subtree keeps
+        declaring the placeholder that names it. Gated behind
+        ``fs:workspace-read`` like the narrower reads above; there is no
+        read-write form, because a writable bind of the workspace root lets a
+        container rewrite core's own source.
+
         ``$AW_WORKSPACE_FOLDERS`` is the general form of ``$AW_WORKSPACE_REPOS``
         and the one that finally drops the repo binding: it expands to one bind
         per **mapped folder** (``src/api/folders.py``) at ``<target>/<name>``,
@@ -1467,6 +1479,32 @@ class AppRuntime:
                 host_path = self._container_host_bind_path(skills)
                 binds[host_path] = {"bind": target, "mode": mode}
                 continue
+            if source == "$AW_WORKSPACE_ROOT":
+                if "fs:workspace-read" not in manifest.permissions:
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_WORKSPACE_ROOT volume requires the "
+                        f"'fs:workspace-read' permission declared in its manifest")
+                if mode != "ro":
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_WORKSPACE_ROOT volume must be read-only")
+                # The widest read this vocabulary grants: the whole workspace
+                # tree, repos/ AND skills/ AND .aw-workspace/ (secrets, the
+                # workspace .env, every app's data dir) in one bind. Only ever
+                # justified for an app whose entire job is to show the user
+                # their own workspace — aw-app-code-server, whose window is a
+                # VS Code rooted at it (Frederico 2026-08-22: "faz o Code
+                # Server abrir por padrão o /opt/aw-workspace"). Anything that
+                # needs one subtree should keep declaring the narrow
+                # placeholder that names it; this one is not a convenience.
+                #
+                # Read-only, like $AW_WORKSPACE_REPOS and $AW_WORKSPACE_SKILLS
+                # — a writable bind of the workspace root would let a
+                # container rewrite core's own source, and there is no
+                # capability in the catalog with that blast radius.
+                root = paths.workspace_root()
+                host_path = self._container_host_bind_path(root)
+                binds[host_path] = {"bind": target, "mode": mode}
+                continue
             if source == "$AW_WORKSPACE_FOLDERS":
                 # The repo-binding escape hatch. Unlike every other placeholder
                 # this one expands to *N* binds — one per folder the user mapped
@@ -1500,6 +1538,20 @@ class AppRuntime:
             if os.path.isabs(source):
                 raise ContainerError(
                     f"app {manifest.id!r} volume source must be package-relative")
+            if source.startswith("$"):
+                # An unrecognised placeholder used to fall through to the
+                # package-relative branch below, where os.path.join happily
+                # produced "<package>/$AW_WHATEVER", mkdir'd it, and mounted
+                # an empty directory. The container then started perfectly
+                # with nothing where its data was supposed to be — the exact
+                # silent-degradation shape this workspace keeps losing days
+                # to. The common way to hit it is an app built against a
+                # placeholder NEWER than the workspace it lands on, which is
+                # precisely when a clear error matters most.
+                raise ContainerError(
+                    f"app {manifest.id!r} declares unknown volume source {source!r} — "
+                    f"this workspace does not support that placeholder "
+                    f"(it may need updating)")
             local_path = os.path.realpath(os.path.join(package_root, source))
             if not (local_path == package_root or local_path.startswith(package_root + os.sep)):
                 raise ContainerError(

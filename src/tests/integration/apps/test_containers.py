@@ -1101,6 +1101,94 @@ def test_runtime_mounts_workspace_skills_read_only(tmp_path, monkeypatch):
     _async(run())
 
 
+def test_runtime_mounts_workspace_root_read_only(tmp_path, monkeypatch):
+    """The whole tree in one bind, for the one app whose window IS the user's
+    workspace: code-server used to root its editor at repos/ only, so half of
+    what the user actually works on (src/, skills/, apps/) was unreachable
+    from the editor that was supposed to show it."""
+    container_root = tmp_path / "workspace"
+    container_root.mkdir()
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(container_root))
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage", "fs:workspace-data", "fs:workspace-read"],
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_WORKSPACE_ROOT", "target": "/opt/aw-workspace", "mode": "ro"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+
+        await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data", "fs:workspace-read"],
+                      signed=True)
+
+        assert fake.run_calls[-1]["volumes"] == {
+            str(container_root.resolve()): {"bind": "/opt/aw-workspace", "mode": "ro"}
+        }
+
+    _async(run())
+
+
+def test_runtime_rejects_writable_workspace_root_mount(tmp_path, monkeypatch):
+    """No capability in the catalog covers a container rewriting core's own
+    source, which is exactly what a read-write bind of the root would allow."""
+    container_root = tmp_path / "workspace"
+    container_root.mkdir()
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(container_root))
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage", "fs:workspace-data", "fs:workspace-read"],
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_WORKSPACE_ROOT", "target": "/opt/aw-workspace", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+        with pytest.raises(Exception):
+            await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data", "fs:workspace-read"],
+                          signed=True)
+
+    _async(run())
+
+
+def test_runtime_rejects_ungated_workspace_root_mount(tmp_path, monkeypatch):
+    """Widest read in the vocabulary — secrets, the workspace .env and every
+    app's data dir — so a manifest claiming no filesystem access must not get
+    it by declaring the placeholder alone."""
+    container_root = tmp_path / "workspace"
+    container_root.mkdir()
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(container_root))
+    pkg = _write_container_app(
+        tmp_path,
+        perms=["containers:manage", "fs:workspace-data"],
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_WORKSPACE_ROOT", "target": "/opt/aw-workspace", "mode": "ro"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+        with pytest.raises(Exception):
+            await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data"],
+                          signed=True)
+
+    _async(run())
+
+
 def test_runtime_rejects_writable_workspace_skills_mount(tmp_path, monkeypatch):
     """The skill corpus is owned by `agent sync`, not by a container."""
     monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "workspace"))

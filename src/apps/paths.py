@@ -120,6 +120,20 @@ def skills_dir() -> str:
     return d
 
 
+def workspace_root() -> str:
+    """The workspace tree's own root — ``/opt/aw-workspace`` by default.
+
+    The parent of ``skills_dir()``/``repos_dir()`` and of the
+    ``.aw-workspace`` state dir, i.e. everything a workspace terminal sees
+    at its cwd. Unlike the two below there is no ``makedirs``: this
+    directory is the checkout itself, so if it's missing something is
+    catastrophically wrong and conjuring an empty one would only hide it.
+    """
+    return os.path.realpath(
+        os.environ.get("AW_WORKSPACE_CONTAINER_DIR", DEFAULT_WORKSPACE_CONTAINER_DIR)
+    )
+
+
 def repos_dir() -> str:
     """Top-level ``repos/`` at the workspace root — where a user/agent working
     from a workspace terminal clones repos for general dev work (the git
