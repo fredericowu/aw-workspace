@@ -47,6 +47,32 @@ class Plugin:
         """
         return None
 
+    async def list_skill_sources(self, ctx: "AppContext") -> dict | None:
+        """Directories of skills this app contributes that ``contributes.skills``
+        cannot describe — optional hook, called right after ``activate``.
+
+        ``contributes.skills`` is copied in once, at activate. That fits skills
+        an app ships in its package, and not at all skills that only exist
+        later: ``aw-autoskill`` writes a new one into tenant storage every
+        night. A plugin that owns such a directory names it here and
+        ``materialize()`` scans it on every sync.
+
+        Return one of:
+
+        * ``{"ok": True, "dirs": ["/abs/path", ...]}`` — authoritative; skills
+          under these dirs are synced in and ones that vanished are deleted.
+        * ``{"ok": False}`` — could not enumerate right now. The last known
+          answer stands and the delete pass is skipped, so a transient failure
+          never wipes a tenant's skills out of every agent mirror.
+        * ``None`` (the default) — this app contributes no such directories.
+
+        The ``ok: False`` state is the whole reason this returns a dict rather
+        than a plain list: sync semantics are an exact mirror, so "I have no
+        skills" and "I could not answer" must not look alike. See
+        ``src/apps/skill_sources.py``.
+        """
+        return None
+
 
 class _Facade:
     """Base for a capability-gated facade.

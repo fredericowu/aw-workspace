@@ -2,13 +2,20 @@
 
 Ported from the ``agentic-workspace`` monolith (``src/libs/skills_sync.py``).
 
-``skills/`` is **generated**, not authored. It has two upstreams:
+``skills/`` is **generated**, not authored. It has three upstreams:
 
 * ``native-skills/`` — the skills this repo owns. Committed; the only skills
   a fresh clone or a brand-new deployment starts with.
 * each installed app's ``contributes.skills`` — copied in by the apps
   framework (``src/apps/skills.py``), each copy carrying a ``.aw-app-id``
   marker naming its owner.
+* each installed app's registered **skill source dirs** — scanned here on
+  every sync, each copy carrying ``.aw-skill-source`` on top of ``.aw-app-id``
+  (``src/apps/skill_sources.py``). This is the half that can hold skills which
+  did not exist at install time: an app declares "also look here" from
+  ``Plugin.list_skill_sources()``, and the directory's *contents* are re-read
+  every sync. ``aw-autoskill`` writing a new skill into tenant storage each
+  night is the case it exists for — a copy-at-activate push can never see one.
 
 Keeping ``skills/`` out of git and generating it is what stops a workspace's
 app roster from leaking into this repo's history — before this split, two
@@ -21,10 +28,13 @@ bind-mount it read-only (``$AW_WORKSPACE_SKILLS``, see
 nothing on the far side — the failure mode being an agent that silently finds
 no skills.
 
-Ownership decides who may delete what. :func:`materialize` manages only the
-native half: an entry carrying ``.aw-app-id`` belongs to its app, which
-registers it on activate and removes it on uninstall. Without that split a
-sync would delete every app's skill the moment it ran.
+Ownership decides who may delete what. :func:`materialize`'s native pass
+manages only the native half: an entry carrying ``.aw-app-id`` belongs to its
+app, which registers it on activate and removes it on uninstall. Without that
+split a sync would delete every app's skill the moment it ran. The sourced
+pass is scoped the same way in the other direction — it only ever touches
+entries carrying ``.aw-skill-source``, so a pushed skill stays the uninstall
+journal's to remove and a native one stays the native pass's.
 
 Sync semantics into the per-CLI mirrors are an **exact mirror**: a file that
 leaves ``skills/`` leaves every target, and directories left empty are pruned.
@@ -42,6 +52,8 @@ from pathlib import Path
 
 from src.apps.paths import DEFAULT_WORKSPACE_CONTAINER_DIR
 from src.apps.skills import OWNER_MARKER
+from src.apps import skill_sources
+from src.apps.skill_sources import SOURCE_MARKER
 
 log = logging.getLogger(__name__)
 
@@ -205,6 +217,110 @@ def _app_owned_entries(merged: Path) -> set[str]:
     }
 
 
+def _sourced_entries(merged: Path) -> dict[str, str]:
+    """``{entry name: owning app id}`` for entries pulled from a source dir.
+
+    Read off :data:`SOURCE_MARKER`, which only entries materialized by
+    :func:`_materialize_app_sources` carry. Entries an app *pushed* via
+    ``contributes.skills`` have ``.aw-app-id`` but not this one, which is
+    exactly what keeps them out of the delete pass below — removing those is
+    the uninstall journal's job, not ours.
+    """
+    if not merged.exists():
+        return {}
+    out: dict[str, str] = {}
+    for entry in merged.iterdir():
+        marker = entry / SOURCE_MARKER
+        if entry.is_dir() and marker.is_file():
+            try:
+                out[entry.name] = marker.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+    return out
+
+
+def _materialize_app_sources(dest: Path, result: SyncResult) -> None:
+    """Pull each registered app source dir into ``skills/``.
+
+    Runs after the native pass and is scoped to entries carrying
+    :data:`SOURCE_MARKER`, so it can neither see nor delete a native skill or
+    an app's pushed one.
+
+    An app absent from the registry has been uninstalled (or never reported),
+    so its entries go — the exact-mirror rule. An app whose hook answered
+    ``ok: False`` never reaches the registry write at all, so its last known
+    dirs are still listed here and its skills survive the outage.
+    """
+    registry = skill_sources.read_registry()
+    existing = _sourced_entries(dest)
+
+    seen: set[str] = set()
+    for app_id, entry in sorted(registry.items()):
+        for raw_dir in entry.get("dirs", []):
+            src_root = Path(raw_dir)
+            if not src_root.is_dir():
+                log.warning("skills_sync: %s lists a missing skill source %s", app_id, src_root)
+                continue
+            for skill_dir in sorted(p for p in src_root.iterdir() if p.is_dir()):
+                if not (skill_dir / "SKILL.md").is_file():
+                    continue
+                name = skill_dir.name
+                owner = existing.get(name)
+                if name in seen or (owner is not None and owner != app_id):
+                    # Same collision rule as the push half: first writer keeps
+                    # the id, the loser is reported rather than silently losing
+                    # its skill to whoever synced last.
+                    log.warning("skills_sync: skill id %r claimed by more than one source; "
+                                "keeping %s", name, owner or "the first")
+                    continue
+                seen.add(name)
+                _copy_source_skill(skill_dir, dest / name, app_id, result)
+
+    for name, app_id in sorted(existing.items()):
+        if name in seen:
+            continue
+        try:
+            shutil.rmtree(dest / name)
+            result.deleted.append(f"{name}/")
+        except OSError as exc:
+            log.warning("skills_sync: failed to delete sourced skill %s: %s", name, exc)
+
+
+def _copy_source_skill(src: Path, dest: Path, app_id: str, result: SyncResult) -> None:
+    """Mirror one skill dir in, then stamp both ownership markers."""
+    dest.mkdir(parents=True, exist_ok=True)
+    src_files = _iter_relative_files(src)
+    for rel in sorted(src_files):
+        src_path, dest_path = src / rel, dest / rel
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        if not dest_path.exists():
+            shutil.copy2(src_path, dest_path)
+            result.added.append(f"{dest.name}/{rel}")
+        elif not _files_equal(src_path, dest_path):
+            shutil.copy2(src_path, dest_path)
+            result.updated.append(f"{dest.name}/{rel}")
+        else:
+            result.unchanged += 1
+
+    for rel in sorted(_iter_relative_files(dest) - src_files):
+        if rel in (OWNER_MARKER, SOURCE_MARKER):
+            continue
+        try:
+            (dest / rel).unlink()
+            result.deleted.append(f"{dest.name}/{rel}")
+        except OSError as exc:
+            log.warning("skills_sync: failed to delete %s: %s", dest / rel, exc)
+
+    # .aw-app-id so every existing owner check (collision detection, the
+    # native delete pass's reserved set) treats this like any app-owned entry;
+    # SOURCE_MARKER on top so _sourced_entries can tell pulled from pushed.
+    try:
+        (dest / OWNER_MARKER).write_text(app_id, encoding="utf-8")
+        (dest / SOURCE_MARKER).write_text(app_id, encoding="utf-8")
+    except OSError as exc:
+        log.warning("skills_sync: could not mark %s as owned by %s: %s", dest, app_id, exc)
+
+
 def materialize(native: Path | None = None, merged: Path | None = None) -> SyncResult:
     """Copy ``native-skills/`` into ``skills/``, leaving app-owned entries alone.
 
@@ -249,6 +365,7 @@ def materialize(native: Path | None = None, merged: Path | None = None) -> SyncR
         except OSError as exc:
             log.warning("skills_sync: failed to delete %s: %s", dest / rel, exc)
 
+    _materialize_app_sources(dest, result)
     _prune_empty_dirs(dest)
     try:
         (dest / GENERATED_MARKER).write_text(_MARKER_TEXT, encoding="utf-8")

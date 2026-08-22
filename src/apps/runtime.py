@@ -42,6 +42,7 @@ from src.apps.manifest import Manifest, load_manifest
 from src.apps.proxy import ContainerReverseProxy
 from src.apps.secret_store import SecretStore
 from src.apps.services import ServiceSupervisor
+from src.apps import skill_sources
 from src.apps import agents as agents_mod
 from src.apps import mcp_template
 from src.apps import repos as repos_mod
@@ -842,6 +843,11 @@ class AppRuntime:
         self._apps[slug] = loaded
         self._render_mcp_template(loaded)
         self._register_skills(loaded)
+        # ...and the pull half: skills that only exist after install, which a
+        # copy-at-activate push cannot see (src/apps/skill_sources.py). Runs
+        # here, where the plugin is live, because `agent sync` also runs from
+        # the CLI with no apps loaded and must reach the same skills/.
+        await skill_sources.refresh(slug, plugin, ctx)
         self._register_tasks(loaded)
         self._register_agents(loaded)
         await self._register_repos(manifest)
@@ -922,6 +928,14 @@ class AppRuntime:
                 self.secret_store.purge(slug)
             except Exception:
                 log.exception("apps: purging secrets for %s failed", slug)
+            # Same "real uninstall, not an upgrade" test: drop the app's
+            # recorded skill sources so the next materialize deletes what they
+            # put in skills/. An upgrade must NOT, or every version bump would
+            # blank the tenant's skills between unload and reload.
+            try:
+                skill_sources.forget(slug)
+            except Exception:
+                log.exception("apps: forgetting skill sources for %s failed", slug)
 
         # An uninstalled app's CLI is gone on purpose — stop the healer from
         # trying to resurrect it (system_cli:revert-hook already ran above).
