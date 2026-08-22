@@ -1078,7 +1078,7 @@ class AppRuntime:
         # mount a checkout that isn't there, and for an app that declares the
         # repo itself this is the step that puts it there.
         await self._register_repos(manifest)
-        volumes = self._container_volumes(manifest, package_dir)
+        volumes = self._container_volumes(manifest, package_dir, granted=granted)
 
         ctx = AppContext(
             runtime=self, app_id=slug, version=manifest.version,
@@ -1108,7 +1108,7 @@ class AppRuntime:
         # Companion containers, before the app's own: aw-app-crispal's MCP
         # dials the WordPress/MySQL pair as soon as it comes up, and starting
         # them after it would make every boot's first tool call fail.
-        self._register_sidecars(manifest, package_dir, config)
+        self._register_sidecars(manifest, package_dir, config, granted)
         try:
             if config.get("auto_start", True):
                 for key in self.containers.sidecar_keys(slug):
@@ -1152,7 +1152,8 @@ class AppRuntime:
         return manifest
 
     def _register_sidecars(self, manifest: Manifest, package_dir: str,
-                           config: dict[str, Any]) -> None:
+                           config: dict[str, Any],
+                           granted: list[str] | None = None) -> None:
         """Register every ``runtime.sidecars`` entry of a Tier-2 app.
 
         Each gets the app's own placeholder vocabulary for volumes and the
@@ -1169,7 +1170,8 @@ class AppRuntime:
         for spec in manifest.sidecars:
             name = str(spec.get("name") or "").strip()
             volumes = self._container_volumes(
-                manifest, package_dir, declared=spec.get("volumes") or [])
+                manifest, package_dir, declared=spec.get("volumes") or [],
+                granted=granted)
             key = self.containers.register_sidecar(
                 slug, name,
                 image=str(spec.get("image") or ""),
@@ -1216,7 +1218,8 @@ class AppRuntime:
         return os.path.realpath(os.path.join(host_root, rel))
 
     def _container_volumes(self, manifest: Manifest, package_dir: str,
-                           declared: list[dict] | None = None) -> dict[str, dict]:
+                           declared: list[dict] | None = None,
+                           granted: list[str] | None = None) -> dict[str, dict]:
         """Resolve package-relative ``runtime.volumes`` into Docker binds.
 
         ``declared`` overrides which list is resolved, so a sidecar
@@ -1267,16 +1270,19 @@ class AppRuntime:
         namespaced slice, nothing else's.
 
         ``$AW_WORKSPACE_ROOT`` mounts ``paths.workspace_root()``
-        (``/opt/aw-workspace``) read-only — the whole tree, not one subtree:
-        ``repos/`` and ``skills/`` and ``.aw-workspace/`` (secrets, the
-        workspace ``.env``, every app's data dir) at once. Deliberately the
-        last resort of this vocabulary, for the one app whose job IS to show
-        the user their own workspace — aw-app-code-server, whose window is a
-        VS Code rooted at it. An app that needs a single subtree keeps
-        declaring the placeholder that names it. Gated behind
-        ``fs:workspace-read`` like the narrower reads above; there is no
-        read-write form, because a writable bind of the workspace root lets a
-        container rewrite core's own source.
+        (``/opt/aw-workspace``) — the whole tree, not one subtree: ``repos/``
+        and ``skills/`` and ``.aw-workspace/`` (secrets, the workspace
+        ``.env``, every app's data dir) at once. Deliberately the last resort
+        of this vocabulary, for the one app whose job IS to BE the user's
+        workspace — aw-app-code-server, whose window is a VS Code rooted at
+        it. An app that needs a single subtree keeps declaring the
+        placeholder that names it. Gated behind ``fs:workspace-read`` like
+        the narrower reads above; mounting it ``rw`` additionally demands
+        ``fs:workspace-write``, a HIGH-risk capability (signed/marketplace
+        apps only), because writing here means rewriting core's own source,
+        another app's data, or the secret store — categorically not the same
+        request as reading, so it takes its own grant rather than riding on
+        the read one.
 
         ``$AW_WORKSPACE_FOLDERS`` is the general form of ``$AW_WORKSPACE_REPOS``
         and the one that finally drops the repo binding: it expands to one bind
@@ -1302,6 +1308,13 @@ class AppRuntime:
         no volume ever provided, so it failed for every skill (see the note at
         the placeholder's handler below).
         """
+        # What the app was actually GRANTED, not merely what it declared.
+        # Every other placeholder below gates on manifest.permissions, which
+        # is declaration-only — fine while the caps involved are low-risk,
+        # but a high-risk one has to survive filter_grants or "high-risk"
+        # means nothing. Callers that cannot supply it fall back to the
+        # declared set, matching the historical behaviour.
+        effective = list(granted) if granted is not None else list(manifest.permissions)
         binds: dict[str, dict] = {}
         package_root = os.path.realpath(package_dir)
         entries = declared if declared is not None else (manifest.runtime.get("volumes") or [])
@@ -1484,23 +1497,32 @@ class AppRuntime:
                     raise ContainerError(
                         f"app {manifest.id!r} $AW_WORKSPACE_ROOT volume requires the "
                         f"'fs:workspace-read' permission declared in its manifest")
-                if mode != "ro":
+                if mode == "rw" and "fs:workspace-write" not in effective:
                     raise ContainerError(
-                        f"app {manifest.id!r} $AW_WORKSPACE_ROOT volume must be read-only")
-                # The widest read this vocabulary grants: the whole workspace
+                        f"app {manifest.id!r} read-write $AW_WORKSPACE_ROOT volume requires "
+                        f"the 'fs:workspace-write' permission declared in its manifest")
+                if mode not in ("ro", "rw"):
+                    raise ContainerError(
+                        f"app {manifest.id!r} $AW_WORKSPACE_ROOT volume mode must be "
+                        f"'ro' or 'rw'")
+                # The widest bind this vocabulary grants: the whole workspace
                 # tree, repos/ AND skills/ AND .aw-workspace/ (secrets, the
-                # workspace .env, every app's data dir) in one bind. Only ever
-                # justified for an app whose entire job is to show the user
-                # their own workspace — aw-app-code-server, whose window is a
-                # VS Code rooted at it (Frederico 2026-08-22: "faz o Code
-                # Server abrir por padrão o /opt/aw-workspace"). Anything that
-                # needs one subtree should keep declaring the narrow
-                # placeholder that names it; this one is not a convenience.
+                # workspace .env, every app's data dir) at once. Only ever
+                # justified for an app whose entire job is to be the user's
+                # workspace — aw-app-code-server, whose window is a VS Code
+                # rooted at it (Frederico 2026-08-22: "faz o Code Server abrir
+                # por padrão o /opt/aw-workspace"). Anything that needs one
+                # subtree should keep declaring the narrow placeholder that
+                # names it; this one is not a convenience.
                 #
-                # Read-only, like $AW_WORKSPACE_REPOS and $AW_WORKSPACE_SKILLS
-                # — a writable bind of the workspace root would let a
-                # container rewrite core's own source, and there is no
-                # capability in the catalog with that blast radius.
+                # ``rw`` takes a SECOND, high-risk capability rather than
+                # riding on fs:workspace-read, because the two are not the
+                # same request at all: read exposes the tree, write lets the
+                # container rewrite core's own source, swap an app's data
+                # under it, or edit the secret store. High-risk also means
+                # signed/marketplace apps only (ADR Decision 4), so a
+                # side-loaded app can never obtain it — deliberate, since
+                # side-loading is how an unreviewed manifest gets in.
                 root = paths.workspace_root()
                 host_path = self._container_host_bind_path(root)
                 binds[host_path] = {"bind": target, "mode": mode}
@@ -1624,7 +1646,9 @@ class AppRuntime:
             if not self._declares_mapped_folders(loaded.manifest):
                 continue
             try:
-                volumes = self._container_volumes(loaded.manifest, loaded.package_dir)
+                volumes = self._container_volumes(
+                    loaded.manifest, loaded.package_dir,
+                    granted=loaded.granted_permissions)
                 # set_volumes + start, NOT register: the app is already
                 # registered and nothing but the bind set is changing.
                 self.containers.set_volumes(slug, volumes)

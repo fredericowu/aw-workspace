@@ -1134,9 +1134,9 @@ def test_runtime_mounts_workspace_root_read_only(tmp_path, monkeypatch):
     _async(run())
 
 
-def test_runtime_rejects_writable_workspace_root_mount(tmp_path, monkeypatch):
-    """No capability in the catalog covers a container rewriting core's own
-    source, which is exactly what a read-write bind of the root would allow."""
+def test_runtime_rejects_writable_workspace_root_without_write_permission(tmp_path, monkeypatch):
+    """Reading the tree and rewriting core's own source are not the same
+    request, so fs:workspace-read alone must not buy the writable bind."""
     container_root = tmp_path / "workspace"
     container_root.mkdir()
     monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(container_root))
@@ -1157,6 +1157,67 @@ def test_runtime_rejects_writable_workspace_root_mount(tmp_path, monkeypatch):
         with pytest.raises(Exception):
             await rt.load(pkg, granted_permissions=["containers:manage", "fs:workspace-data", "fs:workspace-read"],
                           signed=True)
+
+    _async(run())
+
+
+def test_runtime_mounts_workspace_root_read_write_with_permission(tmp_path, monkeypatch):
+    """code-server is meant to be an editor, and an editor that cannot save
+    is half a tool — so the writable bind exists, behind its own grant."""
+    container_root = tmp_path / "workspace"
+    container_root.mkdir()
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(container_root))
+    perms = ["containers:manage", "fs:workspace-data", "fs:workspace-read",
+             "fs:workspace-write"]
+    pkg = _write_container_app(
+        tmp_path,
+        perms=perms,
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_WORKSPACE_ROOT", "target": "/opt/aw-workspace", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+
+        await rt.load(pkg, granted_permissions=perms, signed=True)
+
+        assert fake.run_calls[-1]["volumes"] == {
+            str(container_root.resolve()): {"bind": "/opt/aw-workspace", "mode": "rw"}
+        }
+
+    _async(run())
+
+
+def test_runtime_refuses_workspace_write_to_an_unsigned_app(tmp_path, monkeypatch):
+    """High-risk means signed/marketplace only. Side-loading is exactly how
+    an unreviewed manifest gets in, so the grant is filtered out there and
+    the rw mount must fail rather than quietly downgrade to ro."""
+    container_root = tmp_path / "workspace"
+    container_root.mkdir()
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(container_root))
+    perms = ["containers:manage", "fs:workspace-data", "fs:workspace-read",
+             "fs:workspace-write"]
+    pkg = _write_container_app(
+        tmp_path,
+        perms=perms,
+        runtime_extra={
+            "volumes": [
+                {"source": "$AW_WORKSPACE_ROOT", "target": "/opt/aw-workspace", "mode": "rw"}
+            ]
+        },
+    )
+
+    async def run():
+        fake = _FakeDocker()
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=fake)
+        with pytest.raises(Exception):
+            await rt.load(pkg, granted_permissions=perms, signed=False)
 
     _async(run())
 

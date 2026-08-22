@@ -222,7 +222,13 @@ def _loaded_app(tmp_path, volumes, tier="container"):
         id="kb", tier=tier, runtime={"volumes": volumes, "image": "img", "port": 1},
         permissions=["fs:workspace-data", "containers:manage"],
     )
-    return SimpleNamespace(manifest=manifest, package_dir=str(tmp_path))
+    # granted_permissions, like the real LoadedApp carries: resolving volumes
+    # gates the high-risk fs:workspace-write on what was GRANTED, not on what
+    # the manifest declared, so a stand-in without it no longer stands in.
+    return SimpleNamespace(
+        manifest=manifest, package_dir=str(tmp_path),
+        granted_permissions=list(manifest.permissions),
+    )
 
 
 async def _remap(rt):
