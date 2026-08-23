@@ -53,6 +53,42 @@ log = logging.getLogger(__name__)
 _DOCTOR_CHECK_TIMEOUT_S = 20.0
 
 
+def _autostart_disabled(runtime) -> list[dict]:
+    """Installed apps that will NOT come up with the workspace.
+
+    ``auto_start`` is stored per-workspace, never in code, and turning it off
+    leaves no trace anywhere a human or an agent looks: the app is simply
+    absent after a boot, ``status`` renders it exactly like one that crashed,
+    and the manifest still says ``"default": true`` — so reading the code
+    tells you the opposite of what the workspace will do.
+
+    That cost a day on aw-app-browser (2026-08-23). Its ``auto_start`` had
+    been false for long enough that nobody remembered setting it, so every
+    cookie the aw-sync extension pushed was persisted into a browser that was
+    never started, and the whole sync read as broken code.
+
+    Like ``host_power``'s ``unused``, this is deliberately NOT counted as a
+    failure — switching an app off is a legitimate thing to do. It is
+    reported because it is the one thing about that setting nobody can see
+    otherwise.
+    """
+    out: list[dict] = []
+    for slug in runtime.loaded_slugs():
+        loaded = runtime.get(slug)
+        if loaded is None:
+            continue
+        # Only apps that actually have something to start: the framework adds
+        # auto_start for managed apps, and an in-process app declares its own
+        # when it supervises a service (aw-app-proxy's proxy-server).
+        props = (loaded.manifest.effective_config_schema or {}).get("properties") or {}
+        if "auto_start" not in props:
+            continue
+        if (loaded.config or {}).get("auto_start", True):
+            continue
+        out.append({"app": slug, "tier": loaded.manifest.tier})
+    return out
+
+
 async def _app_doctor_checks(runtime) -> list[dict]:
     """Ask every loaded app the self-checks it declared in ``contributes.doctor``.
 
@@ -879,6 +915,9 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
           high-risk capability silently removes an app's entire frontend, so
           this is the one that reads as "the app is broken").
         * ``mcp`` — apps contributing tools vs upstreams the gateway serves.
+        * ``autostart`` — apps the manifest says start on boot vs apps this
+          workspace's stored config will actually start (see
+          ``_autostart_disabled``).
         * ``host_power`` — what the BYOD host opted into vs what each loaded
           app was actually granted. An app whose grant is empty while its
           manifest asks for one cannot be loaded at all (the load raises), so
@@ -942,6 +981,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         unused = sorted(g for g in host_offers if g not in claimed)
 
         app_checks = await _app_doctor_checks(runtime)
+        autostart_off = _autostart_disabled(runtime)
 
         unhealthy = [c for c in clis if not c["healthy"]]
         failing_app_checks = [c for c in app_checks if not c["ok"]]
@@ -954,6 +994,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 "unhealthy": unhealthy,
             },
             "permissions": permissions,
+            "autostart": autostart_off,
             "host_power": {
                 "host_offers": list(host_offers),
                 "summary": hostpower.describe(host_offers),

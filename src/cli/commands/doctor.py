@@ -43,6 +43,7 @@ def run(args: list[str]) -> int:
     problems += _system_clis(report.get("system_clis") or {})
     problems += _permissions(report.get("permissions") or [])
     problems += _app_checks(report.get("app_checks") or [])
+    _autostart(report.get("autostart") or [])
     _host_power(report.get("host_power") or {})
     problems += _mcp(report.get("mcp") or {})
 
@@ -116,6 +117,26 @@ def _app_checks(rows: list) -> int:
             summary = str(detail)
         print(f"  ✗ {row['app']}: {row['label']} — {summary}")
     return len(bad)
+
+
+def _autostart(rows: list) -> None:
+    """Apps this workspace will not bring up on its own.
+
+    Not counted as a problem — switching an app off is legitimate. It is
+    printed because ``auto_start`` is stored per-workspace and reads nowhere
+    else: after a boot the app is just absent, indistinguishable from one that
+    crashed, while its manifest still says it defaults to on.
+    """
+    print()
+    if not rows:
+        print("Auto-start — every managed app comes up with the workspace")
+        return
+    print(f"Auto-start — {len(rows)} app(s) will NOT start on boot")
+    for row in rows:
+        print(f"  ○ {row['app']:<14} auto_start is off ({row.get('tier', '?')}) "
+              f"— someone has to start it by hand, every time")
+    print("      turn one back on in Apps › <app> › Settings › Auto-start, or")
+    print("      POST /api/apps/<slug>/config {\"config\": {\"auto_start\": true}}")
 
 
 def _host_power(section: dict) -> None:
