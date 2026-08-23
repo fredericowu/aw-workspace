@@ -221,3 +221,23 @@ def test_task_reconcile_never_touches_enabled_across_passes():
 
     assert provider.live["enabled"] is True
     assert provider.live["prompt"] == "v2"
+
+
+def test_a_prompt_file_trailing_newline_is_not_a_divergence(tmp_path):
+    """A one-byte phantom divergence that would disable reconcile app-wide.
+
+    Prompt files end with a newline; the stored value does not. Left in, the
+    very first comparison classifies every system_prompt_file agent as
+    hand-edited — so the app's own corrections are silently never applied,
+    which is the exact failure this whole surface exists to fix.
+    """
+    from src.apps.agents import resolve_file_fields
+
+    pkg = tmp_path / "pkg"
+    (pkg / "prompts").mkdir(parents=True)
+    (pkg / "prompts" / "p.md").write_text("You are an agent.\n")
+
+    out = resolve_file_fields(
+        {"agents": [{"slug": "a", "system_prompt_file": "prompts/p.md"}]}, str(pkg))
+
+    assert out["agents"][0]["system_prompt"] == "You are an agent."

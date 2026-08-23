@@ -318,7 +318,13 @@ def resolve_file_fields(spec: dict[str, Any], package_dir: str) -> dict[str, Any
                     continue
                 try:
                     with open(target, encoding="utf-8") as fh:
-                        entry[field] = fh.read()
+                        # rstrip, because a prompt file ends with a newline and
+                        # the stored value does not. Left in, that one byte
+                        # reads as a permanent divergence to the reconcile pass
+                        # (src/apps/seeded_state.py): the app's own corrections
+                        # would be classified as hand-edits and silently never
+                        # applied, for every app using system_prompt_file.
+                        entry[field] = fh.read().rstrip()
                 except OSError:
                     log.exception("apps: failed to read %s_file %r", field, ref)
     return out
