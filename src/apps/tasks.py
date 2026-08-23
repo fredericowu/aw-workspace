@@ -163,7 +163,7 @@ class TasksRegistry:
                     seeded_state.record(app_id, "tasks", name, dict(spec))
                     log.info("apps: seeded task %r from %s", name, app_id)
                 else:
-                    TaskRegistry._reconcile(provider, app_id, name, dict(spec))
+                    TasksRegistry._reconcile(provider, app_id, name, dict(spec))
             except Exception:  # noqa: BLE001 — a bad seed must not fail activation
                 log.exception("apps: failed to seed task %r from %s", name, app_id)
         return created
@@ -193,9 +193,12 @@ class TasksRegistry:
         if not live:
             return
         changes = seeded_state.updatable_fields(app_id, "tasks", name, spec, live)
-        if not changes:
-            return
-        write(name, changes)
+        if changes:
+            write(name, changes)
+            log.info("apps: reconciled task %r from %s (%s)",
+                     name, app_id, ", ".join(sorted(changes)))
+        # Record even when nothing changed — including the very first pass,
+        # which has no baseline and so can compute no changes at all. Skipping
+        # the write here left the surface permanently unable to start: no
+        # baseline meant no changes, and no changes meant no baseline.
         seeded_state.record(app_id, "tasks", name, spec)
-        log.info("apps: reconciled task %r from %s (%s)",
-                 name, app_id, ", ".join(sorted(changes)))

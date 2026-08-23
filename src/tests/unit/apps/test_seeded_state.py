@@ -123,6 +123,23 @@ def test_recording_again_moves_the_baseline():
     ) == {}
 
 
+def test_the_first_pass_must_record_a_baseline_to_ever_reconcile():
+    """The bootstrap deadlock this surface shipped with, caught on reinstall.
+
+    With no baseline, ``updatable_fields`` correctly returns nothing. If the
+    caller then treats "no changes" as "nothing to do" and skips recording,
+    the baseline is never written — so there are never any changes, so it is
+    never recorded. The surface looks healthy and silently never reconciles.
+    """
+    live = dict(SPEC)
+    assert seeded_state.updatable_fields("app", "tasks", "demo", SPEC, live) == {}
+
+    seeded_state.record("app", "tasks", "demo", SPEC)  # what the caller must do anyway
+
+    assert seeded_state.updatable_fields(
+        "app", "tasks", "demo", {**SPEC, "prompt": "v2"}, live) == {"prompt": "v2"}
+
+
 def test_forget_drops_the_app_entirely():
     seeded_state.record("app", "tasks", "demo", SPEC)
     seeded_state.forget("app")
@@ -150,3 +167,57 @@ def test_a_field_absent_from_live_is_skipped():
         "app", "tasks", "demo", {**SPEC, "command": "echo bye"}, live)
 
     assert changes == {}
+
+
+# --- the caller, where the bootstrap deadlock actually lived ------------------
+
+
+class _FakeTaskProvider:
+    """Minimal stand-in for aw-app-tasks' provider surface."""
+
+    def __init__(self, live):
+        self.live = dict(live)
+        self.writes = []
+
+    def register_contributed_task(self, app_id, spec):
+        return False  # always "already exists" — the reconcile path
+
+    def read_contributed_task(self, name):
+        return dict(self.live) if self.live.get("name") == name else None
+
+    def update_contributed_task(self, name, changes):
+        self.live.update(changes)
+        self.writes.append(dict(changes))
+        return True
+
+
+def test_task_reconcile_records_on_the_first_pass_then_updates():
+    """Two passes, because one is exactly what the shipped bug looked like.
+
+    Pass 1 has no baseline and must still record one. Pass 2 is the first that
+    can compute a change — if pass 1 returned early without recording, this
+    stays empty forever and the whole surface silently never reconciles.
+    """
+    from src.apps.tasks import TasksRegistry
+
+    provider = _FakeTaskProvider(SPEC)
+
+    TasksRegistry._dispatch(provider, "app", [dict(SPEC)])
+    assert provider.writes == []  # nothing to change yet, correctly
+
+    TasksRegistry._dispatch(provider, "app", [{**SPEC, "prompt": "corrected"}])
+
+    assert provider.writes == [{"prompt": "corrected"}]
+    assert provider.live["prompt"] == "corrected"
+
+
+def test_task_reconcile_never_touches_enabled_across_passes():
+    provider = _FakeTaskProvider({**SPEC, "enabled": True})
+
+    from src.apps.tasks import TasksRegistry
+
+    TasksRegistry._dispatch(provider, "app", [dict(SPEC)])
+    TasksRegistry._dispatch(provider, "app", [{**SPEC, "enabled": False, "prompt": "v2"}])
+
+    assert provider.live["enabled"] is True
+    assert provider.live["prompt"] == "v2"
