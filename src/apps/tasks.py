@@ -25,9 +25,14 @@ migrated out of the monolith.
 
 Consequences worth being explicit about, since both are deliberate:
 
-* **Nothing is updated, ever.** Shipping a corrected command in a new app
-  version does *not* reach an existing installation. The app must ship it
-  under a new name, or the user edits theirs.
+* **Content is reconciled; operational state is not.** Shipping a corrected
+  command or prompt in a new app version *does* now reach an existing
+  installation — but only for fields still holding the value we seeded, and
+  never for ``enabled``/``schedules``, which are the user's the moment the
+  task exists (``src/apps/seeded_state.py``). A field the user edited is left
+  alone and logged. Until 2026-08-22 nothing was updated ever, which meant a
+  manifest could read like the source of truth while the live task quietly
+  disagreed — an app had no way to fix its own mistake short of a new name.
 * **Nothing is removed on uninstall.** Unlike ``skills.py``, which reverts
   its copies via the journal, a seeded task belongs to the user the moment
   it exists — deleting one they had enabled and tuned would be the same
@@ -57,6 +62,8 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Protocol, runtime_checkable
+
+from src.apps import seeded_state
 
 log = logging.getLogger(__name__)
 
@@ -153,9 +160,42 @@ class TasksRegistry:
             try:
                 if provider.register_contributed_task(app_id, dict(spec)):
                     created += 1
+                    seeded_state.record(app_id, "tasks", name, dict(spec))
                     log.info("apps: seeded task %r from %s", name, app_id)
                 else:
-                    log.debug("apps: task %r already exists, leaving it alone", name)
+                    TaskRegistry._reconcile(provider, app_id, name, dict(spec))
             except Exception:  # noqa: BLE001 — a bad seed must not fail activation
                 log.exception("apps: failed to seed task %r from %s", name, app_id)
         return created
+
+    @staticmethod
+    def _reconcile(provider, app_id: str, name: str, spec: dict[str, Any]) -> None:
+        """Push the app's corrected *content* onto a task that already exists.
+
+        Only fields the app still owns — untouched since we seeded them, and
+        not ``enabled``/``schedules``, which stay the user's (see
+        ``src/apps/seeded_state.py``). Without this an app could never fix a
+        prompt it shipped wrong: the manifest would say one thing and the
+        running task another, indefinitely.
+
+        Optional on the provider side. A tasks app older than this reads as
+        "no reconcile available" and keeps the previous create-if-absent
+        behaviour rather than failing — the same held/replayed spirit as the
+        rest of this surface.
+        """
+        read = getattr(provider, "read_contributed_task", None)
+        write = getattr(provider, "update_contributed_task", None)
+        if read is None or write is None:
+            log.debug("apps: task provider has no reconcile hooks; %r left alone", name)
+            return
+
+        live = read(name)
+        if not live:
+            return
+        changes = seeded_state.updatable_fields(app_id, "tasks", name, spec, live)
+        if not changes:
+            return
+        write(name, changes)
+        seeded_state.record(app_id, "tasks", name, spec)
+        log.info("apps: reconciled task %r from %s (%s)",
+                 name, app_id, ", ".join(sorted(changes)))

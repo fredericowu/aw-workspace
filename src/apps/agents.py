@@ -58,6 +58,14 @@ rather than duplicated.
 The two consequences are deliberate, and both are the same bet the tasks
 surface makes — that a user's edit outranks an app's default:
 
+* **Content is reconciled since 2026-08-22.** A corrected system prompt in a
+  new app version now reaches an existing installation — but only for fields
+  still holding the value we seeded (``src/apps/seeded_state.py``); anything
+  edited by hand stays the user's and is logged instead. The first pass after
+  this landed adopts whatever is live as the baseline, so a field that had
+  already diverged is treated as hand-edited and never clobbered. What
+  follows was the behaviour before that:
+
 * **Nothing is updated, ever.** A corrected system prompt in a new app
   version does not reach an existing installation. Ship it under a new
   slug, or the user edits theirs. This matters more here than it does for
@@ -107,6 +115,8 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any, Protocol, runtime_checkable
+
+from src.apps import seeded_state
 
 log = logging.getLogger(__name__)
 
@@ -229,7 +239,50 @@ class AgentsRegistry:
             log.info("apps: seeded %s from %s", _fmt(created), app_id)
         else:
             log.debug("apps: %s declared agents, all already existed", app_id)
+        cls._reconcile(provider, app_id, resolved)
         return dict(created)
+
+    @classmethod
+    def _reconcile(cls, provider, app_id: str, resolved: dict[str, Any]) -> None:
+        """Push corrected *content* onto objects that already existed.
+
+        Records what we seeded on the way through, so a first pass after this
+        lands adopts the current state as the baseline rather than declaring
+        everything hand-edited.
+
+        Only fields still holding the value we seeded are written — a prompt
+        the user rewrote in the UI stays theirs. Optional on the provider
+        side: an agents app older than this keeps the previous
+        create-if-absent behaviour instead of failing.
+        """
+        read = getattr(provider, "read_contributed_agent", None)
+        write = getattr(provider, "update_contributed_agent", None)
+
+        for kind in KINDS:
+            for entry in resolved.get(kind, []) or []:
+                slug = str(entry.get("slug") or "").strip()
+                if not slug:
+                    continue
+                key = f"{kind}:{slug}"
+                if read is None or write is None:
+                    seeded_state.record(app_id, "agents", key, dict(entry))
+                    continue
+                try:
+                    live = read(kind, slug)
+                    if not live:
+                        # Not there at all — the create path owns this one, and
+                        # recording now would baseline a row that doesn't exist.
+                        continue
+                    changes = seeded_state.updatable_fields(
+                        app_id, "agents", key, dict(entry), live)
+                    if changes:
+                        write(kind, slug, changes)
+                        log.info("apps: reconciled %s %r from %s (%s)",
+                                 kind, slug, app_id, ", ".join(sorted(changes)))
+                    seeded_state.record(app_id, "agents", key, dict(entry))
+                except Exception:  # noqa: BLE001 — never fail activation
+                    log.exception("apps: failed to reconcile %s %r from %s",
+                                  kind, slug, app_id)
 
 
 # ---- helpers ----------------------------------------------------------------
