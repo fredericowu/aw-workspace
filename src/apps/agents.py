@@ -63,14 +63,10 @@ surface makes — that a user's edit outranks an app's default:
   still holding the value we seeded (``src/apps/seeded_state.py``); anything
   edited by hand stays the user's and is logged instead. The first pass after
   this landed adopts whatever is live as the baseline, so a field that had
-  already diverged is treated as hand-edited and never clobbered. What
-  follows was the behaviour before that:
-
-* **Nothing is updated, ever.** A corrected system prompt in a new app
-  version does not reach an existing installation. Ship it under a new
-  slug, or the user edits theirs. This matters more here than it does for
-  tasks: an agent's prompt is exactly the thing a user tunes for weeks, and
-  an app re-asserting its own copy on every boot would erase that silently.
+  already diverged is treated as hand-edited and never clobbered. This
+  matters more here than it does for tasks: an agent's prompt is exactly the
+  thing a user tunes for weeks, and an app re-asserting its own copy on
+  every boot without this care would erase that silently.
 * **Nothing is removed on uninstall.** An agent that has run — with
   sessions, runs and retro scores hanging off it — belongs to the user the
   moment it exists. Uninstalling the app leaves it there to be deleted
@@ -112,6 +108,7 @@ converges regardless of order, on every boot.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any, Protocol, runtime_checkable
@@ -122,20 +119,30 @@ log = logging.getLogger(__name__)
 
 PROVIDER_METHOD = "register_contributed_agents"
 
-#: The six kinds, in creation order. An agent references a model, a config
-#: and a group by slug; an agent flow references agents by slug — so flows
-#: come last, after everything they can point at exists. ``targets`` has no
-#: dependency on, and no dependent among, the other five (a Run points at a
-#: Target, not an Agent), so it is seeded first — as good a slot as any for
-#: something with no ordering constraint.
-KINDS = ("targets", "models", "agent_configs", "groups", "agents", "agent_flows")
+#: The eight kinds, in creation order. An agent references a model, a config
+#: and a group by slug; a workflow's graph references agents by slug, so it
+#: comes after them; an eval's target_slug can point at either an agent or a
+#: workflow, so it comes after both; an agent flow references agents by
+#: slug too, so it comes last. ``targets`` has no dependency on, and no
+#: dependent among, the other seven (a Run points at a Target, not an
+#: Agent), so it is seeded first — as good a slot as any for something with
+#: no ordering constraint.
+KINDS = ("targets", "models", "agent_configs", "groups", "agents",
+         "workflows", "evals", "agent_flows")
 
 #: ``<field>_file`` sugar: a path relative to the package dir whose contents
 #: become ``<field>``. Long prompts don't belong inside JSON.
 FILE_FIELDS = {
     "agents": ("system_prompt",),
     "groups": ("instructions",),
+    "evals": ("dataset",),
 }
+
+#: ``FILE_FIELDS`` entries whose file content is JSON, not plain text — see
+#: ``resolve_file_fields``: a JSON field is parsed instead of ``rstrip()``-ed,
+#: because for JSON the fingerprint-stability fix a trailing newline needed
+#: is "compare the parsed value", not "trim one byte of the raw text".
+JSON_FILE_FIELDS = frozenset({("evals", "dataset")})
 
 
 @runtime_checkable
@@ -152,8 +159,9 @@ class AgentsRegistry:
     """Runtime-owned dispatcher for the ``contributes.agents`` surface."""
 
     def __init__(self) -> None:
-        # app_id -> (spec, package_dir) that arrived before any provider loaded.
-        self._pending: dict[str, tuple[dict[str, Any], str]] = {}
+        # app_id -> (spec, package_dir, app_version) that arrived before any
+        # provider loaded.
+        self._pending: dict[str, tuple[dict[str, Any], str, str]] = {}
 
     # ---- provider lookup ----------------------------------------------------
 
@@ -170,7 +178,8 @@ class AgentsRegistry:
     # ---- registration -------------------------------------------------------
 
     def register(
-        self, runtime, app_id: str, spec: dict[str, Any], package_dir: str = ""
+        self, runtime, app_id: str, spec: dict[str, Any], package_dir: str = "",
+        app_version: str = "",
     ) -> dict[str, int]:
         """Seed ``app_id``'s declared agents. Returns counts created per kind.
 
@@ -182,13 +191,13 @@ class AgentsRegistry:
             return {}
         provider = self.find_provider(runtime)
         if provider is None:
-            self._pending[app_id] = (dict(spec), package_dir)
+            self._pending[app_id] = (dict(spec), package_dir, app_version)
             log.info(
                 "apps: no agent provider loaded yet, holding %s declaration(s) from %s",
                 _counts(spec), app_id,
             )
             return {}
-        return self._dispatch(provider, app_id, spec, package_dir)
+        return self._dispatch(provider, app_id, spec, package_dir, app_version)
 
     def drain_pending(self, runtime) -> dict[str, int]:
         """Replay declarations held while no provider was loaded."""
@@ -198,8 +207,8 @@ class AgentsRegistry:
         if provider is None:
             return {}
         created: dict[str, int] = {}
-        for app_id, (spec, package_dir) in list(self._pending.items()):
-            _merge(created, self._dispatch(provider, app_id, spec, package_dir))
+        for app_id, (spec, package_dir, app_version) in list(self._pending.items()):
+            _merge(created, self._dispatch(provider, app_id, spec, package_dir, app_version))
             del self._pending[app_id]
         return created
 
@@ -216,10 +225,12 @@ class AgentsRegistry:
         created = self.drain_pending(runtime)
         for slug in runtime.loaded_slugs():
             loaded = runtime.get(slug)
-            spec = getattr(getattr(loaded, "manifest", None), "agents", None) or {}
+            manifest = getattr(loaded, "manifest", None)
+            spec = getattr(manifest, "agents", None) or {}
             if _any_declared(spec):
                 _merge(created, self._dispatch(
-                    provider, slug, spec, getattr(loaded, "package_dir", "") or ""
+                    provider, slug, spec, getattr(loaded, "package_dir", "") or "",
+                    getattr(manifest, "version", "") or "",
                 ))
         return created
 
@@ -227,8 +238,14 @@ class AgentsRegistry:
 
     @classmethod
     def _dispatch(
-        cls, provider, app_id: str, spec: dict[str, Any], package_dir: str
+        cls, provider, app_id: str, spec: dict[str, Any], package_dir: str,
+        app_version: str = "",
     ) -> dict[str, int]:
+        # For the "agents" namespace, seeded_state delegates record/
+        # updatable_fields to whichever provider is current — set on every
+        # dispatch (not just once) since a token pasted into settings, or a
+        # provider swap, must take effect on the very next activation.
+        seeded_state.set_provider(provider)
         resolved = resolve_file_fields(spec, package_dir)
         try:
             created = provider.register_contributed_agents(app_id, resolved) or {}
@@ -239,11 +256,12 @@ class AgentsRegistry:
             log.info("apps: seeded %s from %s", _fmt(created), app_id)
         else:
             log.debug("apps: %s declared agents, all already existed", app_id)
-        cls._reconcile(provider, app_id, resolved)
+        cls._reconcile(provider, app_id, resolved, app_version)
         return dict(created)
 
     @classmethod
-    def _reconcile(cls, provider, app_id: str, resolved: dict[str, Any]) -> None:
+    def _reconcile(cls, provider, app_id: str, resolved: dict[str, Any],
+                   app_version: str = "") -> None:
         """Push corrected *content* onto objects that already existed.
 
         Records what we seeded on the way through, so a first pass after this
@@ -254,6 +272,12 @@ class AgentsRegistry:
         the user rewrote in the UI stays theirs. Optional on the provider
         side: an agents app older than this keeps the previous
         create-if-absent behaviour instead of failing.
+
+        ``app_version`` is this APP's own manifest version (not any single
+        object's) — it only matters for the "agents" namespace, where
+        :func:`seeded_state.record` forwards it on to the tenant-shared
+        table so two workspaces racing to seed the same object can be
+        arbitrated instead of one silently clobbering the other's baseline.
         """
         read = getattr(provider, "read_contributed_agent", None)
         write = getattr(provider, "update_contributed_agent", None)
@@ -265,7 +289,8 @@ class AgentsRegistry:
                     continue
                 key = f"{kind}:{slug}"
                 if read is None or write is None:
-                    seeded_state.record(app_id, "agents", key, dict(entry))
+                    seeded_state.record(app_id, "agents", key, dict(entry),
+                                        app_version=app_version)
                     continue
                 try:
                     live = read(kind, slug)
@@ -279,7 +304,8 @@ class AgentsRegistry:
                         write(kind, slug, changes)
                         log.info("apps: reconciled %s %r from %s (%s)",
                                  kind, slug, app_id, ", ".join(sorted(changes)))
-                    seeded_state.record(app_id, "agents", key, dict(entry))
+                    seeded_state.record(app_id, "agents", key, dict(entry),
+                                        app_version=app_version)
                 except Exception:  # noqa: BLE001 — never fail activation
                     log.exception("apps: failed to reconcile %s %r from %s",
                                   kind, slug, app_id)
@@ -289,7 +315,8 @@ class AgentsRegistry:
 
 
 def resolve_file_fields(spec: dict[str, Any], package_dir: str) -> dict[str, Any]:
-    """Inline ``system_prompt_file`` / ``instructions_file`` from the package.
+    """Inline ``system_prompt_file`` / ``instructions_file`` / ``dataset_file``
+    from the package.
 
     Returns a copy — the manifest's own dict is never mutated, since it is
     re-read on every boot and a resolved copy would be re-resolved. A path
@@ -318,15 +345,32 @@ def resolve_file_fields(spec: dict[str, Any], package_dir: str) -> dict[str, Any
                     continue
                 try:
                     with open(target, encoding="utf-8") as fh:
-                        # rstrip, because a prompt file ends with a newline and
-                        # the stored value does not. Left in, that one byte
-                        # reads as a permanent divergence to the reconcile pass
-                        # (src/apps/seeded_state.py): the app's own corrections
-                        # would be classified as hand-edits and silently never
-                        # applied, for every app using system_prompt_file.
-                        entry[field] = fh.read().rstrip()
+                        raw = fh.read()
                 except OSError:
                     log.exception("apps: failed to read %s_file %r", field, ref)
+                    continue
+                if (kind, field) in JSON_FILE_FIELDS:
+                    # No rstrip here — a JSON field's fingerprint-stability
+                    # problem isn't a trailing newline, it's formatting
+                    # (indentation, key order) that survives round-tripping
+                    # through the platform's own JSON column. Parsing it now
+                    # means seeded_state.fingerprint hashes the PARSED value
+                    # (json.dumps(..., sort_keys=True)), which is stable
+                    # under exactly that kind of noise the way rstrip() is
+                    # stable under one trailing byte.
+                    try:
+                        entry[field] = json.loads(raw)
+                    except json.JSONDecodeError:
+                        log.warning("apps: %s_file %r for %s %r is not valid JSON",
+                                    field, ref, kind, entry.get("slug"))
+                    continue
+                # rstrip, because a prompt file ends with a newline and the
+                # stored value does not. Left in, that one byte reads as a
+                # permanent divergence to the reconcile pass
+                # (src/apps/seeded_state.py): the app's own corrections
+                # would be classified as hand-edits and silently never
+                # applied, for every app using system_prompt_file.
+                entry[field] = raw.rstrip()
     return out
 
 

@@ -24,6 +24,17 @@ def _home(tmp_path, monkeypatch):
     monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / ".aw-workspace"))
 
 
+@pytest.fixture(autouse=True)
+def _reset_provider():
+    """``_provider`` is module-global state — a test that registers one and
+    doesn't clean up would silently change how every OTHER test's "agents"
+    namespace calls behave, including ones in this same file that never
+    mention a provider at all."""
+    seeded_state.set_provider(None)
+    yield
+    seeded_state.set_provider(None)
+
+
 SPEC = {
     "name": "demo",
     "prompt": "original prompt",
@@ -221,6 +232,85 @@ def test_task_reconcile_never_touches_enabled_across_passes():
 
     assert provider.live["enabled"] is True
     assert provider.live["prompt"] == "v2"
+
+
+# --- "agents" namespace delegates to a tenant-scoped provider ---------------
+
+
+class _FakeStateProvider:
+    """Stands in for aw-app-agents-platform-runners' read_state/write_state —
+    a tenant-shared store, not a per-workspace file."""
+
+    def __init__(self):
+        self.store: dict[str, dict] = {}
+        self.writes: list[tuple] = []
+
+    def read_state(self, kind, slug):
+        return self.store.get(f"{kind}:{slug}")
+
+    def write_state(self, app_id, kind, slug, app_version, fingerprints):
+        self.writes.append((app_id, kind, slug, app_version, fingerprints))
+        self.store[f"{kind}:{slug}"] = {
+            "app_id": app_id, "app_version": app_version, "fingerprints": fingerprints,
+        }
+
+
+class _OldProvider:
+    """A provider from before read_state/write_state existed — has neither
+    method, same as agent_provisioner.py before this landed."""
+
+
+def test_agents_namespace_records_remotely_not_locally():
+    provider = _FakeStateProvider()
+    seeded_state.set_provider(provider)
+
+    seeded_state.record("app", "agents", "agents:coder-sonnet", SPEC, app_version="1.0.0")
+
+    assert provider.writes  # went to the provider...
+    assert seeded_state._read() == {}  # ...never touched the local file
+
+
+def test_agents_namespace_reconciles_against_the_remote_baseline():
+    provider = _FakeStateProvider()
+    seeded_state.set_provider(provider)
+
+    seeded_state.record("app", "agents", "agents:coder-sonnet", SPEC, app_version="1.0.0")
+    live = dict(SPEC)
+
+    changes = seeded_state.updatable_fields(
+        "app", "agents", "agents:coder-sonnet", {**SPEC, "prompt": "corrected"}, live)
+
+    assert changes == {"prompt": "corrected"}
+
+
+def test_a_local_baseline_migrates_onto_a_first_seen_provider():
+    """The sharpest trap in the whole card: a workspace upgrading from the
+    local file must not start from an empty remote baseline, or every field
+    it already owned gets reclassified as hand-edited on this very pass."""
+    seeded_state.record("app", "agents", "agents:coder-sonnet", SPEC)  # pre-upgrade: local file
+
+    provider = _FakeStateProvider()
+    seeded_state.set_provider(provider)  # post-upgrade boot: provider now available, remote empty
+    live = dict(SPEC)
+
+    changes = seeded_state.updatable_fields(
+        "app", "agents", "agents:coder-sonnet", {**SPEC, "prompt": "corrected"}, live)
+
+    assert changes == {"prompt": "corrected"}  # not {} — the local baseline was honoured
+
+
+def test_an_old_provider_without_state_methods_falls_back_to_the_local_file():
+    """aw-workspace core can ship this before aw-app-agents-platform-runners
+    does — a provider with neither method must not silently write nowhere."""
+    seeded_state.set_provider(_OldProvider())
+
+    seeded_state.record("app", "agents", "agents:coder-sonnet", SPEC)
+    live = dict(SPEC)
+
+    changes = seeded_state.updatable_fields(
+        "app", "agents", "agents:coder-sonnet", {**SPEC, "prompt": "corrected"}, live)
+
+    assert changes == {"prompt": "corrected"}
 
 
 def test_a_prompt_file_trailing_newline_is_not_a_divergence(tmp_path):

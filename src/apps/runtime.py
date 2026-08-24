@@ -742,7 +742,8 @@ class AppRuntime:
         """
         slug = loaded.manifest.id
         try:
-            self.agents.register(self, slug, loaded.manifest.agents, loaded.package_dir)
+            self.agents.register(self, slug, loaded.manifest.agents, loaded.package_dir,
+                                 loaded.manifest.version)
             plugin = getattr(loaded, "plugin", None)
             if plugin is not None and callable(getattr(plugin, agents_mod.PROVIDER_METHOD, None)):
                 seeded = self.agents.sweep(self)

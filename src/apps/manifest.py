@@ -543,6 +543,8 @@ AGENT_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "agent_configs": ("name",),
     "groups": ("name",),
     "agents": ("name",),
+    "workflows": ("name",),
+    "evals": ("name",),
     "agent_flows": ("name",),
 }
 

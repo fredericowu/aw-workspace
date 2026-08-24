@@ -53,6 +53,31 @@ def test_a_full_declaration_is_accepted():
     assert m.agents["agent_flows"][0]["enabled"] is True
 
 
+def test_a_full_declaration_with_workflows_and_evals_is_accepted():
+    m = validate_manifest(_manifest(contributes=_agents(
+        agents=[{"slug": "sec-reviewer", "name": "Security Reviewer"}],
+        workflows=[{"slug": "wf1", "name": "WF1", "kind": "review",
+                   "graph": {"nodes": [{"id": "a", "agent_slug": "sec-reviewer"}]}}],
+        evals=[{"slug": "ev1", "name": "EV1", "target_kind": "agent",
+               "target_slug": "sec-reviewer", "dataset": [], "metric": "judge_llm"}],
+    )))
+    assert m.agents["workflows"][0]["slug"] == "wf1"
+    assert m.agents["evals"][0]["target_slug"] == "sec-reviewer"
+
+
+def test_a_workflow_needs_a_name():
+    with pytest.raises(ManifestError, match="needs a 'name'"):
+        validate_manifest(_manifest(contributes=_agents(
+            workflows=[{"slug": "wf1", "kind": "review", "graph": {}}])))
+
+
+def test_an_eval_needs_a_name():
+    with pytest.raises(ManifestError, match="needs a 'name'"):
+        validate_manifest(_manifest(contributes=_agents(
+            evals=[{"slug": "ev1", "target_kind": "agent", "target_slug": "x",
+                   "dataset": [], "metric": "judge_llm"}])))
+
+
 def test_a_target_needs_a_name():
     with pytest.raises(ManifestError, match="needs a 'name'"):
         validate_manifest(_manifest(contributes=_agents(
@@ -151,6 +176,29 @@ def test_a_missing_prompt_file_does_not_raise(tmp_path):
     spec = {"agents": [{"slug": "rev", "name": "Rev",
                         "system_prompt_file": "nope.md"}]}
     assert resolve_file_fields(spec, str(tmp_path))["agents"][0].get("system_prompt") is None
+
+
+def test_a_dataset_file_is_parsed_not_rstripped(tmp_path):
+    """dataset is JSON, not text — the fingerprint-stability fix a prompt
+    file needs (rstrip the trailing newline) doesn't apply; the equivalent
+    for JSON is comparing the PARSED value, which survives re-serialization
+    whitespace/ordering noise that rstrip() alone would not."""
+    (tmp_path / "eval.json").write_text('[\n  {"input": "hi", "expected": "hey"}\n]\n')
+    spec = {"evals": [{"slug": "e1", "dataset_file": "eval.json"}]}
+
+    out = resolve_file_fields(spec, str(tmp_path))
+
+    assert out["evals"][0]["dataset"] == [{"input": "hi", "expected": "hey"}]
+    assert "dataset_file" not in out["evals"][0]
+
+
+def test_an_invalid_json_dataset_file_is_dropped_with_a_warning(tmp_path):
+    (tmp_path / "eval.json").write_text("{not json")
+    spec = {"evals": [{"slug": "e1", "dataset_file": "eval.json"}]}
+
+    out = resolve_file_fields(spec, str(tmp_path))
+
+    assert "dataset" not in out["evals"][0]
 
 
 def test_resolution_never_mutates_the_manifest_dict(tmp_path):
@@ -276,6 +324,48 @@ def test_sweep_seeds_apps_that_loaded_before_the_provider():
     assert AgentsRegistry().sweep(rt)["agents"] == 1
 
 
+class FakeStateProvider(FakeProvider):
+    """FakeProvider plus the read/write pair _reconcile uses, plus the
+    tenant-state pair seeded_state delegates to — enough to trace an
+    app's manifest version all the way into a write_state call."""
+
+    def __init__(self, existing=None):
+        super().__init__(existing)
+        self.state: dict[str, dict] = {}
+        self.write_state_calls: list[tuple] = []
+
+    def read_contributed_agent(self, kind, slug):
+        return self.store.get(kind, {}).get(slug)
+
+    def update_contributed_agent(self, kind, slug, changes):
+        self.store[kind][slug].update(changes)
+        return True
+
+    def read_state(self, kind, slug):
+        return self.state.get(f"{kind}:{slug}")
+
+    def write_state(self, app_id, kind, slug, app_version, fingerprints):
+        self.write_state_calls.append((app_id, kind, slug, app_version, fingerprints))
+        self.state[f"{kind}:{slug}"] = {"app_version": app_version, "fingerprints": fingerprints}
+
+
+def test_the_apps_own_manifest_version_reaches_the_tenant_state_write():
+    from src.apps import seeded_state
+
+    provider = FakeStateProvider()
+    manifest = type("M", (), {"agents": SPEC, "version": "2.3.1"})()
+    rt = FakeRuntime({"runners": FakeLoaded({}, provider),
+                      "sec": FakeLoaded(SPEC)})
+    rt._apps["sec"].manifest = manifest
+
+    try:
+        AgentsRegistry().sweep(rt)
+        versions = {call[3] for call in provider.write_state_calls}
+        assert versions == {"2.3.1"}
+    finally:
+        seeded_state.set_provider(None)
+
+
 def test_a_raising_provider_does_not_fail_the_activation():
     class Broken:
         def register_contributed_agents(self, app_id, spec):
@@ -290,3 +380,26 @@ def test_an_empty_declaration_never_reaches_the_provider():
     rt = FakeRuntime({"runners": FakeLoaded({}, provider)})
     assert AgentsRegistry().register(rt, "sec", {"models": [], "agents": []}) == {}
     assert provider.order == []
+
+
+def test_kinds_orders_workflows_and_evals_between_agents_and_flows():
+    # Workflows reference agents by slug (comes after); evals target either
+    # an agent or a workflow by slug (comes after both); agent_flows
+    # reference agents by slug too, so it still goes last.
+    assert KINDS == ("targets", "models", "agent_configs", "groups", "agents",
+                     "workflows", "evals", "agent_flows")
+
+
+def test_a_workflow_and_eval_are_seeded_in_order():
+    spec = {**SPEC,
+            "workflows": [{"slug": "wf1", "name": "WF1", "kind": "review",
+                          "graph": {"nodes": [{"id": "a", "agent_slug": "sec-reviewer"}]}}],
+            "evals": [{"slug": "ev1", "name": "EV1", "target_kind": "agent",
+                      "target_slug": "sec-reviewer", "dataset": [], "metric": "judge_llm"}]}
+    provider = FakeProvider()
+    rt = FakeRuntime({"runners": FakeLoaded({}, provider)})
+    created = AgentsRegistry().register(rt, "sec", spec)
+    assert created["workflows"] == 1
+    assert created["evals"] == 1
+    assert [kind for kind, _ in provider.order] == [
+        "targets", "models", "agent_configs", "groups", "agents", "workflows", "evals", "agent_flows"]
