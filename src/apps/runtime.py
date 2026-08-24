@@ -1115,7 +1115,8 @@ class AppRuntime:
 
         self.containers.register(
             slug, image, port, run_flags=run_flags, resources=resources, env=env,
-            volumes=volumes, host_power=host_power)
+            volumes=volumes, host_power=host_power,
+            publish=rt.get("publish") or [])
         self.journal.record(slug, "container:register", image,
                             {"port": port, "run_flags": run_flags, "resources": resources,
                              "host_power": list(host_power)})

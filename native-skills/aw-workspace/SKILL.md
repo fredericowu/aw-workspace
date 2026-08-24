@@ -48,6 +48,12 @@ aw-workspace-cli update workspace
 aw-workspace-cli update remote-host --token <central-identity-jwt>
 ```
 
+Tier-2 manifests may expose non-HTTP listeners with `runtime.publish` entries
+(`container`, optional `host`, and `protocol` `tcp|udp`). Port ranges such as
+`10000-10100` are expanded one-to-one and limited to 1001 ports. These bindings
+are additional to `runtime.port`, which remains the authenticated HTTP reverse-
+proxy target. Publishing requires `tier=container` and `containers:manage`.
+
 Most of these are ports of the monolith's `./aw` verbs (`status`, `start`,
 `stop`, `restart`, `logs`, `test`) re-pointed at this workspace's own API, so
 muscle memory from `agentic-workspace` carries over. Lifecycle commands take a

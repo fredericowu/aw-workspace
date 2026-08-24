@@ -191,6 +191,22 @@ def test_network_gives_name_based_url():
     assert "ports" not in fake.run_calls[-1]
 
 
+def test_network_can_publish_udp_and_rtp_range():
+    fake = _FakeDocker()
+    sup = ContainerSupervisor(socket="/dev/null", network="aw-remote-host", client=fake)
+    sup.register("phone", "asterisk:test", 9412, publish=[
+        {"container": 5060, "host": 5060, "protocol": "udp"},
+        {"container": "10000-10002", "host": "10000-10002", "protocol": "udp"},
+    ])
+    sup.start("phone")
+    assert fake.run_calls[-1]["ports"] == {
+        "5060/udp": 5060,
+        "10000/udp": 10000,
+        "10001/udp": 10001,
+        "10002/udp": 10002,
+    }
+
+
 def test_network_injects_workspace_host_env():
     """On the shared network, the container must be told how to call BACK into
     the workspace process (e.g. aw-app-browser's Chrome reaching aw-app-proxy) —

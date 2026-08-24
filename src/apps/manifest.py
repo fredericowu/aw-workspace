@@ -815,6 +815,24 @@ def _validate_sidecars(runtime: dict[str, Any], permissions: list[str]) -> None:
             )
 
 
+def _validate_publish(runtime: dict[str, Any], tier: str,
+                      permissions: list[str]) -> None:
+    declared = runtime.get("publish")
+    if declared is None:
+        return
+    if tier != "container" or "containers:manage" not in permissions:
+        raise ManifestError("runtime.publish requires tier=container and containers:manage")
+    if not isinstance(declared, list):
+        raise ManifestError("runtime.publish must be a list")
+    # The container supervisor is the canonical range parser; invoke it here
+    # so malformed or colliding bindings fail at install, before image pull.
+    try:
+        from src.apps.containers import _publish_ports
+        _publish_ports(declared)
+    except Exception as exc:
+        raise ManifestError(f"invalid runtime.publish: {exc}") from exc
+
+
 def validate_manifest(data: dict[str, Any]) -> Manifest:
     """Validate a parsed manifest dict against the v1 schema; return a Manifest.
 
@@ -963,6 +981,7 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
     _validate_contributed_agents(contributes, permissions)
     _validate_contributed_repos(contributes, permissions)
     _validate_sidecars(runtime, permissions)
+    _validate_publish(runtime, tier, permissions)
     _validate_host_power(runtime, tier, permissions)
     _validate_requires_workspace(runtime)
 

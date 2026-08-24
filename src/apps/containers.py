@@ -241,13 +241,53 @@ def _resource_kwargs(resources: dict | None) -> dict:
     return kwargs
 
 
+def _port_range(value: int | str, label: str) -> list[int]:
+    """Expand one port or an inclusive ``start-end`` range."""
+    raw = str(value).strip()
+    if "-" in raw:
+        left, right = raw.split("-", 1)
+    else:
+        left = right = raw
+    try:
+        start, end = int(left), int(right)
+    except ValueError as exc:
+        raise ContainerError(f"{label} must be a port or port range") from exc
+    if not (1 <= start <= end <= 65535):
+        raise ContainerError(f"{label} must be within 1..65535")
+    if end - start > 1000:
+        raise ContainerError(f"{label} range may contain at most 1001 ports")
+    return list(range(start, end + 1))
+
+
+def _publish_ports(publish: list[dict] | None) -> dict[str, int]:
+    """Translate manifest ``runtime.publish`` into docker SDK port bindings."""
+    ports: dict[str, int] = {}
+    occupied: set[tuple[int, str]] = set()
+    for entry in publish or []:
+        protocol = str(entry.get("protocol") or "tcp").lower()
+        if protocol not in {"tcp", "udp"}:
+            raise ContainerError("published port protocol must be tcp or udp")
+        inside = _port_range(entry.get("container"), "container port")
+        outside = _port_range(entry.get("host", entry.get("container")), "host port")
+        if len(inside) != len(outside):
+            raise ContainerError("container and host port ranges must have equal length")
+        for container_port, host_port in zip(inside, outside):
+            binding = (host_port, protocol)
+            if binding in occupied:
+                raise ContainerError(f"duplicate host port {host_port}/{protocol}")
+            occupied.add(binding)
+            ports[f"{container_port}/{protocol}"] = host_port
+    return ports
+
+
 class _Container:
     def __init__(self, app_id: str, image: str, port: int,
                  run_flags: list[str] | None, resources: dict | None,
                  env: dict | None, network: str | None,
                  volumes: dict[str, dict] | None = None,
                  container_name: str | None = None,
-                 host_power: tuple[str, ...] | None = None) -> None:
+                 host_power: tuple[str, ...] | None = None,
+                 publish: list[dict] | None = None) -> None:
         self.app_id = app_id
         self.image = image
         # 0 for a sidecar with nothing to expose — a database is dialled by
@@ -262,6 +302,7 @@ class _Container:
         # opt-in by the caller (src.apps.runtime) — this is the granted set,
         # not the requested one, so nothing here re-decides policy.
         self.host_power = tuple(host_power or ())
+        self.publish = list(publish or [])
         self._name = container_name
         self.container_id: str | None = None
 
@@ -317,7 +358,8 @@ class ContainerSupervisor:
                  env: dict | None = None, autostart: bool = False,
                  volumes: dict[str, dict] | None = None,
                  container_name: str | None = None,
-                 host_power: tuple[str, ...] | None = None) -> None:
+                 host_power: tuple[str, ...] | None = None,
+                 publish: list[dict] | None = None) -> None:
         if app_id in self._containers:
             raise ContainerError(f"container already registered for {app_id!r}")
         if not image:
@@ -333,8 +375,9 @@ class ContainerSupervisor:
         # a typo fails here instead of at start() — or worse, silently, if some
         # later refactor stops passing them to docker at all.
         host_power = hostpower.expand(host_power)
+        _publish_ports(publish)
         c = _Container(app_id, image, port, run_flags, resources, env, self._network,
-                       volumes, container_name, host_power)
+                       volumes, container_name, host_power, publish)
         self._containers[app_id] = c
         log.info("apps: registered container %s (image=%s port=%s network=%s)",
                  c.name, image, port, self._network)
@@ -461,6 +504,9 @@ class ContainerSupervisor:
         kwargs.update(_parse_run_flags(c.run_flags))
         kwargs.update(_resource_kwargs(c.resources))
         kwargs.update(hostpower.docker_kwargs(c.host_power))
+        published = _publish_ports(c.publish)
+        if published:
+            kwargs["ports"] = published
         # This workspace's own slug (AW_WORKSPACE, set by whatever launched
         # this process) — apps that need to namespace something by workspace
         # identity (e.g. aw-mcp-gateway prefixing its published tool names)
@@ -491,7 +537,7 @@ class ContainerSupervisor:
             # this shared network already resolve it by (aardvark-dns), same
             # mechanism as AW_WORKSPACE_HOST above, just the other direction.
             kwargs["environment"]["AW_APP_SELF_HOST"] = c.name
-        elif c.port:
+        elif c.port and not published:
             # No shared network → publish the port so the proxy host can reach it.
             kwargs["ports"] = {f"{c.port}/tcp": c.port}
 
