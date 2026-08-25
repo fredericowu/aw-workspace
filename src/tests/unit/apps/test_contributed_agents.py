@@ -366,6 +366,28 @@ def test_the_apps_own_manifest_version_reaches_the_tenant_state_write():
         seeded_state.set_provider(None)
 
 
+def test_failed_reconcile_does_not_advance_the_remote_baseline():
+    """A transient PATCH failure must remain retryable on the next boot."""
+    from src.apps import seeded_state
+
+    old = {"agents": [{"slug": "phone", "name": "Phone",
+                       "agent_config_slug": None}]}
+    new = {"agents": [{"slug": "phone", "name": "Phone",
+                       "agent_config_slug": "tools"}]}
+    provider = FakeStateProvider(existing={"agents": {"phone": old["agents"][0]}})
+    seeded_state.set_provider(provider)
+    seeded_state.record("call-agent", "agents", "agents:phone",
+                        old["agents"][0], app_version="1.0.0")
+    before = dict(provider.state["agents:phone"])
+    provider.update_contributed_agent = lambda kind, slug, changes: False
+
+    try:
+        AgentsRegistry._reconcile(provider, "call-agent", new, "2.0.0")
+        assert provider.state["agents:phone"] == before
+    finally:
+        seeded_state.set_provider(None)
+
+
 def test_a_raising_provider_does_not_fail_the_activation():
     class Broken:
         def register_contributed_agents(self, app_id, spec):

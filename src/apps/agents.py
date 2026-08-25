@@ -300,12 +300,18 @@ class AgentsRegistry:
                         continue
                     changes = seeded_state.updatable_fields(
                         app_id, "agents", key, dict(entry), live)
+                    updated = True
                     if changes:
-                        write(kind, slug, changes)
-                        log.info("apps: reconciled %s %r from %s (%s)",
-                                 kind, slug, app_id, ", ".join(sorted(changes)))
-                    seeded_state.record(app_id, "agents", key, dict(entry),
-                                        app_version=app_version)
+                        updated = write(kind, slug, changes) is not False
+                        if updated:
+                            log.info("apps: reconciled %s %r from %s (%s)",
+                                     kind, slug, app_id, ", ".join(sorted(changes)))
+                    # Never advance the baseline past a write that failed.
+                    # Doing so makes the desired value look already seeded on
+                    # the next boot and permanently suppresses the retry.
+                    if updated:
+                        seeded_state.record(app_id, "agents", key, dict(entry),
+                                            app_version=app_version)
                 except Exception:  # noqa: BLE001 — never fail activation
                     log.exception("apps: failed to reconcile %s %r from %s",
                                   kind, slug, app_id)

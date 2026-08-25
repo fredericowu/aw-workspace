@@ -180,6 +180,37 @@ def test_a_field_absent_from_live_is_skipped():
     assert changes == {}
 
 
+def test_a_new_manifest_field_fills_an_empty_platform_default():
+    """A later app version may start wiring an optional reference.
+
+    The row is known to be app-seeded because a baseline exists, and ``None``
+    is the platform's untouched default.  This is the Call Agent migration:
+    v0.35 added ``agent_config_slug`` so its existing phone agent gained MCP
+    tools without changing slug or losing conversation continuity.
+    """
+    old = {"slug": "phone", "name": "Phone"}
+    seeded_state.record("app", "tasks", "phone", old)
+    live = {**old, "agent_config_slug": None}
+
+    changes = seeded_state.updatable_fields(
+        "app", "tasks", "phone",
+        {**old, "agent_config_slug": "agent-config-call-agent-tools"}, live)
+
+    assert changes == {"agent_config_slug": "agent-config-call-agent-tools"}
+
+
+def test_a_new_manifest_field_does_not_replace_a_nonempty_live_value():
+    old = {"slug": "phone", "name": "Phone"}
+    seeded_state.record("app", "tasks", "phone", old)
+    live = {**old, "agent_config_slug": "users-own-config"}
+
+    changes = seeded_state.updatable_fields(
+        "app", "tasks", "phone",
+        {**old, "agent_config_slug": "app-default"}, live)
+
+    assert changes == {}
+
+
 # --- the caller, where the bootstrap deadlock actually lived ------------------
 
 

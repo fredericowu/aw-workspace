@@ -231,6 +231,16 @@ def updatable_fields(app_id: str, kind: str, key: str,
             continue
         was = seeded.get(field)
         if was is None:
+            # The app added this field in a newer manifest.  Once a baseline
+            # exists the row is known to be ours, so an empty platform
+            # default is safe to fill in.  Without this branch a newly added
+            # ``agent_config_slug`` (or any future optional field) is skipped
+            # once, then ``record`` advances the baseline and it can never be
+            # reconciled at all.  A non-empty live value still wins: someone
+            # configured the field before the app did, so it is user-owned.
+            live_value = live.get(field)
+            if live_value is None or live_value == "" or live_value == [] or live_value == {}:
+                out[field] = new_value
             continue
         if field not in live:
             continue
