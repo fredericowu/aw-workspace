@@ -551,6 +551,109 @@ def test_uninstall_does_not_reload_gateway_for_a_plain_app(tmp_path, monkeypatch
     assert calls == []
 
 
+# ---- sideloaded package_dir outside the gateway's scan root (2026-08-26) --
+#
+# A sideloaded app's package_dir (POST /api/apps/install {"package_dir": ...},
+# a dev checkout anywhere on disk — e.g. under repos/) is never copied into
+# AW_APPS_ROOT the way a repo= install is (fetch_app_repo always extracts
+# straight into apps_root()/<slug>). The gateway's own scan_app_mcp_servers()
+# only ever walks AW_APP_SCAN_ROOTS == apps_root(), so a sideloaded app that
+# contributes.mcp was loaded, functional, and answering its own /mcp route —
+# yet permanently invisible to the gateway, no matter how many times reload()
+# or the periodic rescan watchdog fired. Confirmed live on aw-windows-pilot.
+#
+# A symlink at apps_root()/<slug> was the first fix attempted and does NOT
+# work against the real deployment: mcp-gateway is its own Tier-2 container
+# whose manifest bind-mounts ONLY $AW_APPS_ROOT (read-only) — a link pointing
+# outside it (e.g. into repos/) is dangling from inside that container, so
+# _ensure_mcp_scan_visible copies the mcp.json bytes instead.
+
+def test_install_copies_a_sideloaded_apps_mcp_json_into_the_gateway_scan_root(
+        tmp_path, monkeypatch):
+    calls = []
+    _patch_reload(monkeypatch, calls)
+
+    # Lives OUTSIDE AW_APPS_ROOT on purpose — e.g. repos/aw-app-widget-mcp,
+    # not fetched by the reconciler at all.
+    package_dir = _make_app_repo(tmp_path, "widget-sideload-mcp",
+                                 reload_mcp_gateway_on_save=True)
+    mcp_json = '{"mcpServers": {"widget-sideload-mcp": {"type": "http", "url": "http://x"}}}'
+    (Path(package_dir) / "mcp.json").write_text(mcp_json)
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    _async(rc.install(AppSpec(app_id="widget-sideload-mcp", package_dir=package_dir)))
+
+    assert len(calls) == 1
+    copied = Path(fetch_mod.package_dir_for("widget-sideload-mcp"))
+    assert not copied.is_symlink()  # a real file, not a link the gateway container can't see
+    assert (copied / "mcp.json").read_text() == mcp_json
+    # The real dev checkout is untouched — only its mcp.json got mirrored.
+    assert not (copied / "aw-app.json").exists()
+    assert (Path(package_dir) / "aw-app.json").is_file()
+
+
+def test_install_does_not_copy_mcp_json_for_a_normal_marketplace_app(tmp_path, monkeypatch):
+    """package_dir already IS apps_root()/<slug> for a repo= install — no
+    separate copy to make, _ensure_mcp_scan_visible must no-op."""
+    calls = []
+    _patch_reload(monkeypatch, calls)
+
+    repo = _make_app_repo(tmp_path, "widget-mcp2", reload_mcp_gateway_on_save=True)
+    (Path(repo) / "mcp.json").write_text('{"mcpServers": {"widget-mcp2": {"type": "http"}}}')
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    _async(rc.install(AppSpec(app_id="widget-mcp2", repo=repo, ref="main")))
+
+    installed = Path(fetch_mod.package_dir_for("widget-mcp2"))
+    assert (installed / "aw-app.json").is_file()  # the real fetched app, not a bare copy
+
+
+def test_install_skips_the_copy_when_mcp_json_needs_its_own_package_dir(
+        tmp_path, monkeypatch):
+    """cwd_app_dir ties a stdio server's cwd (and its relative command/args)
+    to the REAL package_dir — a bare mcp.json copy elsewhere would silently
+    point it at an empty directory, so this must refuse instead."""
+    calls = []
+    _patch_reload(monkeypatch, calls)
+
+    package_dir = _make_app_repo(tmp_path, "widget-sideload-stdio",
+                                 reload_mcp_gateway_on_save=True)
+    (Path(package_dir) / "mcp.json").write_text(
+        '{"mcpServers": {"widget-sideload-stdio": '
+        '{"type": "stdio", "command": "./run.sh", "cwd_app_dir": true}}}')
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    _async(rc.install(AppSpec(app_id="widget-sideload-stdio", package_dir=package_dir)))
+
+    assert len(calls) == 1  # the reload still fires — this is a visibility gap, not an install failure
+    copied = Path(fetch_mod.package_dir_for("widget-sideload-stdio"))
+    assert not copied.exists()
+
+
+def test_uninstall_removes_the_copied_mcp_json_without_touching_the_real_repo(
+        tmp_path, monkeypatch):
+    calls = []
+    _patch_reload(monkeypatch, calls)
+
+    package_dir = _make_app_repo(tmp_path, "widget-sideload-mcp2",
+                                 reload_mcp_gateway_on_save=True)
+    (Path(package_dir) / "mcp.json").write_text(
+        '{"mcpServers": {"widget-sideload-mcp2": {"type": "http", "url": "http://x"}}}')
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+    _async(rc.install(AppSpec(app_id="widget-sideload-mcp2", package_dir=package_dir)))
+    copied = Path(fetch_mod.package_dir_for("widget-sideload-mcp2"))
+    assert copied.is_dir()
+
+    _async(rc.uninstall("widget-sideload-mcp2"))
+
+    assert not copied.exists()
+    assert Path(package_dir).is_dir()  # the real dev checkout survives
+
+
 def test_reconcile_coalesces_many_app_installs_into_one_gateway_reload(
         tmp_path, monkeypatch):
     """Boot reconciles ~20 apps; each /reload re-dials every upstream, so the

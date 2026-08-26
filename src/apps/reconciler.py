@@ -25,8 +25,10 @@ workspace's ``AppInstall`` PG mirror.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import shutil
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -187,6 +189,75 @@ class Reconciler:
             return
         from src.apps.routes import _reload_mcp_gateway
         await _reload_mcp_gateway(self.runtime)
+
+    def _ensure_mcp_scan_visible(self, app_id: str, package_dir: str) -> None:
+        """A sideloaded app's ``package_dir`` (a dev checkout, e.g. under
+        ``repos/`` — see ``POST /api/apps/install``'s ``package_dir`` branch)
+        can sit anywhere on disk. The MCP Gateway's own ``scan_app_mcp_servers()``
+        only ever walks ``AW_APP_SCAN_ROOTS`` (default ``fetch.apps_root()``,
+        i.e. ``/opt/aw-workspace/apps``) — the ONE tree a marketplace install
+        actually lands in, because ``fetch_app_repo`` always extracts straight
+        into ``apps_root()/<slug>``.
+
+        A sideloaded app whose ``package_dir`` is NOT under that root is fully
+        loaded and functional (it answers its own ``/mcp`` route correctly)
+        yet permanently invisible to the gateway — no amount of ``/reload`` or
+        the periodic rescan watchdog helps, because the scan never looks at
+        the directory the app actually lives in. Confirmed live on
+        aw-windows-pilot, 2026-08-26: 21 working tools, 0 seen by the gateway,
+        for as long as the app had been installed.
+
+        A symlink at ``apps_root()/<slug>`` pointing at the real ``package_dir``
+        was the first attempt here and it does NOT work: the mcp-gateway app
+        is Tier-2 (its own container) and its manifest
+        (``aw-mcp-gateway/aw-app.json``) bind-mounts ONLY ``$AW_APPS_ROOT`` —
+        read-only, and nothing else of the host filesystem. A symlink pointing
+        outside that root (e.g. into ``repos/``) is dangling from inside that
+        container's mount namespace; the scan finds the link, tries to read
+        through it, gets nothing, and silently moves on — confirmed live via a
+        direct ``POST /reload`` that came back with ``"added": []``.
+
+        So this COPIES the ``mcp.json`` file's bytes into
+        ``apps_root()/<slug>/mcp.json`` instead — the one artifact the scan
+        actually reads (``config.scan_app_mcp_servers()``), and small enough
+        to refresh cheaply on every install/update. Skipped entirely (with a
+        warning) when any declared server sets ``cwd_app_dir: true`` — that
+        flag makes a stdio server's ``cwd`` (and therefore its relative-path
+        ``command``/``args``) resolve against the REAL package_dir; a bare
+        mcp.json copy would silently point it at an empty directory. That
+        combination needs a real (repo=) install, not this workaround."""
+        dest_dir = fetch_mod.package_dir_for(app_id)
+        if os.path.abspath(dest_dir) == os.path.abspath(package_dir):
+            return  # marketplace install already lives there
+        src = os.path.join(package_dir, "mcp.json")
+        if not os.path.isfile(src):
+            return
+        try:
+            with open(src, encoding="utf-8") as f:
+                spec = json.load(f)
+        except (OSError, ValueError):
+            log.exception("apps: could not read %s to check mcp-gateway scan "
+                          "visibility for %s", src, app_id)
+            return
+        servers = spec.get("mcpServers") if isinstance(spec, dict) else None
+        if isinstance(servers, dict) and any(
+                isinstance(s, dict) and s.get("cwd_app_dir") for s in servers.values()):
+            log.warning(
+                "apps: %s's mcp.json sets cwd_app_dir — a bare copy into %s "
+                "would break its relative paths, and the mcp-gateway "
+                "container cannot see %s directly. This sideloaded app needs "
+                "a real (repo=) install to be visible to the gateway.",
+                app_id, dest_dir, package_dir)
+            return
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+            shutil.copyfile(src, os.path.join(dest_dir, "mcp.json"))
+            log.info("apps: copied %s's mcp.json into %s for mcp-gateway scan "
+                     "visibility (sideloaded package_dir %s is outside the "
+                     "gateway container's mount)", app_id, dest_dir, package_dir)
+        except OSError:
+            log.exception("apps: failed to copy mcp.json for mcp-gateway scan "
+                          "visibility (%s)", app_id)
 
     # ---- resolve a package dir for a spec (fetch unless already on disk) ----
 
@@ -459,6 +530,7 @@ class Reconciler:
         # gets installed/updated afterward. Gated on _app_touches_mcp, NOT
         # on the narrower reload_on_save opt-in (see manifest.contributes_mcp).
         if self._app_touches_mcp(loaded.manifest if loaded else manifest, package_dir):
+            self._ensure_mcp_scan_visible(manifest.id, package_dir)
             await self._trigger_gateway_reload()
 
         return {"app_id": manifest.id, "version": spec.version,
@@ -498,6 +570,11 @@ class Reconciler:
         if self.runtime.is_loaded(app_id):
             await self.runtime.unload(app_id, purge_secrets=purge_secrets)
         self.local.forget(app_id)
+        # _remove (fetch.remove_app_repo) already shutil.rmtree's whatever
+        # sits at apps_root()/<slug> — for a sideloaded app that's the real
+        # mcp.json COPY _ensure_mcp_scan_visible left behind (a real dir, not
+        # a symlink into the original package_dir), so no special-casing is
+        # needed here to clean it up.
         removed_repo = await asyncio.to_thread(self._remove, app_id) if remove_repo else False
         if write_cloud and self.cloud.configured:
             try:
