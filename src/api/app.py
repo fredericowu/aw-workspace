@@ -25,6 +25,7 @@ from src.api.marketplace import register_marketplace_routes
 from src.api.identity import _extract_token, decode_identity_jwt, require_identity
 from src.api.models import Setting
 from src.api.notifications import register_notification_routes
+from src.api.observability import register_observability_routes
 from src.api.terminal import register_terminal_routes
 from src.api.workspace_api_key import (
     get_or_create_workspace_api_key,
@@ -169,6 +170,11 @@ def create_app() -> FastAPI:
     # $AW_WORKSPACE_REPOS placeholder's general replacement. See
     # src/api/folders.py.
     register_folder_routes(app)
+
+    # Observability: where this workspace sends OTLP telemetry (Desligado /
+    # Local auto-detected via aw-app-signoz / Custom endpoint+key). See
+    # src/api/observability.py.
+    register_observability_routes(app)
 
     # Marketplace sources: user-managed list of marketplaces the catalog is
     # merged from, including private ones (per-source credential in the
