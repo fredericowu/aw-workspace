@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import jwt as pyjwt
 import pytest
@@ -51,6 +52,10 @@ def ctx(monkeypatch):
                          lambda app_id: f"https://{app_id}.app.ws.example.com")
     monkeypatch.setattr(observability_mod, "get_or_create_workspace_api_key",
                          lambda: "the-workspace-key")
+    # The push to agents-platform-runners is a real outbound HTTP call — never
+    # let it hit the network from a test. Individual push tests below replace
+    # this with their own mock and assert on it.
+    monkeypatch.setattr(observability_mod, "_notify_agents_platform_runners", AsyncMock())
 
     app = FastAPI()
     app.state.app_runtime = SimpleNamespace(is_loaded=lambda slug: True)
@@ -130,3 +135,20 @@ def test_unknown_mode_is_400(ctx):
     client, _ = ctx
     res = client.put("/api/settings/observability", json={"mode": "bogus"})
     assert res.status_code == 400
+
+
+# --- push to agents-platform-runners on save -----------------------------------
+
+
+def test_successful_save_triggers_the_push(ctx):
+    client, _ = ctx
+    res = client.put("/api/settings/observability", json={"mode": "local"})
+    assert res.status_code == 200
+    observability_mod._notify_agents_platform_runners.assert_awaited_once_with()
+
+
+def test_rejected_save_does_not_trigger_the_push(ctx):
+    client, _ = ctx
+    res = client.put("/api/settings/observability", json={"mode": "bogus"})
+    assert res.status_code == 400
+    observability_mod._notify_agents_platform_runners.assert_not_awaited()

@@ -8,7 +8,9 @@ Postgres in this suite.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from src.api import observability
@@ -150,3 +152,43 @@ def test_update_rejects_an_unknown_mode(monkeypatch):
     _store(monkeypatch)
     with pytest.raises(observability.ObservabilityError, match="mode must be"):
         observability.update("bogus", None, None, _runtime(False))
+
+
+# --- _notify_agents_platform_runners --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_notify_posts_to_the_local_register_observability_route(monkeypatch):
+    monkeypatch.setenv("AW_PORT", "9030")
+    mock_client = AsyncMock()
+    mock_client.post.return_value = httpx.Response(200, json={"pushed": True})
+    mock_client.__aenter__.return_value = mock_client
+
+    with patch("src.api.observability.httpx.AsyncClient", return_value=mock_client):
+        await observability._notify_agents_platform_runners()
+
+    mock_client.post.assert_awaited_once_with(
+        "http://127.0.0.1:9030/api/apps/agents-platform-runners/register-observability",
+        headers={"X-Api-Key": "the-workspace-key"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_notify_swallows_a_connection_failure(monkeypatch):
+    mock_client = AsyncMock()
+    mock_client.post.side_effect = httpx.ConnectError("connection refused")
+    mock_client.__aenter__.return_value = mock_client
+
+    with patch("src.api.observability.httpx.AsyncClient", return_value=mock_client):
+        await observability._notify_agents_platform_runners()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_notify_swallows_an_app_not_installed_404(monkeypatch):
+    request = httpx.Request("POST", "http://127.0.0.1:9030/api/apps/agents-platform-runners/register-observability")
+    mock_client = AsyncMock()
+    mock_client.post.return_value = httpx.Response(404, request=request)
+    mock_client.__aenter__.return_value = mock_client
+
+    with patch("src.api.observability.httpx.AsyncClient", return_value=mock_client):
+        await observability._notify_agents_platform_runners()  # must not raise

@@ -29,13 +29,15 @@ today; documented as the chosen trade-off rather than built as a new hook.
 from __future__ import annotations
 
 import logging
+import os
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException
 
 from src.api.db import get_session
 from src.api.identity import require_identity
 from src.api.models import Setting
-from src.api.workspace_api_key import get_or_create_workspace_api_key
+from src.api.workspace_api_key import HEADER_NAME as API_KEY_HEADER, get_or_create_workspace_api_key
 from src.apps.containers import app_public_url
 
 log = logging.getLogger(__name__)
@@ -177,6 +179,33 @@ def update(mode: str, custom_endpoint: str | None, custom_api_key: str | None,
     return resolve(runtime)
 
 
+# --- push to agents-platform-multitenant --------------------------------------
+
+#: aw-app-agents-platform-runners' manifest id — where the mode change is
+#: pushed to (that app owns the actual AP-MT round trip, see its own
+#: observability_push.py). Best-effort only: this workspace's setting is the
+#: source of truth regardless of whether the push lands.
+RUNNERS_APP_ID = "agents-platform-runners"
+
+
+async def _notify_agents_platform_runners() -> None:
+    """Tell aw-app-agents-platform-runners a mode change just saved, so it can
+    push the new target to agents-platform-multitenant immediately instead of
+    waiting on a poll. Fire-and-forget: any failure (app not installed, AP-MT
+    unreachable, timeout) is logged and swallowed — never raised into the
+    caller, since the settings save already succeeded and is the one thing
+    that must not be undone by this."""
+    port = os.environ.get("AW_PORT", "9030")
+    url = f"http://127.0.0.1:{port}/api/apps/{RUNNERS_APP_ID}/register-observability"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, headers={API_KEY_HEADER: get_or_create_workspace_api_key()})
+        resp.raise_for_status()
+    except Exception:  # noqa: BLE001 — best-effort push, never fails the save
+        log.warning("observability: could not notify %s of the mode change", RUNNERS_APP_ID,
+                    exc_info=True)
+
+
 # --- routes ------------------------------------------------------------------
 
 
@@ -198,7 +227,7 @@ def register_observability_routes(app: FastAPI) -> None:
         runtime = getattr(app.state, "app_runtime", None)
         custom = body.get("custom") or {}
         try:
-            return update(
+            result = update(
                 mode=str(body.get("mode") or ""),
                 custom_endpoint=custom.get("endpoint"),
                 custom_api_key=custom.get("api_key"),
@@ -206,3 +235,5 @@ def register_observability_routes(app: FastAPI) -> None:
             )
         except ObservabilityError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await _notify_agents_platform_runners()
+        return result
