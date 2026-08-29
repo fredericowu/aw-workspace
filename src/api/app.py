@@ -123,24 +123,6 @@ def create_app() -> FastAPI:
         claims = decode_identity_jwt(token) if token else None
         return {"authenticated": bool(claims), "mode": "identity"}
 
-    @app.get("/api/settings/{key}")
-    async def get_setting(key: str, identity: dict = Depends(require_identity)):
-        with get_session() as session:
-            row = session.get(Setting, key)
-            return {"key": key, "value": row.value if row else None}
-
-    @app.put("/api/settings/{key}")
-    async def put_setting(key: str, value: dict, identity: dict = Depends(require_identity)):
-        with get_session() as session:
-            row = session.get(Setting, key)
-            if row is None:
-                row = Setting(key=key, value=value)
-            else:
-                row.value = value
-            session.add(row)
-            session.commit()
-        return {"key": key, "value": value, "schema": get_workspace_schema()}
-
     # Workspace API key (Integrations settings item): a single shared secret
     # other apps/MCPs present as an X-Api-Key header to authenticate into
     # this workspace (see src/api/workspace_api_key.py + IdentityGuard's
@@ -196,5 +178,32 @@ def create_app() -> FastAPI:
     # containers through /api/components and /ws/logs so managed app title-bar
     # controls operate against this workspace backend.
     register_component_routes(app)
+
+    # Generic settings KV, registered LAST: Starlette matches routes in
+    # registration order, not by specificity, so a catch-all `{key}` route
+    # registered earlier than a literal one (e.g. `/workspace-api-key`,
+    # `/observability`) would shadow it forever — every dedicated settings
+    # item above depends on being reachable, so this must come after all of
+    # them. Found 2026-08-29 verified live: `/api/settings/workspace-api-key`
+    # was silently returning `{"key": "workspace-api-key", "value": null}`
+    # (the catch-all's own shape, looked up under the wrong storage key)
+    # instead of the real key, ever since that route was added.
+    @app.get("/api/settings/{key}")
+    async def get_setting(key: str, identity: dict = Depends(require_identity)):
+        with get_session() as session:
+            row = session.get(Setting, key)
+            return {"key": key, "value": row.value if row else None}
+
+    @app.put("/api/settings/{key}")
+    async def put_setting(key: str, value: dict, identity: dict = Depends(require_identity)):
+        with get_session() as session:
+            row = session.get(Setting, key)
+            if row is None:
+                row = Setting(key=key, value=value)
+            else:
+                row.value = value
+            session.add(row)
+            session.commit()
+        return {"key": key, "value": value, "schema": get_workspace_schema()}
 
     return app
