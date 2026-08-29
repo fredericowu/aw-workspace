@@ -20,8 +20,8 @@ same mechanism as the workspace API key and mapped folders — see
 If ``aw-app-signoz`` is uninstalled while mode is ``local``, :func:`resolve`
 downgrades the stored mode to ``off`` and returns a warning instead of
 silently keeping a mode that no longer resolves to anything (Frederico's
-explicit ask: "se o app for desinstalado depois enquanto em modo Local, cair
-pra Desligado e avisar, não falhar silenciosamente"). The downgrade is
+explicit ask: if the app gets uninstalled while in Local mode, fall back to
+Off and warn — never fail silently. The downgrade is
 lazy — it happens the next time the config is read (GET, or the resolver
 used by aw-backend), not via an uninstall hook, since none exists for this
 today; documented as the chosen trade-off rather than built as a new hook.
