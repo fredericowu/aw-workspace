@@ -28,6 +28,7 @@ today; documented as the chosen trade-off rather than built as a new hook.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -187,23 +188,54 @@ def update(mode: str, custom_endpoint: str | None, custom_api_key: str | None,
 #: source of truth regardless of whether the push lands.
 RUNNERS_APP_ID = "agents-platform-runners"
 
+#: A few attempts with a short backoff, all inside this PUT's own request
+#: cycle — NOT the polling watchdog this card removed (no background timer,
+#: no reconnect loop). Worst case (3 attempts, 5s httpx timeout each, backoff
+#: between the first two) stays well under any reasonable request timeout.
+NOTIFY_MAX_ATTEMPTS = 3
+NOTIFY_RETRY_BACKOFF_S = 0.5
 
-async def _notify_agents_platform_runners() -> None:
+
+async def _notify_agents_platform_runners() -> dict:
     """Tell aw-app-agents-platform-runners a mode change just saved, so it can
     push the new target to agents-platform-multitenant immediately instead of
-    waiting on a poll. Fire-and-forget: any failure (app not installed, AP-MT
-    unreachable, timeout) is logged and swallowed — never raised into the
-    caller, since the settings save already succeeded and is the one thing
-    that must not be undone by this."""
+    waiting on a poll. Retries a few times with a short backoff before giving
+    up — never raised into the caller, since the settings save already
+    succeeded and is the one thing that must not be undone by this.
+
+    A 200 from ``/register-observability`` does not mean the push itself
+    landed — that route always returns 200 and reports the outcome in its
+    body (``{"pushed": bool, "reason": str}``, see
+    ``observability_push.push_once``), because the remote leg to AP-MT can
+    fail (AP-MT down, timeout, ``agents_platform_token`` not configured)
+    independently of the local call succeeding. Checking only
+    ``raise_for_status()`` here would treat that failure as success, which is
+    exactly the silent-failure gap this retry exists to close: every failed
+    attempt is logged, and the final outcome is returned so the PUT response
+    can surface it instead of swallowing it."""
     port = os.environ.get("AW_PORT", "9030")
     url = f"http://127.0.0.1:{port}/api/apps/{RUNNERS_APP_ID}/register-observability"
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(url, headers={API_KEY_HEADER: get_or_create_workspace_api_key()})
-        resp.raise_for_status()
-    except Exception:  # noqa: BLE001 — best-effort push, never fails the save
-        log.warning("observability: could not notify %s of the mode change", RUNNERS_APP_ID,
-                    exc_info=True)
+    reason = "unknown error"
+    for attempt in range(1, NOTIFY_MAX_ATTEMPTS + 1):
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(url, headers={API_KEY_HEADER: get_or_create_workspace_api_key()})
+            resp.raise_for_status()
+            body = resp.json()
+            if body.get("pushed"):
+                return {"ok": True, "reason": None}
+            reason = body.get("reason") or "push did not succeed"
+        except Exception as exc:  # noqa: BLE001 — any leg failure is a retry candidate
+            reason = str(exc)
+
+        log.warning("observability: push attempt %d/%d to %s failed: %s",
+                    attempt, NOTIFY_MAX_ATTEMPTS, RUNNERS_APP_ID, reason)
+        if attempt < NOTIFY_MAX_ATTEMPTS:
+            await asyncio.sleep(NOTIFY_RETRY_BACKOFF_S)
+
+    log.error("observability: giving up notifying %s after %d attempts — last error: %s",
+              RUNNERS_APP_ID, NOTIFY_MAX_ATTEMPTS, reason)
+    return {"ok": False, "reason": reason}
 
 
 # --- routes ------------------------------------------------------------------
@@ -235,5 +267,5 @@ def register_observability_routes(app: FastAPI) -> None:
             )
         except ObservabilityError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        await _notify_agents_platform_runners()
-        return result
+        push = await _notify_agents_platform_runners()
+        return {**result, "push": push}

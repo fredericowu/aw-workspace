@@ -55,7 +55,8 @@ def ctx(monkeypatch):
     # The push to agents-platform-runners is a real outbound HTTP call — never
     # let it hit the network from a test. Individual push tests below replace
     # this with their own mock and assert on it.
-    monkeypatch.setattr(observability_mod, "_notify_agents_platform_runners", AsyncMock())
+    monkeypatch.setattr(observability_mod, "_notify_agents_platform_runners",
+                         AsyncMock(return_value={"ok": True, "reason": None}))
 
     app = FastAPI()
     app.state.app_runtime = SimpleNamespace(is_loaded=lambda slug: True)
@@ -152,3 +153,30 @@ def test_rejected_save_does_not_trigger_the_push(ctx):
     res = client.put("/api/settings/observability", json={"mode": "bogus"})
     assert res.status_code == 400
     observability_mod._notify_agents_platform_runners.assert_not_awaited()
+
+
+def test_successful_push_is_reported_in_the_response_body(ctx):
+    client, _ = ctx
+    res = client.put("/api/settings/observability", json={"mode": "local"})
+    assert res.status_code == 200
+    assert res.json()["push"] == {"ok": True, "reason": None}
+
+
+def test_exhausted_push_failure_still_returns_200_and_persists_the_setting(ctx):
+    """The setting must persist even when the push to AP-MT never lands —
+    this is purely additive to the response shape, never a reason to fail
+    the save itself."""
+    client, app = ctx
+    observability_mod._notify_agents_platform_runners.return_value = {
+        "ok": False, "reason": "agents-platform-multitenant unreachable",
+    }
+
+    res = client.put("/api/settings/observability", json={"mode": "local"})
+
+    assert res.status_code == 200
+    assert res.json()["mode"] == "local"
+    assert res.json()["push"] == {"ok": False, "reason": "agents-platform-multitenant unreachable"}
+
+    # The setting itself is not undone by a push failure.
+    got = client.get("/api/settings/observability")
+    assert got.json()["mode"] == "local"
