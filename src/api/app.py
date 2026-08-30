@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import Headers
 
 from src.api.db import create_all_tables, get_session, get_workspace_schema
 from src.api.components import register_component_routes
@@ -61,6 +62,45 @@ def _spa_origin_regex() -> str:
     return rf"^(?:{spa}|{extensions})$"
 
 
+def _is_app_mount_host(host: str) -> bool:
+    """True for a Tier-2 container app's own hostname (``<app_id>.app.<anything>``,
+    e.g. ``signoz.app.aw.workspace.aw.tekflox.com``) — the same shape
+    ``src/apps/runtime.py``'s ``_attach_mount`` mounts a ``Host(f"{app_id}.app.
+    {{_:str}}"...)`` route for."""
+    return ".app." in f"{host}."
+
+
+class _ScopedCORSMiddleware(CORSMiddleware):
+    """Starlette's ``CORSMiddleware``, skipped entirely for an app-mount host.
+
+    A Tier-2 container app (e.g. SigNoz) is reverse-proxied byte-for-byte
+    (``src/apps/proxy.py``) and owns its own CORS policy end-to-end — some
+    set a blanket ``Access-Control-Allow-Origin: *`` on every response.
+    ``CORSMiddleware.send()`` stamps ``Access-Control-Allow-Credentials:
+    true`` onto ANY response that carries an ``Origin`` header, regardless
+    of whether that origin actually matched ``allow_origin_regex`` (it only
+    gates whether to ALSO reflect an explicit ``Access-Control-Allow-
+    Origin`` — see ``send()`` in Starlette's ``cors.py``). Left unscoped,
+    that turns into ``Access-Control-Allow-Origin: *`` (the app's own,
+    forwarded verbatim) plus ``Access-Control-Allow-Credentials: true``
+    (stamped by this middleware for an origin it was never asked to allow)
+    on every credentialed request to an app's own hostname — a combination
+    the Fetch/CORS spec forbids and a spec-compliant browser refuses to use
+    (confirmed live against aw-app-signoz, 2026-08-30: this is what turned
+    a genuinely valid login session into an unusable one). This middleware
+    exists only for the SPA<->API pair (``_spa_origin_regex``); an app-mount
+    host was never in scope for it, so skip straight to the wrapped app and
+    leave the app's own CORS headers untouched."""
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http":
+            host = Headers(scope=scope).get("host", "").split(":", 1)[0]
+            if _is_app_mount_host(host):
+                await self.app(scope, receive, send)
+                return
+        await super().__call__(scope, receive, send)
+
+
 def create_app() -> FastAPI:
     create_all_tables()
 
@@ -98,7 +138,7 @@ def create_app() -> FastAPI:
     # preflight (OPTIONS) succeeds. allow_credentials forbids a "*" origin,
     # hence the per-workspace regex.
     app.add_middleware(
-        CORSMiddleware,
+        _ScopedCORSMiddleware,
         allow_origin_regex=_spa_origin_regex(),
         allow_credentials=True,
         allow_methods=["*"],
