@@ -149,6 +149,48 @@ def test_an_app_declaring_no_agents_has_an_empty_dict():
     assert validate_manifest(_manifest()).agents == {}
 
 
+# --- mcp_servers by reference ------------------------------------------------
+#
+# The rule being enforced is "a manifest may not carry a credential", not
+# "strings only": an app may also name one of the gateway's own scoped
+# profiles, because a profile NAME is not a secret.
+
+
+def _cfg_with(refs):
+    return _manifest(contributes=_agents(
+        agent_configs=[{"slug": "cfg-a", "name": "C", "mcp_servers": refs}]))
+
+
+def test_a_plain_server_name_is_accepted():
+    m = validate_manifest(_cfg_with(["aw-gateway"]))
+    assert m.agents["agent_configs"][0]["mcp_servers"] == ["aw-gateway"]
+
+
+def test_a_scoped_profile_reference_is_accepted():
+    refs = [{"name": "crispal", "server": "aw-gateway", "profile": "crispal-full"}]
+    m = validate_manifest(_cfg_with(refs))
+    assert m.agents["agent_configs"][0]["mcp_servers"] == refs
+
+
+def test_a_reference_may_not_inline_a_url():
+    # The whole point of the indirection: the connection is resolved locally.
+    with pytest.raises(ManifestError, match="cannot inline a URL or a credential"):
+        validate_manifest(_cfg_with([{"name": "x", "url": "http://gw:9200/mcp"}]))
+
+
+def test_a_reference_may_not_inline_headers():
+    with pytest.raises(ManifestError, match="cannot inline a URL or a credential"):
+        validate_manifest(_cfg_with(
+            [{"name": "x", "headers": {"Authorization": "Bearer nope"}}]))
+
+
+def test_a_blank_or_non_string_reference_is_rejected():
+    for refs in ([""], [None], [7], "aw-gateway", [["aw-gateway"]],
+                 [{"name": "x", "profile": ""}]):
+        with pytest.raises(ManifestError, match="mcp_servers"):
+            validate_manifest(_cfg_with(refs))
+
+
 # --- file-backed prompts -----------------------------------------------------
 
 

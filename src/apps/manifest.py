@@ -594,23 +594,60 @@ def _validate_contributed_agents(
                     raise ManifestError(
                         f"contributes.agents.{kind}[{slug!r}] needs a {required!r}"
                     )
-            # ``mcp_servers`` names MCP servers by reference — the provider
-            # resolves each name against the workspace's own .mcp.json at seed
-            # time. It exists so a manifest never has to carry the gateway's
-            # bearer token, so the one thing to enforce is that it stays a
-            # list of names: anything richer is someone starting to inline the
-            # credential this indirection exists to keep out of a public
-            # artefact.
-            refs = entry.get("mcp_servers")
-            if refs is not None:
-                if not isinstance(refs, list) or not all(
-                    isinstance(n, str) and n.strip() for n in refs
-                ):
-                    raise ManifestError(
-                        f"contributes.agents.{kind}[{slug!r}].mcp_servers must be "
-                        "a list of MCP server names (the provider resolves each "
-                        "name locally — credentials must not appear in a manifest)"
-                    )
+            _validate_mcp_references(kind, slug, entry.get("mcp_servers"))
+
+
+#: The only keys a dict-form ``mcp_servers`` entry may carry. Everything a
+#: connection actually needs to authenticate — ``url``, ``headers``, a token —
+#: is deliberately absent: that is the whole point of the indirection.
+MCP_REFERENCE_KEYS = frozenset({"name", "server", "profile"})
+
+
+def _validate_mcp_references(kind: str, slug: str, refs: Any) -> None:
+    """``mcp_servers`` names MCP servers by reference.
+
+    The provider resolves each reference against the workspace's own
+    ``.mcp.json`` at seed time, so a manifest never has to carry the
+    gateway's bearer token. Two forms are accepted:
+
+    * ``"aw-gateway"`` — a server named in ``.mcp.json``, whole.
+    * ``{"name": ..., "server": ..., "profile": ...}`` — the same server
+      narrowed to one of the gateway's own scoped profiles, stored locally
+      under ``name``. A profile NAME is not a credential (it is already
+      visible in the gateway's Settings UI), so this stays inside the rule.
+
+    What is enforced is therefore not "strings only" but the thing that
+    rule was protecting: no key that could inline a credential. Anything
+    richer is someone starting to paste the secret this indirection exists
+    to keep out of a public artefact.
+    """
+    if refs is None:
+        return
+    bad = (
+        f"contributes.agents.{kind}[{slug!r}].mcp_servers must be a list of "
+        "MCP server names, or {'name','server','profile'} objects naming a "
+        "scoped profile (the provider resolves each reference locally — "
+        "credentials must not appear in a manifest)"
+    )
+    if not isinstance(refs, list):
+        raise ManifestError(bad)
+    for ref in refs:
+        if isinstance(ref, str):
+            if not ref.strip():
+                raise ManifestError(bad)
+            continue
+        if not isinstance(ref, dict):
+            raise ManifestError(bad)
+        extra = set(ref) - MCP_REFERENCE_KEYS
+        if extra:
+            raise ManifestError(
+                f"contributes.agents.{kind}[{slug!r}].mcp_servers carries "
+                f"{sorted(extra)!r}, which a reference may not: only "
+                f"{sorted(MCP_REFERENCE_KEYS)!r} are allowed, so a manifest "
+                "cannot inline a URL or a credential"
+            )
+        if not all(isinstance(v, str) and v.strip() for v in ref.values()):
+            raise ManifestError(bad)
 
 
 def _validate_contributed_repos(
