@@ -1096,8 +1096,9 @@ async def reconcile_on_boot(app: FastAPI) -> None:
     except asyncio.TimeoutError:
         log.error(
             "apps: boot reconcile exceeded %ss — giving up for this boot; "
-            "apps may be partially converged and will retry on the next "
-            "reconcile (redeploy, watchdog, or a manual /api/apps/reconcile)",
+            "apps may be partially converged. There is no periodic reconcile "
+            "watchdog today — convergence only resumes on the next restart "
+            "or a manual POST /api/apps/reconcile",
             _BOOT_RECONCILE_TIMEOUT,
         )
     except Exception:
