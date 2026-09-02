@@ -83,7 +83,9 @@ def test_missing_source_is_a_skip_not_a_crash(tmp_path, monkeypatch):
 def test_list_skills_reads_frontmatter(workspace):
     assert skills_sync.list_skills() == [
         {"name": "aw-demo", "description": "A demo skill",
-         "path": str(workspace / "skills" / "aw-demo" / "SKILL.md")},
+         "path": str(workspace / "skills" / "aw-demo" / "SKILL.md"),
+         "rel_path": "skills/aw-demo/SKILL.md",
+         "editable": True, "owner": None},
     ]
 
 
@@ -157,6 +159,77 @@ def test_materialize_is_idempotent(two_source_workspace):
     result = skills_sync.materialize()
 
     assert not result.changed
+
+
+def test_list_skills_marks_app_owned_entries_read_only(two_source_workspace):
+    skills_sync.sync_all()
+
+    by_name = {s["name"]: s for s in skills_sync.list_skills()}
+    assert by_name["aw-native"]["editable"] is True
+    assert by_name["aw-native"]["owner"] is None
+    assert by_name["aw-from-app"]["editable"] is False
+    assert by_name["aw-from-app"]["owner"] == "some-app"
+
+
+# --- create_skill / delete_skill (Settings > Skills CRUD) --------------------
+#
+# Both operate on native-skills/, never on the generated skills/ merge — a
+# skill written straight into skills/ with no native-skills/ backing would be
+# deleted as stale on the very next materialize() (see its docstring).
+
+
+def test_create_skill_writes_to_native_skills_not_the_merged_tree(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path))
+
+    path = skills_sync.create_skill("aw-new-thing", "Does a new thing.")
+
+    assert path == tmp_path / "native-skills" / "aw-new-thing" / "SKILL.md"
+    assert path.is_file()
+    assert "name: aw-new-thing" in path.read_text()
+    assert "description: Does a new thing." in path.read_text()
+    assert not (tmp_path / "skills" / "aw-new-thing").exists()
+
+
+def test_create_skill_rejects_invalid_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path))
+
+    with pytest.raises(ValueError):
+        skills_sync.create_skill("Not Valid!")
+
+
+def test_create_skill_rejects_collision_with_existing_native(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path))
+    skills_sync.create_skill("aw-dup")
+
+    with pytest.raises(ValueError):
+        skills_sync.create_skill("aw-dup")
+
+
+def test_create_skill_rejects_collision_with_app_owned(two_source_workspace):
+    with pytest.raises(ValueError):
+        skills_sync.create_skill("aw-from-app")
+
+
+def test_delete_skill_removes_the_native_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path))
+    skills_sync.create_skill("aw-temp")
+
+    assert skills_sync.delete_skill("aw-temp") is True
+    assert not (tmp_path / "native-skills" / "aw-temp").exists()
+
+
+def test_delete_skill_returns_false_for_an_unknown_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path))
+
+    assert skills_sync.delete_skill("does-not-exist") is False
+
+
+def test_delete_skill_refuses_an_app_owned_entry(two_source_workspace):
+    skills_sync.sync_all()
+
+    with pytest.raises(ValueError):
+        skills_sync.delete_skill("aw-from-app")
+    assert (two_source_workspace / "skills" / "aw-from-app").exists()
 
 
 # --- AGENTS.md ---------------------------------------------------------------

@@ -27,6 +27,7 @@ from src.api.identity import _extract_token, decode_identity_jwt, require_identi
 from src.api.models import Setting
 from src.api.notifications import register_notification_routes
 from src.api.observability import register_observability_routes
+from src.api.skills_routes import register_skills_routes
 from src.api.terminal import register_terminal_routes
 from src.api.workspace_api_key import (
     get_or_create_workspace_api_key,
@@ -234,6 +235,10 @@ def create_app() -> FastAPI:
     # so the SPA can re-run the fan-out without a terminal. See
     # src/api/agent_routes.py.
     register_agent_routes(app)
+
+    # Settings > General > Skills: list/create/delete native skills and open
+    # one in code-server. See src/api/skills_routes.py.
+    register_skills_routes(app)
 
     # Decoupled-apps framework (F1): plugin runtime + /api/apps management.
     # Tier-1 apps hot-load into THIS process — no restart. Installed apps are
