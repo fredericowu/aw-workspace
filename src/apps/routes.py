@@ -1070,18 +1070,36 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
     return runtime
 
 
+# Overall cap on the boot reconcile pass (src/api/app.py runs this in the
+# background, but a hung GitHub fetch — reconciler.reconcile() walks every
+# configured app serially, each fetch (src/apps/fetch.py) carrying its own
+# 60s httpx timeout x 3 retries — could otherwise stall app convergence
+# indefinitely; see bug 3cf5bf3b-9510-8149-be2d-db20915f6872).
+_BOOT_RECONCILE_TIMEOUT = 300.0
+
+
 async def reconcile_on_boot(app: FastAPI) -> None:
     """Reconcile to the cloud registry on startup (ADR Decision 5).
 
     This is what makes a recreated/fresh workspace auto-reinstall the user's
     apps: an empty loaded-set + a populated registry → the reconciler fetches +
     hot-loads each app. Falls back to the local mirror when the cloud isn't
-    configured/reachable. Best-effort — never blocks boot.
+    configured/reachable. Best-effort — never blocks boot: the caller runs
+    this in the background (see src/api/app.py's lifespan), and this function
+    itself bounds the reconcile pass with an overall timeout so a stalled
+    network path can't run forever either.
     """
     reconciler: Reconciler = app.state.app_reconciler
     try:
-        result = await reconciler.reconcile()
+        result = await asyncio.wait_for(reconciler.reconcile(), timeout=_BOOT_RECONCILE_TIMEOUT)
         log.info("apps: boot reconcile — %s", result)
+    except asyncio.TimeoutError:
+        log.error(
+            "apps: boot reconcile exceeded %ss — giving up for this boot; "
+            "apps may be partially converged and will retry on the next "
+            "reconcile (redeploy, watchdog, or a manual /api/apps/reconcile)",
+            _BOOT_RECONCILE_TIMEOUT,
+        )
     except Exception:
         log.exception("apps: boot reconcile failed")
     # Boot reconcile only (re)installs apps that aren't currently loaded; an

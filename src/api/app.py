@@ -101,6 +101,21 @@ class _ScopedCORSMiddleware(CORSMiddleware):
         await super().__call__(scope, receive, send)
 
 
+async def _boot_reconcile_and_sync(app: FastAPI) -> None:
+    """Background half of boot: converge apps to the cloud registry, then
+    mirror their skills — split out of the lifespan itself so it can run
+    concurrently with request-serving instead of gating it. Both steps are
+    documented never to raise (best-effort by design), so this is safe as a
+    bare background task. See the call site in ``lifespan`` for why this
+    isn't inline anymore.
+    """
+    await reconcile_on_boot(app)
+    # AFTER reconcile: an app's activate() copies its contributes.skills
+    # into skills/ (AppRuntime._register_skills), so syncing earlier would
+    # mirror a skills/ tree that's about to change.
+    await sync_on_boot()
+
+
 def create_app() -> FastAPI:
     create_all_tables()
 
@@ -122,13 +137,24 @@ def create_app() -> FastAPI:
         # aw-workspace-cli running in a spawned agent-runner container (no
         # loopback to the server) can reach it via the public tunnel edge.
         publish_workspace_api_url()
-        # Converge the running app set to the cloud registry on startup — a
-        # fresh/recreated workspace auto-reinstalls the user's apps (F3).
-        await reconcile_on_boot(app)
-        # AFTER reconcile: an app's activate() copies its contributes.skills
-        # into skills/ (AppRuntime._register_skills), so syncing earlier would
-        # mirror a skills/ tree that's about to change.
-        await sync_on_boot()
+        # Converge the running app set to the cloud registry, then (only
+        # after) mirror contributes.skills — a fresh/recreated workspace
+        # auto-reinstalls the user's apps this way (F3). Backgrounded, NOT
+        # awaited here: this used to run inline before `yield`, which means
+        # Starlette served ZERO requests — including /api/health — until it
+        # finished. reconciler.reconcile() walks every configured app
+        # SERIALLY, each GitHub fetch (src/apps/fetch.py) carrying its own
+        # 60s timeout x 3 retries, so one slow/unreachable app could black
+        # out the whole public edge for minutes on every redeploy (proven:
+        # commit 89f7b99's redeploy stalled 4m14s this way, see bug
+        # 3cf5bf3b-9510-8149-be2d-db20915f6872). The server now starts
+        # accepting requests immediately; apps converge shortly after in the
+        # background. reconcile_on_boot itself also bounds the reconcile
+        # pass with an overall timeout, so a hung fetch can't stall
+        # convergence forever either. Kept on app.state so it isn't
+        # garbage-collected mid-flight (asyncio only holds a weak ref to a
+        # bare fire-and-forget task).
+        app.state.boot_reconcile_task = asyncio.ensure_future(_boot_reconcile_and_sync(app))
         yield
 
     app = FastAPI(title="aw-workspace", version="0.1.0", lifespan=lifespan)
