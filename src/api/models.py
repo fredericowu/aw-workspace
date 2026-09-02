@@ -71,6 +71,35 @@ class AppInstall(SQLModel, table=True):
     enabled: bool = True
 
 
+class GuestUser(SQLModel, table=True):
+    """A username/password login scoped to a fixed list of this workspace's apps.
+
+    Backs Settings > General > Users. Ported from the monolith/aw-backend
+    ``db_models.py::GuestUser``, but stored in THIS workspace's own schema
+    rather than the control plane's: the Settings SPA reaches its API at
+    ``api.<slug>.workspace.<apex>`` (see ``apiBase.js``'s fetch rewrite), so
+    a control-plane-only implementation is unreachable from the tab that
+    manages it — which is exactly why the Users tab 404'd.
+
+    ``allowed_apps`` is JSONB here, not the reference's generic ``JSON`` —
+    every other JSON column in this module is JSONB and the engine is always
+    Postgres (``src.api.db``), so there's no portability reason to differ.
+
+    **A row here does not yet grant access to anything.** Only the admin-side
+    CRUD is implemented; there is no guest login in this workspace runtime —
+    see ``src/api/guest_users.py``'s module docstring for why that half needs
+    a control-plane decision rather than a port.
+    """
+
+    __tablename__ = "guest_users"  # type: ignore[assignment]
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    username: str = Field(unique=True, index=True)
+    password_hash: str
+    allowed_apps: list[str] = Field(default_factory=list, sa_column=Column(JSONB))
+    created_at: Optional[float] = Field(default=None)
+
+
 class MarketplaceSource(SQLModel, table=True):
     """One marketplace the catalog is merged from — user-managed, private-capable.
 

@@ -22,6 +22,7 @@ from src.api.db import create_all_tables, get_session, get_workspace_schema
 from src.api.components import register_component_routes
 from src.api.agent_routes import register_agent_routes, sync_on_boot
 from src.api.folders import register_folder_routes
+from src.api.guest_users import register_guest_user_routes
 from src.api.marketplace import reconcile_sources_on_boot, register_marketplace_routes
 from src.api.identity import _extract_token, decode_identity_jwt, require_identity
 from src.api.models import Setting
@@ -249,6 +250,13 @@ def create_app() -> FastAPI:
     # Settings > General > Skills: list/create/delete native skills and open
     # one in code-server. See src/api/skills_routes.py.
     register_skills_routes(app)
+
+    # Settings > General > Users: CRUD for scoped guest logins, stored in this
+    # workspace's own schema. The SPA calls this origin (apiBase.js rewrites
+    # relative /api/* to api.<slug>.workspace.<apex>), which is why the
+    # aw-backend copy of this feature never answered it. See
+    # src/api/guest_users.py — admin CRUD only, no guest login yet.
+    register_guest_user_routes(app)
 
     # Decoupled-apps framework (F1): plugin runtime + /api/apps management.
     # Tier-1 apps hot-load into THIS process — no restart. Installed apps are
