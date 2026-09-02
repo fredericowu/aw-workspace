@@ -1074,8 +1074,15 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
 # background, but a hung GitHub fetch — reconciler.reconcile() walks every
 # configured app serially, each fetch (src/apps/fetch.py) carrying its own
 # 60s httpx timeout x 3 retries — could otherwise stall app convergence
-# indefinitely; see bug 3cf5bf3b-9510-8149-be2d-db20915f6872).
-_BOOT_RECONCILE_TIMEOUT = 300.0
+# indefinitely; see bug 3cf5bf3b-9510-8149-be2d-db20915f6872). 300s looked
+# generous until it wasn't: this workspace's real boot reconcile (47 apps)
+# ran past it live on 2026-09-02, leaving notion/aw-kanban and others
+# unloaded until a manual POST /api/apps/reconcile finished the remaining
+# apps in ~150s on top of the 300s already spent — a genuine full cold
+# convergence needs ~450s+ here alone, before any app count growth. 1200s
+# keeps this a real safety net (not a no-op) instead of a threshold normal
+# operation already clears.
+_BOOT_RECONCILE_TIMEOUT = 1200.0
 
 
 async def reconcile_on_boot(app: FastAPI) -> None:
