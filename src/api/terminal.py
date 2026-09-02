@@ -36,7 +36,9 @@ from fastapi.responses import JSONResponse
 
 from src.api.components import component_snapshot
 from src.api.identity import authorize_ws, require_identity
-from src.api.terminal_manager import TerminalManager, session_child_procs
+from src.api.terminal_manager import (
+    TerminalManager, kill_proc_tree, session_child_procs,
+)
 
 log = logging.getLogger(__name__)
 
@@ -209,17 +211,19 @@ class TerminalRoutes:
 
     async def kill_proc(self, session_id: str, pid: int,
                        identity: dict = Depends(require_identity)):
-        import signal as _signal
         session = self.mgr.get(session_id)
         if not session:
             return {"error": "Session not found", "success": False}
         procs = await asyncio.to_thread(session_child_procs, session.pid)
         if not any(p["pid"] == pid for p in procs):
             return {"error": "PID does not belong to this session", "success": False}
+        # kill_proc_tree, not a bare os.kill: `pid` can be a mid-tree node
+        # (e.g. an `apt-get`/`dpkg`/`bash` inside this session), and its own
+        # live children (dpkg-preconfigure, git, gh, ...) would otherwise be
+        # orphaned onto this container's PID 1 and never reaped — see
+        # terminal_manager.kill_proc_tree's docstring.
         try:
-            os.kill(pid, _signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+            await asyncio.to_thread(kill_proc_tree, pid)
         except OSError as e:
             return {"error": str(e), "success": False}
         return {"success": True}

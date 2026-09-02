@@ -91,6 +91,17 @@ _CLI_HEALER_TASK_ID = "system-cli-health"
 DEFAULT_MCP_RESCAN_INTERVAL_S = float(os.environ.get("AW_APPS_MCP_RESCAN_INTERVAL_S", "60"))
 _MCP_RESCAN_TASK_ID = "mcp-gateway-rescan"
 
+# PID-1 orphan-zombie reaper cadence. This container's CMD runs the workspace
+# process directly with no init/tini wrapper, so it IS PID 1 — any process
+# that ends up reparented onto it (see src.api.terminal_manager.kill_proc_tree
+# and reap_pid1_orphans's docstrings) has nothing else that will ever wait()
+# it. 60s, matching the MCP rescan default: this is a slow safety net, not a
+# tight loop — reap_pid1_orphans only touches a pid once it has shown up as a
+# zombie on two consecutive ticks specifically so this interval stays well
+# clear of a live subprocess.run() reaping its own child (milliseconds).
+DEFAULT_ZOMBIE_REAP_INTERVAL_S = float(os.environ.get("AW_APPS_ZOMBIE_REAP_INTERVAL_S", "60"))
+_ZOMBIE_REAP_TASK_ID = "pid1-zombie-reap"
+
 # Cookie the central-identity JWT lands in (mirrors src.api.identity.COOKIE_NAME).
 _ID_COOKIE = "aw_id_jwt"
 
@@ -544,6 +555,28 @@ class AppRuntime:
         Deferred import: routes.py imports FROM this module."""
         from src.apps.routes import _reload_mcp_gateway
         await _reload_mcp_gateway(self, raise_on_failure=True)
+
+    # ---- PID-1 orphan-zombie reaper ---------------------------------------
+
+    def start_zombie_reaper(self, interval_s: float = DEFAULT_ZOMBIE_REAP_INTERVAL_S) -> None:
+        """Start the runtime-owned periodic sweep for zombies reparented onto
+        this process (this container's PID 1). Same shape and rationale as
+        ``start_system_cli_healer``: core runtime code, so no
+        ``watchdog:tasks`` grant is involved. Call once, from an async
+        context (``reconcile_on_boot``); idempotent.
+        """
+        if _ZOMBIE_REAP_TASK_ID in self.watchdog.task_ids_for(_SYSTEM_APP_ID):
+            return
+        self.watchdog.register(
+            _SYSTEM_APP_ID, _ZOMBIE_REAP_TASK_ID, self._reap_zombies,
+            interval_s, run_immediately=False,
+        )
+
+    async def _reap_zombies(self) -> None:
+        """One tick. Deferred import: terminal_manager is an API module, this
+        is apps/runtime — keep the dependency one-directional."""
+        from src.api.terminal_manager import reap_pid1_orphans
+        await asyncio.to_thread(reap_pid1_orphans)
 
     # ---- introspection --------------------------------------------------
 

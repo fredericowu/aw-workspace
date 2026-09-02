@@ -1119,3 +1119,7 @@ async def reconcile_on_boot(app: FastAPI) -> None:
     # Safety net under the install/uninstall/config-save reload hooks and the
     # boot reload above.
     app.state.app_runtime.start_mcp_gateway_rescan()
+    # This container's CMD runs the workspace process with no init/tini
+    # wrapper, so it IS PID 1 — nothing else ever waits() a process that ends
+    # up reparented onto it. See src.api.terminal_manager.reap_pid1_orphans.
+    app.state.app_runtime.start_zombie_reaper()

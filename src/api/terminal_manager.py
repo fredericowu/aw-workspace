@@ -78,25 +78,28 @@ def _next_id() -> str:
 
 
 def _ps_snapshot() -> dict[int, dict]:
-    """Snapshot of all processes: {pid: {"ppid", "cpu", "args"}} via one ps."""
+    """Snapshot of all processes: {pid: {"ppid", "state", "cpu", "args"}} via one ps."""
     import subprocess
     procs: dict[int, dict] = {}
     try:
         out = subprocess.run(
-            ["ps", "-eo", "pid=,ppid=,%cpu=,args="],
+            ["ps", "-eo", "pid=,ppid=,stat=,%cpu=,args="],
             capture_output=True, text=True, timeout=5,
         ).stdout
     except Exception:
         return procs
     for line in out.splitlines():
-        parts = line.split(None, 3)
-        if len(parts) < 3:
+        parts = line.split(None, 4)
+        if len(parts) < 4:
             continue
         try:
-            pid = int(parts[0]); ppid = int(parts[1]); cpu = float(parts[2])
+            pid = int(parts[0]); ppid = int(parts[1]); cpu = float(parts[3])
         except ValueError:
             continue
-        procs[pid] = {"ppid": ppid, "cpu": cpu, "args": parts[3] if len(parts) > 3 else ""}
+        procs[pid] = {
+            "ppid": ppid, "state": parts[2], "cpu": cpu,
+            "args": parts[4] if len(parts) > 4 else "",
+        }
     return procs
 
 
@@ -140,6 +143,109 @@ def session_child_procs(root_pid: int | None, procs: dict[int, dict] | None = No
             stack.append(child)
     result.sort(key=lambda p: p["pid"])
     return result
+
+
+def kill_proc_tree(pid: int, timeout: float = 2.0) -> None:
+    """Kill ``pid`` and every process still under it, then wait until any
+    descendant left orphaned by the kill is actually reaped.
+
+    ``pid`` is an arbitrary node inside a terminal's process tree, not a
+    direct child of this process — reaping IT is its real (still-alive)
+    parent's job, same as a shell always reaping the job it just ran.
+    What used to leak: killing only ``pid`` left any of ITS OWN live
+    children (e.g. ``dpkg-preconfigure`` under a killed ``apt-get``)
+    running unsupervised, and the instant one of them finished it had no
+    parent left to collect it — it reparented onto this container's PID 1
+    and sat ``<defunct>`` forever, because nothing else in this module
+    waits for a pid outside ``_OWN_CHILD_PIDS``.
+
+    So: kill the whole subtree first (nothing is left running to orphan
+    later), then retry ``waitpid(WNOHANG)`` on each descendant — mirroring
+    ``TerminalSession.kill()``'s pattern, for the same reason: SIGKILL isn't
+    instant, so the first check almost always answers "not dead yet". A
+    descendant not yet reparented onto us raises ``ChildProcessError``
+    (ECHILD) rather than confirming reaped, so it's retried, never mistaken
+    for done. ``reap_pid1_orphans`` below is the backstop for anything
+    still pending once ``timeout`` runs out.
+    """
+    procs = _ps_snapshot()
+    subtree_pids = [p["pid"] for p in session_child_procs(pid, procs)]
+    for spid in subtree_pids:
+        try:
+            os.kill(spid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    pending = {spid for spid in subtree_pids if spid != pid}
+    deadline = time.monotonic() + timeout
+    while pending and time.monotonic() < deadline:
+        for opid in list(pending):
+            try:
+                reaped, _ = os.waitpid(opid, os.WNOHANG)
+            except ChildProcessError:
+                continue  # not (yet) reparented to us, or reaped elsewhere
+            if reaped:
+                pending.discard(opid)
+        if pending:
+            time.sleep(0.05)
+
+
+# Candidates seen zombie-with-ppid-us on the PREVIOUS reap_pid1_orphans()
+# tick — see that function's docstring for why a pid must show up twice
+# before it's touched.
+_PENDING_ORPHANS: set[int] = set()
+
+
+def reap_pid1_orphans() -> list[int]:
+    """Periodic safety net: reap zombies genuinely orphaned onto this process.
+
+    Complements ``_reap_children`` (which only ever reaps ``_OWN_CHILD_PIDS``)
+    and ``kill_proc_tree`` (which only cleans up after itself, and only for
+    its own ``timeout``) — this is the general backstop for ANY process that
+    ends up reparented here without a dedicated reaper of its own, whatever
+    orphaned it (``kill_proc_tree`` past its timeout, a ``killpg``'d service
+    in ``src/apps/services.py`` whose own children outlive it, or a leak not
+    yet found).
+
+    A zombie with ``ppid == os.getpid()`` does not, by itself, prove it is a
+    true orphan: a plain ``subprocess.run()`` call anywhere in this process
+    (this module's own ``_ps_snapshot`` included) spawns a direct child with
+    that exact same ppid, and that child briefly shows the same zombie state
+    in the instant between exiting and that caller's own blocking ``wait()``
+    reaping it. Racing THAT is exactly the 2026-08-12 bug this module's
+    docstring above warns never to reintroduce — a single ``ps`` snapshot
+    cannot tell the two situations apart. So this only reaps a pid once it
+    has shown up as a zombie on two separate calls: a live
+    ``subprocess.run()`` reaps its own child within milliseconds of exit,
+    while a genuine PID-1 orphan (whose real parent is gone, not merely
+    busy) stays a zombie until something collects it — so two ticks apart
+    (this runs on a watchdog interval measured in tens of seconds, not a
+    tight loop) is a wide margin, not a coin flip.
+    """
+    global _PENDING_ORPHANS
+    my_pid = os.getpid()
+    procs = _ps_snapshot()
+    candidates = {
+        pid for pid, info in procs.items()
+        if info["ppid"] == my_pid
+        and info.get("state", "").startswith("Z")
+        and pid not in _OWN_CHILD_PIDS
+    }
+    ready = candidates & _PENDING_ORPHANS
+    _PENDING_ORPHANS = candidates
+
+    reaped: list[int] = []
+    for pid in ready:
+        try:
+            got, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            continue
+        if got:
+            reaped.append(pid)
+    if reaped:
+        logger.warning("reap_pid1_orphans: reaped %d PID-1 orphan zombie(s): %s",
+                        len(reaped), reaped)
+    return reaped
 
 
 class TerminalSession:
