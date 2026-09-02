@@ -22,7 +22,7 @@ from src.api.db import create_all_tables, get_session, get_workspace_schema
 from src.api.components import register_component_routes
 from src.api.agent_routes import register_agent_routes, sync_on_boot
 from src.api.folders import register_folder_routes
-from src.api.marketplace import register_marketplace_routes
+from src.api.marketplace import reconcile_sources_on_boot, register_marketplace_routes
 from src.api.identity import _extract_token, decode_identity_jwt, require_identity
 from src.api.models import Setting
 from src.api.notifications import register_notification_routes
@@ -138,6 +138,16 @@ def create_app() -> FastAPI:
         # aw-workspace-cli running in a spawned agent-runner container (no
         # loopback to the server) can reach it via the public tunnel edge.
         publish_workspace_api_url()
+        # Restore any private-marketplace source Postgres forgot but the
+        # local mirror still remembers (see marketplace.py's module
+        # docstring — incident 2026-09-02). Local-only (Postgres + one
+        # file, no network) so it's cheap enough to await inline, and MUST
+        # run before the app reconciler below: a private app's image pull
+        # needs its source's credential (registry_credential), so restoring
+        # the source first is what lets a lost-Postgres crispal-style app
+        # come back on the very first boot instead of needing a second,
+        # manual `marketplace install --update` once someone notices.
+        reconcile_sources_on_boot()
         # Converge the running app set to the cloud registry, then (only
         # after) mirror contributes.skills — a fresh/recreated workspace
         # auto-reinstalls the user's apps this way (F3). Backgrounded, NOT

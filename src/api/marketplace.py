@@ -38,7 +38,9 @@ can never collide with a real app's secret namespace.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 import time
 from typing import Any
@@ -50,12 +52,26 @@ from sqlmodel import select
 from src.api.db import get_session
 from src.api.identity import require_identity
 from src.api.models import MarketplaceSource
+from src.apps import paths
 from src.apps.secret_store import SecretStore
 
 log = logging.getLogger(__name__)
 
 # Reserved secret-store namespace for marketplace credentials (see docstring).
 SECRETS_NS = "_marketplace"
+
+# Local mirror of the row metadata (never the credential — that's already
+# durable via SecretStore, see reconcile_sources_on_boot below), written to
+# the same host-mounted home dir every other durable-by-design piece of
+# workspace state uses (secret_store.py, catalog.py's on-disk catalog
+# cache). marketplace_sources is otherwise pure single-Postgres-row state
+# with no cloud mirror (unlike app_installs, see src/apps/reconciler.py) —
+# a lost/reset Postgres loses every private-marketplace registration with
+# no way back, even though the credential it needs survives right next to
+# it. Incident 2026-09-02: exactly this happened to the "tekflox-private"
+# source (Crispal's private catalog + GHCR image), and recovering it took
+# manually decrypting the surviving secret-store blob and re-POSTing it.
+_MIRROR_FILENAME = "marketplace_sources.json"
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(@[^\s]+)?$")
@@ -186,6 +202,84 @@ def describe(row: MarketplaceSource) -> dict[str, Any]:
     }
 
 
+# --- durable mirror + boot recovery ------------------------------------------
+
+
+def _mirror_path() -> str:
+    return os.path.join(paths.workspace_home(), _MIRROR_FILENAME)
+
+
+def _write_mirror() -> None:
+    """Snapshot every source's non-secret fields to the local mirror file.
+
+    Best-effort: a write failure (e.g. read-only disk) must never break the
+    request that triggered it — the mirror is a recovery aid, not the
+    primary store. Called after every successful upsert/delete so the file
+    is always at most one request stale.
+    """
+    try:
+        rows = [describe(r) for r in list_sources()]
+        for row in rows:
+            row.pop("has_credential", None)  # derived, not stored
+        with open(_mirror_path(), "w", encoding="utf-8") as f:
+            json.dump({"sources": rows}, f, indent=2)
+    except OSError:
+        log.exception("marketplace: failed to write local source mirror")
+
+
+def reconcile_sources_on_boot() -> None:
+    """Restore any source the mirror file remembers but Postgres does not.
+
+    Runs once at startup, synchronously and before the app-install
+    reconciler kicks off (a private app's image pull needs its source's
+    credential — see registry_credential — so this has to land first).
+    Purely local (Postgres + one small file, no network), unlike the
+    app-install reconciler's GitHub fetches, so there is no equivalent
+    boot-latency risk to bound here.
+
+    A mirrored source is only recreated when it can still work: either it
+    never needed a credential (auth_type "none"), or the credential is
+    still sitting in the secret store (it's file-backed too, so it usually
+    survives a Postgres loss on its own — see the module docstring). A
+    mirrored entry whose credential is ALSO gone is logged loudly instead
+    of silently skipped or half-recreated with no way to authenticate.
+    """
+    try:
+        with open(_mirror_path(), encoding="utf-8") as f:
+            mirrored = json.load(f).get("sources", [])
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError):
+        log.exception("marketplace: local source mirror unreadable, skipping boot recovery")
+        return
+
+    restored, unrecoverable = [], []
+    for entry in mirrored:
+        sid = entry.get("id")
+        if not sid or get_source(sid) is not None:
+            continue  # already in Postgres — nothing to recover
+        has_credential = entry.get("auth_type") == "none" or _secrets.get(SECRETS_NS, sid) is not None
+        if not has_credential:
+            unrecoverable.append(sid)
+            continue
+        fields = {k: v for k, v in entry.items() if k in
+                  ("id", "name", "url", "enabled", "priority", "auth_type", "auth_host")}
+        upsert_source(fields)  # credential=None: reuses what's already in the secret store
+        restored.append(sid)
+
+    if restored:
+        log.warning(
+            "marketplace: restored %d source(s) from local mirror missing in Postgres: %s",
+            len(restored), restored,
+        )
+    if unrecoverable:
+        log.error(
+            "marketplace: %d source(s) in the local mirror could NOT be restored — "
+            "their credential is also gone, re-add them via Settings > Marketplace: %s",
+            len(unrecoverable), unrecoverable,
+        )
+
+
 # --- registry ----------------------------------------------------------------
 
 
@@ -229,6 +323,7 @@ def upsert_source(entry: dict[str, Any], credential: str | None = None) -> Marke
         _secrets.delete(SECRETS_NS, row.id)
 
     log.info("marketplace: saved source %s (%s, auth=%s)", row.id, row.url, row.auth_type)
+    _write_mirror()
     return row
 
 
@@ -241,6 +336,7 @@ def delete_source(source_id: str) -> bool:
         session.commit()
     _secrets.delete(SECRETS_NS, source_id)
     log.info("marketplace: removed source %s", source_id)
+    _write_mirror()
     return True
 
 

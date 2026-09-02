@@ -4,6 +4,8 @@ The host binding is the security-critical part: a user can add an arbitrary
 URL as a marketplace, so a credential must never be attached to a request
 for a host it wasn't issued for.
 """
+import json
+
 import pytest
 
 from src.api import marketplace as mp
@@ -161,3 +163,100 @@ def test_registry_credential_is_none_without_a_github_source(monkeypatch):
     monkeypatch.setattr(mp, "list_sources", lambda enabled_only=False: [row])
     monkeypatch.setattr(mp._secrets, "get", lambda ns, key: "tok")
     assert mp.registry_credential("ghcr.io") is None
+
+
+# --- local mirror + boot recovery --------------------------------------------
+#
+# Incident 2026-09-02: Postgres lost the marketplace_sources table entirely
+# (unlike app_installs, which has a cloud-registry boot reconciler). The
+# credential survived on disk (SecretStore is already file-backed) but the
+# row referencing it did not, so Crispal's private catalog + private GHCR
+# image both went dark until someone manually decrypted the credential and
+# re-POSTed the source. These tests cover the fix: a local mirror of the
+# row metadata, and a boot-time reconcile that restores a mirrored row
+# Postgres has forgotten, but only when it can still actually authenticate.
+
+
+@pytest.fixture
+def mirror_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(mp.paths, "workspace_home", lambda: str(tmp_path))
+    return tmp_path
+
+
+def test_write_mirror_persists_non_secret_fields(mirror_home, monkeypatch):
+    row = MarketplaceSource(id="private", name="Private", url="tekflox/aw-marketplace-private",
+                            enabled=True, priority=50, auth_type="github_pat",
+                            auth_host="github.com", created_at=1.0)
+    monkeypatch.setattr(mp, "list_sources", lambda enabled_only=False: [row])
+    monkeypatch.setattr(mp._secrets, "get", lambda ns, key: "ghp_secret")
+
+    mp._write_mirror()
+
+    with open(mirror_home / "marketplace_sources.json") as f:
+        data = json.load(f)
+    assert data["sources"] == [{
+        "id": "private", "name": "Private", "url": "tekflox/aw-marketplace-private",
+        "enabled": True, "priority": 50, "auth_type": "github_pat",
+        "auth_host": "github.com", "created_at": 1.0,
+    }]  # no credential and no has_credential — never persisted to disk
+
+
+def test_reconcile_restores_a_mirrored_source_missing_from_postgres(mirror_home, monkeypatch):
+    with open(mirror_home / "marketplace_sources.json", "w") as f:
+        json.dump({"sources": [{
+            "id": "tekflox-private", "name": "Crispal private catalog",
+            "url": "tekflox/aw-marketplace-private@master", "enabled": True,
+            "priority": 50, "auth_type": "github_pat", "auth_host": "github.com",
+        }]}, f)
+    monkeypatch.setattr(mp, "get_source", lambda sid: None)  # gone from Postgres
+    monkeypatch.setattr(mp._secrets, "get", lambda ns, key: "ghp_recovered")  # survived
+    calls = []
+    monkeypatch.setattr(mp, "upsert_source", lambda entry, credential=None: calls.append(entry))
+
+    mp.reconcile_sources_on_boot()
+
+    assert len(calls) == 1
+    assert calls[0]["id"] == "tekflox-private"
+    assert calls[0]["url"] == "tekflox/aw-marketplace-private@master"
+
+
+def test_reconcile_skips_a_source_already_in_postgres(mirror_home, monkeypatch):
+    with open(mirror_home / "marketplace_sources.json", "w") as f:
+        json.dump({"sources": [{"id": "already-there", "url": "a/b", "auth_type": "none"}]}, f)
+    monkeypatch.setattr(mp, "get_source", lambda sid: object())  # still present
+    calls = []
+    monkeypatch.setattr(mp, "upsert_source", lambda entry, credential=None: calls.append(entry))
+
+    mp.reconcile_sources_on_boot()
+
+    assert calls == []
+
+
+def test_reconcile_does_not_restore_when_the_credential_is_also_gone(mirror_home, monkeypatch):
+    with open(mirror_home / "marketplace_sources.json", "w") as f:
+        json.dump({"sources": [{"id": "private", "url": "a/b", "auth_type": "github_pat"}]}, f)
+    monkeypatch.setattr(mp, "get_source", lambda sid: None)
+    monkeypatch.setattr(mp._secrets, "get", lambda ns, key: None)  # credential also lost
+    calls = []
+    monkeypatch.setattr(mp, "upsert_source", lambda entry, credential=None: calls.append(entry))
+
+    mp.reconcile_sources_on_boot()
+
+    assert calls == []  # nothing to authenticate with — don't half-restore it
+
+
+def test_reconcile_restores_an_unauthenticated_source_with_no_credential_needed(mirror_home, monkeypatch):
+    with open(mirror_home / "marketplace_sources.json", "w") as f:
+        json.dump({"sources": [{"id": "public", "url": "acme/store", "auth_type": "none"}]}, f)
+    monkeypatch.setattr(mp, "get_source", lambda sid: None)
+    monkeypatch.setattr(mp._secrets, "get", lambda ns, key: None)
+    calls = []
+    monkeypatch.setattr(mp, "upsert_source", lambda entry, credential=None: calls.append(entry))
+
+    mp.reconcile_sources_on_boot()
+
+    assert len(calls) == 1  # auth_type "none" never needed a credential to begin with
+
+
+def test_reconcile_is_a_noop_when_no_mirror_file_exists(mirror_home):
+    mp.reconcile_sources_on_boot()  # must not raise
