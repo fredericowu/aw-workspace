@@ -38,6 +38,7 @@ can never collide with a real app's secret namespace.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -409,7 +410,13 @@ def register_marketplace_routes(app: FastAPI) -> None:
 
     @app.get("/api/marketplace/sources")
     async def get_sources(identity: dict = Depends(require_identity)):
-        return {"sources": [describe(r) for r in list_sources()]}
+        # to_thread: list_sources() opens a SYNCHRONOUS get_session (sync
+        # psycopg) and this process runs one uvicorn worker, so calling it
+        # inline would block the single event loop for the DB round-trip and
+        # stall every other in-flight request. Same reason on every handler
+        # below. See src/api/db.py's get_session docstring.
+        rows = await asyncio.to_thread(list_sources)
+        return {"sources": [describe(r) for r in rows]}
 
     @app.post("/api/marketplace/sources")
     async def post_source(body: dict = Body(...),
@@ -418,35 +425,37 @@ def register_marketplace_routes(app: FastAPI) -> None:
             entry = validate(body)
         except SourceError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        row = upsert_source(entry, credential=body.get("credential") or None)
+        row = await asyncio.to_thread(
+            upsert_source, entry, credential=body.get("credential") or None)
         _invalidate_catalog()
         return {"source": describe(row)}
 
     @app.put("/api/marketplace/sources/{source_id}")
     async def put_source(source_id: str, body: dict = Body(...),
                          identity: dict = Depends(require_identity)):
-        if get_source(source_id) is None:
+        if await asyncio.to_thread(get_source, source_id) is None:
             raise HTTPException(status_code=404, detail=f"no marketplace source {source_id!r}")
         try:
             entry = validate(body, source_id=source_id)
         except SourceError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        row = upsert_source(entry, credential=body.get("credential") or None)
+        row = await asyncio.to_thread(
+            upsert_source, entry, credential=body.get("credential") or None)
         _invalidate_catalog()
         return {"source": describe(row)}
 
     @app.delete("/api/marketplace/sources/{source_id}")
     async def del_source(source_id: str, identity: dict = Depends(require_identity)):
-        if not delete_source(source_id):
+        if not await asyncio.to_thread(delete_source, source_id):
             raise HTTPException(status_code=404, detail=f"no marketplace source {source_id!r}")
         _invalidate_catalog()
         return {"removed": source_id}
 
     @app.delete("/api/marketplace/sources/{source_id}/credential")
     async def del_credential(source_id: str, identity: dict = Depends(require_identity)):
-        if get_source(source_id) is None:
+        if await asyncio.to_thread(get_source, source_id) is None:
             raise HTTPException(status_code=404, detail=f"no marketplace source {source_id!r}")
-        delete_credential(source_id)
+        await asyncio.to_thread(delete_credential, source_id)
         _invalidate_catalog()
         return {"cleared": source_id}
 
@@ -459,13 +468,18 @@ def register_marketplace_routes(app: FastAPI) -> None:
         wrong/expired token looks identical to an empty catalog. This gives
         the user a direct answer at the moment they paste the token.
         """
-        row = get_source(source_id)
+        row = await asyncio.to_thread(get_source, source_id)
         if row is None:
             raise HTTPException(status_code=404, detail=f"no marketplace source {source_id!r}")
         from src.apps import catalog
 
         try:
-            apps = catalog.fetch_source(row.url, source_id=row.id)
+            # Threaded for the DB read above AND for the fetch itself: this is
+            # a blocking HTTP round-trip to a possibly-unreachable private
+            # marketplace, i.e. exactly the kind of multi-second stall that
+            # must never sit on the single event-loop thread.
+            apps = await asyncio.to_thread(
+                catalog.fetch_source, row.url, source_id=row.id)
         except Exception as exc:  # noqa: BLE001 — the whole point is reporting it
             return {"ok": False, "error": str(exc), "app_count": 0}
         return {"ok": True, "app_count": len(apps), "app_ids": [a.get("id") for a in apps][:50]}

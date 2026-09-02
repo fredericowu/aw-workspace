@@ -11,6 +11,7 @@ without ever touching aw-backend over the network per request:
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 import time
@@ -98,8 +99,19 @@ def _workspace_api_key_authorized(request: Request) -> bool:
 
 
 async def require_identity(request: Request, authorization: str = Header(default="")) -> dict:
-    """FastAPI dependency — returns the verified JWT claims dict or 401s."""
-    if _workspace_api_key_authorized(request):
+    """FastAPI dependency — returns the verified JWT claims dict or 401s.
+
+    ``_workspace_api_key_authorized`` reads the stored key out of Postgres
+    through the synchronous ``src.api.db.get_session``, and this dependency
+    runs on nearly every authenticated route — so it is threaded off the
+    event loop. Left inline it blocked the single uvicorn worker's ONE loop
+    thread (``AW_WORKSPACE_WORKERS=1``) for a full DB round-trip on every
+    request carrying an ``X-Api-Key``, freezing every other in-flight
+    request with it. It short-circuits without touching the DB when no key
+    header is present (the browser/JWT path), which is why this only ever
+    showed up for API-key callers — the MCP gateway, apps, and this
+    workspace's own CLI."""
+    if await asyncio.to_thread(_workspace_api_key_authorized, request):
         return {"sub": "workspace-api-key", "api_key": True}
 
     token = _extract_token(request, authorization)

@@ -114,5 +114,32 @@ def create_all_tables() -> None:
 
 
 def get_session() -> Session:
-    """Return a fresh ``sqlmodel.Session`` bound to this workspace's engine."""
+    """Return a fresh ``sqlmodel.Session`` bound to this workspace's engine.
+
+    **This session is SYNCHRONOUS** (sqlmodel over the sync psycopg driver),
+    and this process runs a SINGLE uvicorn worker — ``AW_WORKSPACE_WORKERS=1``
+    in ``docker-compose.yml``/``Dockerfile``, deliberate because terminal PTY
+    sessions keep in-memory state that cannot be sharded across workers (see
+    ``src/api/app.py``). One worker means ONE asyncio event-loop thread
+    serving every concurrent request as a coroutine.
+
+    So: **never call this directly inside an ``async def``.** The blocking DB
+    round-trip would run on that one loop thread and freeze every other
+    in-flight request for its full duration — including requests that touch
+    no database at all. That is not hypothetical: a boot-time reconcile pass
+    doing dozens of serial mirror reads/writes this way produced 23–25s
+    latencies on four unrelated GET routes (2026-09-02).
+
+    Two correct shapes, both already used across this codebase:
+
+    - ``await asyncio.to_thread(<sync function that opens a session>)`` —
+      the default; matches how ``src/apps/reconciler.py`` already treats its
+      blocking GitHub fetches.
+    - make the route handler a plain ``def`` instead of ``async def``, and
+      FastAPI runs it in its own threadpool (see ``src/api/guest_users.py``).
+
+    ``src/tests/unit/api/test_no_blocking_db_in_async_routes.py`` statically
+    enforces the first rule for the cases it can resolve; read its docstring
+    for what it deliberately cannot catch.
+    """
     return Session(get_engine())

@@ -628,9 +628,12 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         # src/apps/config_store.py.
         config_store.save(slug, loaded.config)
 
+        # to_thread: LocalMirror writes go through the SYNCHRONOUS get_session
+        # and this process serves every request on one event-loop thread
+        # (AW_WORKSPACE_WORKERS=1), so an inline write stalls all of them.
         update_config = getattr(reconciler.local, "update_config", None)
         if callable(update_config):
-            update_config(slug, loaded.config)
+            await asyncio.to_thread(update_config, slug, loaded.config)
         else:
             spec = AppSpec(
                 app_id=slug,
@@ -640,7 +643,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 signed=loaded.signed,
                 package_dir=loaded.package_dir,
             )
-            reconciler.local.upsert(spec, loaded.package_dir)
+            await asyncio.to_thread(reconciler.local.upsert, spec, loaded.package_dir)
         if reconciler.cloud.configured:
             try:
                 reconciler.cloud.put_desired(
@@ -767,7 +770,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                             signed=spec.signed)
                     except Exception:
                         log.exception("apps: update of %s did not reach the cloud registry", slug)
-                reconciler.local.upsert(spec, loaded.package_dir)
+                await asyncio.to_thread(reconciler.local.upsert, spec, loaded.package_dir)
 
                 summary = await reconciler.reconcile()
                 for error in summary.get("errors", []):
@@ -851,7 +854,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                     signed=spec.signed)
             except Exception:
                 log.exception("apps: version pin of %s did not reach the cloud registry", slug)
-        reconciler.local.upsert(spec, loaded.package_dir)
+        await asyncio.to_thread(reconciler.local.upsert, spec, loaded.package_dir)
 
         job = jobs.start(slug)
 

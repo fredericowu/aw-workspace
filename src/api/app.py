@@ -103,6 +103,34 @@ class _ScopedCORSMiddleware(CORSMiddleware):
         await super().__call__(scope, receive, send)
 
 
+def _read_setting(key: str) -> dict:
+    """Blocking read of one generic settings row. Never call from the event
+    loop directly — see ``_write_setting``."""
+    with get_session() as session:
+        row = session.get(Setting, key)
+        return {"key": key, "value": row.value if row else None}
+
+
+def _write_setting(key: str, value: dict) -> None:
+    """Blocking upsert of one generic settings row.
+
+    Split out of the route handler so the handler can hand it to
+    ``asyncio.to_thread``: ``src.api.db.get_session`` is a SYNCHRONOUS
+    session over a sync psycopg driver, and this process runs ONE uvicorn
+    worker (``AW_WORKSPACE_WORKERS=1``, deliberate — terminal PTY sessions
+    keep in-memory state). Called inline from an ``async def`` it blocks the
+    single event-loop thread for the whole DB round-trip, freezing every
+    other in-flight request — including ones touching no DB at all."""
+    with get_session() as session:
+        row = session.get(Setting, key)
+        if row is None:
+            row = Setting(key=key, value=value)
+        else:
+            row.value = value
+        session.add(row)
+        session.commit()
+
+
 async def _boot_reconcile_and_sync(app: FastAPI) -> None:
     """Background half of boot: converge apps to the cloud registry, then
     mirror their skills — split out of the lifespan itself so it can run
@@ -208,11 +236,11 @@ def create_app() -> FastAPI:
     # only ever handed out over these two identity-gated routes.
     @app.get("/api/settings/workspace-api-key")
     async def get_workspace_api_key_route(identity: dict = Depends(require_identity)):
-        return {"key": get_or_create_workspace_api_key()}
+        return {"key": await asyncio.to_thread(get_or_create_workspace_api_key)}
 
     @app.post("/api/settings/workspace-api-key/regenerate")
     async def regenerate_workspace_api_key_route(identity: dict = Depends(require_identity)):
-        return {"key": regenerate_workspace_api_key()}
+        return {"key": await asyncio.to_thread(regenerate_workspace_api_key)}
 
     # Terminal feature (strangler migration #1): PTY shells on this BYOD host.
     # In-memory session state → must run single-worker (see AW_WORKSPACE_WORKERS
@@ -279,20 +307,11 @@ def create_app() -> FastAPI:
     # instead of the real key, ever since that route was added.
     @app.get("/api/settings/{key}")
     async def get_setting(key: str, identity: dict = Depends(require_identity)):
-        with get_session() as session:
-            row = session.get(Setting, key)
-            return {"key": key, "value": row.value if row else None}
+        return await asyncio.to_thread(_read_setting, key)
 
     @app.put("/api/settings/{key}")
     async def put_setting(key: str, value: dict, identity: dict = Depends(require_identity)):
-        with get_session() as session:
-            row = session.get(Setting, key)
-            if row is None:
-                row = Setting(key=key, value=value)
-            else:
-                row.value = value
-            session.add(row)
-            session.commit()
+        await asyncio.to_thread(_write_setting, key, value)
         return {"key": key, "value": value, "schema": get_workspace_schema()}
 
     return app

@@ -218,8 +218,11 @@ async def _notify_agents_platform_runners() -> dict:
     reason = "unknown error"
     for attempt in range(1, NOTIFY_MAX_ATTEMPTS + 1):
         try:
+            # to_thread: reads/mints the key through the SYNCHRONOUS
+            # get_session — inline it would block the one event-loop thread.
+            api_key = await asyncio.to_thread(get_or_create_workspace_api_key)
             async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(url, headers={API_KEY_HEADER: get_or_create_workspace_api_key()})
+                resp = await client.post(url, headers={API_KEY_HEADER: api_key})
             resp.raise_for_status()
             body = resp.json()
             if body.get("pushed"):
@@ -251,7 +254,11 @@ def register_observability_routes(app: FastAPI) -> None:
     @app.get("/api/settings/observability")
     async def get_observability(identity: dict = Depends(require_identity)):
         runtime = getattr(app.state, "app_runtime", None)
-        return resolve(runtime)
+        # to_thread: resolve()/update() read and write the settings row via
+        # the SYNCHRONOUS get_session, and this process has ONE event-loop
+        # thread serving every request (AW_WORKSPACE_WORKERS=1) — an inline
+        # call stalls all of them for the DB round-trip.
+        return await asyncio.to_thread(resolve, runtime)
 
     @app.put("/api/settings/observability")
     async def put_observability(body: dict,
@@ -259,7 +266,8 @@ def register_observability_routes(app: FastAPI) -> None:
         runtime = getattr(app.state, "app_runtime", None)
         custom = body.get("custom") or {}
         try:
-            result = update(
+            result = await asyncio.to_thread(
+                update,
                 mode=str(body.get("mode") or ""),
                 custom_endpoint=custom.get("endpoint"),
                 custom_api_key=custom.get("api_key"),

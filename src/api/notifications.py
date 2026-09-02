@@ -140,7 +140,12 @@ class NotificationRoutes:
         message = data.get("message", "")
         if not message:
             return {"error": "message is required"}
-        notif = self.manager.add_notification(
+        # to_thread on every manager call in this class: NotificationDB works
+        # through the SYNCHRONOUS get_session (sync psycopg), and this process
+        # runs a single uvicorn worker — one event-loop thread for every
+        # request. An inline call blocks all of them for the DB round-trip.
+        notif = await asyncio.to_thread(
+            self.manager.add_notification,
             message=message,
             level=data.get("level", "info"),
             title=data.get("title", ""),
@@ -157,17 +162,17 @@ class NotificationRoutes:
     async def dismiss_notification(self, notif_id: int,
                                   identity: dict = Depends(require_identity)):
         """Dismiss (mark as read) a notification."""
-        self.manager.dismiss(notif_id)
+        await asyncio.to_thread(self.manager.dismiss, notif_id)
         return {"success": True}
 
     async def get_pending(self, identity: dict = Depends(require_identity)):
         """Get all pending notifications."""
-        return {"notifications": self.manager.get_pending()}
+        return {"notifications": await asyncio.to_thread(self.manager.get_pending)}
 
     async def get_recent(self, limit: int = 50,
                         identity: dict = Depends(require_identity)):
         """Get recent notifications (all statuses)."""
-        return {"notifications": self.manager.get_recent(limit)}
+        return {"notifications": await asyncio.to_thread(self.manager.get_recent, limit)}
 
     # ---- WebSocket ----------------------------------------------------------
 
@@ -180,10 +185,19 @@ class NotificationRoutes:
             return
 
         await websocket.accept()
-        pending = self.manager.get_pending()
-        if pending:
-            for n in pending:
+
+        def _drain_pending() -> list[dict]:
+            """One thread hop for the read AND every mark_delivered write:
+            done one-call-at-a-time this was N serial DB round-trips on the
+            event-loop thread, so a client connecting with a backlog stalled
+            every other in-flight request for the whole backlog."""
+            rows = self.manager.get_pending()
+            for n in rows:
                 self.manager.mark_delivered(n["id"])
+            return rows
+
+        pending = await asyncio.to_thread(_drain_pending)
+        if pending:
             await websocket.send_text(json.dumps({
                 "type": "ninja_init",
                 "notifications": pending,

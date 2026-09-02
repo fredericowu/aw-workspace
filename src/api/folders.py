@@ -217,7 +217,11 @@ def register_folder_routes(app: FastAPI) -> None:
 
     @app.get("/api/folders")
     async def get_folders(identity: dict = Depends(require_identity)):
-        return {"folders": [describe(f) for f in list_folders()]}
+        # to_thread: list_folders() opens a SYNCHRONOUS get_session, and one
+        # uvicorn worker means one event-loop thread for every request — an
+        # inline call freezes all of them for the DB round-trip. Same below.
+        folders = await asyncio.to_thread(list_folders)
+        return {"folders": [describe(f) for f in folders]}
 
     @app.get("/api/folders/-/browse")
     async def browse_folders(path: str | None = None,
@@ -231,7 +235,8 @@ def register_folder_routes(app: FastAPI) -> None:
     async def post_folder(body: dict = Body(...),
                           identity: dict = Depends(require_identity)):
         try:
-            entry = add_folder(
+            entry = await asyncio.to_thread(
+                add_folder,
                 path=str(body.get("path") or ""),
                 name=body.get("name"),
                 mode=str(body.get("mode") or "ro"),
@@ -243,7 +248,7 @@ def register_folder_routes(app: FastAPI) -> None:
 
     @app.delete("/api/folders/{name}")
     async def delete_folder(name: str, identity: dict = Depends(require_identity)):
-        if not remove_folder(name):
+        if not await asyncio.to_thread(remove_folder, name):
             raise HTTPException(status_code=404, detail=f"no mapped folder named {name!r}")
         remapped = await _remap_apps(app)
         return {"removed": name, "remapped_apps": remapped}

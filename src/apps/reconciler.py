@@ -379,7 +379,10 @@ class Reconciler:
     async def _install_dependencies(self, manifest, *, write_cloud: bool,
                                     stack: tuple[str, ...]) -> list[str]:
         installed: list[str] = []
-        known_rows = self._known_dependency_rows()
+        # to_thread: _known_dependency_rows does BOTH a cloud-registry HTTP
+        # call and a local-mirror DB read, either of which would otherwise
+        # block the single event-loop thread for its full round-trip.
+        known_rows = await asyncio.to_thread(self._known_dependency_rows)
         for dep in self._required_app_dependencies(manifest):
             dep_id = dep["id"]
             if dep_id in stack:
@@ -506,7 +509,13 @@ class Reconciler:
         effective = loaded.granted_permissions if loaded else granted_req
         spec.granted_permissions = effective
 
-        self.local.upsert(spec, package_dir)
+        # to_thread, same as the cloud/fetch calls around it: LocalMirror talks
+        # to Postgres through the SYNCHRONOUS get_session, and reconcile()
+        # walks every installed app SERIALLY on the single event-loop thread.
+        # Left inline, a boot-time reconcile over ~47 apps put dozens of
+        # blocking DB round-trips on the one thread that serves every request,
+        # freezing unrelated requests for seconds right after boot.
+        await asyncio.to_thread(self.local.upsert, spec, package_dir)
         # Refresh the snapshot from whatever this install actually resolved,
         # so an app configured before this mechanism existed is protected by
         # the first reconcile that loads it, not only by its next config save.
@@ -563,13 +572,13 @@ class Reconciler:
         if loaded_before is not None:
             config_store.save(app_id, loaded_before.config)
         else:
-            for row in self.local.list():
+            for row in await asyncio.to_thread(self.local.list):
                 if row.get("app_id") == app_id:
                     config_store.save(app_id, row.get("config"))
                     break
         if self.runtime.is_loaded(app_id):
             await self.runtime.unload(app_id, purge_secrets=purge_secrets)
-        self.local.forget(app_id)
+        await asyncio.to_thread(self.local.forget, app_id)
         # _remove (fetch.remove_app_repo) already shutil.rmtree's whatever
         # sits at apps_root()/<slug> — for a sideloaded app that's the real
         # mcp.json COPY _ensure_mcp_scan_visible left behind (a real dir, not
@@ -607,10 +616,10 @@ class Reconciler:
                 except Exception:
                     log.exception("apps: reconcile could not read the cloud registry; "
                                   "falling back to the local mirror")
-                    desired = self.local.list()
+                    desired = await asyncio.to_thread(self.local.list)
                     source = "local-fallback"
             else:
-                desired = self.local.list()
+                desired = await asyncio.to_thread(self.local.list)
                 source = "local"
 
         specs = [AppSpec.from_row(r) for r in desired]
@@ -673,7 +682,8 @@ class Reconciler:
                 # normal install, must always re-fetch to pick up updates
                 # even when a stale `package_dir` already exists on disk).
                 previous_row = next(
-                    (r for r in self.local.list() if r.get("app_id") == app_id), None)
+                    (r for r in await asyncio.to_thread(self.local.list)
+                     if r.get("app_id") == app_id), None)
                 previous = AppSpec.from_row(previous_row) if previous_row else None
                 if previous is not None and loaded and loaded.package_dir:
                     previous.package_dir = loaded.package_dir
