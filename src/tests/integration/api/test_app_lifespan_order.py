@@ -130,6 +130,12 @@ def test_health_is_served_immediately_even_while_boot_reconcile_hangs(env, monke
             assert startup_elapsed < 5.0
             # The hang is still in flight — startup did NOT wait for it.
             assert not app.state.boot_reconcile_task.done()
+            # MUST release before TestClient.__exit__: lifespan shutdown closes
+            # the event loop, which joins its default ThreadPoolExecutor
+            # (asyncio.to_thread's home) and would otherwise deadlock forever
+            # waiting for the still-blocked `hang.wait()` thread to finish —
+            # a `finally` below runs too late to unblock that join.
+            hang.set()
     finally:
-        # Let the background task finish so it doesn't leak past the test.
+        # Idempotent safety net in case an assertion above failed first.
         hang.set()
