@@ -30,6 +30,7 @@ from src.api.notifications import register_notification_routes
 from src.api.observability import register_observability_routes
 from src.api.skills_routes import register_skills_routes
 from src.api.terminal import register_terminal_routes
+from src.api.vpn import register_vpn_routes
 from src.api.workspace_api_key import (
     get_or_create_workspace_api_key,
     regenerate_workspace_api_key,
@@ -307,6 +308,13 @@ def create_app() -> FastAPI:
     # aw-backend copy of this feature never answered it. See
     # src/api/guest_users.py — admin CRUD only, no guest login yet.
     register_guest_user_routes(app)
+
+    # Settings NEW > General > VPNs: stored VPN config profiles (upload, edit,
+    # delete, Nord import). Phase 1 stores and validates; NOTHING dials — the
+    # dialer is a Tier-2 app holding the `tun` host-power grant. These routes
+    # live HERE, not on aw-backend, because apiBase.js rewrites the SPA's
+    # relative /api/vpn/* to this origin. See src/api/vpn.py.
+    register_vpn_routes(app)
 
     # Decoupled-apps framework (F1): plugin runtime + /api/apps management.
     # Tier-1 apps hot-load into THIS process — no restart. Installed apps are
