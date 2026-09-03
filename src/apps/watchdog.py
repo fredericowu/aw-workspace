@@ -12,6 +12,23 @@ the next success, so a wedged endpoint (gh logged out) can't crash-loop.
 On app uninstall the runtime cancels every task the app registered
 (``cancel_all_for`` — called BEFORE drain so the app stops producing while its
 sockets close); the journal reverse-replay cancels again idempotently.
+
+W1: leader mode. At ``AW_WORKSPACE_WORKERS>1`` every worker process ends up
+with its own ``WatchdogSupervisor`` registering the SAME tasks (core CLI
+healer, mcp-gateway rescan, zombie reaper, any app-contributed
+``watchdog:tasks``) — without a gate that's N copies of each, and N
+concurrent CLI-healer installers racing the same binary path is corruption,
+not just waste. ``src/api/app.py``'s lifespan wires a ``RedisLease("core")``
+whose ``on_acquire``/``on_release`` call ``resume()``/``pause()`` here — the
+ONE choke point every periodic task funnels through, so app-contributed
+tasks are covered without each starter needing its own gate.
+``WatchdogSupervisor`` defaults to leader (``register()`` starts the loop
+immediately, exactly as before W1) so a process that never wires a lease at
+all — or one where Redis is unreachable, since ``RedisLease`` then never
+manages to fire ``on_acquire`` — keeps running its tasks locally instead of
+silently going dark. ``pause()`` only ever runs on a confirmed lease loss,
+which by construction can't happen at ``AW_WORKSPACE_WORKERS=1`` (a single
+process has no rival to lose the lease to).
 """
 from __future__ import annotations
 
@@ -57,7 +74,7 @@ class _Task:
         raw = self.interval_s() if callable(self.interval_s) else self.interval_s
         return max(0.0, float(raw))
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, paused: bool = False) -> dict[str, Any]:
         return {
             "app": self.app_id,
             "task_id": self.task_id,
@@ -66,14 +83,27 @@ class _Task:
             "last_error": self.last_error,
             "consecutive_failures": self.consecutive_failures,
             "next_run": self.next_run,
+            "paused": paused,
         }
 
 
 class WatchdogSupervisor:
-    """Runtime-owned registry + lifecycle for apps' periodic tasks."""
+    """Runtime-owned registry + lifecycle for apps' periodic tasks.
+
+    See the module docstring's "W1: leader mode" section for the
+    resume()/pause() contract this process's RedisLease("core") drives.
+    """
 
     def __init__(self) -> None:
         self._tasks: dict[tuple[str, str], _Task] = {}
+        self._leader: bool = True
+
+    @property
+    def is_leader(self) -> bool:
+        """Whether this process's tasks currently run their loops.
+        True by default (ungated) — only ``pause()`` ever flips it False,
+        which only happens from a confirmed RedisLease("core") loss."""
+        return self._leader
 
     def register(self, app_id: str, task_id: str,
                  fn: Callable[[], Awaitable[Any]],
@@ -86,8 +116,14 @@ class WatchdogSupervisor:
             raise WatchdogError("watchdog fn must be an async callable")
         t = _Task(app_id, task_id, fn, interval_s, run_immediately)
         self._tasks[key] = t
-        t.task = asyncio.ensure_future(self._run(t))
-        log.info("apps: registered watchdog %s/%s", app_id, task_id)
+        # Always recorded; the loop only spins while this process is the
+        # lease leader (or ungated — see the class docstring). A task
+        # registered while paused starts on the next resume(), no
+        # re-registration needed.
+        if self._leader:
+            t.task = asyncio.ensure_future(self._run(t))
+        log.info("apps: registered watchdog %s/%s%s", app_id, task_id,
+                  "" if self._leader else " (paused — not the lease leader)")
         return {"task_id": task_id, "registered": True}
 
     async def _run(self, t: _Task) -> None:
@@ -130,9 +166,39 @@ class WatchdogSupervisor:
             if t.task is not None and not t.task.done():
                 t.task.cancel()
 
+    def pause(self) -> None:
+        """RedisLease("core") on_release: stop every registered task's loop
+        WITHOUT dropping the registrations, so a subsequent resume() restarts
+        them with no re-registration. Idempotent — a task with no running
+        loop (already paused, or registered while paused) is left alone."""
+        self._leader = False
+        stopped = 0
+        for t in self._tasks.values():
+            if t.task is not None and not t.task.done():
+                t.task.cancel()
+                stopped += 1
+            t.task = None
+            t.next_run = None
+        log.warning("apps: watchdog paused (lease lost) — stopped %d running task(s), "
+                    "%d registration(s) kept", stopped, len(self._tasks))
+
+    def resume(self) -> None:
+        """RedisLease("core") on_acquire: (re)start every registered task's
+        loop. Idempotent — a task already running is left alone."""
+        self._leader = True
+        started = 0
+        for t in self._tasks.values():
+            if t.task is None or t.task.done():
+                t.task = asyncio.ensure_future(self._run(t))
+                started += 1
+        log.warning("apps: watchdog resumed (lease acquired) — started %d task(s)", started)
+
     def snapshot(self) -> list[dict[str, Any]]:
-        """Introspection for ``GET /api/apps/-/watchdog``."""
-        return [t.snapshot() for t in self._tasks.values()]
+        """Introspection for ``GET /api/apps/-/watchdog``. Each task also
+        reports ``paused`` — a non-leader worker's tasks are all paused by
+        design (see pause()/resume()), NOT failing/stale, and a consumer
+        must not conflate the two."""
+        return [t.snapshot(paused=not self._leader) for t in self._tasks.values()]
 
     def task_ids_for(self, app_id: str) -> list[str]:
         return [k[1] for k in self._tasks if k[0] == app_id]

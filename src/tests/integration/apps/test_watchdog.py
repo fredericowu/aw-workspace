@@ -195,5 +195,92 @@ def test_watchdog_introspection_endpoint():
         "last_error": None, "consecutive_failures": 0, "next_run": 301.0,
     }]
     body = TestClient(app).get("/api/apps/-/watchdog").json()
+    assert body["leader"] is True  # fresh WatchdogSupervisor defaults to leader
     assert body["tasks"][0]["task_id"] == "pr-poll"
     assert body["tasks"][0]["app"] == "git"
+
+
+# ---------------------------------------------------------------------------
+# W1: leader mode (RedisLease("core") on_acquire -> resume(), on_release ->
+# pause()) — see WatchdogSupervisor's module docstring. These exercise the
+# supervisor in isolation (no Redis); the real cross-process lease handoff is
+# covered by test_watchdog_lease_multiworker.py.
+# ---------------------------------------------------------------------------
+
+def test_leader_defaults_true_and_flips_via_pause_resume():
+    wd = WatchdogSupervisor()
+    assert wd.is_leader is True
+    wd.pause()
+    assert wd.is_leader is False
+    wd.resume()
+    assert wd.is_leader is True
+
+
+def test_register_while_paused_records_but_does_not_run():
+    async def run():
+        wd = WatchdogSupervisor()
+        wd.pause()  # simulate: this process lost the lease before the app registered
+        assert wd.is_leader is False
+
+        counter = {"n": 0}
+
+        async def fn():
+            counter["n"] += 1
+
+        wd.register("app", "t", fn, 0.01)
+        await asyncio.sleep(0.05)
+        assert counter["n"] == 0, "task ran despite the supervisor being paused"
+        assert wd.task_ids_for("app") == ["t"]  # recorded even though not running
+        snap = wd.snapshot()[0]
+        assert snap["paused"] is True
+
+        wd.resume()
+        await asyncio.sleep(0.05)
+        assert counter["n"] > 0, "resume() never started the previously-registered task"
+
+        wd.cancel_all_for("app")
+
+    _async(run())
+
+
+def test_pause_stops_running_task_but_keeps_registration():
+    async def run():
+        wd = WatchdogSupervisor()
+        counter = {"n": 0}
+
+        async def fn():
+            counter["n"] += 1
+
+        wd.register("app", "t", fn, 0.01)
+        await asyncio.sleep(0.05)
+        assert counter["n"] > 0
+
+        wd.pause()
+        assert wd.is_leader is False
+        assert wd.snapshot()[0]["paused"] is True
+        frozen = counter["n"]
+        await asyncio.sleep(0.05)
+        assert counter["n"] == frozen, "task kept running after pause()"
+        assert wd.task_ids_for("app") == ["t"], "pause() must not drop the registration"
+
+        wd.cancel_all_for("app")
+
+    _async(run())
+
+
+def test_resume_is_idempotent_for_an_already_running_task():
+    async def run():
+        wd = WatchdogSupervisor()
+
+        async def fn():
+            pass
+
+        wd.register("app", "t", fn, 1.0)
+        task_before = wd._tasks[("app", "t")].task
+        wd.resume()  # already leader, already running — must not replace the task
+        task_after = wd._tasks[("app", "t")].task
+        assert task_before is task_after
+
+        wd.cancel_all_for("app")
+
+    _async(run())

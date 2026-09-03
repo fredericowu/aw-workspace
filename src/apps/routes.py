@@ -926,8 +926,15 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         """Introspection over every app's registered watchdog tasks (F6 Cap 3):
         per-task last_run / last_ok / last_error / consecutive_failures /
         next_run — so a wedged poller (e.g. gh logged out) is visible without
-        crashing the app."""
-        return {"tasks": runtime.watchdog.snapshot()}
+        crashing the app.
+
+        W1: ``leader`` reports whether THIS process currently runs the
+        tasks at all — at ``AW_WORKSPACE_WORKERS>1`` only the worker holding
+        ``RedisLease("core")`` is the leader, and every other worker's tasks
+        come back with ``paused: true``. A paused task is a normal
+        non-leader state, not a failure — see ``WatchdogSupervisor.pause()``.
+        """
+        return {"leader": runtime.watchdog.is_leader, "tasks": runtime.watchdog.snapshot()}
 
     @app.get("/api/apps/-/doctor")
     async def doctor(identity: dict = Depends(require_identity)):

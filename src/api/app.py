@@ -36,7 +36,7 @@ from src.api.workspace_api_key import (
     regenerate_workspace_api_key,
 )
 from src.api.workspace_url import publish_workspace_api_url
-from src.apps.routes import reconcile_on_boot, register_apps_routes
+from src.apps.routes import _redis_coord_status, reconcile_on_boot, register_apps_routes
 
 log = logging.getLogger(__name__)
 
@@ -178,6 +178,65 @@ def create_app() -> FastAPI:
         # come back on the very first boot instead of needing a second,
         # manual `marketplace install --update` once someone notices.
         reconcile_sources_on_boot()
+        # W1: gate WatchdogSupervisor's periodic tasks (CLI healer,
+        # mcp-gateway rescan, zombie reaper, any app-contributed
+        # watchdog:tasks) on a Redis leader lease — at AW_WORKSPACE_WORKERS>1
+        # every worker's supervisor registers the SAME tasks below via
+        # reconcile_on_boot; without this gate that's N concurrent copies,
+        # and N CLI healers racing the same apt/npm install path is
+        # corruption, not just waste. resume()/pause() are idempotent and
+        # WatchdogSupervisor defaults to leader (see its module docstring),
+        # so if Redis is unreachable — no environment here has ever had the
+        # F5a companion, see src/libs/redis_coord.py — on_acquire simply
+        # never fires and this process keeps running its own tasks locally,
+        # unlike aw-backend's F3 (a replica with no leader runs nothing).
+        # At AW_WORKSPACE_WORKERS=1 (what ships) there's only ever one
+        # candidate, so behaviour is identical either way — the lease is
+        # still always attempted so a later scale-up to workers>1 needs no
+        # further change here.
+        #
+        # The reachability check below is ONLY for the loud log line (the
+        # lease itself is always started regardless of its result) — NOT
+        # awaited inline, matching this lifespan's own "don't gate serving
+        # on a slow check" rule two comments up (_boot_reconcile_and_sync).
+        # _redis_coord_status carries its own 3s connect + 3s ping timeout;
+        # inline here that's up to 6s added to EVERY app boot (every test
+        # using create_app() included) whenever Redis is unreachable — which
+        # is the CI runner's normal case today (no AW_REDIS_URL / Postgres-
+        # style ephemeral service wired for it, see .github/workflows/test.yml).
+        async def _log_watchdog_redis_status() -> None:
+            redis_status = await _redis_coord_status()
+            if not redis_status["reachable"]:
+                log.warning(
+                    "lifespan: Redis unreachable (%s) — WatchdogSupervisor has no "
+                    "leader lease to win; every periodic task runs locally in "
+                    "this process instead (today's single-worker behaviour; see "
+                    "doctor's `redis` check)",
+                    redis_status["note"],
+                )
+
+        asyncio.ensure_future(_log_watchdog_redis_status())
+
+        async def _on_watchdog_lease_acquire() -> None:
+            log.warning(
+                "lifespan: acquired RedisLease(\"core\") — this worker runs the periodic watchdog tasks"
+            )
+            app.state.app_runtime.watchdog.resume()
+
+        async def _on_watchdog_lease_release() -> None:
+            log.warning(
+                "lifespan: released RedisLease(\"core\") — pausing this worker's periodic watchdog tasks"
+            )
+            app.state.app_runtime.watchdog.pause()
+
+        from src.libs.redis_coord import RedisLease
+        watchdog_lease = RedisLease(
+            role="core",
+            on_acquire=_on_watchdog_lease_acquire,
+            on_release=_on_watchdog_lease_release,
+        )
+        await watchdog_lease.start()
+        app.state.watchdog_lease = watchdog_lease
         # Converge the running app set to the cloud registry, then (only
         # after) mirror contributes.skills — a fresh/recreated workspace
         # auto-reinstalls the user's apps this way (F3). Backgrounded, NOT
@@ -211,6 +270,17 @@ def create_app() -> FastAPI:
         task = app.state.boot_reconcile_task
         if not task.done():
             task.cancel()
+        # Best-effort: RedisLease.stop() re-raises whatever killed its
+        # internal renew loop (e.g. a connection error from a Redis outage
+        # that started after acquisition — redis_coord.py's _run() has no
+        # broad except around the redis calls) when it awaits that already-
+        # failed task. That's a shutdown-path detail of a lease we may never
+        # have actually won; it must not block or crash this process's own
+        # teardown.
+        try:
+            await app.state.watchdog_lease.stop()
+        except Exception:
+            log.exception("lifespan: watchdog_lease.stop() raised during shutdown")
 
     app = FastAPI(title="aw-workspace", version="0.1.0", lifespan=lifespan)
 
