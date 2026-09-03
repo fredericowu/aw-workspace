@@ -72,11 +72,14 @@ def test_requires_identity(ctx):
     assert client.get("/api/settings/observability").status_code == 401
 
 
-def test_defaults_to_off(ctx):
+def test_defaults_to_auto(ctx):
     client, _ = ctx
     res = client.get("/api/settings/observability")
     assert res.status_code == 200
-    assert res.json()["mode"] == "off"
+    body = res.json()
+    assert body["mode"] == "auto"
+    # ctx's runtime reports aw-app-signoz installed, so auto resolves live.
+    assert body["resolved"]["endpoint"] == "https://signoz.app.ws.example.com"
 
 
 def test_set_local_then_read_it_back(ctx):

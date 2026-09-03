@@ -199,6 +199,14 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="aw-workspace", version="0.1.0", lifespan=lifespan)
 
+    # This process's own OTel graph (logs + traces to whatever Observability
+    # currently resolves to) — unconditional and BEFORE add_middleware:
+    # set_tracer_provider is one-shot and Starlette refuses middleware once
+    # the app has started serving, so this can't be deferred until an app
+    # (aw-app-signoz) is actually installed. See src/api/otel.py.
+    from src.api.otel import init_otel
+    init_otel(app)
+
     # SPA→API is cross-origin (same apex) and credentialed — allow the SPA
     # origin with credentials so the apex aw_id_jwt cookie is accepted and
     # preflight (OPTIONS) succeeds. allow_credentials forbids a "*" origin,

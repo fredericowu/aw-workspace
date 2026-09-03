@@ -1,14 +1,28 @@
 """Observability settings — where THIS workspace sends OTLP telemetry.
 
-Three explicit states, not "blank field = auto" (Frederico, 2026-08-29
-Notion thread ``signoz``: a blank endpoint is ambiguous once ``aw-app-signoz``
-is installed — does blank mean "don't export" or "use the local one"?):
+Four explicit states, not "blank field = auto-or-off, guess which" (Frederico,
+2026-08-29 Notion thread ``signoz``: a blank endpoint is ambiguous once
+``aw-app-signoz`` is installed — does blank mean "don't export" or "use the
+local one"?):
 
-* ``off`` (default) — nothing is exported.
-* ``local`` — only selectable while ``aw-app-signoz`` is installed in this
-  workspace. Endpoint + auth are resolved automatically from the local
-  instance (:func:`src.apps.containers.app_public_url` + this workspace's
-  own API key) — the user types nothing.
+* ``auto`` (default for a workspace that never touched this setting) —
+  exports to this workspace's own aw-app-signoz automatically WHILE it is
+  installed, exports nothing while it isn't. Never persists a downgrade:
+  it just reflects whatever ``signoz_installed`` says on the next resolve.
+  This is what makes "install the app, telemetry just appears" true with no
+  manual step (Architect decision on card
+  ``observability:aw-workspace-core-no-otel-log-export`` — reverses the
+  2026-08-29 off-by-default call now that there is something to export TO
+  by default; Frederico accepted the reversal 2026-09-02).
+* ``off`` — an EXPLICIT opt-out. Unlike ``auto``, installing aw-app-signoz
+  later does not turn this back on — the user said no and stays no until
+  they change it themselves.
+* ``local`` — an EXPLICIT opt-in, only selectable while ``aw-app-signoz`` is
+  installed in this workspace. Endpoint + auth are resolved automatically
+  from the local instance (:func:`src.apps.containers.app_public_url` +
+  this workspace's own API key) — the user types nothing. Differs from
+  ``auto`` only in what happens when the app disappears: this one
+  downgrades (see below), ``auto`` just re-resolves to nothing.
 * ``custom`` — endpoint + API key filled in by hand, to point at any OTLP
   collector (including the ``aw-app-signoz`` of a *different* workspace of
   the same owner).
@@ -25,6 +39,13 @@ Off and warn — never fail silently. The downgrade is
 lazy — it happens the next time the config is read (GET, or the resolver
 used by aw-backend), not via an uninstall hook, since none exists for this
 today; documented as the chosen trade-off rather than built as a new hook.
+``auto`` mode has no equivalent downgrade to write: it was never pinned to
+"local" in the first place, so there's nothing to fall back from.
+
+Whatever this resolves to is only half the story — :mod:`src.api.otel` reads
+it (via ``ensure_export_state``) to decide what the core process's own OTel
+exporters actually send to. This module has no opentelemetry import and
+never did; it only ever describes intent.
 """
 from __future__ import annotations
 
@@ -49,7 +70,11 @@ SETTING_KEY = "observability"
 #: what "Local (auto)" resolves against.
 SIGNOZ_APP_ID = "signoz"
 
-MODES = ("off", "local", "custom")
+MODES = ("auto", "off", "local", "custom")
+
+#: What a workspace that has never touched this setting gets — see the
+#: module docstring's ``auto`` entry.
+DEFAULT_MODE = "auto"
 
 
 class ObservabilityError(ValueError):
@@ -114,11 +139,13 @@ def resolve(runtime) -> dict:
     Desligado — the endpoint/key that mode resolves to right now.
 
     Downgrades a stale ``local`` mode to ``off`` and persists that, per the
-    module docstring, whenever the app has disappeared since it was set."""
+    module docstring, whenever the app has disappeared since it was set.
+    ``auto`` never downgrades — it just resolves to nothing while the app
+    is gone and picks back up the moment it's installed again."""
     stored = _load()
-    mode = stored.get("mode") or "off"
+    mode = stored.get("mode")
     if mode not in MODES:
-        mode = "off"
+        mode = DEFAULT_MODE
     local_available = signoz_installed(runtime)
 
     warning = None
@@ -133,7 +160,10 @@ def resolve(runtime) -> dict:
         log.warning("observability: local mode stale (app not installed), reset to off")
 
     resolved = None
-    if mode == "local":
+    if mode == "auto":
+        if local_available:
+            resolved = {**local_target(), "source": "auto"}
+    elif mode == "local":
         resolved = {**local_target(), "source": "local"}
     elif mode == "custom":
         custom = _custom(stored)
@@ -275,5 +305,10 @@ def register_observability_routes(app: FastAPI) -> None:
             )
         except ObservabilityError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Re-evaluate what the core process's own OTel exporters should send
+        # to right NOW, so a save takes effect immediately — no restart, no
+        # waiting for the next boot reconcile. See src/api/otel.py.
+        from src.api.otel import ensure_export_state
+        await asyncio.to_thread(ensure_export_state, runtime)
         push = await _notify_agents_platform_runners()
         return {**result, "push": push}

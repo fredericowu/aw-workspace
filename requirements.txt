@@ -24,3 +24,13 @@ docker==7.1.0
 python-multipart==0.0.20
 redis==8.0.1
 pytest==9.0.2
+# This process's own OTel export — see src/api/otel.py. Set pinned/proved
+# together (1.40.0 SDK line, 0.61b0 instrumentation line, matching the
+# monolith's own working config). No RequestsInstrumentor: this codebase
+# only calls out over httpx, and NOT instrumenting requests is what keeps
+# the OTLP exporters below (built on requests) from tracing their own
+# outbound export call.
+opentelemetry-sdk==1.40.0
+opentelemetry-exporter-otlp-proto-http==1.40.0
+opentelemetry-instrumentation-asgi==0.61b0
+opentelemetry-instrumentation-httpx==0.61b0

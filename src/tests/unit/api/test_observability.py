@@ -69,12 +69,39 @@ def test_signoz_installed_false_without_a_runtime():
 # --- resolve -------------------------------------------------------------------
 
 
-def test_defaults_to_off(monkeypatch):
+def test_defaults_to_auto_and_resolves_when_installed(monkeypatch):
     _store(monkeypatch)
     result = observability.resolve(_runtime(True))
-    assert result["mode"] == "off"
+    assert result["mode"] == "auto"
+    assert result["resolved"] == {
+        "endpoint": "https://signoz.app.ws.example.com",
+        "api_key": "the-workspace-key",
+        "source": "auto",
+    }
+    assert result["warning"] is None
+
+
+def test_defaults_to_auto_and_resolves_to_nothing_when_not_installed(monkeypatch):
+    _store(monkeypatch)
+    result = observability.resolve(_runtime(False))
+    assert result["mode"] == "auto"
     assert result["resolved"] is None
     assert result["warning"] is None
+
+
+def test_auto_mode_re_resolves_live_instead_of_downgrading(monkeypatch):
+    """Unlike local, auto never persists a downgrade — it just tracks
+    whatever signoz_installed says on the next call."""
+    state = _store(monkeypatch, {"mode": "auto"})
+
+    gone = observability.resolve(_runtime(False))
+    assert gone["mode"] == "auto"
+    assert gone["resolved"] is None
+    assert state["value"].get("mode") == "auto"  # never rewritten to off
+
+    back = observability.resolve(_runtime(True))
+    assert back["mode"] == "auto"
+    assert back["resolved"]["source"] == "auto"
 
 
 def test_local_resolves_to_the_derived_endpoint_and_key(monkeypatch):
@@ -120,6 +147,12 @@ def test_custom_with_no_endpoint_yet_resolves_to_nothing(monkeypatch):
 
 
 # --- update ----------------------------------------------------------------
+
+
+def test_update_to_auto_always_succeeds(monkeypatch):
+    state = _store(monkeypatch, {"mode": "local"})
+    observability.update("auto", None, None, _runtime(False))
+    assert state["value"]["mode"] == "auto"
 
 
 def test_update_to_off_always_succeeds(monkeypatch):

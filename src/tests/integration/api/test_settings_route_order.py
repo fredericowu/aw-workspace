@@ -85,4 +85,4 @@ def test_observability_route_is_not_shadowed_by_the_generic_catchall(client):
     assert res.status_code == 200
     body = res.json()
     assert "value" not in body
-    assert body["mode"] == "off"
+    assert body["mode"] == "auto"

@@ -1192,3 +1192,9 @@ async def reconcile_on_boot(app: FastAPI) -> None:
     # wrapper, so it IS PID 1 — nothing else ever waits() a process that ends
     # up reparented onto it. See src.api.terminal_manager.reap_pid1_orphans.
     app.state.app_runtime.start_zombie_reaper()
+    # Re-evaluate what this process's own OTel exporters should send to —
+    # a boot reconcile is exactly the moment "auto" mode's answer can have
+    # changed underneath a stale in-memory target (e.g. aw-app-signoz was
+    # uninstalled while this process was down). See src/api/otel.py.
+    from src.api.otel import ensure_export_state
+    ensure_export_state(app.state.app_runtime)

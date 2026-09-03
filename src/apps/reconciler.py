@@ -542,6 +542,13 @@ class Reconciler:
             self._ensure_mcp_scan_visible(manifest.id, package_dir)
             await self._trigger_gateway_reload()
 
+        # An install of aw-app-signoz specifically is exactly what flips
+        # "auto" mode's answer from nothing to something — no gate on
+        # manifest.id here, ensure_export_state itself decides that by
+        # asking signoz_installed(). See src/api/otel.py.
+        from src.api.otel import ensure_export_state
+        ensure_export_state(self.runtime)
+
         return {"app_id": manifest.id, "version": spec.version,
                 "granted_permissions": effective, "package_dir": package_dir,
                 "dependencies_installed": deps_installed}
@@ -598,6 +605,11 @@ class Reconciler:
         # tools/call until something else happens to reload.
         if touched_mcp:
             await self._trigger_gateway_reload()
+
+        # Symmetric with install(): uninstalling aw-app-signoz is exactly
+        # what "auto" mode needs to notice so it stops trying to export.
+        from src.api.otel import ensure_export_state
+        ensure_export_state(self.runtime)
 
         return {"app_id": app_id, "uninstalled": True, "repo_removed": removed_repo}
 
