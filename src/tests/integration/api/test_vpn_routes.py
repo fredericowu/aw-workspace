@@ -81,7 +81,7 @@ def client(tmp_path, monkeypatch):
 # --- the plane ----------------------------------------------------------------
 
 
-def test_the_routes_are_registered_on_the_core_app(monkeypatch):
+def test_the_routes_are_registered_on_the_core_app(monkeypatch, tmp_path):
     """The claim: these routes answer on the WORKSPACE plane.
 
     Built against ``create_app()`` itself, with only the Postgres bootstrap
@@ -91,6 +91,12 @@ def test_the_routes_are_registered_on_the_core_app(monkeypatch):
     """
     import src.api.app as app_mod
 
+    # Point the home dir at a tmp path before anything registers: with
+    # AW_WORKSPACE_HOME unset, paths.py falls back to
+    # /opt/aw-workspace/.aw-workspace, which on a CI runner is either absent or
+    # read-only. Only the Postgres bootstrap is stubbed — everything else in
+    # create_app() runs for real, which is the point.
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(app_mod, "create_all_tables", lambda: None)
 
     paths = {getattr(r, "path", None) for r in app_mod.create_app().routes}
