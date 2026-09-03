@@ -31,9 +31,48 @@ jobs:
             exit 1
           fi
 
+      # src/tests' own Postgres-gated suites (test_isolation.py, test_db_tables.py,
+      # test_workspace_api_key.py, etc. — 10 files) each hardcode
+      # 127.0.0.1:5432/postgres for their own `_postgres_reachable()` probe and
+      # set AW_WORKSPACE_DB_URL to 127.0.0.1:5432/awserv themselves, so there's
+      # no env var to inject for THEM — they just need a real Postgres
+      # reachable at that fixed address. That address has to resolve inside the
+      # pytest container below, not on the runner host: no GH Actions
+      # `services:` block (needs a Docker daemon with host networking this
+      # runner doesn't uniformly have — Podman machine on macbook-fred), and no
+      # published host port either (this runner's bare-metal host already runs
+      # production Postgres, which can own 127.0.0.1:5432 there). Instead, join
+      # the pytest container to the ephemeral Postgres container's OWN network
+      # namespace (--network container:<name>) — the exact idiom
+      # docker-compose.yml already uses in production (aw-workspace joins
+      # aw-sandbox's netns to reach its own Postgres on loopback).
+      - name: Start ephemeral Postgres
+        id: pg
+        run: |
+          set -euo pipefail
+          NAME="aw-workspace-ci-pg-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          "$PODMAN" run -d --name "$NAME" \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=awserv \
+            postgres:16-alpine > /dev/null
+          for _ in $(seq 1 40); do
+            if "$PODMAN" exec "$NAME" pg_isready -U postgres -d awserv -q; then
+              echo "Postgres ready ($NAME)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::throwaway Postgres never became ready"
+          "$PODMAN" logs "$NAME"
+          exit 1
+
       - name: Test suite (in a python:3.12-slim container)
         run: |
-          "$PODMAN" run --rm -v "$PWD:/repo:ro" -w /repo python:3.12-slim \
+          "$PODMAN" run --rm --network "container:${{ steps.pg.outputs.name }}" \
+            -e AWSERV_DB_URL="postgresql+psycopg://postgres:postgres@127.0.0.1:5432/awserv" \
+            -v "$PWD:/repo:ro" -w /repo python:3.12-slim \
             sh -c "apt-get -qq update && apt-get -qq install -y --no-install-recommends git >/dev/null && \
                    pip install -q -r requirements.txt pytest pytest-asyncio && \
                    python3 -m pytest src/tests \
@@ -59,3 +98,9 @@ jobs:
           # fails inside this minimal, nested container (no real
           # terminal/init, restricted process visibility), unrelated to app
           # correctness. Passes fine on a bare host.
+
+      - name: Stop ephemeral Postgres
+        if: always()
+        run: |
+          NAME="${{ steps.pg.outputs.name }}"
+          [ -n "$NAME" ] && "$PODMAN" rm -f "$NAME" > /dev/null 2>&1 || true
