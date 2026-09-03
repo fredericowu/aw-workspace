@@ -18,7 +18,22 @@ from contextlib import contextmanager
 import httpx
 import pytest
 
+from src.apps import catalog as catalog_mod
 from src.apps import fetch as fetch_mod
+
+
+@pytest.fixture(autouse=True)
+def _no_catalog_network(monkeypatch):
+    """Every call here that doesn't pass an explicit ``token`` falls through
+    ``_download_headers`` into ``catalog.auth_headers_for_repo`` ->
+    ``get_catalog()`` — a REAL network fetch of the marketplace catalog from
+    raw.githubusercontent.com, which this file's own docstring claims never
+    happens. Undetected because whichever test hit it first here always ran
+    after an earlier, still-hanging CI test elsewhere in the suite (see
+    incident 2026-09-03, commit 50c1671) — this file's "no network is hit"
+    promise was already broken on its own before that fix ever landed.
+    """
+    monkeypatch.setattr(catalog_mod, "auth_headers_for_repo", lambda repo, url: {})
 
 
 def _make_tarball(root: str, files: dict[str, str | None]) -> bytes:
