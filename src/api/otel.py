@@ -124,6 +124,13 @@ def ensure_export_state(runtime: Any = None) -> dict[str, Any] | None:
     (Architect finding #2). ``custom`` mode is left as given: it may point
     at a *different* workspace's signoz, which this process only has a
     public path to.
+
+    If that internal lookup itself raises (malformed ``runtime.containers``,
+    ``is_loaded()`` lying about liveness — Architect finding #7), the public
+    endpoint was NEVER this consumer's intended target and is known to hang
+    (finding #2 above) — so this publishes ``None`` (export nothing) rather
+    than falling back to it. Confirmed live 2026-09-03: exactly this path is
+    what stalled CI 25+ minutes when pytest ran with no real ``AppRuntime``.
     """
     try:
         from src.api.observability import SIGNOZ_APP_ID, resolve
@@ -140,7 +147,11 @@ def ensure_export_state(runtime: Any = None) -> dict[str, Any] | None:
                 except Exception:
                     log.warning(
                         "otel: could not resolve aw-app-signoz's internal container "
-                        "URL, falling back to the public endpoint", exc_info=True)
+                        "URL — exporting nothing rather than falling back to the "
+                        "public endpoint, which is known to hang (Architect finding #2)",
+                        exc_info=True)
+                    _set_target(None)
+                    return None
             headers = {}
             api_key = resolved.get("api_key")
             if api_key:

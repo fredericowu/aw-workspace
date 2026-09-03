@@ -68,7 +68,13 @@ def test_custom_mode_keeps_the_endpoint_as_given():
     assert target["endpoint"] == "https://other.example.com"
 
 
-def test_falls_back_to_the_public_endpoint_if_the_internal_lookup_fails():
+def test_internal_lookup_failure_disables_export_rather_than_falling_back_to_public():
+    """Real-workspace finding (2026-09-03): CI ran pytest with no real
+    AppRuntime, ``base_url()`` raised, and the old code fell back to the
+    PUBLIC tunnel endpoint — which has a 30s cutoff and stalled CI for 25+
+    minutes. The public endpoint was never this consumer's intended target
+    (see the module/function docstrings), so a failed internal lookup must
+    disable export (``None``), not silently redirect to it."""
     def _boom(app_id):
         raise RuntimeError("no container registered")
     runtime = SimpleNamespace(containers=SimpleNamespace(base_url=_boom))
@@ -76,7 +82,8 @@ def test_falls_back_to_the_public_endpoint_if_the_internal_lookup_fails():
                return_value=_resolved("auto", "https://signoz.app.ws.example.com")):
         target = otel.ensure_export_state(runtime)
 
-    assert target["endpoint"] == "https://signoz.app.ws.example.com"
+    assert target is None
+    assert otel.current_target() is None
 
 
 def test_nothing_resolved_publishes_no_target():
