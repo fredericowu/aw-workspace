@@ -53,6 +53,29 @@ def ctx(monkeypatch):
     # the same session, in which case patching src.api.db has no effect here.
     monkeypatch.setattr(app_module, "create_all_tables", lambda: None)
 
+    # Defensive hardening, not a fix for a live bug here: this fixture never
+    # entered TestClient via `with`, so ASGI lifespan never ran and
+    # reconcile_on_boot was never actually exercised (confirmed empirically —
+    # this file has no hang). But every other real-lifespan fixture in this
+    # directory does stub it (see test_notification_routes.py's ctx), and a
+    # future `with` wrap for an unrelated reason would silently reintroduce
+    # the real-network boot-reconcile hang fixed in e9c8745/50c1671. Stub it
+    # now so that risk can't recur.
+    #
+    # NOT wrapped in `with` here despite that repo convention: doing so
+    # actually runs ASGI lifespan startup (get_or_create_workspace_api_key
+    # etc.), which needs a real Postgres this file's own design intentionally
+    # avoids ("this runs with no Postgres" — see module docstring). Verified
+    # empirically: switching to `with` fails every test here with
+    # `OperationalError: connection to server at 127.0.0.1:5432 failed` when
+    # no Postgres is running (as in local dev, and as this file was designed
+    # to allow). The reconcile_on_boot stub above is enough insurance without
+    # taking on that requirement.
+    async def noop_reconcile(app):
+        return None
+
+    monkeypatch.setattr(app_module, "reconcile_on_boot", noop_reconcile)
+
     token = pyjwt.encode(
         {"sub": "u1", "exp": int(time.time()) + 3600}, priv, algorithm="EdDSA"
     )
