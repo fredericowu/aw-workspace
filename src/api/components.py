@@ -77,6 +77,8 @@ def _service_snapshot(app: FastAPI) -> list[dict]:
             "status": "running" if running else "off",
             "running": running,
             "pid": status.get("pid"),
+            "last_exit_code": status.get("last_exit_code"),
+            "last_error": status.get("last_error"),
         })
     return rows
 

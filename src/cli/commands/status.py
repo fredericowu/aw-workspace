@@ -69,6 +69,8 @@ def _components(rows: list[dict], running: int) -> None:
         mark = "●" if row.get("running") else "○"
         port = f":{row['port']}" if row.get("port") else ""
         print(f"  {mark} {name.ljust(width)}  {str(row.get('status', '?')):<8}{port}")
+        if not row.get("running") and row.get("last_error"):
+            print(f"      exit {row.get('last_exit_code')}: {row['last_error']}")
 
 
 def _folders() -> None:

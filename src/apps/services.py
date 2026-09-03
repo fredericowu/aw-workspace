@@ -45,6 +45,11 @@ class _Service:
         # query the way ContainerSupervisor does.
         self.log_lines: deque[str] = deque(maxlen=_LOG_BACKLOG)
         self._reader_thread: threading.Thread | None = None
+        # Set by the reader thread once stdout closes (process exited), so a
+        # service that failed to even exec (e.g. a dead venv interpreter) is
+        # reported as "off" alongside WHY, not just silently off exactly like
+        # a service nobody ever asked to start.
+        self.last_exit_code: int | None = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -74,6 +79,7 @@ class ServiceSupervisor:
         if svc.proc is not None and svc.proc.poll() is None:
             return self.status(app_id, service_id)  # already running
         svc.log_lines.clear()
+        svc.last_exit_code = None
         svc.proc = subprocess.Popen(
             shlex.split(svc.start), cwd=svc.package_dir,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -90,6 +96,11 @@ class ServiceSupervisor:
                     buf.append(line.rstrip("\n"))
             except Exception:
                 log.exception("apps: log reader for service %s/%s crashed", app_id, service_id)
+            finally:
+                svc.last_exit_code = proc.poll()
+                if svc.last_exit_code not in (None, 0):
+                    log.warning("apps: service %s/%s exited with code %s",
+                                app_id, service_id, svc.last_exit_code)
 
         svc._reader_thread = threading.Thread(
             target=_pump, args=(svc.proc, svc.log_lines), daemon=True,
@@ -129,12 +140,18 @@ class ServiceSupervisor:
     def status(self, app_id: str, service_id: str) -> dict:
         svc = self._require(app_id, service_id)
         running = svc.proc is not None and svc.proc.poll() is None
-        return {
+        result = {
             "service": service_id,
             "running": running,
             "pid": svc.proc.pid if running and svc.proc else None,
             "autostart": svc.autostart,
         }
+        if not running and svc.last_exit_code not in (None, 0):
+            result["last_exit_code"] = svc.last_exit_code
+            tail = [l for l in svc.log_lines if l.strip()][-3:]
+            if tail:
+                result["last_error"] = " | ".join(tail)
+        return result
 
     def stop_all_for(self, app_id: str) -> None:
         """Stop + drop every service an app registered (uninstall)."""
