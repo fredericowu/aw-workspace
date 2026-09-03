@@ -15,6 +15,7 @@ import pytest
 from fastapi import FastAPI
 
 from src.api.identity import require_identity
+from src.apps import catalog as catalog_mod
 from src.apps import routes as routes_mod
 from src.apps.reconciler import AppSpec
 from src.apps.routes import register_apps_routes
@@ -40,7 +41,14 @@ def _app(tmp_path, monkeypatch, cloud):
 
 
 def _set_catalog(monkeypatch, apps):
-    monkeypatch.setattr(routes_mod, "get_catalog", lambda force=False: {"apps": apps})
+    """Patch the catalog at its SOURCE (``catalog_mod``), not just the name
+    re-imported into ``routes_mod`` — ``is_marketplace_app`` closes over
+    ``catalog_mod``'s own ``get_catalog`` global, so patching only the
+    re-export leaves it hitting the real network (see finding_key
+    infra:ci-test-suite-second-distinct-hang-post-otel-fix)."""
+    fake_get_catalog = lambda force=False: {"apps": apps}
+    monkeypatch.setattr(routes_mod, "get_catalog", fake_get_catalog)
+    monkeypatch.setattr(catalog_mod, "get_catalog", fake_get_catalog)
 
 
 async def _get(app, path):
