@@ -309,6 +309,49 @@ class TestRedisBroadcasterCrossProcess:
         assert received == [(topic, {"self": True})]
 
 
+class TestRedisCoordUsesRealFallbackResolution:
+    """W0: proves the PRODUCTION resolution path — no explicit redis_url
+    passed anywhere here — actually reaches a live Redis in this
+    environment, not just that an explicit REDIS_URL works. Before W0,
+    get_workspace_redis_url() had no AW_REDIS_URL fallback and would
+    resolve to the dead hardcoded 127.0.0.1:6379 default whenever
+    AW_WORKSPACE_REDIS_URL was unset (the normal case — F5a, which would
+    provision that var, is blocked in Need Human)."""
+
+    def test_publish_and_receive_via_default_resolution_no_explicit_url(self, monkeypatch):
+        monkeypatch.delenv("AW_WORKSPACE_REDIS_URL", raising=False)
+        monkeypatch.setenv("AW_REDIS_URL", REDIS_URL)
+
+        import importlib
+        import src.libs.redis_coord as redis_coord
+        importlib.reload(redis_coord)
+        assert redis_coord.get_workspace_redis_url() == REDIS_URL
+
+        topic = f"f5b-test-realpath-{uuid.uuid4().hex[:8]}"
+
+        async def scenario():
+            broadcaster = redis_coord.RedisBroadcaster()  # no redis_url — must resolve on its own
+            received = []
+
+            async def handler(recv_topic, payload):
+                received.append((recv_topic, payload))
+
+            await broadcaster.start_relay(handler)
+            await asyncio.sleep(0.2)
+            await broadcaster.publish(topic, {"via": "default_resolution"})
+
+            deadline = time.time() + 3.0
+            while not received and time.time() < deadline:
+                await asyncio.sleep(0.05)
+
+            await broadcaster.stop()
+            return received
+
+        received = asyncio.run(scenario())
+        importlib.reload(redis_coord)
+        assert received == [(topic, {"via": "default_resolution"})]
+
+
 class TestRedisBroadcasterKeyIsWorkspaceScoped:
     def test_publish_uses_aw_ws_prefix(self):
         from src.libs.redis_coord import RedisBroadcaster, _bcast_prefix

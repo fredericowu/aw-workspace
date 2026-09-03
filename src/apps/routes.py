@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 
 from fastapi import Body, Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
@@ -413,6 +414,34 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
         "degraded": degraded,
         "note": note,
     }
+
+
+async def _redis_coord_status() -> dict:
+    """Whether `src/libs/redis_coord.py` can actually reach a Redis right
+    now (W0). That module (F5b: RedisBroadcaster/RedisLease/cooldown/
+    RedisPollQueue) has zero consumers today, so nothing else would ever
+    notice its resolved URL going dead — its hardcoded fallback
+    (127.0.0.1:6379) answers nothing outside local dev sharing
+    aw-sandbox's netns, and the per-workspace companion that would provide
+    a real `AW_WORKSPACE_REDIS_URL` (F5a) is blocked in Need Human. This
+    exists so that dead-end is visible in ``doctor`` instead of only
+    surfacing the day a consumer is finally wired in and breaks silently.
+    """
+    import redis.asyncio as aioredis
+    from src.libs.redis_coord import get_workspace_redis_url
+
+    url = get_workspace_redis_url()
+    safe_url = re.sub(r"://[^@/]+@", "://***@", url)
+    client = aioredis.from_url(url, socket_connect_timeout=3)
+    try:
+        await asyncio.wait_for(client.ping(), timeout=3.0)
+    except Exception as e:  # noqa: BLE001 — the failure itself IS the finding
+        return {"reachable": False, "url": safe_url,
+                "note": f"redis_coord cannot reach {safe_url}: {e}"}
+    finally:
+        await client.aclose()
+    return {"reachable": True, "url": safe_url,
+            "note": "redis_coord's resolved Redis answers PING"}
 
 
 def register_apps_routes(app: FastAPI) -> AppRuntime:
@@ -927,6 +956,10 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
           what this catches is the subtler shape: a host that granted power
           nothing is using, and — once ``all`` is in play — a host offering
           less than it was asked for.
+        * ``redis`` — whether ``src/libs/redis_coord.py``'s resolved Redis
+          URL (W0) actually answers PING. That module has zero consumers
+          today, so nothing else would ever surface it silently resolving
+          to a dead address.
         """
         clis = runtime.commands.system_cli_report()
 
@@ -969,6 +1002,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
 
         mcp_status = await _mcp_gateway_status(
             runtime, expect_tools=bool(mcp_apps), expected=mcp_expected)
+        redis_status = await _redis_coord_status()
 
         host_offers = hostpower.host_grants()
         host_apps = []
@@ -989,6 +1023,11 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         unhealthy = [c for c in clis if not c["healthy"]]
         failing_app_checks = [c for c in app_checks if not c["ok"]]
         return {
+            # redis_status is NOT folded into "ok": src/libs/redis_coord.py
+            # has zero consumers today (W0), so its Redis being unreachable
+            # breaks nothing yet — it's still reported below for a human (or
+            # the CLI's own problem count) to see, just not treated as an
+            # active production degradation until something depends on it.
             "ok": (not unhealthy and not permissions and not failing_app_checks
                    and not mcp_status["degraded"]),
             "app_checks": app_checks,
@@ -1008,6 +1047,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 "apps_contributing_tools": mcp_apps,
                 **mcp_status,
             },
+            "redis": redis_status,
         }
 
     @app.get("/api/apps/-/catalog")

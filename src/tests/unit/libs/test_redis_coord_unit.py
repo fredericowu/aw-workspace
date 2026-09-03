@@ -15,6 +15,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     monkeypatch.delenv("AW_WORKSPACE_REDIS_URL", raising=False)
+    monkeypatch.delenv("AW_REDIS_URL", raising=False)
     monkeypatch.delenv("AW_WORKSPACE", raising=False)
     import src.libs.redis_coord as redis_coord
     importlib.reload(redis_coord)
@@ -28,6 +29,15 @@ class TestGetWorkspaceRedisUrl:
 
     def test_uses_env_var_when_set(self, _clean_env, monkeypatch):
         monkeypatch.setenv("AW_WORKSPACE_REDIS_URL", "redis://10.0.0.5:6379/2")
+        assert _clean_env.get_workspace_redis_url() == "redis://10.0.0.5:6379/2"
+
+    def test_falls_back_to_shared_aw_redis_url_when_workspace_url_unset(self, _clean_env, monkeypatch):
+        monkeypatch.setenv("AW_REDIS_URL", "redis://172.18.0.1:6379/1")
+        assert _clean_env.get_workspace_redis_url() == "redis://172.18.0.1:6379/1"
+
+    def test_workspace_redis_url_wins_over_shared_aw_redis_url(self, _clean_env, monkeypatch):
+        monkeypatch.setenv("AW_WORKSPACE_REDIS_URL", "redis://10.0.0.5:6379/2")
+        monkeypatch.setenv("AW_REDIS_URL", "redis://172.18.0.1:6379/1")
         assert _clean_env.get_workspace_redis_url() == "redis://10.0.0.5:6379/2"
 
 

@@ -6,11 +6,21 @@ driver (F5a) — one companion container per workspace, joined into the
 workspace container's own netns and injected as `AW_WORKSPACE_REDIS_URL`
 (deterministically `redis://127.0.0.1:6379` from inside the workspace
 container; see `docker_driver.py`'s "Redis companion (F5a)" note in the
-aw-backend repo). `get_workspace_redis_url()` falls back to that same
-address when the env var isn't set (e.g. local dev against the repo's own
-docker-compose, which currently shares aw-sandbox's netns and therefore the
-*shared* `aw-redis` — fine for local exercising of this module, just not
-workspace-isolated).
+aw-backend repo).
+
+F5a (the card that would provision that companion) is blocked in Need
+Human, so no environment running this module today actually has
+`AW_WORKSPACE_REDIS_URL` set, and the hardcoded `127.0.0.1:6379` default
+is dead everywhere except a local dev box sharing aw-sandbox's netns —
+`get_workspace_redis_url()` would otherwise resolve to an address nothing
+is listening on, silently, since this module had (and has) zero
+consumers to notice. W0 adds `AW_REDIS_URL` as a second fallback: the
+shared Redis this environment actually has reachable (e.g.
+`redis://172.18.0.1:6379/1`, the docker bridge gateway — see
+`get_workspace_redis_url()` for the full resolution order). Not
+workspace-isolated the way a real per-workspace companion would be (see
+the key-scoping note below), but real and alive, unlike the hardcoded
+default.
 
 Unlike aw-backend's `aw:` namespace, every key here is additionally scoped
 under `aw:ws:<AW_WORKSPACE>:` — the companion Redis is already isolated
@@ -50,11 +60,14 @@ import redis.asyncio as aioredis
 logger = logging.getLogger(__name__)
 
 REDIS_URL_ENV = "AW_WORKSPACE_REDIS_URL"
+SHARED_REDIS_URL_ENV = "AW_REDIS_URL"
 WORKSPACE_ENV = "AW_WORKSPACE"
 
 # Same address the F5a docker placement driver injects as
 # AW_WORKSPACE_REDIS_URL — the workspace container always reaches its own
-# Redis companion at 127.0.0.1:6379 inside its own netns.
+# Redis companion at 127.0.0.1:6379 inside its own netns. Last-resort
+# fallback only: dead in any environment with no companion and no
+# AW_REDIS_URL set either (see get_workspace_redis_url()).
 DEFAULT_REDIS_URL = "redis://127.0.0.1:6379/0"
 DEFAULT_WORKSPACE = "default"
 
@@ -64,12 +77,23 @@ BroadcastHandler = Callable[[str, dict], Awaitable[None]]
 
 
 def get_workspace_redis_url() -> str:
-    """`AW_WORKSPACE_REDIS_URL` (set by F5a for every managed workspace
-    container), falling back to `DEFAULT_REDIS_URL` — same 127.0.0.1:6379
-    address the companion is deterministically reachable at, useful when
-    running this module outside the managed placement driver (local dev,
-    unit tests)."""
-    return os.environ.get(REDIS_URL_ENV) or DEFAULT_REDIS_URL
+    """Resolution order, most specific (and most isolated) first:
+
+    1. `AW_WORKSPACE_REDIS_URL` — the per-workspace companion F5a's docker
+       placement driver injects when it exists. Not provisioned in any
+       environment today (F5a is blocked in Need Human).
+    2. `AW_REDIS_URL` — the shared Redis this environment actually has
+       reachable. Not workspace-isolated on its own (see the module
+       docstring), which is why every key this module writes is still
+       scoped under `aw:ws:<AW_WORKSPACE>:`.
+    3. `DEFAULT_REDIS_URL` — hardcoded guess at the companion's address,
+       only correct for local dev sharing aw-sandbox's netns.
+    """
+    return (
+        os.environ.get(REDIS_URL_ENV)
+        or os.environ.get(SHARED_REDIS_URL_ENV)
+        or DEFAULT_REDIS_URL
+    )
 
 
 def get_workspace_slug() -> str:

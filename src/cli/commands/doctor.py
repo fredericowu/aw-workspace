@@ -46,6 +46,7 @@ def run(args: list[str]) -> int:
     _autostart(report.get("autostart") or [])
     _host_power(report.get("host_power") or {})
     problems += _mcp(report.get("mcp") or {})
+    problems += _redis(report.get("redis") or {})
 
     print()
     if problems:
@@ -186,3 +187,17 @@ def _mcp(section: dict) -> int:
     print("      an upstream the gateway failed to connect to serves zero tools")
     print("      until a reload; the runtime re-checks every 60s")
     return 0
+
+
+def _redis(section: dict) -> int:
+    print()
+    if not section:
+        print("Redis (redis_coord) — no report from the server")
+        return 0
+    url = section.get("url", "?")
+    if section.get("reachable"):
+        print(f"Redis (redis_coord) — reachable at {url}")
+        return 0
+    print(f"Redis (redis_coord) — ✗ unreachable at {url}")
+    print(f"      {section.get('note', '')}")
+    return 1
