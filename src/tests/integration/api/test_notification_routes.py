@@ -63,7 +63,24 @@ def ctx(monkeypatch):
     monkeypatch.setattr(dbmod, "_engine", None)
 
     from starlette.testclient import TestClient
-    from src.api.app import create_app
+    import src.api.app as app_mod
+
+    # Unlike every other real-lifespan fixture in this directory (see
+    # test_skills_routes.py / test_settings_route_order.py /
+    # test_guest_user_routes.py), this one used to leave reconcile_on_boot
+    # unstubbed — the only file whose `with TestClient(...)` actually ran the
+    # REAL, network-fetching boot reconcile (GitHub tarball + catalog fetches)
+    # against a throwaway Postgres with no configured apps to converge. That
+    # background task (app.state.boot_reconcile_task) isn't cancelled on
+    # lifespan shutdown, and its retry loop runs over asyncio.to_thread —
+    # cancelling the awaiting coroutine doesn't stop the underlying worker
+    # thread — so it kept retrying real GitHub fetches for the rest of the
+    # pytest PROCESS's lifetime, eventually stalling later tests. See CI
+    # incident 2026-09-03 (commit e9c8745, run 33740591583).
+    async def noop_reconcile(app):
+        return None
+
+    monkeypatch.setattr(app_mod, "reconcile_on_boot", noop_reconcile)
 
     token = pyjwt.encode(
         {"sub": "u1", "exp": int(time.time()) + 3600}, priv, algorithm="EdDSA"
@@ -71,7 +88,7 @@ def ctx(monkeypatch):
     # `with` triggers the ASGI lifespan (startup/shutdown) — needed here because
     # NotificationManager.set_loop() only runs in lifespan startup, and the WS
     # broadcast path is a no-op (silently drops the message) without a loop set.
-    with TestClient(create_app()) as client:
+    with TestClient(app_mod.create_app()) as client:
         yield client, token
 
     from src.api.db import get_engine

@@ -196,6 +196,20 @@ def create_app() -> FastAPI:
         # bare fire-and-forget task).
         app.state.boot_reconcile_task = asyncio.ensure_future(_boot_reconcile_and_sync(app))
         yield
+        # Cancel rather than leave it running past shutdown: reconcile_on_boot
+        # walks every configured app serially, each network fetch (GitHub
+        # tarball / catalog) carrying its own retries, and nothing here was
+        # cancelling it on a short-lived process (e.g. a test's TestClient)
+        # exiting mid-reconcile — see incident 2026-09-03 (commit e9c8745),
+        # where exactly that kept a pytest process retrying real GitHub
+        # fetches long after the test that started it had finished. This
+        # bounds the *next* iteration of reconcile's per-app loop; a fetch
+        # already in flight runs via asyncio.to_thread, whose worker thread
+        # cancellation can't reach — real tests must not rely on this and
+        # should stub reconcile_on_boot instead (see test_skills_routes.py).
+        task = app.state.boot_reconcile_task
+        if not task.done():
+            task.cancel()
 
     app = FastAPI(title="aw-workspace", version="0.1.0", lifespan=lifespan)
 
