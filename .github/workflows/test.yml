@@ -56,7 +56,7 @@ jobs:
             -e POSTGRES_USER=postgres \
             -e POSTGRES_PASSWORD=postgres \
             -e POSTGRES_DB=awserv \
-            postgres:16-alpine > /dev/null
+            docker.io/library/postgres:16-alpine > /dev/null
           for _ in $(seq 1 40); do
             if "$PODMAN" exec "$NAME" pg_isready -U postgres -d awserv -q; then
               echo "Postgres ready ($NAME)"
