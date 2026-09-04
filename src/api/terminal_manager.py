@@ -690,8 +690,10 @@ def _xadd(key: str, frame: bytes, data: bytes, maxlen: int) -> bool:
     if client is None:
         return False
     try:
-        client.xadd(key, {b"t": frame, b"d": data},
-                    maxlen=maxlen, approximate=True)
+        entry_id = client.xadd(key, {b"t": frame, b"d": data},
+                                maxlen=maxlen, approximate=True)
+        logger.info("DUPDBG xadd pid=%s key=%s id=%s frame=%s len=%d preview=%r",
+                    os.getpid(), key, entry_id, frame, len(data), data[:24])
         return True
     except Exception as exc:
         logger.warning("terminal stream XADD to %s failed: %s", key, exc)
@@ -1028,6 +1030,8 @@ class TerminalSession:
 
     def _fan_out(self, data: bytes):
         """Deliver one chunk to this worker's subscribers. Loop thread only."""
+        logger.info("DUPDBG fan_out pid=%s session=%s len=%d subscribers=%d preview=%r",
+                    os.getpid(), self.id, len(data), len(self._subscribers), data[:24])
         if data:
             with self._scrollback_lock:
                 self._scrollback.append(data)
@@ -1090,8 +1094,11 @@ class TerminalSession:
         # consumer starting afterwards has to resume at the newest entry that
         # is now in it. Leaving an older cursor would re-deliver everything the
         # replay already covered, i.e. duplicate it on the client.
+        prev_cursor = self._out_cursor
         if newest is not None:
             self._out_cursor = newest
+        logger.info("DUPDBG prime_scrollback pid=%s session=%s chunks=%d prev_cursor=%s new_cursor=%s out_consumer_started=%s",
+                    os.getpid(), self.id, len(chunks), prev_cursor, self._out_cursor, self._out_consumer_started)
 
     # ---- input: every writer XADDs, only the owner touches the fd -------
 
@@ -1305,8 +1312,11 @@ class TerminalSession:
                 continue
             for _stream, entries in result or []:
                 for entry_id, fields in entries:
+                    prev_cursor = self._out_cursor
                     self._out_cursor = entry_id
                     frame = fields.get(b"t")
+                    logger.info("DUPDBG xread pid=%s session=%s id=%s prev_cursor=%s frame=%s",
+                                os.getpid(), self.id, entry_id, prev_cursor, frame)
                     if frame == _F_DATA:
                         self._deliver(fields.get(b"d") or b"")
                     elif frame == _F_EOF:
@@ -1633,6 +1643,8 @@ class TerminalManager:
         once and stays off the event loop: ``terminal.py`` reaches ``get()``
         exclusively through ``asyncio.to_thread``.
         """
+        logger.info("DUPDBG refresh_idle_scrollback pid=%s session=%s out_consumer_started=%s streams_enabled=%s",
+                    os.getpid(), session.id, session._out_consumer_started, streams_enabled())
         if session._out_consumer_started or not streams_enabled():
             return
         session.prime_scrollback()
@@ -1891,11 +1903,15 @@ class TerminalManager:
         with self._lock_for(session_id):
             session = self.sessions.get(session_id)
             if session is not None and session.alive:
+                logger.info("DUPDBG get cold-miss-but-cached pid=%s session=%s", os.getpid(), session_id)
                 return session
             meta = self._meta.get(session_id)
             if not meta:
+                logger.info("DUPDBG get no-meta pid=%s session=%s", os.getpid(), session_id)
                 return None
-            return self._adopt(session_id, meta)
+            adopted = self._adopt(session_id, meta)
+            logger.info("DUPDBG get adopted pid=%s session=%s ok=%s", os.getpid(), session_id, adopted is not None)
+            return adopted
 
     def remove(self, session_id: str,
                loop: asyncio.AbstractEventLoop | None = None):

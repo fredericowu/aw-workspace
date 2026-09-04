@@ -356,13 +356,18 @@ class TerminalRoutes:
 
         await websocket.accept()
         loop = asyncio.get_running_loop()
+        log.info("DUPDBG ws-connect pid=%s session=%s gen=%s is_owner=%s",
+                  os.getpid(), session_id, getattr(session, "gen", None), getattr(session, "is_owner", None))
         session.start_reader(loop)
 
         scrollback = session.get_scrollback()
+        log.info("DUPDBG ws-scrollback pid=%s session=%s len=%d preview=%r",
+                  os.getpid(), session_id, len(scrollback), scrollback[:24])
         if scrollback:
             await websocket.send_bytes(scrollback)
 
         queue = session.subscribe()
+        log.info("DUPDBG ws-subscribed pid=%s session=%s", os.getpid(), session_id)
 
         async def pty_to_ws():
             try:
@@ -377,6 +382,8 @@ class TerminalRoutes:
                             break
                         buf.extend(chunk)
                     try:
+                        log.info("DUPDBG ws-send pid=%s session=%s len=%d preview=%r",
+                                  os.getpid(), session_id, len(buf), bytes(buf)[:24])
                         await websocket.send_bytes(bytes(buf))
                     except Exception:
                         break
@@ -390,6 +397,8 @@ class TerminalRoutes:
                 if msg.get("type") == "websocket.disconnect":
                     break
                 if "bytes" in msg and msg["bytes"]:
+                    log.info("DUPDBG ws-input pid=%s session=%s len=%d preview=%r",
+                              os.getpid(), session_id, len(msg["bytes"]), msg["bytes"][:24])
                     session.write(msg["bytes"])
                 elif "text" in msg and msg["text"]:
                     text = msg["text"]
