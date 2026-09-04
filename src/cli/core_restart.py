@@ -139,6 +139,32 @@ def _exec_wait(backend_url: str, workspace: str, token: str, job_id: str,
     return _parse(resp)
 
 
+# exec_wait called immediately after exec_start has been observed, live, to
+# race a job-registration window on the host-side relay: the very next wait
+# call sometimes lands before the host has finished registering the job it
+# just started, and comes back "unknown job_id" for a job that in fact ran
+# fine (same shape as the documented exec_status/exec_wait race — see
+# native-skills/aw-workspace/SKILL.md). A short, bounded retry absorbs that
+# window; it must NOT retry the actual restart dispatch (see
+# _dispatch_restart's docstring for why), only this read-only wait.
+_EXEC_WAIT_RETRY_DELAYS_S = (0.5, 1.0, 2.0)
+
+
+def _exec_wait_with_retry(backend_url: str, workspace: str, token: str, job_id: str,
+                           timeout_s: float) -> dict:
+    last_error: RemoteHostError | None = None
+    for attempt, delay in enumerate((0.0, *_EXEC_WAIT_RETRY_DELAYS_S)):
+        if delay:
+            time.sleep(delay)
+        try:
+            return _exec_wait(backend_url, workspace, token, job_id, timeout_s)
+        except RemoteHostError as e:
+            if "unknown job_id" not in str(e):
+                raise
+            last_error = e
+    raise last_error
+
+
 def _parse(resp: httpx.Response) -> dict:
     try:
         data = resp.json()
@@ -169,7 +195,7 @@ def _preflight(backend_url: str, workspace: str, token: str, container_name: str
     job_id = started.get("job_id")
     if not job_id:
         raise RemoteHostError(f"exec_start returned no job_id: {started}")
-    result = _exec_wait(backend_url, workspace, token, job_id, timeout_s=PREFLIGHT_TIMEOUT_S)
+    result = _exec_wait_with_retry(backend_url, workspace, token, job_id, timeout_s=PREFLIGHT_TIMEOUT_S)
     stdout = result.get("stdout", "")
     if marker in stdout:
         names_part, _, digest_part = stdout.partition(marker)

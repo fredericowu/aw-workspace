@@ -90,6 +90,51 @@ def test_wait_reports_never_happened_at_deadline(monkeypatch):
     assert rc == 1
 
 
+# ---- exec_wait "unknown job_id" registration-race retry -----------------
+
+def test_exec_wait_with_retry_absorbs_a_transient_unknown_job_id(monkeypatch):
+    monkeypatch.setattr(core_restart, "_EXEC_WAIT_RETRY_DELAYS_S", (0, 0, 0))
+    calls = []
+
+    def fake_exec_wait(backend_url, workspace, token, job_id, timeout_s):
+        calls.append(1)
+        if len(calls) < 3:
+            raise core_restart.RemoteHostError('unknown job_id "abc"')
+        return {"stdout": "ok"}
+
+    monkeypatch.setattr(core_restart, "_exec_wait", fake_exec_wait)
+
+    result = core_restart._exec_wait_with_retry("url", "ws", "tok", "abc", timeout_s=5)
+    assert result == {"stdout": "ok"}
+    assert len(calls) == 3
+
+
+def test_exec_wait_with_retry_reraises_a_different_error_immediately(monkeypatch):
+    calls = []
+
+    def fake_exec_wait(backend_url, workspace, token, job_id, timeout_s):
+        calls.append(1)
+        raise core_restart.RemoteHostError("some other failure")
+
+    monkeypatch.setattr(core_restart, "_exec_wait", fake_exec_wait)
+
+    with pytest.raises(core_restart.RemoteHostError, match="some other failure"):
+        core_restart._exec_wait_with_retry("url", "ws", "tok", "abc", timeout_s=5)
+    assert len(calls) == 1
+
+
+def test_exec_wait_with_retry_gives_up_after_exhausting_retries(monkeypatch):
+    monkeypatch.setattr(core_restart, "_EXEC_WAIT_RETRY_DELAYS_S", (0, 0))
+
+    def fake_exec_wait(backend_url, workspace, token, job_id, timeout_s):
+        raise core_restart.RemoteHostError('unknown job_id "abc"')
+
+    monkeypatch.setattr(core_restart, "_exec_wait", fake_exec_wait)
+
+    with pytest.raises(core_restart.RemoteHostError, match="unknown job_id"):
+        core_restart._exec_wait_with_retry("url", "ws", "tok", "abc", timeout_s=5)
+
+
 # ---- sentinel idempotency ------------------------------------------------
 
 def test_restart_script_is_a_noop_on_second_dispatch(tmp_path):
