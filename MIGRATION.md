@@ -68,18 +68,29 @@ single-tenant host; they get migrated as the BYOD product needs them.
 
 5. **Mind stateful routes + worker count.** In-memory session state (PTY fds,
    subscriber queues) only lives in ONE uvicorn worker, so create-on-worker-A /
-   WS-on-worker-B would miss. That is no longer true of terminals: **W5 restored
-   the `screen` backing** (`src/api/terminal_manager.py`), so a session lives in
-   a screen server outside every worker, its metadata lives in a Redis hash, and
-   any worker can `screen -x` into it. Restart persistence falls out of the same
-   change — a screen outlives the process that made it.
+   WS-on-worker-B would miss. That is no longer true of terminals: **W7 relays
+   them over two Redis Streams per session** (`src/api/terminal_manager.py`) —
+   an output stream the owner XADDs and every worker XREADs, and an input
+   stream any worker XADDs and only the owner consumes. The PTY is still forked
+   by, and owned by, exactly one worker, because a master fd cannot cross a
+   process boundary; what crosses is the bytes. W7 replaced W5's GNU `screen`
+   backing, and `screen` is no longer installed in the image.
    `AW_WORKSPACE_WORKERS` ships as **10** (Dockerfile/compose) as of W6 — every
    phase W1-W5 shipped at workers=1 with behaviour identical to today, which is
    what made the flip a two-literal change instead of a revert-under-pressure.
    If you add a new stateful route, add its shared backing store before relying
    on the count staying at 10 — and check the fallbacks, because this module
-   degrades to a worker-owned PTY wherever `screen` or Redis is missing rather
-   than failing loudly.
+   degrades to a worker-owned PTY wherever Redis is unreachable rather than
+   failing loudly.
+
+   **The price W7 charges, and it is broader than "on deploy":** a PTY now dies
+   with its owning worker — a deploy, a crash, or a worker recycle. A `screen`
+   used to survive an app-process restart; **nothing does now.** Every terminal
+   open when a deploy lands dies with it (accepted and authorised on W7's card),
+   but so does every terminal whose worker is recycled for any other reason.
+   Restoring cross-restart survival would mean moving the PTY out of the workers
+   into a supervised sidecar — a different, larger change, not an extension of
+   this one.
 
 6. **Test.** Manager-level test for the real mechanics (a live PTY that actually
    runs a shell), TestClient test for the HTTP/WS contract + the identity gate.

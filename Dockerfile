@@ -15,15 +15,12 @@ ARG AW_WORKSPACE_VERSION=dev
 # want of it. Those now fall back to python3's stdlib zipfile so they work on
 # any base, but a 200KB package is cheaper than every future app rediscovering
 # this — and `unzip` in a terminal is table stakes.
-# screen → W5 restored the GNU screen backing for terminal sessions. A PTY's
-# master fd belongs to the process that forked it, so a screen server — which
-# is external to every uvicorn worker — is what lets any worker serve
-# /ws/terminal for any session, and what lets a session outlive a restart.
-# Without this binary src/api/terminal_manager.py falls back to a direct PTY
-# and terminals are worker-owned again (silently, and correctly, at
-# AW_WORKSPACE_WORKERS=1).
+# NOT here: `screen`. W5 installed it to relay terminal sessions between
+# uvicorn workers; W7 replaced that with two Redis Streams per session
+# (src/api/terminal_manager.py), so nothing in this image shells out to it any
+# more. `procps` stays — _ps_snapshot() needs `ps` for the process badge.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl build-essential libpq-dev procps git sudo unzip screen \
+        curl build-essential libpq-dev procps git sudo unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Headless-Chromium shared libraries. This image has no GUI stack, so a
@@ -94,11 +91,14 @@ COPY . /opt/aw-workspace
 RUN chown -R ubuntu:ubuntu /opt/aw-workspace \
     && git config --system --add safe.directory /opt/aw-workspace
 
-# 10 workers (W0-W6 multiworker chain): the boot path, periodic singletons,
+# 10 workers (W0-W7 multiworker chain): the boot path, periodic singletons,
 # per-app lifecycle, WS registries and terminal PTYs were all made
 # multi-worker-safe first (see W1-W5) — the state that used to be in-process
-# memory now lives in Postgres/Redis/GNU screen, so any worker can serve any
-# request. See MIGRATION.md for the phase-by-phase history.
+# memory now lives in Postgres and Redis, so any worker can serve any request.
+# A terminal PTY is the one thing still forked by exactly ONE worker (a master
+# fd cannot cross a process boundary); since W7 its BYTES cross instead, over
+# two Redis Streams per session. See MIGRATION.md for the phase-by-phase
+# history.
 # HOME is left at its useradd default (/home/ubuntu) — overriding it to
 # /opt/aw-workspace was confusing (a fresh terminal opening in the workspace
 # root is a nice-to-have, not worth hijacking $HOME for). AW_WORKSPACE_HOME is

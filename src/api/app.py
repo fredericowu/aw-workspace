@@ -317,6 +317,15 @@ def create_app() -> FastAPI:
                 "lifespan: acquired RedisLease(\"core\") — this worker runs the periodic watchdog tasks"
             )
             app.state.app_runtime.watchdog.resume()
+            # W7 one-shot, DELETE ONE RELEASE AFTER W7 (together with
+            # src/api/terminal_screen_sweep.py). `/opt/aw-workspace` is a bind
+            # mount, so this deploy landed on a RUNNING container whose pre-W7
+            # code left GNU screen servers behind with user shells inside them
+            # — and nothing in terminal_manager lists or kills them any more.
+            # Under the lease so only the leader sweeps; a no-op on any
+            # container built from the post-W7 Dockerfile (no `screen` binary).
+            from src.api.terminal_screen_sweep import sweep_orphaned_screens
+            asyncio.ensure_future(asyncio.to_thread(sweep_orphaned_screens))
 
         async def _on_watchdog_lease_release() -> None:
             log.warning(
@@ -460,19 +469,19 @@ def create_app() -> FastAPI:
         return {"key": await asyncio.to_thread(regenerate_workspace_api_key)}
 
     # Terminal feature (strangler migration #1): PTY shells on this BYOD host.
-    # W5 made these safe at AW_WORKSPACE_WORKERS>1 by restoring the GNU
-    # `screen` backing: the shell lives in a screen server external to every
-    # worker, its metadata lives in a Redis hash, and any worker attaches with
-    # `screen -x`. So this is no longer the piece that pins the workspace to
-    # one worker — W1 (watchdog), W2 (boot), W3 (app lifecycle), W4 (WS
-    # registries) and W5 (here) together cover the boot/runtime state.
-    # AW_WORKSPACE_WORKERS still SHIPS as 1 (Dockerfile/compose): the
-    # W-series' golden rule is that single-worker behaviour is unchanged, and
-    # raising it is a separate, deliberate decision — not a side effect of
-    # this line. Caveat worth keeping in view: terminals degrade to a
-    # worker-owned PTY wherever `screen` or Redis is missing, so a bump also
-    # depends on the image actually shipping screen (it does — see the
-    # Dockerfile) and Redis being reachable.
+    # Safe at AW_WORKSPACE_WORKERS>1 since W5 and, since W7, without the GNU
+    # `screen` dependency: the PTY is still forked by exactly one worker (a
+    # master fd cannot cross a process boundary), but its bytes travel over
+    # two Redis Streams per session, so any worker can serve
+    # /ws/terminal/<id>. So this is no longer the piece that pins the
+    # workspace to one worker — W1 (watchdog), W2 (boot), W3 (app lifecycle),
+    # W4 (WS registries) and W5/W7 (here) together cover the boot/runtime
+    # state, and AW_WORKSPACE_WORKERS ships as 10 as of W6.
+    # Caveat worth keeping in view: terminals degrade to a worker-owned PTY
+    # wherever Redis is unreachable, which is single-worker behaviour and the
+    # golden rule of the whole series — never "no Redis, no terminals". The
+    # price W7 charges instead: a PTY now dies with its owning worker
+    # (deploy, crash or recycle), where a screen used to survive one.
     register_terminal_routes(app)
 
     # Notification engine (strangler migration): POST /api/notify + WS
