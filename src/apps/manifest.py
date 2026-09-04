@@ -55,6 +55,35 @@ CONTRIBUTED_TASK_TYPES = ("terminal", "agentic_output", "agent_prompt")
 #: auth — that one has to be copied, or rotated on both sides at once.
 CONFIG_GENERATORS = ("urlsafe32", "urlsafe64", "hex32", "uuid4")
 
+#: ``x-options`` — a ``config_schema`` string field whose dropdown options come
+#: from LIVE, per-account data instead of an author-time ``enum: [...]``
+#: literal, and whose option LABEL may differ from the stored value::
+#:
+#:     "remote_host_id": {
+#:       "type": "string",
+#:       "default": "c76c606b0a2a5a8b",
+#:       "x-options": {
+#:         "source": "remote-hosts",
+#:         "filter": {"os": "windows"},
+#:         "value": "id",
+#:         "label": ["{id} ({friendly_name})", "{id}"]
+#:       }
+#:     }
+#:
+#: Resolved entirely CLIENT-SIDE (``repos/aw-workspace-ui/src/lib/
+#: configOptions.js``, ``AppConfigBody.jsx``) against a small fixed set of
+#: core-owned sources — today only ``remote-hosts``. ``label`` is a list of
+#: templates; the first whose referenced fields are all non-empty wins.
+#:
+#: DELIBERATELY UNVALIDATED here, unlike ``x-generate`` above: the renderer
+#: falls back to a plain text input for an unrecognised ``source`` or a failed
+#: fetch, so a manifest carrying ``x-options`` installs cleanly on a core that
+#: predates this convention, or names a source no version of core has yet.
+#: Adding validation would turn that graceful degrade into an install-time
+#: rejection for no gain — see the ``x-options`` design comment on Kanban card
+#: ``feature:windows-pilot-host-id-combobox`` for the full rollout-ordering
+#: argument.
+
 
 def _generate_value(kind: str) -> str:
     import secrets as _secrets
