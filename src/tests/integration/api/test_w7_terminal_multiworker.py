@@ -984,6 +984,59 @@ def test_terminal_routes_never_call_the_manager_from_an_async_def():
 
 
 # ---------------------------------------------------------------------------
+# Shutdown: a worker must not leave sessions it owned advertised as alive
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_clears_owner_meta_and_streams_for_an_owned_session(managers):
+    """``cleanup()`` is what app.py's lifespan shutdown calls on every worker
+    exit. Regression guard for the bug where it existed fully implemented but
+    was never wired in anywhere (``grep -rn "\\.cleanup(" src/api src/apps``
+    returned zero call sites) — every core restart left an owned session's
+    owner key, meta hash and streams alive for up to ``_OWNER_TTL`` seconds
+    after the worker that forked it was gone."""
+    _require_streams()
+    session_id = _sid()
+    mgr = managers()
+    session = mgr.create(name="shutdown-owned", session_id=session_id,
+                         command="sleep 60")
+    assert session.is_owner
+    assert _owner_alive(session_id), "precondition: the session has a live owner"
+
+    mgr.cleanup()
+
+    client = _get_redis()
+    assert client.exists(_term_key(tm._OWNER_SUFFIX, session_id)) == 0, \
+        "cleanup() left the owner key behind — still 'alive' for _OWNER_TTL"
+    assert mgr._meta.get(session_id) == {}, "cleanup() left the meta hash behind"
+    assert client.exists(_out_key(session_id, session.gen)) == 0, \
+        "cleanup() left the output stream behind"
+    assert client.exists(_in_key(session_id, session.gen)) == 0, \
+        "cleanup() left the input stream behind"
+    assert mgr.sessions == {}, "cleanup() left a local session handle behind"
+
+
+def test_cleanup_does_not_touch_a_session_this_worker_does_not_own(managers):
+    """A non-owner's ``cleanup()`` must act only on ITS OWN owned sessions —
+    a REST-only worker with an adopted remote handle must not tear down a
+    session another worker is still serving."""
+    _require_streams()
+    session_id = _sid()
+    owner, non_owner = managers(2)
+    owner.create(name="shutdown-not-owned", session_id=session_id,
+                command="sleep 60")
+    remote = non_owner.get(session_id)
+    assert remote is not None and not remote.is_owner
+
+    non_owner.cleanup()
+
+    assert _owner_alive(session_id), \
+        "a non-owner's cleanup() tore down another worker's live session"
+    assert owner._meta.get(session_id).get("shell_pid"), \
+        "a non-owner's cleanup() deleted meta for a session it did not own"
+
+
+# ---------------------------------------------------------------------------
 # Golden rule: no reachable Redis must never mean "no terminals"
 # ---------------------------------------------------------------------------
 

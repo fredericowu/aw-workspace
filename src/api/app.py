@@ -415,6 +415,18 @@ def create_app() -> FastAPI:
             await app.state.status_hub.aclose()
         except Exception:
             log.exception("lifespan: status_hub relay teardown raised during shutdown")
+        # W7: end every session this worker owns — otherwise its owner key,
+        # meta hash and streams keep advertising a terminal nobody can serve
+        # for up to _OWNER_TTL after this process is gone (see
+        # TerminalManager.cleanup's own docstring). Sync and Redis-blocking,
+        # so it goes through to_thread same as every other manager call from
+        # async code — same best-effort posture as the teardowns above.
+        try:
+            await asyncio.to_thread(
+                app.state.terminal_mgr.cleanup, asyncio.get_running_loop()
+            )
+        except Exception:
+            log.exception("lifespan: terminal manager cleanup raised during shutdown")
 
     app = FastAPI(title="aw-workspace", version="0.1.0", lifespan=lifespan)
 
@@ -486,7 +498,7 @@ def create_app() -> FastAPI:
     # golden rule of the whole series — never "no Redis, no terminals". The
     # price W7 charges instead: a PTY now dies with its owning worker
     # (deploy, crash or recycle), where a screen used to survive one.
-    register_terminal_routes(app)
+    app.state.terminal_mgr = register_terminal_routes(app)
 
     # Notification engine (strangler migration): POST /api/notify + WS
     # /ws/notifications, backed by this workspace's own Postgres schema. Any
