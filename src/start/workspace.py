@@ -158,6 +158,13 @@ def main():
     _reexec_into_venv()  # everything below runs under the shared venv interpreter
     _put_app_bin_dir_on_path()
 
+    # Mint boot_id/git_head/started_at into os.environ HERE — in the parent,
+    # before uvicorn.run(workers=N) below forks/spawns workers — so every
+    # worker inherits the same values via env instead of minting its own.
+    # See src/api/boot_info.py.
+    from src.api.boot_info import mint_boot_identity
+    mint_boot_identity()
+
     port = int(os.environ.get("AW_PORT", "9030"))
     workers = int(os.environ.get("AW_WORKSPACE_WORKERS", "1"))
     workspace = os.environ.get("AW_WORKSPACE", "")

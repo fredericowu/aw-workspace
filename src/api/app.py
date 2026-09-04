@@ -18,6 +18,7 @@ from fastapi import Depends, FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import Headers
 
+from src.api import boot_info
 from src.api.db import create_all_tables, get_session, get_workspace_schema
 from src.api.components import register_component_routes
 from src.api.agent_routes import register_agent_routes, sync_on_boot
@@ -443,6 +444,9 @@ def create_app() -> FastAPI:
             "status": "ok",
             "workspace": os.environ.get("AW_WORKSPACE", ""),
             "version": os.environ.get("AW_WORKSPACE_VERSION", ""),
+            "boot_id": boot_info.boot_id(),
+            "git_head": boot_info.git_head(),
+            "started_at": boot_info.started_at(),
         }
 
     @app.get("/api/auth/status")

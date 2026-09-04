@@ -185,6 +185,101 @@ hand-roll a `curl -H "X-Api-Key: ..."` by grepping `.env` yourself — that
 duplicates exactly what `local_client.request()` already does correctly,
 including the loopback/tunnel fallback.
 
+## `aw-workspace-cli restart core` vs. `update workspace`
+
+Two different problems that got conflated in a 2026-09-04 incident (card
+`3d15bf3b-9510-816a-bff8-fc6698619fa4`), and now have two different verbs:
+
+- **"I pushed a fix to this repo's core code, make it live."**
+  `/opt/aw-workspace` is a host bind mount — the moment a commit lands on
+  the linked BYOD host (`git push`, since the host and the container share
+  this tree), the code is already there. Only the **process** is stale.
+  That's `aw-workspace-cli restart core` — no identity token, agent
+  -triggerable from a sibling runner container.
+- **"I want a new container image."** That's
+  `aw-workspace-cli update workspace` below — it pulls `:latest` and syncs
+  the image's baked repo copy OVER the host source tree, rewriting it. Human
+  -only, JWT-gated, and NOT what you want after an ordinary code push (if
+  the image hasn't been rebuilt from the commit you're chasing, this can
+  silently overwrite newer files with older ones).
+
+### `restart core`
+
+```bash
+aw-workspace-cli restart core            # dispatch, don't wait
+aw-workspace-cli restart core --wait     # dispatch and poll /api/health
+```
+
+Mechanism (`src/cli/core_restart.py`), dispatched from **outside** the
+workspace container over the aw-remote-host link this workspace already
+has (same link `remote-hosts exec` uses) — the process serving the restart
+can't usefully wait on its own response, since it's the process about to
+die:
+
+1. Resolve `AW_BACKEND_URL` / `AW_WORKSPACE` / `AW_WORKSPACE_HOST_TOKEN`
+   (env first, then `<AW_WORKSPACE_HOME>/.env` — same fallback
+   `aw-app-remote-host-cli`'s client uses, so this also works from a
+   sibling agent-runner container, not just from inside the workspace).
+2. Capture `expected_head` (`git rev-parse HEAD` of this checkout) and
+   `boot_id_before` (current `/api/health`).
+3. Pre-flight: confirm the target container
+   (`aw-remote-host-workspace`, `CONTAINER_NAME_ENV` override
+   `AW_REMOTE_HOST_WORKSPACE_CONTAINER`) actually exists on the linked
+   host — refuses to restart a container it can't confirm by name — and
+   best-effort captures the currently-pulled `:latest` image digest for
+   the receipt (a restart on this host has been observed to come back as a
+   **recreate** from `:latest`, silently activating a pending image-baked
+   env change like `AW_WORKSPACE_WORKERS`; this doesn't prevent that, only
+   makes it attributable).
+4. Write a receipt to `.tmp/core-restart/<request_id>.json`.
+5. Dispatch the restart **async** (`exec_start`, never `exec_run`/
+   `exec_wait` for the mutating step — those are documented-flaky for a
+   job that ran fine, and the job kills the very channel a wait would sit
+   on). The host-side command is `[ -e <sentinel> ] && exit 0; touch
+   <sentinel>; { podman restart <container>; echo EXIT=$?; } >>
+   <log> 2>&1` — idempotent, because exec has been proven to execute the
+   same command TWICE during a link reconnect, and a double
+   `podman restart` would kill the freshly-booted process seconds after
+   boot. Sentinel/log live at a plain `/tmp` host path, never under
+   `/opt/aw-workspace` — that path is a bind mount of the HOST's own dir,
+   invisible to a script running ON the host.
+
+**`--wait` poll contract**: poll `/api/health` (below) until `boot_id`
+changes AND `git_head == expected_head`, to a ~180s deadline. Three
+distinguishable outcomes, three exit codes — never collapse them:
+
+| outcome | exit | meaning |
+|---|---|---|
+| `boot_id` unchanged at deadline | 1 | the restart never happened |
+| `boot_id` changed, `git_head` mismatches | 2 | came back on the WRONG code |
+| `boot_id` changed, `git_head` matches | 0 | success |
+
+The poller is disposable — all durable state is the receipt plus
+`/api/health` itself, so killing `--wait` loses nothing but the exit code.
+
+This grants **no new privilege**: anything that can read
+`<AW_WORKSPACE_HOME>/.env` can already run arbitrary shell on the linked
+host via `remote-hosts exec`. This only packages that into one idempotent,
+observable verb instead of a hand-rolled one-liner.
+
+### `/api/health`'s boot identity
+
+`src/api/boot_info.py` — `boot_id` (random uuid4), `git_head` (`git
+rev-parse HEAD` of the tree the process started from), `started_at` (epoch
+seconds), alongside the existing `status`/`workspace`/`version`. Minted
+**once**, in the parent process, before `uvicorn.run(workers=N)` in
+`src/start/workspace.py` — `AW_WORKSPACE_WORKERS=10` is live on this
+deployment, and if each worker minted its own `boot_id` a poller could
+never converge on one value. `git_head` in particular is captured at
+process **start**, never read live per request — reading it live would
+report the current bind-mounted worktree even on a stale process, exactly
+the lie this field exists to catch.
+
+This is now a public contract other services poll (`restart core --wait`
+above; aw-console and aw-backend's `_wait_for_workspace_version` also read
+`/api/health`) — add fields here, never repurpose or remove
+`status`/`workspace`/`version`/`boot_id`/`git_head`/`started_at`.
+
 ## `aw-workspace-cli update <workspace|remote-host>`
 
 Calls **aw-backend** (the cloud control plane), not this workspace:
@@ -205,9 +300,17 @@ export AW_ID_TOKEN=<aw_id_jwt value>
 aw-workspace-cli update workspace
 ```
 
-`AW_BACKEND_URL` and `AW_WORKSPACE` come from the same env this workspace
-already uses to reach aw-backend (see `.env.example`,
-`src/apps/registry_client.py`) — no new config needed beyond the token.
+`AW_BACKEND_URL` and `AW_WORKSPACE` resolve through the same env-then-`.env`
+fallback `restart core` uses (`src/cli/core_restart._env`) — no new config
+needed beyond the token, and this command now fails on the actual gate (the
+missing JWT) instead of on env vars that were readable all along. The JWT
+itself is deliberately NOT read from `.env` — nothing ever publishes it
+there, and it must stay something only a human hands the CLI explicitly.
+Widening this route to also accept the workspace's own host token was
+considered and **rejected** in the `restart core` design (see the card
+above): cross-repo, aw-backend deploys are manual, and it would widen a
+data-plane credential onto control-plane lifecycle routes that also cover
+uninstall/reinstall — the host token stays scoped to `remote-host/exec`.
 
 **Do not** reuse the workspace API key for this command. It only proves
 possession of one workspace's shared secret; aw-backend's per-user,
