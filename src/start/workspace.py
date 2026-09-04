@@ -169,6 +169,54 @@ def _resolve_workers() -> int:
     return int(read_workspace_env("AW_WORKSPACE_WORKERS") or os.environ.get("AW_WORKSPACE_WORKERS", "1"))
 
 
+def _uvicorn_log_config():
+    """Build a uvicorn ``log_config`` dict that also attaches a root-logger handler.
+
+    uvicorn.run(..., log_level="info") only configures uvicorn's OWN loggers
+    (``uvicorn``, ``uvicorn.error``, ``uvicorn.access``) via
+    ``Config.configure_logging()`` — it never touches the root logger. Without
+    this, every other module's ``logging.getLogger(__name__).info/warning(...)``
+    call has no handler anywhere in its propagation chain and is silently
+    dropped (INFO) or swallowed by Python's bare ``logging.lastResort``
+    handler at WARNING+ with no useful format. Confirmed live (2026-09-04):
+    terminal_manager.py's diagnostic logger.info/warning calls never reached
+    podman logs while uvicorn's own access-log lines for the same requests
+    did.
+
+    This must be wired in via ``log_config=`` rather than a bare
+    ``logging.basicConfig()`` call before ``uvicorn.run()`` — that would only
+    configure the parent process. With ``AW_WORKSPACE_WORKERS>1``, uvicorn
+    spawns each worker as a genuinely separate process
+    (``multiprocessing.get_context("spawn")``, see
+    ``uvicorn._subprocess.subprocess_started``) that never re-runs this
+    module's ``main()``; it only calls ``Config.configure_logging()`` on
+    itself, which applies whatever ``log_config`` dict was handed to
+    ``uvicorn.run()`` via ``logging.config.dictConfig(...)``. Routing our root
+    handler through that same mechanism is what makes it reach every worker
+    — where requests (and terminal_manager.py's logging) actually happen —
+    not just the parent supervisor.
+
+    uvicorn's own loggers ship with ``propagate=False`` in its default
+    dictConfig, so adding a root handler here does not double-print uvicorn's
+    access/error lines.
+    """
+    from copy import deepcopy
+
+    from uvicorn.config import LOGGING_CONFIG
+
+    log_config = deepcopy(LOGGING_CONFIG)
+    log_config["formatters"]["root"] = {
+        "format": "%(asctime)s %(levelname)s %(name)s: %(message)s",
+    }
+    log_config["handlers"]["root"] = {
+        "formatter": "root",
+        "class": "logging.StreamHandler",
+        "stream": "ext://sys.stdout",
+    }
+    log_config["root"] = {"handlers": ["root"], "level": "INFO"}
+    return log_config
+
+
 def main():
     _sync_venv_deps()
     _reexec_into_venv()  # everything below runs under the shared venv interpreter
@@ -197,6 +245,8 @@ def main():
 
     import uvicorn
 
+    log_config = _uvicorn_log_config()
+
     if workers > 1:
         uvicorn.run(
             "src.api.app:create_app",
@@ -205,10 +255,11 @@ def main():
             port=port,
             workers=workers,
             log_level="info",
+            log_config=log_config,
         )
     else:
         from src.api.app import create_app
-        uvicorn.run(create_app(), host="0.0.0.0", port=port, log_level="info")
+        uvicorn.run(create_app(), host="0.0.0.0", port=port, log_level="info", log_config=log_config)
 
 
 if __name__ == "__main__":
