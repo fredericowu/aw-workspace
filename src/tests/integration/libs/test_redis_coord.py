@@ -105,11 +105,25 @@ def _lease_churn_worker(role: str, redis_url: str, ttl: float, renew: float,
             if stop_event.is_set():
                 break
 
+            # W1 fix: on_release now fires on BOTH a confirmed loss of a
+            # held lease AND a confirmed loss of the initial race (never
+            # held it at all) — see redis_coord.py's _try_acquire(). This
+            # counter is an active-leader gauge, so it must only move on a
+            # genuine leader transition; track locally whether this attempt
+            # actually won so a first-attempt loss (which never
+            # incremented) doesn't decrement it below zero.
+            ever_leader = False
+
             async def on_acquire():
+                nonlocal ever_leader
+                ever_leader = True
                 await client.incr(counter_key)
 
             async def on_release():
-                await client.decr(counter_key)
+                nonlocal ever_leader
+                if ever_leader:
+                    ever_leader = False
+                    await client.decr(counter_key)
 
             lease = RedisLease(role=role, redis_url=redis_url, ttl=ttl, renew=renew,
                                 on_acquire=on_acquire, on_release=on_release)

@@ -7,6 +7,7 @@ test_redis_poll_queue.py (require a real Redis, skip cleanly otherwise).
 """
 from __future__ import annotations
 
+import asyncio
 import importlib
 
 import pytest
@@ -82,3 +83,67 @@ class TestGetRedisPool:
         monkeypatch.setenv("AW_WORKSPACE_REDIS_URL", "redis://127.0.0.1:6379/3")
         pool = _clean_env.get_redis_pool()
         assert pool is _clean_env.get_redis_pool("redis://127.0.0.1:6379/3")
+
+
+class _FailingRedisClient:
+    """Fake `aioredis.Redis` whose `set()` always raises — no live Redis
+    needed. Stands in for a transient connection blip."""
+
+    async def set(self, *args, **kwargs):
+        raise ConnectionError("simulated Redis blip")
+
+
+class TestRedisLeaseRunSurvivesExceptions:
+    """W1 fix (2) regression guard: `_run()` used to die permanently (an
+    unretrieved asyncio task exception) on ANY Redis exception — no
+    `except Exception`, only `except asyncio.CancelledError: raise`. A
+    losing worker that gets paused and then hits a blip on its next poll
+    would go dark forever, with its registrations intact and nothing to
+    resume them. This must hold with no Redis reachable at all."""
+
+    @pytest.mark.asyncio
+    async def test_exception_leaves_state_unknown_and_task_alive(self, _clean_env):
+        lease = _clean_env.RedisLease(role="w1-unit-test", renew=0.01)
+        lease._client = _FailingRedisClient()
+
+        task = asyncio.ensure_future(lease._run())
+        try:
+            # Several poll cycles' worth of raised exceptions.
+            await asyncio.sleep(0.05)
+            assert not task.done(), "lease._run() task died on a Redis exception"
+            assert lease._state == "unknown", (
+                "an exception carries no fact about the lease — state must "
+                "stay unchanged, not flip to standby/leader"
+            )
+            assert lease.is_leader is False
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_on_release_not_fired_by_a_raised_exception(self, _clean_env):
+        """Only a clean `nil` from Redis (a confirmed loss) may fire
+        on_release — a raised exception must not, or a transient blip would
+        pause a worker that never actually lost the race."""
+        released = False
+
+        async def on_release():
+            nonlocal released
+            released = True
+
+        lease = _clean_env.RedisLease(role="w1-unit-test", renew=0.01, on_release=on_release)
+        lease._client = _FailingRedisClient()
+
+        task = asyncio.ensure_future(lease._run())
+        try:
+            await asyncio.sleep(0.05)
+            assert released is False
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass

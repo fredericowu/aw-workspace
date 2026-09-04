@@ -286,11 +286,18 @@ class RedisLease:
         self._on_release = on_release
         self._client: Optional[aioredis.Redis] = None
         self._task: Optional[asyncio.Task] = None
-        self._is_leader = False
+        # Ternary, not boolean: "unknown" (no confirmed fact about the lease
+        # yet — either we haven't polled, or the last poll raised) is
+        # distinct from "standby" (Redis answered nil — a positive fact that
+        # someone else holds the key). Only a confirmed "standby" transition
+        # fires on_release; "unknown" never does, which is what keeps the
+        # ungated fallback (Redis unreachable -> WatchdogSupervisor stays at
+        # its default leader=True) intact. See _try_acquire()/_run().
+        self._state: str = "unknown"
 
     @property
     def is_leader(self) -> bool:
-        return self._is_leader
+        return self._state == "leader"
 
     def _get_client(self) -> aioredis.Redis:
         if self._client is None:
@@ -310,7 +317,7 @@ class RedisLease:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        if self._is_leader:
+        if self._state == "leader":
             await self._release()
         if self._client is not None:
             await self._client.aclose()
@@ -319,10 +326,24 @@ class RedisLease:
     async def _run(self) -> None:
         try:
             while True:
-                if not self._is_leader:
-                    await self._try_acquire()
-                else:
-                    await self._try_renew()
+                try:
+                    if self._state != "leader":
+                        await self._try_acquire()
+                    else:
+                        await self._try_renew()
+                except Exception as e:  # noqa: BLE001 — transient Redis blip
+                    # A raised exception carries no fact about who holds the
+                    # lease (unlike a clean nil), so state is deliberately
+                    # left untouched here — see the module's on_release
+                    # contract in _try_acquire(). Without this, any blip
+                    # would previously kill this task forever (an unretrieved
+                    # asyncio task exception), silently darkening whichever
+                    # worker hit it — paused losers included, since they'd
+                    # never poll again to notice Redis came back.
+                    logger.warning(
+                        "redis_coord: role=%s poll failed (Redis unreachable?), "
+                        "state unchanged (%s): %s", self.role, self._state, e,
+                    )
                 await asyncio.sleep(self.renew_interval)
         except asyncio.CancelledError:
             raise
@@ -331,16 +352,29 @@ class RedisLease:
         client = self._get_client()
         won = await client.set(self._key, self.token, nx=True, px=int(self.ttl * 1000))
         if won:
-            self._is_leader = True
-            logger.info("redis_coord: role=%s acquired by token=%s", self.role, self.token)
-            if self._on_acquire is not None:
-                await self._on_acquire()
+            if self._state != "leader":
+                self._state = "leader"
+                logger.info("redis_coord: role=%s acquired by token=%s", self.role, self.token)
+                if self._on_acquire is not None:
+                    await self._on_acquire()
+        else:
+            # Redis answered nil: a positive fact (Redis works AND someone
+            # else holds the key), not the same as "no fact" from a raised
+            # exception. Edge-triggered on the transition INTO standby, not
+            # every poll — _run() polls every renew_interval (5s default),
+            # so a naive "fire on_release every losing poll" would call
+            # watchdog.pause() 12x/min forever on every losing worker.
+            if self._state != "standby":
+                self._state = "standby"
+                logger.warning("redis_coord: role=%s lost race, standby token=%s", self.role, self.token)
+                if self._on_release is not None:
+                    await self._on_release()
 
     async def _try_renew(self) -> None:
         client = self._get_client()
         renewed = await client.eval(_RENEW_LUA, 1, self._key, self.token, int(self.ttl * 1000))
         if not renewed:
-            self._is_leader = False
+            self._state = "standby"
             logger.warning("redis_coord: role=%s lost by token=%s", self.role, self.token)
             if self._on_release is not None:
                 await self._on_release()
@@ -348,7 +382,7 @@ class RedisLease:
     async def _release(self) -> None:
         client = self._get_client()
         await client.eval(_RELEASE_LUA, 1, self._key, self.token)
-        self._is_leader = False
+        self._state = "standby"
         if self._on_release is not None:
             await self._on_release()
 

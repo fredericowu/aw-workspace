@@ -954,8 +954,22 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         ``RedisLease("core")`` is the leader, and every other worker's tasks
         come back with ``paused: true``. A paused task is a normal
         non-leader state, not a failure — see ``WatchdogSupervisor.pause()``.
+
+        ``gate`` additionally reports the underlying RedisLease("core")
+        state directly, rather than making a caller infer it from
+        ``leader`` alone (which can't distinguish "no lease system at all"
+        from "contending and currently standby"): ``"ungated"`` — no lease
+        was ever started for this process (``leader`` is the
+        WatchdogSupervisor default, true by design); ``"leader"`` — this
+        process holds RedisLease("core"); ``"standby"`` — this process is
+        contending but lost/hasn't won yet.
         """
-        return {"leader": runtime.watchdog.is_leader, "tasks": runtime.watchdog.snapshot()}
+        lease = getattr(app.state, "watchdog_lease", None)
+        if lease is None:
+            gate = "ungated"
+        else:
+            gate = "leader" if lease.is_leader else "standby"
+        return {"leader": runtime.watchdog.is_leader, "gate": gate, "tasks": runtime.watchdog.snapshot()}
 
     @app.get("/api/apps/-/doctor")
     async def doctor(identity: dict = Depends(require_identity)):
