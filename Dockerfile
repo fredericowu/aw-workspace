@@ -94,9 +94,11 @@ COPY . /opt/aw-workspace
 RUN chown -R ubuntu:ubuntu /opt/aw-workspace \
     && git config --system --add safe.directory /opt/aw-workspace
 
-# Single worker: the terminal feature keeps PTY sessions in-process memory, so
-# create/WS must land on the same worker. A single-user data-plane doesn't need
-# more. Revisit if a stateless multi-worker backing store is added (MIGRATION.md).
+# 10 workers (W0-W6 multiworker chain): the boot path, periodic singletons,
+# per-app lifecycle, WS registries and terminal PTYs were all made
+# multi-worker-safe first (see W1-W5) — the state that used to be in-process
+# memory now lives in Postgres/Redis/GNU screen, so any worker can serve any
+# request. See MIGRATION.md for the phase-by-phase history.
 # HOME is left at its useradd default (/home/ubuntu) — overriding it to
 # /opt/aw-workspace was confusing (a fresh terminal opening in the workspace
 # root is a nice-to-have, not worth hijacking $HOME for). AW_WORKSPACE_HOME is
@@ -105,7 +107,7 @@ RUN chown -R ubuntu:ubuntu /opt/aw-workspace \
 # /opt/aw-workspace/.aw-workspace to match the hardcoded PATH entry below and
 # the existing host bind-mount — decoupled from $HOME on purpose.
 ENV AW_PORT=9030 \
-    AW_WORKSPACE_WORKERS=1 \
+    AW_WORKSPACE_WORKERS=10 \
     AW_WORKSPACE_VERSION=${AW_WORKSPACE_VERSION} \
     PYTHONPATH=/opt/aw-workspace \
     AW_WORKSPACE_HOME=/opt/aw-workspace/.aw-workspace \

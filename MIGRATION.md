@@ -73,12 +73,13 @@ single-tenant host; they get migrated as the BYOD product needs them.
    a screen server outside every worker, its metadata lives in a Redis hash, and
    any worker can `screen -x` into it. Restart persistence falls out of the same
    change — a screen outlives the process that made it.
-   `AW_WORKSPACE_WORKERS` still **ships as 1** (Dockerfile/compose): the golden
-   rule for the whole W-series is that single-worker behaviour is unchanged, and
-   nothing yet requires the bump. If you add a stateful route, add its shared
-   backing store before raising the count — and check the fallbacks, because
-   this module degrades to a worker-owned PTY wherever `screen` or Redis is
-   missing rather than failing loudly.
+   `AW_WORKSPACE_WORKERS` ships as **10** (Dockerfile/compose) as of W6 — every
+   phase W1-W5 shipped at workers=1 with behaviour identical to today, which is
+   what made the flip a two-literal change instead of a revert-under-pressure.
+   If you add a new stateful route, add its shared backing store before relying
+   on the count staying at 10 — and check the fallbacks, because this module
+   degrades to a worker-owned PTY wherever `screen` or Redis is missing rather
+   than failing loudly.
 
 6. **Test.** Manager-level test for the real mechanics (a live PTY that actually
    runs a shell), TestClient test for the HTTP/WS contract + the identity gate.
@@ -94,7 +95,7 @@ single-tenant host; they get migrated as the BYOD product needs them.
    `podman pull` the new image, then `podman rm -f aw-remote-host-workspace` and
    re-`run` it on the `aw-remote-host` network, publishing `127.0.0.1:9030`, with
    the same env (`AW_WORKSPACE`, `AW_WORKSPACE_SCHEMA`, `AW_WORKSPACE_DB_URL`,
-   `AW_REDIS_URL`, `AW_BACKEND_URL`) and `AW_WORKSPACE_WORKERS=1`.
+   `AW_REDIS_URL`, `AW_BACKEND_URL`) and `AW_WORKSPACE_WORKERS=10`.
 
 8. **Update this map + the KB/ADR**, and decide the monolith copy's fate: keep it
    for the single-tenant host, or deprecate it once the BYOD path fully replaces
