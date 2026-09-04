@@ -21,8 +21,15 @@ from fastapi import Body, Depends, FastAPI, WebSocket, WebSocketDisconnect
 
 from src.api.identity import authorize_ws, require_identity
 from src.api.notification_db import NotificationDB
+from src.libs.redis_coord import RedisBroadcaster
 
 log = logging.getLogger("notifications")
+
+# W4: cross-worker fan-out topic. Notifications themselves are already
+# persisted in Postgres (`get_pending`/`get_recent`, already cross-worker) —
+# this relay carries only the live nudge to whichever workers have a
+# /ws/notifications listener open right now.
+_RELAY_TOPIC = "notifications"
 
 
 class NotificationManager:
@@ -32,9 +39,62 @@ class NotificationManager:
         self._db = NotificationDB()
         self._listeners: set[WebSocket] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._broadcaster = RedisBroadcaster()
+        self._relay_up = False
 
     def set_loop(self, loop):
         self._loop = loop
+
+    async def start_relay(self) -> None:
+        """Subscribe this worker to the ``notifications`` relay so a message
+        published from ANY worker (including this one — redis_coord's single
+        delivery path, no local shortcut) reaches this worker's
+        ``_listeners``. Awaited from the lifespan (not fire-and-forget): the
+        underlying ``psubscribe`` must be confirmed before this process
+        starts serving requests, or a broadcast published in the gap between
+        ``start()`` returning and the subscribe landing is simply never
+        delivered (redis_coord's relay has no replay). Never raises: a
+        workspace with no reachable Redis must still boot and deliver
+        notifications to whichever worker produced them, which is exactly
+        ``AW_WORKSPACE_WORKERS=1`` behaviour."""
+        try:
+            await self._broadcaster.start_relay(self._on_relay_message)
+            self._relay_up = True
+            log.info("notifications: subscribed to the %r relay for cross-worker fan-out",
+                     _RELAY_TOPIC)
+        except Exception:
+            log.warning(
+                "notifications: could not start the Redis relay — this worker "
+                "will only deliver notifications to its own local listeners "
+                "until restarted (harmless at AW_WORKSPACE_WORKERS=1; see "
+                "doctor's `redis` check)", exc_info=True)
+
+    async def _on_relay_message(self, topic: str, payload: dict) -> None:
+        if topic != _RELAY_TOPIC:
+            return
+        await self._broadcast(json.dumps(payload))
+
+    async def _publish(self, payload: dict) -> None:
+        """Single delivery path: publish to Redis, which this worker's own
+        relay subscription (``_on_relay_message``) fans back out locally —
+        never call ``_broadcast`` directly from the producer side. Degrades
+        to local-only delivery, loudly, if Redis is unreachable or the relay
+        never came up, so a notification is never silently dropped."""
+        if self._relay_up:
+            try:
+                await self._broadcaster.publish(_RELAY_TOPIC, payload)
+                return
+            except Exception:
+                log.warning("notifications: Redis publish failed — falling "
+                           "back to local-only delivery for this notification",
+                           exc_info=True)
+        await self._broadcast(json.dumps(payload))
+
+    async def aclose(self) -> None:
+        try:
+            await self._broadcaster.stop()
+        except Exception:
+            log.debug("notifications: relay teardown raised", exc_info=True)
 
     def add_notification(self, message: str, level: str = "info", title: str = "",
                          source: str = "", url: str = "",
@@ -64,15 +124,15 @@ class NotificationManager:
         superseded_ids = notif.pop("superseded_ids", [])
         log.info("Notification #%d: [%s] %s (superseded: %s)", notif["id"], level, message[:80], superseded_ids or "none")
 
-        if self._loop and self._listeners:
-            msg = json.dumps({
+        if self._loop:
+            payload = {
                 "type": "ninja_notification",
                 "notification": notif,
                 "superseded_ids": superseded_ids,
-            })
+            }
             self._loop.call_soon_threadsafe(
                 asyncio.ensure_future,
-                self._broadcast(msg),
+                self._publish(payload),
             )
         return notif
 

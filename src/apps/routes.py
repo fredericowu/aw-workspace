@@ -1099,7 +1099,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             await websocket.close(code=4401, reason="unauthorized")
             return
         await websocket.accept()
-        for job in jobs.all_active():
+        for job in await jobs.all_active_shared():
             await websocket.send_text(json.dumps({"type": "app_install_status", "job": job}))
         jobs.add_listener(websocket)
         try:

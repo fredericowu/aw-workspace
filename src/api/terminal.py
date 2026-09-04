@@ -39,17 +39,53 @@ from src.api.identity import authorize_ws, require_identity
 from src.api.terminal_manager import (
     TerminalManager, kill_proc_tree, session_child_procs,
 )
+from src.libs.redis_coord import RedisBroadcaster
 
 log = logging.getLogger(__name__)
 
 _DROPS_DIR = os.path.join(tempfile.gettempdir(), "aw-drops")
 
+#: W4 relay topic for the /ws/status push socket.
+_STATUS_TOPIC = "terminal-status"
+
 
 class StatusHub:
-    """Fan-out for the ``/ws/status`` push socket (single-worker, in-memory)."""
+    """Fan-out for the ``/ws/status`` push socket.
+
+    W4: cross-worker via ``RedisBroadcaster`` — a ``terminal_update`` fired
+    by a REST call that landed on one worker must reach a client whose
+    ``/ws/status`` socket is open on a different one.
+    """
 
     def __init__(self):
         self._clients: set[WebSocket] = set()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._broadcaster = RedisBroadcaster()
+        self._relay_up = False
+
+    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+
+    async def start_relay(self) -> None:
+        """Awaited from the lifespan, not fire-and-forget — see
+        ``NotificationManager.start_relay`` for why. Never raises: a
+        workspace with no reachable Redis must still push terminal updates
+        to whichever worker produced them, which is exactly
+        ``AW_WORKSPACE_WORKERS=1`` behaviour."""
+        try:
+            await self._broadcaster.start_relay(self._on_relay_message)
+            self._relay_up = True
+        except Exception:
+            log.warning(
+                "terminal: could not start the /ws/status Redis relay — this "
+                "worker will only deliver terminal updates to its own local "
+                "listeners until restarted (harmless at "
+                "AW_WORKSPACE_WORKERS=1)", exc_info=True)
+
+    async def _on_relay_message(self, topic: str, payload: dict) -> None:
+        if topic != _STATUS_TOPIC:
+            return
+        await self._send_to_all(payload)
 
     def add(self, ws: WebSocket):
         self._clients.add(ws)
@@ -58,6 +94,22 @@ class StatusHub:
         self._clients.discard(ws)
 
     async def broadcast(self, message: dict):
+        """Push ``message`` to every ``/ws/status`` listener across every
+        worker via the Redis relay (single delivery path — this worker's own
+        listeners are reached through ``_on_relay_message`` too, never
+        directly from here). Degrades to local-only delivery, loudly, if
+        Redis is unreachable or the relay never came up."""
+        if self._relay_up:
+            try:
+                await self._broadcaster.publish(_STATUS_TOPIC, message)
+                return
+            except Exception:
+                log.warning("terminal: /ws/status Redis publish failed — "
+                           "falling back to local-only delivery for this "
+                           "message", exc_info=True)
+        await self._send_to_all(message)
+
+    async def _send_to_all(self, message: dict):
         payload = json.dumps(message)
         dead = []
         for ws in list(self._clients):
@@ -75,6 +127,12 @@ class StatusHub:
         except RuntimeError:
             return
         loop.create_task(self.broadcast(message))
+
+    async def aclose(self) -> None:
+        try:
+            await self._broadcaster.stop()
+        except Exception:  # noqa: BLE001 — shutdown path
+            pass
 
 
 class TerminalRoutes:

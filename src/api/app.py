@@ -221,6 +221,18 @@ def create_app() -> FastAPI:
         # sync callers (e.g. the apps facade) — see NotificationManager.set_loop.
         app.state.notification_mgr.set_loop(asyncio.get_running_loop())
         app.state.app_install_jobs.set_loop(asyncio.get_running_loop())
+        # W4: same shape as the two calls above — starts the Redis relay
+        # that makes a terminal_update fired on one worker reach a
+        # /ws/status client connected to another.
+        app.state.status_hub.set_loop(asyncio.get_running_loop())
+        # Awaited, not fire-and-forget: each start_relay() only returns once
+        # its psubscribe is confirmed, so no broadcast in the gap between
+        # "server starts accepting requests" and "this worker's relay is up"
+        # can be silently dropped (redis_coord's relay has no replay). Never
+        # raises — see each start_relay()'s own docstring.
+        await app.state.notification_mgr.start_relay()
+        await app.state.app_install_jobs.start_relay()
+        await app.state.status_hub.start_relay()
         # A freshly-installed/recreated workspace always gets a workspace API
         # key with zero manual steps — get_or_create is a no-op once one
         # already exists in the settings table. MUST run before
@@ -384,6 +396,15 @@ def create_app() -> FastAPI:
             await app.state.app_install_jobs.aclose()
         except Exception:
             log.exception("lifespan: app lifecycle teardown raised during shutdown")
+        # W4: drop the three WS-registry Redis relays the same best-effort way.
+        try:
+            await app.state.notification_mgr.aclose()
+        except Exception:
+            log.exception("lifespan: notification relay teardown raised during shutdown")
+        try:
+            await app.state.status_hub.aclose()
+        except Exception:
+            log.exception("lifespan: status_hub relay teardown raised during shutdown")
 
     app = FastAPI(title="aw-workspace", version="0.1.0", lifespan=lifespan)
 

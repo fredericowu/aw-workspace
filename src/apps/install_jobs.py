@@ -32,6 +32,17 @@ with it unreachable every behaviour here is exactly what ships today.
 Keys are ``aw:ws:<ws>:appjob:<app_id>``, TTL'd (``JOB_TTL_S``) because a
 finished job is a transient UI concern, not state anything converges to — the
 ``AppInstall`` row is the durable record.
+
+W4 (multi-worker): the STATE mirror above (W3) only fixed the poll fallback.
+The live WS push (``/ws/apps/install-status``) was still worker-local on both
+ends — ``_broadcast`` only reached ``self._listeners`` in THIS process, and a
+client connecting mid-install replayed only ``self._jobs`` on THIS process —
+so a user watching the Marketplace panel from a worker other than the one
+running the install saw an empty panel that never ticked. This module now
+also runs a ``RedisBroadcaster`` relay (``_WS_TOPIC``) for the live pushes,
+and ``all_active_shared`` folds the Redis-mirrored STATE in for the replay,
+same split as everywhere else in this file: jobs stay owned by the worker
+running the install, everything else reads them from Redis.
 """
 from __future__ import annotations
 
@@ -44,12 +55,18 @@ from typing import Any, Optional
 
 from fastapi import WebSocket
 
+from src.libs.redis_coord import RedisBroadcaster
+
 log = logging.getLogger(__name__)
 
 #: A finished install's status only has to outlive the UI's poll interval;
 #: an in-flight one is refreshed on every transition. Long enough that a
 #: user watching the Marketplace panel always sees the terminal state.
 JOB_TTL_S = 900
+
+#: W4 relay topic for the live WS push (separate from the W3 STATE mirror's
+#: per-app-id keys above).
+_WS_TOPIC = "install-status"
 
 
 @dataclass
@@ -90,9 +107,37 @@ class InstallJobs:
         # reach for a Redis client.
         self._share = share
         self._client: Any = None
+        self._broadcaster = RedisBroadcaster()
+        self._relay_up = False
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
+
+    async def start_relay(self) -> None:
+        """W4: the live half of the cross-worker fix (see module docstring).
+        Awaited from the lifespan, not fire-and-forget — the same reasoning
+        as ``NotificationManager.start_relay``: a subscribe that hasn't
+        landed yet would silently drop this process's own first broadcasts.
+        Never raises: with no reachable Redis, the Marketplace panel falls
+        back to its own 2s poll against ``get_shared`` (still cross-worker
+        via the W3 STATE mirror), same posture as every other relay in this
+        codebase."""
+        if not self._share:
+            return
+        try:
+            await self._broadcaster.start_relay(self._on_relay_message)
+            self._relay_up = True
+        except Exception:
+            log.warning(
+                "apps: could not start the install-status Redis relay — this "
+                "worker will only push live install progress to its own "
+                "local listeners until restarted (harmless at "
+                "AW_WORKSPACE_WORKERS=1)", exc_info=True)
+
+    async def _on_relay_message(self, topic: str, payload: dict) -> None:
+        if topic != _WS_TOPIC:
+            return
+        await self._send_all(json.dumps(payload))
 
     # ---- cross-worker mirror (W3) ---------------------------------------
 
@@ -179,6 +224,10 @@ class InstallJobs:
             except Exception:  # noqa: BLE001 — shutdown path
                 pass
             self._client = None
+        try:
+            await self._broadcaster.stop()
+        except Exception:  # noqa: BLE001 — shutdown path
+            pass
 
     def add_listener(self, ws: WebSocket) -> None:
         self._listeners.add(ws)
@@ -207,9 +256,42 @@ class InstallJobs:
             self._loop.call_soon_threadsafe(asyncio.ensure_future, _del())
 
     def all_active(self) -> list[dict[str, Any]]:
-        """Snapshot of every tracked job — sent to a WS client on connect so
-        it catches up on installs that started before it connected."""
+        """This worker's own tracked jobs — local-only snapshot. Kept for
+        callers that only care about this process; the ``/ws/apps/
+        install-status`` route uses :meth:`all_active_shared` (W4)."""
         return [job.as_dict() for job in self._jobs.values()]
+
+    async def all_active_shared(self) -> list[dict[str, Any]]:
+        """Cross-worker snapshot for a WS client's on-connect replay (W4).
+
+        This worker's own jobs (authoritative, same precedence as
+        :meth:`get_shared`), plus anything mirrored into Redis by another
+        worker that this process has never seen — without this, a client
+        connecting to a worker that isn't running any install saw an empty
+        panel even mid-install, the other half of the bug W3 didn't cover
+        (W3 only fixed ``GET .../install-status``, not this replay)."""
+        jobs = {job.app_id: job.as_dict() for job in self._jobs.values()}
+        if self._share:
+            try:
+                client = self._redis()
+                if client is not None:
+                    prefix = self._key("")
+                    async for key in client.scan_iter(match=f"{prefix}*"):
+                        app_id = key[len(prefix):]
+                        if app_id in jobs:
+                            continue
+                        raw = await client.get(key)
+                        if not raw:
+                            continue
+                        try:
+                            jobs[app_id] = json.loads(raw)
+                        except ValueError:
+                            continue
+            except Exception:
+                log.debug("apps: could not read the shared install-job "
+                         "snapshot for the WS replay — falling back to this "
+                         "worker's own jobs only", exc_info=True)
+        return list(jobs.values())
 
     def is_installing(self, app_id: str) -> bool:
         job = self._jobs.get(app_id)
@@ -237,14 +319,31 @@ class InstallJobs:
         self._broadcast(job)
 
     def _broadcast(self, job: InstallJob) -> None:
-        # Mirror to Redis on every transition, independently of whether this
-        # worker has any WS listener — the point is the OTHER workers' HTTP
-        # status polls, not this one's sockets.
+        # Mirror to Redis on every transition (W3 STATE half), independently
+        # of whether this worker has any WS listener — the point is the
+        # OTHER workers' HTTP status polls, not this one's sockets.
         self._publish_shared(job)
-        if not self._loop or not self._listeners:
+        # W4 LIVE half: publish for the WS push too, independently of local
+        # listeners — the point there is the OTHER workers' open sockets.
+        if not self._loop:
             return
-        msg = json.dumps({"type": "app_install_status", "job": job.as_dict()})
-        self._loop.call_soon_threadsafe(asyncio.ensure_future, self._send_all(msg))
+        payload = {"type": "app_install_status", "job": job.as_dict()}
+        self._loop.call_soon_threadsafe(asyncio.ensure_future, self._publish_ws(payload))
+
+    async def _publish_ws(self, payload: dict) -> None:
+        """Single delivery path: publish to Redis, which this worker's own
+        relay subscription (``_on_relay_message``) fans back out to
+        ``_listeners`` locally too. Degrades to local-only delivery, loudly,
+        if Redis is unreachable or the relay never came up."""
+        if self._share and self._relay_up:
+            try:
+                await self._broadcaster.publish(_WS_TOPIC, payload)
+                return
+            except Exception:
+                log.warning("apps: install-status Redis publish failed — "
+                           "falling back to local-only delivery for this "
+                           "transition", exc_info=True)
+        await self._send_all(json.dumps(payload))
 
     async def _send_all(self, msg: str) -> None:
         dead = []
