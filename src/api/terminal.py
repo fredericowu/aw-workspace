@@ -23,6 +23,7 @@ agent-sessions`` route. The plain PTY terminal shell below stays core.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -164,67 +165,94 @@ class TerminalRoutes:
             "agent_session_id": session.agent_session_id,
         }
 
-    def _broadcast_terminals(self, session_id=None, action=None):
-        session = self.mgr.get(session_id) if session_id else None
-        self.hub.broadcast_soon({
+    async def _broadcast_terminals(self, session_id=None, action=None,
+                                   session=None):
+        """Push the fleet's terminal list to every /ws/status listener.
+
+        ``list_sessions`` shells out to ``screen -ls`` on a screen-backed
+        workspace, so it goes through ``asyncio.to_thread`` like every other
+        blocking call in this file — inside an ``async def`` it would freeze
+        every in-flight request on this worker for the subprocess's duration
+        (the 2026-09-02 event-loop freeze, whose regression guard cannot see
+        through ``self.mgr.<method>`` attribute access).
+        """
+        terminals = await asyncio.to_thread(self.mgr.list_sessions)
+        await self.hub.broadcast({
             "type": "terminal_update",
             "action": action or "update",
             "session_id": session_id,
             "terminal": self._terminal_payload(session) if session else None,
-            "terminals": self.mgr.list_sessions(),
+            "terminals": terminals,
         })
 
     # ---- REST -----------------------------------------------------------
 
     async def list_terminals(self, include_hidden: bool = False,
                              identity: dict = Depends(require_identity)):
-        return self.mgr.list_sessions(include_hidden=include_hidden)
+        return await asyncio.to_thread(self.mgr.list_sessions, include_hidden)
 
     async def create_terminal(self, data: dict = Body(default={}),
                               identity: dict = Depends(require_identity)):
-        session = self.mgr.create(
-            name=data.get("name"),
-            rows=data.get("rows", 24),
-            cols=data.get("cols", 80),
-            command=data.get("command"),
-            session_type=data.get("type", "terminal"),
-            initial_prompt=data.get("initial_prompt"),
-            cwd=data.get("cwd"),
+        # to_thread: a screen-backed create runs `screen -dmS`, polls
+        # `screen -ls` until the server is up, then forks the attach PTY —
+        # up to a couple of seconds of blocking work that must not happen on
+        # the event-loop thread.
+        session = await asyncio.to_thread(
+            functools.partial(
+                self.mgr.create,
+                name=data.get("name"),
+                rows=data.get("rows", 24),
+                cols=data.get("cols", 80),
+                command=data.get("command"),
+                session_type=data.get("type", "terminal"),
+                initial_prompt=data.get("initial_prompt"),
+                cwd=data.get("cwd"),
+            )
         )
         session.start_reader(asyncio.get_running_loop())
-        self._broadcast_terminals(session.id, "create")
+        await self._broadcast_terminals(session.id, "create", session)
         return {"id": session.id, "name": session.name, "type": session.type}
 
     async def rename_terminal(self, session_id: str, data: dict = Body(...),
                              identity: dict = Depends(require_identity)):
-        session = self.mgr.get(session_id)
+        session = await asyncio.to_thread(self.mgr.get, session_id)
         if not session:
             return {"error": "Session not found", "success": False}
         # Through the manager, not `session.name = ...`: the name has to reach
         # Redis or the other workers keep serving the old one (W5 guarantee 2).
-        self.mgr.set_name(session_id, data.get("name", session.name))
-        self._broadcast_terminals(session_id, "rename")
+        await asyncio.to_thread(self.mgr.set_name, session_id,
+                                data.get("name", session.name))
+        await self._broadcast_terminals(session_id, "rename", session)
         return {"id": session.id, "name": session.name, "success": True}
 
     async def restart_terminal(self, session_id: str, data: dict = Body(default={}),
                               identity: dict = Depends(require_identity)):
-        session = self.mgr.restart(
-            session_id,
-            command=data.get("command"),
-            name=data.get("name"),
-            new_session=data.get("new_session", False),
-            is_insecure=data.get("is_insecure"),
+        loop = asyncio.get_running_loop()
+        # The loop is passed in explicitly because this now runs on a worker
+        # thread, where asyncio.get_event_loop() would fail and leave the old
+        # session's fd reader installed on a closed fd.
+        session = await asyncio.to_thread(
+            functools.partial(
+                self.mgr.restart,
+                session_id,
+                command=data.get("command"),
+                name=data.get("name"),
+                new_session=data.get("new_session", False),
+                is_insecure=data.get("is_insecure"),
+                loop=loop,
+            )
         )
         if not session:
             return {"error": "Session not found", "success": False}
-        session.start_reader(asyncio.get_running_loop())
-        self._broadcast_terminals(session_id, "restart")
+        session.start_reader(loop)
+        await self._broadcast_terminals(session_id, "restart", session)
         return {"id": session.id, "name": session.name, "success": True}
 
     async def delete_terminal(self, session_id: str,
                              identity: dict = Depends(require_identity)):
-        self.mgr.remove(session_id)
-        self._broadcast_terminals(session_id, "delete")
+        await asyncio.to_thread(self.mgr.remove, session_id,
+                                asyncio.get_running_loop())
+        await self._broadcast_terminals(session_id, "delete")
         return {"success": True}
 
     async def write_terminal(self, session_id: str, data: dict = Body(...),
@@ -235,7 +263,7 @@ class TerminalRoutes:
         the SPA (voice input embeds ``\\r`` directly; prompt/plan actions pass
         ``send_enter``).
         """
-        session = self.mgr.get(session_id)
+        session = await asyncio.to_thread(self.mgr.get, session_id)
         if not session:
             return {"error": "Session not found", "success": False}
         text = data.get("text", "")
@@ -248,7 +276,7 @@ class TerminalRoutes:
 
     async def get_scrollback(self, session_id: str,
                             identity: dict = Depends(require_identity)):
-        session = self.mgr.get(session_id)
+        session = await asyncio.to_thread(self.mgr.get, session_id)
         if not session:
             return {"error": "Session not found", "success": False}
         raw = session.get_scrollback()
@@ -263,7 +291,7 @@ class TerminalRoutes:
 
     async def list_procs(self, session_id: str,
                         identity: dict = Depends(require_identity)):
-        session = self.mgr.get(session_id)
+        session = await asyncio.to_thread(self.mgr.get, session_id)
         if not session:
             return {"error": "Session not found", "success": False, "procs": []}
         # session.child_procs(), not session_child_procs(session.pid): on a
@@ -274,7 +302,7 @@ class TerminalRoutes:
 
     async def kill_proc(self, session_id: str, pid: int,
                        identity: dict = Depends(require_identity)):
-        session = self.mgr.get(session_id)
+        session = await asyncio.to_thread(self.mgr.get, session_id)
         if not session:
             return {"error": "Session not found", "success": False}
         procs = await asyncio.to_thread(session.child_procs)
@@ -320,7 +348,7 @@ class TerminalRoutes:
             await websocket.close(code=4401, reason="unauthorized")
             return
 
-        session = self.mgr.get(session_id)
+        session = await asyncio.to_thread(self.mgr.get, session_id)
         if not session:
             await websocket.accept()
             await websocket.close(code=4004, reason="Session not found")
@@ -401,7 +429,7 @@ class TerminalRoutes:
             await websocket.send_text(json.dumps({
                 "type": "init",
                 "components": component_snapshot(self.app),
-                "terminals": self.mgr.list_sessions(),
+                "terminals": await asyncio.to_thread(self.mgr.list_sessions),
             }))
             while True:
                 msg = await websocket.receive()

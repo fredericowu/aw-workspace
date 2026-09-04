@@ -529,6 +529,60 @@ def test_restart_reuses_the_name_within_the_claim_ttl(screens):
 
 
 # ---------------------------------------------------------------------------
+# Screen work must not run on the event-loop thread
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_routes_never_call_the_manager_from_an_async_def():
+    """Every blocking manager call must go through ``asyncio.to_thread``.
+
+    A screen-backed create runs ``screen -dmS``, polls ``screen -ls`` until
+    the server answers, then forks — seconds of blocking work. Called straight
+    from an ``async def`` it freezes EVERY in-flight request on this worker,
+    which is the 2026-09-02 event-loop freeze all over again. It really
+    happened here: the first POST /api/terminals after this landed took over
+    10s on the live workspace.
+
+    ``test_no_blocking_db_in_async_routes.py`` cannot catch this — it says so
+    itself: it does not chase blocking calls through attribute access on
+    another object (``self.mgr.create(...)``). So this asserts it directly on
+    the source, in the one file where the calls live.
+    """
+    import ast
+    import inspect
+
+    from src.api import terminal as terminal_mod
+
+    src = inspect.getsource(terminal_mod)
+    tree = ast.parse(src)
+    routes = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.ClassDef) and n.name == "TerminalRoutes")
+
+    offenders = []
+    for fn in routes.body:
+        if not isinstance(fn, ast.AsyncFunctionDef):
+            continue
+        for node in ast.walk(fn):
+            # `self.mgr.<something>(...)` reached without an intervening
+            # to_thread is the shape being banned.
+            if not isinstance(node, ast.Call):
+                continue
+            f = node.func
+            if (isinstance(f, ast.Attribute)
+                    and isinstance(f.value, ast.Attribute)
+                    and f.value.attr == "mgr"
+                    and isinstance(f.value.value, ast.Name)
+                    and f.value.value.id == "self"):
+                offenders.append(f"{fn.name} -> self.mgr.{f.attr}()")
+
+    assert not offenders, (
+        "these async handlers call the terminal manager directly instead of "
+        "via asyncio.to_thread, which blocks the event loop for every other "
+        f"request on this worker: {offenders}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Golden rule: nothing above may change single-worker behaviour
 # ---------------------------------------------------------------------------
 

@@ -382,14 +382,37 @@ def _screen_sessions() -> dict[str, list[int]]:
         if nm and pid_str.isdigit():
             found.setdefault(nm, []).append(int(pid_str))
     if dead:
-        # Reap the sockets so this stays O(live sessions) instead of growing
-        # by one stale entry per terminal per container restart, forever.
-        try:
-            subprocess.run([_SCREEN_BIN, "-wipe"], capture_output=True, timeout=5)
-        except Exception:
-            pass
-        logger.info("screen: wiped %d dead session socket(s)", dead)
+        _wipe_dead_screens(dead)
     return found
+
+
+#: Last time ``screen -wipe`` ran, so a box with dead sockets doesn't fork one
+#: per liveness check. Correctness never depends on the wipe — the parse above
+#: already excludes dead entries — so throttling it costs nothing.
+_last_wipe = 0.0
+_WIPE_INTERVAL = 60.0
+
+
+def _wipe_dead_screens(dead: int) -> None:
+    """Reap dead sockets, at most once a minute.
+
+    Unthrottled this was a real problem, not a theoretical one: ``_create_screen``
+    polls ``_screen_exists`` up to 20 times, and with 5 dead sockets left by a
+    container restart that meant 20 × (``screen -ls`` + ``screen -wipe``)
+    subprocesses on a single create — which is what turned one POST
+    /api/terminals into a >10s call on 2026-09-04.
+    """
+    global _last_wipe
+    now = time.monotonic()
+    if now - _last_wipe < _WIPE_INTERVAL:
+        return
+    _last_wipe = now
+    import subprocess
+    try:
+        subprocess.run([_SCREEN_BIN, "-wipe"], capture_output=True, timeout=5)
+        logger.info("screen: wiped %d dead session socket(s)", dead)
+    except Exception:
+        pass
 
 
 def _screen_server_pids(screen_name: str) -> list[int]:
@@ -1079,7 +1102,8 @@ class TerminalManager:
 
     def restart(self, session_id: str, command: str | None = None, name: str | None = None,
                 rows: int = 24, cols: int = 80, new_session: bool = False,
-                is_insecure: bool | None = None) -> TerminalSession | None:
+                is_insecure: bool | None = None,
+                loop: asyncio.AbstractEventLoop | None = None) -> TerminalSession | None:
         """Kill the existing session and spawn a fresh one with the same ID."""
         old = self.sessions.pop(session_id, None)
         # Fall back to Redis for a restart that landed on a worker holding no
@@ -1088,11 +1112,7 @@ class TerminalManager:
         meta = self._meta.get(session_id) if old is None else {}
         old_screen = old.screen_name if old else (meta.get("screen_name") or None)
         if old:
-            try:
-                loop = asyncio.get_event_loop()
-                old.stop_reader(loop)
-            except Exception:
-                pass
+            _stop_reader(old, loop)
             old.kill()
         # A restart replaces what is RUNNING, so the old screen must go — a
         # detach would leave the previous command alive and unreachable.
@@ -1139,7 +1159,8 @@ class TerminalManager:
             return None
         return self._adopt(session_id, meta)
 
-    def remove(self, session_id: str):
+    def remove(self, session_id: str,
+               loop: asyncio.AbstractEventLoop | None = None):
         """End the session everywhere — not just detach this worker.
 
         ``remove`` is the user closing a terminal, so the screen has to go
@@ -1153,11 +1174,7 @@ class TerminalManager:
         if screen_name is None:
             screen_name = self._meta.get(session_id).get("screen_name") or None
         if session:
-            try:
-                loop = asyncio.get_event_loop()
-                session.stop_reader(loop)
-            except Exception:
-                pass
+            _stop_reader(session, loop)
             session.kill()
         _destroy_screen(screen_name)
         self._meta.delete(session_id)
@@ -1227,7 +1244,7 @@ class TerminalManager:
             session.name = name
         self._meta.update(session_id, name=name)
 
-    def cleanup(self):
+    def cleanup(self, loop: asyncio.AbstractEventLoop | None = None):
         """Shutdown: detach this worker, leave the screens running.
 
         Deliberately NOT ``destroy_screen=True``. A screen surviving the
@@ -1235,13 +1252,8 @@ class TerminalManager:
         different) worker pick the session back up, and killing them here
         would throw away every user's live shell on every deploy.
         """
-        try:
-            loop = asyncio.get_event_loop()
-        except Exception:
-            loop = None
         for session in list(self.sessions.values()):
-            if loop:
-                session.stop_reader(loop)
+            _stop_reader(session, loop)
             session.kill()
         self.sessions.clear()
 
@@ -1249,6 +1261,27 @@ class TerminalManager:
 def _sh_quote(s: str) -> str:
     import shlex
     return shlex.quote(s)
+
+
+def _stop_reader(session: "TerminalSession", loop=None) -> None:
+    """Remove ``session``'s fd reader from the loop that installed it.
+
+    ``loop`` is passed in by callers that now run off the event-loop thread
+    (see terminal.py — creating/removing a screen-backed session does enough
+    blocking subprocess work to need ``asyncio.to_thread``). From a worker
+    thread ``asyncio.get_event_loop()`` raises, and silently swallowing that
+    would leave an ``add_reader`` callback installed on a closed fd, which the
+    loop then wakes on forever.
+    """
+    if loop is None:
+        try:
+            loop = asyncio.get_event_loop()
+        except Exception:
+            return
+    try:
+        session.stop_reader(loop)
+    except Exception:
+        pass
 
 
 def _screen_name_for(session_id: str, session_type: str) -> str:
