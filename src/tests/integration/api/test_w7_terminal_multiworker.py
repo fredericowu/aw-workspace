@@ -600,6 +600,49 @@ def test_scrollback_replays_on_a_worker_that_never_created_the_session(managers)
     asyncio.run(run())
 
 
+def test_scrollback_stays_current_on_a_worker_that_only_serves_rest(managers):
+    """A worker with NO output consumer must still serve a FRESH scrollback.
+
+    ``get_scrollback()`` is a pure in-memory read (``terminal.py`` calls it
+    from an ``async def``) kept current by this worker's output consumer —
+    which only starts on a WS connect. A worker that adopted a session on a
+    plain REST call (``POST …/write``, ``GET …/procs``) has no consumer, so
+    its buffer used to FREEZE at whatever the stream held when it adopted, and
+    every later ``GET …/scrollback`` served that snapshot.
+
+    Found live on 2026-09-04 at workers=10, not by this suite: six consecutive
+    scrollback reads of one session returned 24, 22, **0**, 14, 22 and 24 hits.
+    """
+    _require_streams()
+    session_id = _sid()
+    worker_a, worker_b = managers(2)
+
+    async def run():
+        session_a = worker_a.create(name="rest-only", session_id=session_id)
+        session_a.start_reader(asyncio.get_running_loop())
+        await _settle(session_a)
+
+        # B adopts on a REST-shaped call, BEFORE the interesting output — no
+        # start_reader, so no consumer here. This is what froze the buffer.
+        session_b = worker_b.get(session_id)
+        assert session_b is not None and not session_b._out_consumer_started
+
+        later = f"AFTER_ADOPT_{uuid.uuid4().hex[:6]}"
+        session_a.write(f"echo {later}\r".encode())
+        assert later.encode() in await _wait_for_bytes(session_a, later.encode())
+
+        # The next REST call on B goes through get() again, exactly as
+        # terminal.py does — and must see output produced after B adopted.
+        refreshed = worker_b.get(session_id)
+        assert refreshed is session_b, "expected the cached handle, not a new one"
+        assert later.encode() in refreshed.get_scrollback(), (
+            "a worker serving only REST froze its scrollback at adopt time — "
+            "GET /scrollback returns a stale snapshot there"
+        )
+
+    asyncio.run(run())
+
+
 def test_list_sessions_shows_sessions_created_on_another_worker(managers):
     """The SPA's terminal list must be the same whichever worker serves it."""
     _require_streams()

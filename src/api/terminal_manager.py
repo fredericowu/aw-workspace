@@ -940,14 +940,21 @@ class TerminalSession:
             logger.warning("prime_scrollback(%s) failed: %s", self.id, exc)
             return
         chunks: list[bytes] = []
+        newest: bytes | None = None
         for entry_id, fields in entries:
-            if self._out_cursor == b"0":
-                self._out_cursor = entry_id  # xrevrange is newest-first
+            if newest is None:
+                newest = entry_id  # xrevrange is newest-first
             if fields.get(b"t") == _F_DATA:
                 chunks.append(fields.get(b"d") or b"")
         chunks.reverse()
         with self._scrollback_lock:
             self._scrollback = chunks
+        # Buffer and cursor must always agree: this REPLACED the buffer, so a
+        # consumer starting afterwards has to resume at the newest entry that
+        # is now in it. Leaving an older cursor would re-deliver everything the
+        # replay already covered, i.e. duplicate it on the client.
+        if newest is not None:
+            self._out_cursor = newest
 
     # ---- input: every writer XADDs, only the owner touches the fd -------
 
@@ -1437,6 +1444,28 @@ class TerminalManager:
             return None
         return self._remote_session(session_id, meta)
 
+    def _refresh_idle_scrollback(self, session: TerminalSession) -> None:
+        """Re-read the output tail for a cached handle with no consumer running.
+
+        ``get_scrollback()`` is a pure in-memory read because ``terminal.py``
+        calls it straight from an ``async def``. That buffer is kept current by
+        this worker's output CONSUMER — which only starts from
+        ``start_reader()``, i.e. on a WS connect. A worker that adopted a
+        session on a plain REST call (``POST …/write``, ``GET …/procs``) has no
+        consumer, so its buffer froze at whatever the stream held the moment it
+        adopted, and every later ``GET …/scrollback`` served that snapshot.
+
+        Found live on 2026-09-04 at workers=10: six consecutive scrollback
+        reads of one session returned 24, 22, **0**, 14, 22 and 24 hits —
+        the 0 being a worker that adopted before the shell had produced
+        anything. Re-priming here, on ``get()``, fixes every entry point at
+        once and stays off the event loop: ``terminal.py`` reaches ``get()``
+        exclusively through ``asyncio.to_thread``.
+        """
+        if session._out_consumer_started or not streams_enabled():
+            return
+        session.prime_scrollback()
+
     def create(self, name: str | None = None, rows: int = 24, cols: int = 80,
                command: str | None = None, session_type: str = "terminal",
                session_id: str | None = None, initial_prompt: str | None = None,
@@ -1649,6 +1678,7 @@ class TerminalManager:
             # terminal onto nothing.
             if session.alive and (session.shell_pid is None
                                   or _pid_alive(session.shell_pid)):
+                self._refresh_idle_scrollback(session)
                 return session
             # `alive` flips on the EOF frame, i.e. the shell is genuinely gone.
             # Serving the stale object anyway would hand the SPA a terminal
