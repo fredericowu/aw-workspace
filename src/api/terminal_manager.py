@@ -351,8 +351,18 @@ def _ensure_screenrc() -> str:
     return path
 
 
-def _screen_sessions() -> dict[str, list[int]]:
+def _screen_sessions() -> dict[str, list[int]] | None:
     """Every live screen on this box: ``{name: [server pid, ...]}``.
+
+    ``None`` — not ``{}`` — when the read did not complete (``screen -ls``
+    timed out at 5s, or could not be forked at all). The two are not the same
+    fact and callers that prune on this MUST tell them apart: ``{}`` says "no
+    screens exist", ``None`` says "I don't know". Returning ``{}`` for both is
+    how ``list_sessions()`` used to delete the Redis meta of every terminal in
+    the workspace, while their screen servers kept running, on one failed
+    subprocess — silently. Callers that only ask about ONE screen keep
+    degrading to "not found" (see ``_screen_server_pids``), which is
+    recoverable on the next attempt.
 
     ``screen -ls`` prints one tab-indented line per session,
     ``\\t12345.aw-terminal-abc\\t(date)\\t(Detached)`` — the integer before the
@@ -381,8 +391,10 @@ def _screen_sessions() -> dict[str, list[int]]:
     try:
         out = subprocess.run([_SCREEN_BIN, "-ls"], capture_output=True,
                              text=True, timeout=5).stdout
-    except Exception:
-        return {}
+    except Exception as exc:
+        logger.warning("screen -ls failed (%s) — screen liveness is unknown "
+                       "for this read", exc)
+        return None
     found: dict[str, list[int]] = {}
     dead = 0
     for line in out.splitlines():
@@ -430,8 +442,12 @@ def _wipe_dead_screens(dead: int) -> None:
 
 
 def _screen_server_pids(screen_name: str) -> list[int]:
-    """PID(s) of the GNU screen *server* process(es) backing ``screen_name``."""
-    return _screen_sessions().get(screen_name, [])
+    """PID(s) of the GNU screen *server* process(es) backing ``screen_name``.
+
+    An inconclusive read degrades to "no pids", i.e. the same recoverable
+    "session not found" its callers already handle — deliberately unchanged.
+    """
+    return (_screen_sessions() or {}).get(screen_name, [])
 
 
 def _screen_exists(screen_name: str) -> bool:
@@ -1203,17 +1219,39 @@ class TerminalManager:
         A screen-backed entry with no live screen is dropped and its meta
         deleted — a screen that died (crash, host reboot, ``screen -wipe``)
         is how a session really ends, so that is the liveness check.
+
+        That liveness check is only allowed to DELETE anything when the read
+        it rests on actually completed. A ``screen -ls`` that timed out or
+        could not fork comes back as ``None``, and every prune below is
+        skipped for it: listing a session whose screen has since died is a
+        stale row the next successful read corrects, while deleting the meta
+        of a session whose screen is still running is unrecoverable — the
+        screen leaks with no way left to reattach or kill it. Loud, because
+        the pre-existing failure mode was silent: at ``AW_WORKSPACE_WORKERS``
+        > 1 every worker runs this on every ``terminal_update`` broadcast, so
+        a ``screen -ls`` that starts failing under that load would otherwise
+        freeze the SPA's terminal list with nothing logged anywhere.
         """
         live_screens = _screen_sessions()
+        conclusive = live_screens is not None
+        if not conclusive:
+            live_screens = {}
+            logger.warning(
+                "Terminal list: `screen -ls` was inconclusive — keeping all "
+                "%d local session(s) and every session's metadata, pruning "
+                "nothing this pass", len(self.sessions))
 
         # A local PTY is stale two ways: its own shell exited (``alive``), or
         # ANOTHER worker ended the session and destroyed the screen out from
         # under this attach. Only the first was checked at first, and the
         # second left a ghost terminal in the SPA's list forever — caught by
         # test_list_sessions_shows_sessions_created_on_another_worker.
+        # ``alive`` is a local read, so it still prunes on an inconclusive
+        # pass; the screen half does not.
         dead = [
             sid for sid, s in self.sessions.items()
-            if not s.alive or (s.screen_name and s.screen_name not in live_screens)
+            if not s.alive
+            or (conclusive and s.screen_name and s.screen_name not in live_screens)
         ]
         for sid in dead:
             self.sessions.pop(sid, None)
@@ -1237,8 +1275,11 @@ class TerminalManager:
                 if not screen_name:
                     continue
                 if screen_name not in live_screens:
-                    self._meta.delete(sid)
-                    continue
+                    if conclusive:
+                        self._meta.delete(sid)
+                        continue
+                    # Inconclusive: keep listing it from its last known meta
+                    # rather than deleting the only record of it.
                 listed[sid] = {
                     "id": sid,
                     "name": meta.get("name") or sid,

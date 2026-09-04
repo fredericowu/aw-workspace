@@ -30,6 +30,7 @@ by twice.
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -499,6 +500,77 @@ def test_a_dead_screen_socket_is_not_reported_as_a_live_session(screens):
     # And the worker that DID create it must stop listing it too, rather than
     # keeping a ghost terminal in the SPA off its local cache.
     assert session_id not in {s["id"] for s in worker_a.list_sessions()}
+
+
+def test_list_sessions_keeps_meta_when_screen_ls_fails(screens, caplog):
+    """A `screen -ls` that does not complete must prune NOTHING.
+
+    ``_screen_sessions()`` used to return ``{}`` from its except branch, which
+    ``list_sessions()`` could not tell from "no screens exist" — so one failed
+    subprocess deleted the Redis meta of every terminal in the workspace while
+    their screen servers kept running, leaving unreachable shells and no log
+    line. Two prune branches ride on that read (the local-PTY drop and the
+    meta delete) and both are covered here: fixing only the delete would leave
+    the same session missing from its own worker's list.
+
+    Timing matters more than probability: at ``AW_WORKSPACE_WORKERS=10`` every
+    worker runs this on every ``terminal_update`` broadcast, so ~10x the forks
+    contend for the same 5s timeout.
+    """
+    _require_screen()
+    session_id = f"w5test-{uuid.uuid4().hex[:8]}"
+    screen_name = _screen_name_for(session_id, "terminal")
+    screens.append(screen_name)
+
+    worker_a, worker_b = TerminalManager(), TerminalManager()
+    worker_a.create(name="survives-a-failed-read", session_id=session_id,
+                    command="sleep 120")
+    assert session_id in {s["id"] for s in worker_b.list_sessions()}
+
+    def _timeout(*a, **kw):
+        raise subprocess.TimeoutExpired(cmd="screen -ls", timeout=5)
+
+    # Both real shapes of a failed read: the 5s timeout under load, and a fork
+    # that never runs at all (patching the binary path, so the failure happens
+    # inside `_screen_sessions` rather than in a stubbed-out version of it).
+    failures = {
+        "times out": lambda mp: mp.setattr(subprocess, "run", _timeout),
+        "cannot run": lambda mp: mp.setattr(tm, "_SCREEN_BIN", "/nonexistent/screen"),
+    }
+    for label, break_screen_ls in failures.items():
+        with pytest.MonkeyPatch.context() as mp, \
+                caplog.at_level("WARNING", logger="terminal"):
+            caplog.clear()
+            break_screen_ls(mp)
+
+            assert tm._screen_sessions() is None, \
+                f"a read that {label} must be distinguishable from an empty one"
+
+            # Branch 2 (the irreversible one): worker B never created this
+            # session, so the Redis meta is its only view of it.
+            assert session_id in {s["id"] for s in worker_b.list_sessions()}, \
+                f"session dropped from the list when `screen -ls` {label}"
+            assert worker_b._meta.get(session_id).get("screen_name") == screen_name, \
+                f"meta deleted when `screen -ls` {label} — unrecoverable"
+
+            # Branch 1: worker A's own live PTY must survive it too.
+            assert session_id in {s["id"] for s in worker_a.list_sessions()}
+            assert session_id in worker_a.sessions, \
+                f"local PTY dropped when `screen -ls` {label}"
+
+            # Not-destructive is not enough — a silently stale terminal list
+            # is how nobody finds out `screen -ls` started failing.
+            assert any("inconclusive" in r.message for r in caplog.records
+                       if r.levelname == "WARNING"), \
+                f"nothing logged at WARNING when `screen -ls` {label}"
+
+    # And it recovers: a working read lists the session again and an attach
+    # from the worker that never created it still works.
+    assert tm._screen_sessions() is not None
+    assert session_id in {s["id"] for s in worker_b.list_sessions()}
+    assert worker_b.get(session_id) is not None, "attach broken after recovery"
+
+    worker_b.remove(session_id)
 
 
 def test_restart_reuses_the_name_within_the_claim_ttl(screens):
