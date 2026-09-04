@@ -83,6 +83,21 @@ single-tenant host; they get migrated as the BYOD product needs them.
    degrades to a worker-owned PTY wherever Redis is unreachable rather than
    failing loudly.
 
+   **Changing the Dockerfile `ENV` alone changes nothing on a running
+   container** — it's only resolved once, when a container is created from
+   the image, so a plain process restart keeps whatever count that container
+   was created with (this bit the team on 2026-09-04: the value flip-flopped
+   in git four times with no one seeing an effect, then an unrelated host
+   recreate "won" 10 by surprise). To actually change the worker count of a
+   container that already exists, without rebuilding/recreating it, set
+   `AW_WORKSPACE_WORKERS=` in `<AW_WORKSPACE_HOME>/.env` and restart the
+   process — `src/start/workspace.py`'s `main()` checks that file (via
+   `src.apps.paths.read_workspace_env`) BEFORE the baked `os.environ` value,
+   the opposite precedence from most `.env` fallbacks here, and writes the
+   resolved number back to `os.environ` before uvicorn forks its workers so
+   every worker (e.g. `src.api.app`'s own `AW_WORKSPACE_WORKERS` checks) sees
+   the same number.
+
    **Two rules that fall out of sharing one keyspace across 10 workers**, both
    learned the expensive way and both worth copying into any new shared-state
    route rather than rediscovering:

@@ -109,6 +109,34 @@ def upsert_workspace_env(name: str, value: str) -> None:
         os.close(lock_fd)
 
 
+def read_workspace_env(key: str) -> str | None:
+    """Read a single ``KEY=value`` line from ``<home>/.env`` — the read-only
+    counterpart to :func:`upsert_workspace_env`. Returns ``None`` when the
+    file, or the key inside it, is missing.
+
+    Lets a value baked into the image at build time (a Dockerfile ``ENV``,
+    e.g. ``AW_WORKSPACE_WORKERS``) be overridden at runtime by editing this
+    file and restarting the process — no image rebuild, no container
+    recreation, unlike the ``ENV`` itself which is only resolved once, when
+    the container is created from the image (see MIGRATION.md). Mirrors the
+    same fallback shape as ``src/cli/local_client.py``'s ``read_env_value``
+    and the remote-host-cli app's own ``client.py`` (same file, same idea)
+    — kept separate rather than shared because core must not import an
+    optional app's package, and this lives in ``src/apps`` rather than a
+    CLI-specific module so both ``src/start`` and ``src/api`` can use it
+    without depending on ``src/cli``."""
+    prefix = f"{key}="
+    try:
+        with open(env_file(), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(prefix):
+                    return line[len(prefix):].strip() or None
+    except FileNotFoundError:
+        return None
+    return None
+
+
 def bin_dir() -> str:
     d = os.path.join(workspace_home(), "bin")
     os.makedirs(d, exist_ok=True)

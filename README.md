@@ -50,7 +50,7 @@ expired, or malformed tokens.
 | `AW_WORKSPACE` | Workspace slug served by this process |
 | `AW_WORKSPACE_SCHEMA` | Existing Postgres schema for this workspace |
 | `AW_PORT` | Uvicorn port, default `9030` |
-| `AW_WORKSPACE_WORKERS` | Uvicorn worker count, default `1` |
+| `AW_WORKSPACE_WORKERS` | Uvicorn worker count, default `1` (image ships `10` via `Dockerfile` `ENV`). Overridable at runtime — without a rebuild/recreate — via `AW_WORKSPACE_WORKERS=` in `<workspace_home>/.env`, which `src/start/workspace.py` checks *before* `os.environ` (the reverse of most `.env` fallbacks here — see the comment at its read site) |
 | `AWSERV_DB_URL` | Shared Postgres URL |
 | `AW_BACKEND_URL` | Backend base URL used to fetch the public identity key |
 | `AW_AUTH_PUBLIC_KEY` | Optional Ed25519 public key PEM |

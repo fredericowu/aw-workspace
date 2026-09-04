@@ -153,6 +153,22 @@ def _put_app_bin_dir_on_path():
         os.environ["PATH"] = f"{d}{os.pathsep}{path}" if path else d
 
 
+def _resolve_workers() -> int:
+    """AW_WORKSPACE_WORKERS ships baked into the image (Dockerfile ENV) as the
+    default — that only changes on an image rebuild + container recreate; a
+    plain process restart inherits the same baked value forever. Let
+    ``<workspace_home>/.env`` override it at runtime instead, via
+    ``src.apps.paths.read_workspace_env`` — the same fallback idea
+    AW_BACKEND_URL/AW_WORKSPACE already use in ``src.cli.core_restart``, but
+    with the order FLIPPED: ``.env`` checked first, ``os.environ`` (the image
+    default) second. Unlike those two vars, ``os.environ`` here is *always*
+    populated by the Dockerfile, so an env-first check would make the
+    ``.env`` override a permanent no-op."""
+    from src.apps.paths import read_workspace_env
+
+    return int(read_workspace_env("AW_WORKSPACE_WORKERS") or os.environ.get("AW_WORKSPACE_WORKERS", "1"))
+
+
 def main():
     _sync_venv_deps()
     _reexec_into_venv()  # everything below runs under the shared venv interpreter
@@ -166,7 +182,15 @@ def main():
     mint_boot_identity()
 
     port = int(os.environ.get("AW_PORT", "9030"))
-    workers = int(os.environ.get("AW_WORKSPACE_WORKERS", "1"))
+
+    # Written back to os.environ so every downstream reader in this process
+    # (and any uvicorn worker forked from it) — e.g. src.api.app's own
+    # AW_WORKSPACE_WORKERS checks — sees the same resolved number rather
+    # than the stale baked-in one. See _resolve_workers for why .env takes
+    # precedence over os.environ here.
+    workers = _resolve_workers()
+    os.environ["AW_WORKSPACE_WORKERS"] = str(workers)
+
     workspace = os.environ.get("AW_WORKSPACE", "")
 
     print(f"aw-workspace starting  :{port}  workspace={workspace}  workers={workers}")

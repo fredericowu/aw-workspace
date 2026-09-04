@@ -15,7 +15,7 @@ import threading
 
 import pytest
 
-from src.apps.paths import env_file, upsert_workspace_env
+from src.apps.paths import env_file, read_workspace_env, upsert_workspace_env
 
 
 @pytest.fixture()
@@ -86,6 +86,20 @@ def test_concurrent_upserts_of_distinct_keys_lose_nothing(home):
 
     assert seen == {f"KEY_{i}": str(i) for i in range(n)}, \
         f"lost update: expected {n} keys, file has {sorted(seen)}"
+
+
+def test_read_workspace_env_returns_none_when_file_absent(home):
+    assert read_workspace_env("AW_WORKSPACE_WORKERS") is None
+
+
+def test_read_workspace_env_returns_none_when_key_absent(home):
+    upsert_workspace_env("OTHER", "1")
+    assert read_workspace_env("AW_WORKSPACE_WORKERS") is None
+
+
+def test_read_workspace_env_reads_back_an_upserted_value(home):
+    upsert_workspace_env("AW_WORKSPACE_WORKERS", "3")
+    assert read_workspace_env("AW_WORKSPACE_WORKERS") == "3"
 
 
 def test_concurrent_upserts_of_the_same_key_end_with_one_line(home):
