@@ -68,6 +68,39 @@ jobs:
           "$PODMAN" logs "$NAME"
           exit 1
 
+      # W3 added tests that need a real Redis as well as a real Postgres —
+      # the apps:changed fan-out between two worker PROCESSES is not
+      # something a single-process test can stand in for, so
+      # test_multiworker_app_lifecycle.py skips without one, and a skipped
+      # test is how a card's whole VERIFY step quietly stops running.
+      # (test_redis_coord.py and test_watchdog_lease_multiworker.py, from W0
+      # and W1, were skipping here for the same reason.)
+      #
+      # Joined to the Postgres container's netns, not its own, for exactly
+      # the reason spelled out above it: the suites hardcode loopback
+      # addresses, so everything has to share ONE namespace with the pytest
+      # container. redis_coord's own default is redis://127.0.0.1:6379/0, so
+      # no env var is needed here either.
+      - name: Start ephemeral Redis
+        id: redis
+        run: |
+          set -euo pipefail
+          NAME="aw-workspace-ci-redis-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          "$PODMAN" run -d --name "$NAME" \
+            --network "container:${{ steps.pg.outputs.name }}" \
+            docker.io/library/redis:7-alpine > /dev/null
+          for _ in $(seq 1 40); do
+            if "$PODMAN" exec "$NAME" redis-cli ping 2>/dev/null | grep -q PONG; then
+              echo "Redis ready ($NAME)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::throwaway Redis never became ready"
+          "$PODMAN" logs "$NAME"
+          exit 1
+
       - name: Test suite (in a python:3.12-slim container)
         run: |
           "$PODMAN" run --rm --network "container:${{ steps.pg.outputs.name }}" \
@@ -115,6 +148,15 @@ jobs:
           # This is the OTel SDK's own standard env var (honored directly by
           # TracerProvider/LoggerProvider) — makes both providers no-ops with
           # zero application code changes.
+
+      # Redis first: it lives in the Postgres container's network namespace,
+      # so removing Postgres out from under it leaves a container whose netns
+      # is gone.
+      - name: Stop ephemeral Redis
+        if: always()
+        run: |
+          NAME="${{ steps.redis.outputs.name }}"
+          [ -n "$NAME" ] && "$PODMAN" rm -f "$NAME" > /dev/null 2>&1 || true
 
       - name: Stop ephemeral Postgres
         if: always()
