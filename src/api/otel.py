@@ -280,6 +280,7 @@ def _build_resource():
         "service.instance.id": socket.gethostname(),
         "deployment.environment": os.environ.get("AW_ENV", "production"),
         "workspace.slug": os.environ.get("AW_WORKSPACE", ""),
+        "worker.pid": os.getpid(),
     })
 
 

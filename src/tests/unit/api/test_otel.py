@@ -109,6 +109,20 @@ def test_no_runtime_falls_back_to_the_public_endpoint():
     assert target["endpoint"] == "https://signoz.app.ws.example.com"
 
 
+# --- _build_resource -----------------------------------------------------
+
+
+def test_build_resource_carries_this_processs_own_pid():
+    """Multi-worker: a trace/span alone can't tell which of the N worker
+    processes handled it without this — see finding_key
+    observability:aw-workspace-core-worker-pid-attribute."""
+    import os
+
+    resource = otel._build_resource()
+
+    assert resource.attributes["worker.pid"] == os.getpid()
+
+
 # --- amplification filter -----------------------------------------------------
 
 
