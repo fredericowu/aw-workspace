@@ -938,6 +938,36 @@ class TerminalManager:
     def __init__(self):
         self.sessions: dict[str, TerminalSession] = {}
         self._meta = SessionMetaStore()
+        # W5b: serializes the check-then-act cache-miss -> attach -> store
+        # sequence on `self.sessions`, per session_id. Every caller in
+        # terminal.py reaches `get`/`create`/`restart`/`remove` through
+        # `asyncio.to_thread` — real OS threadpool threads, not just
+        # interleaved coroutines — so two concurrent callers racing the same
+        # cold session_id used to both cache-miss, each fork their own
+        # `screen -x` attach, and only one would win the dict slot: the other
+        # was silently handed back to its own caller as a live, working PTY
+        # into the same shared screen. `screen -x` broadcasts every attached
+        # display's writes into the shared shell and echoes to every
+        # display, so that orphaned second writer produced doubled/quadrupled
+        # keystrokes in the SPA. RLock, not Lock: `restart()` holds the lock
+        # for its whole pop/kill/destroy/recreate sequence and calls
+        # `create()` — which locks the same session_id — on the same thread.
+        self._session_locks: dict[str, _threading_mod.RLock] = {}
+        self._session_locks_guard = _threading_mod.Lock()
+
+    def _lock_for(self, session_id: str) -> _threading_mod.RLock:
+        """Per-session_id RLock, created on first use.
+
+        Never removed — a long-running workspace accumulates one small RLock
+        per session_id it has ever seen, bounded by how many terminals this
+        box has ever opened, not by anything unbounded.
+        """
+        with self._session_locks_guard:
+            lock = self._session_locks.get(session_id)
+            if lock is None:
+                lock = _threading_mod.RLock()
+                self._session_locks[session_id] = lock
+            return lock
 
     def _fork_exec(self, cmd_parts: list[str], rows: int = 24, cols: int = 80) -> tuple[int, int]:
         """Fork a child connected to a PTY. Returns (master_fd, pid)."""
@@ -1068,44 +1098,49 @@ class TerminalManager:
         else:
             inner = f"cd {_sh_quote(effective_cwd)}; exec {_sh_quote(shell)} -l"
 
-        screen_name = None
-        if screen_backing_enabled():
-            screen_name = _screen_name_for(session_id, session_type)
-            if _claim_screen_creation(screen_name):
-                _create_screen(screen_name, inner)
-            else:
-                # Another worker won the race for this name. Wait for its
-                # screen to appear rather than spawning a second one — that
-                # is guarantee (3), and without the wait this worker would
-                # attach to a name that does not exist yet and get a dead PTY.
-                logger.info("Skipping screen creation for %s — another worker "
-                            "is creating it", screen_name)
-                for _ in range(30):
-                    if _screen_exists(screen_name):
-                        break
-                    time.sleep(0.1)
+        # Locked for the same reason as get()'s cold-miss path: `create()` is
+        # called with an explicit (not freshly-generated) session_id from
+        # restart(), and two concurrent callers attaching/storing for that
+        # same id would race `self.sessions` exactly like two get()s would.
+        with self._lock_for(session_id):
+            screen_name = None
+            if screen_backing_enabled():
+                screen_name = _screen_name_for(session_id, session_type)
+                if _claim_screen_creation(screen_name):
+                    _create_screen(screen_name, inner)
                 else:
-                    # Attaching anyway would hand back a PTY onto nothing,
-                    # which reads in the SPA as a terminal that opens blank
-                    # and never responds — the exact silent-degradation shape
-                    # this workspace's AGENTS.md warns about. Say so.
-                    logger.error(
-                        "create: waited 3s for screen %s and it never "
-                        "appeared — the worker that claimed it likely died "
-                        "mid-creation. This terminal will be dead; its claim "
-                        "expires in %ds.", screen_name, _CREATING_TTL)
-            session = self._attach_screen(
-                session_id, name, screen_name, command=command,
-                session_type=session_type, rows=rows, cols=cols)
-        else:
-            master_fd, pid = self._fork_exec(["bash", "-lc", inner], rows, cols)
-            session = TerminalSession(
-                session_id, master_fd, pid, name,
-                session_type=session_type, command=command,
-                insecure=_is_insecure_command(command, session_type),
-                agent_session_id=_extract_agent_session_id(command),
-            )
-            self.sessions[session_id] = session
+                    # Another worker won the race for this name. Wait for its
+                    # screen to appear rather than spawning a second one — that
+                    # is guarantee (3), and without the wait this worker would
+                    # attach to a name that does not exist yet and get a dead PTY.
+                    logger.info("Skipping screen creation for %s — another worker "
+                                "is creating it", screen_name)
+                    for _ in range(30):
+                        if _screen_exists(screen_name):
+                            break
+                        time.sleep(0.1)
+                    else:
+                        # Attaching anyway would hand back a PTY onto nothing,
+                        # which reads in the SPA as a terminal that opens blank
+                        # and never responds — the exact silent-degradation shape
+                        # this workspace's AGENTS.md warns about. Say so.
+                        logger.error(
+                            "create: waited 3s for screen %s and it never "
+                            "appeared — the worker that claimed it likely died "
+                            "mid-creation. This terminal will be dead; its claim "
+                            "expires in %ds.", screen_name, _CREATING_TTL)
+                session = self._attach_screen(
+                    session_id, name, screen_name, command=command,
+                    session_type=session_type, rows=rows, cols=cols)
+            else:
+                master_fd, pid = self._fork_exec(["bash", "-lc", inner], rows, cols)
+                session = TerminalSession(
+                    session_id, master_fd, pid, name,
+                    session_type=session_type, command=command,
+                    insecure=_is_insecure_command(command, session_type),
+                    agent_session_id=_extract_agent_session_id(command),
+                )
+                self.sessions[session_id] = session
 
         self._meta.update(
             session_id, name=name, type=session_type,
@@ -1135,32 +1170,38 @@ class TerminalManager:
                 is_insecure: bool | None = None,
                 loop: asyncio.AbstractEventLoop | None = None) -> TerminalSession | None:
         """Kill the existing session and spawn a fresh one with the same ID."""
-        old = self.sessions.pop(session_id, None)
-        # Fall back to Redis for a restart that landed on a worker holding no
-        # PTY for this session — without it the restart would silently spawn a
-        # plain login shell instead of re-running the old command.
-        meta = self._meta.get(session_id) if old is None else {}
-        old_screen = old.screen_name if old else (meta.get("screen_name") or None)
-        if old:
-            _stop_reader(old, loop)
-            old.kill()
-        # A restart replaces what is RUNNING, so the old screen must go — a
-        # detach would leave the previous command alive and unreachable.
-        _destroy_screen(old_screen)
-        old_type = old.type if old else (meta.get("type") or "terminal")
-        old_name = name or (old.name if old else (meta.get("name") or session_id))
-        old_command = command if command is not None else (
-            old.command if old else (meta.get("command") or None))
-        # `is_insecure` with no fresh `command` is the toggle UI's "detection
-        # still pending" fallback (App.jsx's toggleInsecure) — flip the flag
-        # in place on whatever command was already running instead of
-        # silently dropping the request (the bug this whole block fixes).
-        if is_insecure is not None and command is None:
-            old_command = _set_command_insecure(old_command, old_type, is_insecure)
-        return self.create(
-            name=old_name, rows=rows, cols=cols, command=old_command,
-            session_type=old_type, session_id=session_id,
-        )
+        # Locked for the whole pop -> kill -> destroy -> recreate sequence:
+        # two concurrent restarts of the same session_id would otherwise both
+        # pop/kill the old session and then both race create()'s own attach,
+        # the same class of bug get() had. create() re-acquires the same
+        # session_id's lock (RLock, same thread) below — not a deadlock.
+        with self._lock_for(session_id):
+            old = self.sessions.pop(session_id, None)
+            # Fall back to Redis for a restart that landed on a worker holding no
+            # PTY for this session — without it the restart would silently spawn a
+            # plain login shell instead of re-running the old command.
+            meta = self._meta.get(session_id) if old is None else {}
+            old_screen = old.screen_name if old else (meta.get("screen_name") or None)
+            if old:
+                _stop_reader(old, loop)
+                old.kill()
+            # A restart replaces what is RUNNING, so the old screen must go — a
+            # detach would leave the previous command alive and unreachable.
+            _destroy_screen(old_screen)
+            old_type = old.type if old else (meta.get("type") or "terminal")
+            old_name = name or (old.name if old else (meta.get("name") or session_id))
+            old_command = command if command is not None else (
+                old.command if old else (meta.get("command") or None))
+            # `is_insecure` with no fresh `command` is the toggle UI's "detection
+            # still pending" fallback (App.jsx's toggleInsecure) — flip the flag
+            # in place on whatever command was already running instead of
+            # silently dropping the request (the bug this whole block fixes).
+            if is_insecure is not None and command is None:
+                old_command = _set_command_insecure(old_command, old_type, is_insecure)
+            return self.create(
+                name=old_name, rows=rows, cols=cols, command=old_command,
+                session_type=old_type, session_id=session_id,
+            )
 
     def get(self, session_id: str) -> TerminalSession | None:
         """This worker's PTY for ``session_id``, attaching one if it has none.
@@ -1184,10 +1225,17 @@ class TerminalManager:
             self.sessions.pop(session_id, None)
         if not screen_backing_enabled():
             return None
-        meta = self._meta.get(session_id)
-        if not meta:
-            return None
-        return self._adopt(session_id, meta)
+        # Cold miss: serialize meta-lookup -> attach -> store per session_id
+        # (see __init__) so a second concurrent caller waits for and reuses
+        # the first attach instead of forking its own.
+        with self._lock_for(session_id):
+            session = self.sessions.get(session_id)
+            if session is not None and session.alive:
+                return session
+            meta = self._meta.get(session_id)
+            if not meta:
+                return None
+            return self._adopt(session_id, meta)
 
     def remove(self, session_id: str,
                loop: asyncio.AbstractEventLoop | None = None):
@@ -1199,17 +1247,22 @@ class TerminalManager:
         the screen name from Redis when this worker holds no PTY, so a delete
         that lands on a non-owning worker still works.
         """
-        session = self.sessions.pop(session_id, None)
-        screen_name = session.screen_name if session else None
-        if screen_name is None:
-            screen_name = self._meta.get(session_id).get("screen_name") or None
-        if session:
-            _stop_reader(session, loop)
-            session.kill()
-        _destroy_screen(screen_name)
-        self._meta.delete(session_id)
-        if session or screen_name:
-            logger.info("Terminal removed: %s", session_id)
+        # Locked so a remove() racing a get()/create() cold-miss for the same
+        # session_id can't interleave — e.g. get() adopting a session in the
+        # instant after remove() read a stale meta but before it deleted it,
+        # leaving a freshly-attached PTY into a screen remove() just destroyed.
+        with self._lock_for(session_id):
+            session = self.sessions.pop(session_id, None)
+            screen_name = session.screen_name if session else None
+            if screen_name is None:
+                screen_name = self._meta.get(session_id).get("screen_name") or None
+            if session:
+                _stop_reader(session, loop)
+                session.kill()
+            _destroy_screen(screen_name)
+            self._meta.delete(session_id)
+            if session or screen_name:
+                logger.info("Terminal removed: %s", session_id)
 
     def list_sessions(self, include_hidden: bool = False) -> list[dict]:
         """Every live session in the FLEET, not just this worker's.

@@ -300,6 +300,134 @@ def test_concurrent_create_of_one_session_id_yields_one_screen(screens):
 
 
 # ---------------------------------------------------------------------------
+# W5b: get()/create()/restart() serialize their check-then-act on
+# self.sessions per session_id — see terminal_manager.py's card
+# 3d15bf3b-9510-818e-ae1b-d1a1639c499f. Without this guard, two concurrent
+# callers racing the same cold session_id both cache-miss and each fork
+# their own `screen -x` attach into the same shared screen; only one wins
+# the dict slot and the other is silently handed back to its caller as a
+# live, working second writer — which is what produced the reported
+# keystroke duplication (`screen -x` echoes every attached display's
+# writes to every other display).
+#
+# These tests fake the attach step (`screen_backing_enabled`/`_screen_exists`
+# mocked, `_attach_screen`/`_fork_exec` replaced) rather than requiring a
+# real `screen` binary — mirroring the debugger's own reproduction, which
+# used the same mocks. What is under test is the Python-level mutual
+# exclusion on `self.sessions`, not screen's own behaviour (already covered
+# above), so faking it is not a "skip" in the sense this file's docstring
+# warns about — it runs unconditionally, gated only on Redis.
+# ---------------------------------------------------------------------------
+
+
+class _FakeAttachedSession:
+    """Minimal stand-in `get()`'s cold-miss path can cache and re-serve."""
+
+    def __init__(self, screen_name):
+        self.screen_name = screen_name
+        self.alive = True
+
+
+def test_concurrent_get_on_cold_session_id_yields_one_attach(monkeypatch):
+    """Two threads racing `get()` on the same never-locally-attached
+    session_id must produce exactly ONE attach, not two racing PTYs into
+    the same shared screen.
+
+    Without the per-session_id lock in `TerminalManager.get()`, both threads
+    observe `self.sessions.get(session_id) is None`, both call `_adopt` ->
+    `_attach_screen`, and only one wins `self.sessions[session_id]` — the
+    other is leaked back to its caller as a live extra writer into the same
+    shell. Reproduced deterministically here by stalling the attach step so
+    both threads are guaranteed to be mid-flight at once if nothing
+    serializes them.
+    """
+    session_id = f"w5test-{uuid.uuid4().hex[:8]}"
+    screen_name = _screen_name_for(session_id, "terminal")
+
+    worker_b = TerminalManager()
+    worker_b._meta.update(
+        session_id, name="race", type="terminal", command="",
+        screen_name=screen_name, insecure=False, agent_session_id="")
+    assert session_id not in worker_b.sessions
+
+    monkeypatch.setattr(tm, "screen_backing_enabled", lambda: True)
+    monkeypatch.setattr(tm, "_screen_exists", lambda name: True)
+
+    attach_calls = []
+
+    def fake_attach_screen(session_id_, name, screen_name_, command=None,
+                           session_type="terminal", rows=24, cols=80):
+        attach_calls.append(1)
+        time.sleep(0.3)  # widen the race window, as the debugger's repro did
+        session = _FakeAttachedSession(screen_name_)
+        worker_b.sessions[session_id_] = session
+        return session
+
+    monkeypatch.setattr(worker_b, "_attach_screen", fake_attach_screen)
+
+    results = [None, None]
+
+    def do_get(i):
+        results[i] = worker_b.get(session_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(do_get, range(2)))
+
+    assert len(attach_calls) == 1, (
+        f"expected exactly one _attach_screen call for one cold session_id, "
+        f"got {len(attach_calls)} — the get() check-then-act race is back"
+    )
+    assert results[0] is not None and results[1] is not None
+    assert results[0] is results[1], "both callers must share the one attach"
+    assert len(worker_b.sessions) == 1
+
+    worker_b._meta.delete(session_id)
+
+
+def test_concurrent_restarts_of_one_session_id_never_overlap(monkeypatch):
+    """restart()'s pop -> kill -> destroy -> recreate sequence must be
+    serialized per session_id too (`create()`, `restart()`, `remove()` all
+    touch `self.sessions` the same way `get()` does).
+
+    Uses the direct-PTY backing (no screen at all) so only the lock itself
+    is under test: every `_fork_exec` call records its start/end, and no
+    two windows may overlap once the guard is in place.
+    """
+    session_id = f"w5test-{uuid.uuid4().hex[:8]}"
+    mgr = TerminalManager()
+    monkeypatch.setattr(tm, "screen_backing_enabled", lambda: False)
+
+    intervals = []
+    fake_pid = [10_000]
+
+    def fake_fork_exec(cmd_parts, rows=24, cols=80):
+        start = time.monotonic()
+        time.sleep(0.2)
+        intervals.append((start, time.monotonic()))
+        fake_pid[0] += 1
+        return (os.open(os.devnull, os.O_RDWR), fake_pid[0])
+
+    monkeypatch.setattr(mgr, "_fork_exec", fake_fork_exec)
+
+    mgr.create(name="restart-race", session_id=session_id, command="sleep 30")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(
+            lambda _: mgr.restart(session_id, command="sleep 30"), range(2)))
+
+    # 1 initial create + 2 restarts.
+    assert len(intervals) == 3
+    for (s1, e1), (s2, e2) in zip(sorted(intervals), sorted(intervals)[1:]):
+        assert e1 <= s2, (
+            f"overlapping attach windows {(s1, e1)} vs {(s2, e2)} — "
+            "restart()'s per-session_id guard is missing"
+        )
+    assert len(mgr.sessions) == 1
+
+    mgr.remove(session_id)
+
+
+# ---------------------------------------------------------------------------
 # The whole point: bytes flow both ways from a worker that did not create it
 # ---------------------------------------------------------------------------
 
