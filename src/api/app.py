@@ -117,11 +117,12 @@ def _write_setting(key: str, value: dict) -> None:
 
     Split out of the route handler so the handler can hand it to
     ``asyncio.to_thread``: ``src.api.db.get_session`` is a SYNCHRONOUS
-    session over a sync psycopg driver, and this process runs ONE uvicorn
-    worker (``AW_WORKSPACE_WORKERS=1``, deliberate — terminal PTY sessions
-    keep in-memory state). Called inline from an ``async def`` it blocks the
-    single event-loop thread for the whole DB round-trip, freezing every
-    other in-flight request — including ones touching no DB at all."""
+    session over a sync psycopg driver, and each worker process has its
+    own single event-loop thread — true regardless of
+    ``AW_WORKSPACE_WORKERS`` (which may be >1 as of W1/W2). Called inline
+    from an ``async def`` it blocks that thread for the whole DB
+    round-trip, freezing every other in-flight request on the SAME worker
+    — including ones touching no DB at all."""
     with get_session() as session:
         row = session.get(Setting, key)
         if row is None:
@@ -177,7 +178,25 @@ def create_app() -> FastAPI:
         # the source first is what lets a lost-Postgres crispal-style app
         # come back on the very first boot instead of needing a second,
         # manual `marketplace install --update` once someone notices.
-        reconcile_sources_on_boot()
+        # W2: at AW_WORKSPACE_WORKERS>1 every worker would otherwise run
+        # this at the same instant — harmless (each row is upserted only
+        # if `get_source(sid) is None`, see reconcile_sources_on_boot's own
+        # per-row check) but wasteful, N redundant Postgres round-trips for
+        # convergence that only needs to happen once. `cooldown_acquire` is
+        # a one-shot "first worker through the door wins" claim: whichever
+        # worker wins the 30s window runs it, the rest skip. If Redis is
+        # unreachable (true in every environment today — see
+        # src/libs/redis_coord.py), fall back to today's behaviour and just
+        # run it locally, same as the watchdog lease two blocks down.
+        from src.libs.redis_coord import cooldown_acquire
+        try:
+            should_reconcile_sources = await cooldown_acquire(
+                "boot-marketplace-reconcile", seconds=30.0
+            )
+        except Exception:
+            should_reconcile_sources = True
+        if should_reconcile_sources:
+            reconcile_sources_on_boot()
         # W1: gate WatchdogSupervisor's periodic tasks (CLI healer,
         # mcp-gateway rescan, zombie reaper, any app-contributed
         # watchdog:tasks) on a Redis leader lease — at AW_WORKSPACE_WORKERS>1
@@ -336,8 +355,12 @@ def create_app() -> FastAPI:
         return {"key": await asyncio.to_thread(regenerate_workspace_api_key)}
 
     # Terminal feature (strangler migration #1): PTY shells on this BYOD host.
-    # In-memory session state → must run single-worker (see AW_WORKSPACE_WORKERS
-    # in the Dockerfile/compose and MIGRATION.md).
+    # In-memory session state, sharded by nothing — this is the one piece of
+    # boot/runtime state W1 (watchdog) and W2 (this module's boot path) did
+    # NOT make safe at AW_WORKSPACE_WORKERS>1, and the reason that default
+    # still ships as 1 (see AW_WORKSPACE_WORKERS in the Dockerfile/compose,
+    # src/api/terminal_manager.py, and MIGRATION.md). Do not read "we made
+    # boot multi-worker-safe" as "the whole app is" — this route still isn't.
     register_terminal_routes(app)
 
     # Notification engine (strangler migration): POST /api/notify + WS

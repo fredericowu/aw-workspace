@@ -50,12 +50,14 @@ how a hole gets grandfathered in (§2.4):
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import re
 import threading
 import time
+from contextlib import contextmanager
 
 import httpx
 
@@ -303,14 +305,38 @@ def redact(ctype: str, content: str) -> str:
 class VpnProfiles:
     """Profile CRUD + the Nord client. No lifecycle, no tunnel, no shell.
 
-    One instance per process. ``AW_WORKSPACE_WORKERS=1``
-    (``src/start/workspace.py``), so unlike ``aw-backend``'s ten-worker copy
-    this lock actually guards the file it claims to.
+    One instance per PROCESS, but ``AW_WORKSPACE_WORKERS`` may be >1 as of
+    W1/W2, so this class no longer relies on ``threading.RLock`` alone to
+    guard ``profiles.json`` — that only ever guarded this one process's own
+    threads, not a sibling worker's. ``_locked()`` below adds an ``flock``
+    on a sibling lock file, a real cross-process mutex, around every
+    read-modify-write of the index. ``_save_state``'s tmp-then-``os.replace``
+    already made a single write atomic (a reader never sees a torn file);
+    what was missing was serializing the READ before it, so two concurrent
+    ``save_config``/``delete_config`` calls on different workers don't both
+    read the same "before" index and then each write back a version missing
+    the other's change (a lost update — self-hiding, since ``list_configs``
+    reconciles against disk and the orphaned profile reappears as
+    ``source: disk``).
     """
 
     def __init__(self, secrets: SecretStore | None = None) -> None:
         self._lock = threading.RLock()
         self._secrets = secrets or SecretStore()
+
+    @contextmanager
+    def _locked(self):
+        """Intra-process ``RLock`` plus a cross-process ``flock`` — the
+        combination covers both this process's own threads and every
+        sibling worker process racing the same ``profiles.json``."""
+        with self._lock:
+            lock_fd = os.open(f"{_state_path()}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
 
     # -- state ----------------------------------------------------------------
 
@@ -346,7 +372,7 @@ class VpnProfiles:
         aw-backend original does, and for the same reason — the directory is
         writable by the workspace's own terminal.
         """
-        with self._lock:
+        with self._locked():
             state = self._load_state()
             configs = state["configs"]
 
@@ -374,7 +400,7 @@ class VpnProfiles:
 
     def get_config(self, name: str) -> dict:
         """Metadata plus a **redacted** body. Deliberately not the real one."""
-        with self._lock:
+        with self._locked():
             meta = self._load_state()["configs"].get(name)
             if not meta:
                 raise VpnProfileNotFound(f"no profile named {name!r}")
@@ -401,7 +427,7 @@ class VpnProfiles:
             )
         parsed = validate(ctype, content)
 
-        with self._lock:
+        with self._locked():
             path = self._profile_path(name, ctype)
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -425,7 +451,7 @@ class VpnProfiles:
             return {"name": name, **meta}
 
     def delete_config(self, name: str) -> None:
-        with self._lock:
+        with self._locked():
             state = self._load_state()
             meta = state["configs"].pop(name, None)
             if meta is None:

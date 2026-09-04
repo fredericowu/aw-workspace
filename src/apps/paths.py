@@ -25,6 +25,7 @@ so this self-heals if a core-image update ever touches ``skills/``.
 """
 from __future__ import annotations
 
+import fcntl
 import os
 
 DEFAULT_WORKSPACE_CONTAINER_DIR = "/opt/aw-workspace"
@@ -66,29 +67,46 @@ def env_file() -> str:
 def upsert_workspace_env(name: str, value: str) -> None:
     """Upsert ``name=value`` into ``<home>/.env`` (0600), preserving every
     other line — several secrets/config values share this one file, so this
-    is the single writer for all of them."""
+    is the single writer for all of them.
+
+    W2: the whole read-modify-write is serialized across PROCESSES (not
+    just threads) with an ``flock`` on a sibling lock file, and the result
+    lands via write-temp-then-``os.replace``. Both the workspace API key
+    and the external API URL mint through this one function — at
+    ``AW_WORKSPACE_WORKERS>1`` two workers racing an unguarded
+    read-modify-write here could interleave (a reader sees a half-written
+    file) or silently drop one writer's key (each reads the same "before"
+    content, then the later ``O_TRUNC`` write wins outright)."""
     path = env_file()
     prefix = f"{name}="
-    lines: list[str] = []
-    found = False
+    lock_fd = os.open(f"{path}.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith(prefix):
-                    lines.append(f"{prefix}{value}\n")
-                    found = True
-                else:
-                    lines.append(line)
-    except FileNotFoundError:
-        pass
-    if not found:
-        lines.append(f"{prefix}{value}\n")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    # O_CREAT's mode only applies on first creation; force 0600 every write so
-    # a pre-existing (looser) secrets file is always tightened.
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.writelines(lines)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        lines: list[str] = []
+        found = False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith(prefix):
+                        lines.append(f"{prefix}{value}\n")
+                        found = True
+                    else:
+                        lines.append(line)
+        except FileNotFoundError:
+            pass
+        if not found:
+            lines.append(f"{prefix}{value}\n")
+        tmp_path = f"{path}.tmp.{os.getpid()}"
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # O_CREAT's mode only applies on first creation; force 0600 every write
+        # so a pre-existing (looser) secrets file is always tightened.
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        os.replace(tmp_path, path)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 def bin_dir() -> str:

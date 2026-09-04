@@ -69,10 +69,10 @@ def register_vpn_routes(app: FastAPI, mgr: VpnProfiles | None = None) -> None:
     app.state.vpn_profiles = mgr
 
     # to_thread throughout: every manager call does blocking file I/O or a
-    # blocking httpx call, and this process runs ONE uvicorn worker
-    # (AW_WORKSPACE_WORKERS=1) — an inline call freezes every other in-flight
-    # request, including ones touching no VPN state at all. Same reasoning as
-    # src/api/folders.py.
+    # blocking httpx call, and each worker process has a single event-loop
+    # thread (true regardless of AW_WORKSPACE_WORKERS) — an inline call
+    # freezes every other in-flight request on that worker, including ones
+    # touching no VPN state at all. Same reasoning as src/api/folders.py.
 
     @app.get("/api/vpn/configs")
     async def list_configs(identity: dict = Depends(require_identity)):

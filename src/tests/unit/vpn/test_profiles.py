@@ -200,6 +200,44 @@ def test_deleting_something_that_is_not_there_raises_not_found(mgr):
         mgr.delete_config("nope")
 
 
+def test_concurrent_saves_from_separate_instances_lose_nothing(mgr, tmp_path):
+    """W2: the cross-process lost-update race. In production, each worker
+    process constructs its OWN ``VpnProfiles()`` — a ``threading.RLock``
+    only ever guards one instance's own thread(s), so N separate instances
+    racing ``save_config`` reproduces the exact hazard N separate worker
+    PROCESSES would hit (no shared Python object between them either way).
+    Before the ``_locked()`` fix (an ``flock`` on a sibling lock file —
+    real, cross-instance, cross-process), two concurrent saves could each
+    read the same "before" index and each write back a version missing the
+    other's new entry — a lost update, not a crash, so nothing before this
+    test would have caught it."""
+    import threading
+
+    n = 12
+    barrier = threading.Barrier(n)
+    errors: list[BaseException] = []
+
+    def save_one(i: int) -> None:
+        try:
+            barrier.wait(timeout=10)
+            # Separate VpnProfiles() instance per "worker" — see docstring.
+            VpnProfiles().save_config(f"wg{i}", "wireguard",
+                                      WG_OK.replace("51820", str(51820 + i)))
+        except BaseException as exc:  # noqa: BLE001 — captured, not raised, from a worker thread
+            errors.append(exc)
+
+    threads = [threading.Thread(target=save_one, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+    assert not errors, f"{len(errors)} worker(s) raised: {errors}"
+    names = {c["name"] for c in mgr.list_configs()}
+    assert names == {f"wg{i}" for i in range(n)}, \
+        f"lost update: expected {n} profiles, index has {sorted(names)}"
+
+
 def test_stored_profiles_are_0600_under_the_workspace_home(mgr, tmp_path):
     mgr.save_config("wg0", "wireguard", WG_OK)
 

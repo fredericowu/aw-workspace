@@ -244,6 +244,15 @@ def reconcile_sources_on_boot() -> None:
     survives a Postgres loss on its own — see the module docstring). A
     mirrored entry whose credential is ALSO gone is logged loudly instead
     of silently skipped or half-recreated with no way to authenticate.
+
+    Idempotent per-row (each entry is only upserted if ``get_source(sid)
+    is None``), which is what lets ``src/api/app.py``'s lifespan gate the
+    call itself on a ``cooldown_acquire`` claim (W2) instead of gating
+    here: at ``AW_WORKSPACE_WORKERS>1`` every worker calling this at once
+    is wasteful (N redundant round-trips) but never corrupting, so the
+    call site chooses "first worker through the door wins, Redis
+    unreachable falls back to every worker running it" rather than this
+    function enforcing single-caller itself.
     """
     try:
         with open(_mirror_path(), encoding="utf-8") as f:

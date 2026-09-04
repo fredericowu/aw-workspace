@@ -51,6 +51,7 @@ Consumers
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
 import os
 import re
@@ -60,7 +61,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException
 from src.api.db import get_session
 from src.api.identity import require_identity
 from src.api.models import Setting
-from src.apps.paths import DEFAULT_WORKSPACE_CONTAINER_DIR
+from src.apps.paths import DEFAULT_WORKSPACE_CONTAINER_DIR, workspace_home
 
 log = logging.getLogger(__name__)
 
@@ -318,6 +319,36 @@ class _RemapCoalescer:
 _coalescer = _RemapCoalescer()
 
 
+def _remap_lock_path() -> str:
+    return os.path.join(workspace_home(), "folders-remap.lock")
+
+
+async def _locked_remap(run) -> list[str]:
+    """Cross-process mutex around the actual container recreate.
+
+    ``_RemapCoalescer`` only collapses a burst WITHIN this one process — at
+    ``AW_WORKSPACE_WORKERS>1`` each worker runs its OWN coalescer instance
+    (``_coalescer`` is module-level, one per process), so a burst of folder
+    mutations spread across workers would otherwise still fire one
+    concurrent ``remap_folders()`` per worker: up to N simultaneous
+    recreates of the SAME app containers, exactly what ``_RemapCoalescer``
+    exists to prevent (see its docstring) — just not across the process
+    boundary it was never designed for. An ``flock`` on a sibling lock file
+    serializes those instead: still one recreate per worker that actually
+    saw a mutation (mildly wasteful, not corrupting), but never concurrent.
+    """
+    loop = asyncio.get_running_loop()
+    lock_fd = await loop.run_in_executor(
+        None, os.open, _remap_lock_path(), os.O_CREAT | os.O_RDWR, 0o600
+    )
+    try:
+        await loop.run_in_executor(None, fcntl.flock, lock_fd, fcntl.LOCK_EX)
+        return await run()
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
 async def _remap_apps(app: FastAPI) -> list[str]:
     """Push the new folder set into every running container app that asked for it.
 
@@ -327,13 +358,15 @@ async def _remap_apps(app: FastAPI) -> list[str]:
     folder" silently means "map a folder, then go restart the app yourself".
 
     Coalesced (see ``_RemapCoalescer``) so a burst of mutations costs one
-    recreate, not one per folder.
+    recreate, not one per folder — and, on top of that, serialized across
+    worker processes (see ``_locked_remap``) so a burst spread across
+    workers costs one recreate AT A TIME rather than several at once.
     """
     runtime = getattr(app.state, "app_runtime", None)
     if runtime is None or not hasattr(runtime, "remap_folders"):
         return []
     try:
-        return await _coalescer.request(runtime.remap_folders)
+        return await _coalescer.request(lambda: _locked_remap(runtime.remap_folders))
     except Exception:  # noqa: BLE001 — a failed remap must not fail the mapping
         log.exception("folders: remapping container apps failed")
         return []

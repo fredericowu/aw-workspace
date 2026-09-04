@@ -29,7 +29,7 @@ from __future__ import annotations
 import os
 import secrets
 
-from src.api.db import get_session
+from src.api.db import get_engine, get_session
 from src.api.models import Setting
 from src.apps.paths import env_file, upsert_workspace_env
 
@@ -77,16 +77,33 @@ def get_or_create_workspace_api_key() -> str:
     workspace has a key with no manual step, and again lazily if the
     Settings UI is opened before boot ever ran (belt and suspenders).
     Always (re)publishes even when not freshly generated, so a worker
-    process that didn't mint the key still gets it into its own env."""
+    process that didn't mint the key still gets it into its own env.
+
+    W2: the insert is atomic (``INSERT ... ON CONFLICT DO NOTHING``,
+    followed by a re-``SELECT``), so N workers racing this at boot never
+    each mint and store a DIFFERENT key. Previously this was a plain
+    read-then-write: every worker could read "absent" and each generate
+    + store its own key, with the last writer winning in Postgres while
+    every OTHER worker kept running with the key IT generated, only
+    ever in its own ``os.environ`` — see the KB memory "restoring an
+    older postgres cluster rotates the workspace API key" for the blast
+    radius of a wrong key here (401s the whole MCP gateway while
+    ``/api/health`` stays 200)."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    candidate = secrets.token_hex(32)
+    stmt = (
+        pg_insert(Setting.__table__)
+        .values(key=SETTING_KEY, value={"key": candidate})
+        .on_conflict_do_nothing(index_elements=["key"])
+    )
+    with get_engine().begin() as conn:
+        conn.execute(stmt)
     with get_session() as session:
-        existing = _read(session)
-        if existing:
-            _publish(existing)
-            return existing
-        key = secrets.token_hex(32)
-        _store(session, key)
-    _publish(key)
-    return key
+        winner = _read(session)
+    assert winner is not None  # the insert above guarantees the row exists
+    _publish(winner)
+    return winner
 
 
 def regenerate_workspace_api_key() -> str:

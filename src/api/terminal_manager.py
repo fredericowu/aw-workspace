@@ -9,9 +9,12 @@ What was deliberately dropped vs. the monolith (see MIGRATION.md):
 
 * GNU ``screen`` backing + cross-restart reattach + the ``screen_sessions`` /
   ``agent_sessions`` / ``window_sessions`` DB tables. Sessions here are
-  in-memory only, so the workspace runs single-worker (see
-  ``AW_WORKSPACE_WORKERS`` note in the Dockerfile/compose). Restart
-  persistence is a later card.
+  in-memory only and sharded by nothing — this is the reason
+  ``AW_WORKSPACE_WORKERS`` still ships as 1 (see the Dockerfile/compose)
+  even though the boot path (``src/api/app.py``'s ``create_app()``/
+  ``lifespan``) and the periodic watchdog tasks are themselves safe at
+  N>1 now. A worker bump only becomes safe end-to-end once this module's
+  sessions are sharded too — restart persistence is a later card.
 * Agent-CLI (claude/codex/cursor/gemini) session-id detection + ``--resume``
   reconstruction + the Claude ``PromptDetector``. The slim BYOD image ships
   no agent CLIs, so a terminal is just a shell (or an arbitrary command).

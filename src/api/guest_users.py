@@ -76,11 +76,12 @@ def _to_dict(user: GuestUser) -> dict:
 def register_guest_user_routes(app: FastAPI) -> None:
     # These handlers are deliberately plain `def`, not `async def`: they do
     # nothing but synchronous DB work through src.api.db.get_session (sync
-    # psycopg) plus bcrypt hashing, and this process runs ONE uvicorn worker
-    # (AW_WORKSPACE_WORKERS=1), so an `async def` body would run that blocking
-    # work directly on the single event-loop thread and freeze every other
-    # in-flight request for its duration. FastAPI runs a sync handler in its
-    # own threadpool instead, which is exactly what's wanted here.
+    # psycopg) plus bcrypt hashing, and each worker process has a single
+    # event-loop thread (true regardless of AW_WORKSPACE_WORKERS), so an
+    # `async def` body would run that blocking work directly on it and
+    # freeze every other in-flight request on that worker for its duration.
+    # FastAPI runs a sync handler in its own threadpool instead, which is
+    # exactly what's wanted here.
     @app.get("/api/guest-users")
     def list_guest_users(identity: dict = Depends(require_identity)):
         with get_session() as session:

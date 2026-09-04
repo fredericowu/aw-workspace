@@ -90,6 +90,19 @@ def create_all_tables() -> None:
     ``AW_WORKSPACE_DB_URL`` (the var the aw-remote-host bootstrap sets;
     see ``get_db_url``), which keeps the central invariant intact: with
     only ``AWSERV_DB_URL`` set, the schema must already exist.
+
+    W2: the whole body runs under a session-level ``pg_advisory_lock`` —
+    not the transaction-scoped ``_xact_lock`` variant, since this is
+    called from ``create_app()`` before any event loop or transaction
+    exists, and the lock needs to span more than one DDL statement below.
+    At ``AW_WORKSPACE_WORKERS>1`` every worker calls this at the exact
+    same instant (``create_app()`` runs once per worker, before the
+    lifespan). ``checkfirst=True``/``IF NOT EXISTS`` does not make that
+    safe on its own — Postgres takes an ``ACCESS EXCLUSIVE`` catalog lock
+    per ``CREATE TABLE``, and two workers racing the same
+    check-then-create window either deadlock or raise ``DuplicateTable``.
+    The lock key is a hash of the schema name, so two different
+    workspaces' boots never contend with each other.
     """
     from sqlalchemy import text
 
@@ -97,19 +110,24 @@ def create_all_tables() -> None:
 
     engine = get_engine()
     schema = get_workspace_schema()
+    lock_expr = text("SELECT pg_advisory_lock(hashtext(:schema)::bigint)")
+    unlock_expr = text("SELECT pg_advisory_unlock(hashtext(:schema)::bigint)")
 
-    if os.environ.get("AW_WORKSPACE_DB_URL"):
-        # BYOD host — the runtime owns its local DB, so provision the schema.
-        with engine.begin() as conn:
-            conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
-        _log.info("db: ensured BYOD schema %s exists", schema)
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(lock_expr, {"schema": schema})
+        try:
+            if os.environ.get("AW_WORKSPACE_DB_URL"):
+                # BYOD host — the runtime owns its local DB, so provision the schema.
+                conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+                _log.info("db: ensured BYOD schema %s exists", schema)
 
-    SQLModel.metadata.create_all(engine, checkfirst=True)
-    with engine.begin() as conn:
-        conn.execute(text(
-            f'ALTER TABLE "{schema}".app_installs '
-            'ADD COLUMN IF NOT EXISTS signed BOOLEAN NOT NULL DEFAULT FALSE'
-        ))
+            SQLModel.metadata.create_all(conn, checkfirst=True)
+            conn.execute(text(
+                f'ALTER TABLE "{schema}".app_installs '
+                'ADD COLUMN IF NOT EXISTS signed BOOLEAN NOT NULL DEFAULT FALSE'
+            ))
+        finally:
+            conn.execute(unlock_expr, {"schema": schema})
     _log.info("db: schema %s up to date", schema)
 
 
@@ -117,11 +135,12 @@ def get_session() -> Session:
     """Return a fresh ``sqlmodel.Session`` bound to this workspace's engine.
 
     **This session is SYNCHRONOUS** (sqlmodel over the sync psycopg driver),
-    and this process runs a SINGLE uvicorn worker — ``AW_WORKSPACE_WORKERS=1``
-    in ``docker-compose.yml``/``Dockerfile``, deliberate because terminal PTY
-    sessions keep in-memory state that cannot be sharded across workers (see
-    ``src/api/app.py``). One worker means ONE asyncio event-loop thread
-    serving every concurrent request as a coroutine.
+    and each worker process has its own ONE asyncio event-loop thread
+    serving every concurrent request as a coroutine — true regardless of
+    ``AW_WORKSPACE_WORKERS`` (which may be >1 as of W1/W2; the shipped
+    default is still 1, deliberately, because terminal PTY sessions keep
+    in-memory state that cannot be sharded across workers — see
+    ``src/api/terminal_manager.py``).
 
     So: **never call this directly inside an ``async def``.** The blocking DB
     round-trip would run on that one loop thread and freeze every other
