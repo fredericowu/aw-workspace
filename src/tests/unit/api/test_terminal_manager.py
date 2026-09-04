@@ -494,3 +494,128 @@ def test_reap_pid1_orphans_reaps_true_orphan_after_two_ticks():
     second = tm.reap_pid1_orphans()
     assert grandchild_pid in second, "not reaped on its second consecutive sighting"
     assert _proc_state(grandchild_pid) is None
+
+
+def test_child_env_sets_term_colorterm_and_real_pwd_identity(monkeypatch):
+    """Happy path: ``pwd.getpwuid(os.getuid())`` resolves in this container,
+    so TERM/COLORTERM are forced and HOME/USER/LOGNAME come from the real
+    passwd entry rather than falling back.
+
+    HOME/USER/LOGNAME are cleared from the inherited environment first:
+    ``_child_env`` uses ``setdefault`` for all three, so an already-set
+    HOME (this container's is ``/home/ubuntu``, distinct from the passwd
+    entry's ``pw_dir``) would silently pass regardless of what the pwd
+    branch actually computed — clearing them is what makes this the pwd
+    branch's own happy path, not the inherited-environment path."""
+    import pwd
+
+    real_pw = pwd.getpwuid(os.getuid())
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("LOGNAME", raising=False)
+
+    env = TerminalManager._child_env()
+
+    assert env["TERM"] == "xterm-256color"
+    assert env["COLORTERM"] == "truecolor"
+    assert env["USER"] == real_pw.pw_name
+    assert env["LOGNAME"] == real_pw.pw_name
+    assert env["HOME"] == real_pw.pw_dir
+
+
+def test_child_env_falls_back_when_getpwuid_raises(monkeypatch):
+    """The ``except (KeyError, ImportError)`` branch: a uid with no passwd
+    entry (common in a minimal/BYOD container) must not blow up the fork
+    path — USER/LOGNAME fall back to the numeric uid and HOME keeps whatever
+    the process already inherited, all still non-empty, sensible values."""
+    import pwd
+
+    def raise_keyerror(uid):
+        raise KeyError(f"no such uid {uid}")
+
+    monkeypatch.setattr(pwd, "getpwuid", raise_keyerror)
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("LOGNAME", raising=False)
+
+    env = TerminalManager._child_env()
+
+    assert env["TERM"] == "xterm-256color"
+    assert env["COLORTERM"] == "truecolor"
+    assert env["USER"] == str(os.getuid())
+    assert env["LOGNAME"] == str(os.getuid())
+    assert env["HOME"]  # whatever HOME this process already had
+
+
+def test_fork_exec_builds_child_env_before_fork_and_execs_via_execvpe(monkeypatch):
+    """Pins the safety invariant ``_child_env()`` exists for (see its
+    docstring): the environment must be built BEFORE ``os.fork()`` — the only
+    async-signal-safe window in a multi-threaded process — and the child must
+    hand that SAME pre-built dict to ``execvpe``, never rebuild or mutate
+    ``os.environ`` in the child after the fork, and never fall back to the
+    environ-inheriting ``execvp``.
+
+    Runs the real ``_fork_exec`` with ``os.fork`` faked to return 0 (the
+    child branch) without ever really forking, and every side-effecting
+    syscall in that branch (``setsid``, ``ioctl``, ``dup2``, ``close``)
+    stubbed out so the test process itself is never touched — only
+    ``execvpe``'s arguments and the call order are asserted.
+    """
+    import fcntl
+    import pty
+
+    mgr = TerminalManager()
+    calls: list[str] = []
+    sentinel_env = {"TERM": "xterm-256color", "COLORTERM": "truecolor",
+                     "HOME": "/home/sentinel", "USER": "sentinel", "LOGNAME": "sentinel"}
+
+    def fake_child_env():
+        calls.append("child_env")
+        return sentinel_env
+
+    def fake_fork():
+        calls.append("fork")
+        return 0  # pretend to be the child, without ever actually forking
+
+    class _StoppedAtExec(Exception):
+        pass
+
+    def fake_execvpe(file, args, env):
+        calls.append("execvpe")
+        assert file == "bash"
+        assert args == ["bash", "-lc", "true"]
+        assert env is sentinel_env, "must exec with the pre-built dict, not a fresh/mutated one"
+        raise _StoppedAtExec
+
+    def fail_execvp(*_a, **_k):
+        raise AssertionError("must exec via execvpe (explicit env), not execvp (inherits os.environ)")
+
+    real_openpty = pty.openpty
+    real_close = os.close
+    opened_fds: list[int] = []
+
+    def tracking_openpty():
+        m, s = real_openpty()
+        opened_fds.extend([m, s])
+        return m, s
+
+    monkeypatch.setattr(pty, "openpty", tracking_openpty)
+    monkeypatch.setattr(TerminalManager, "_child_env", staticmethod(fake_child_env))
+    monkeypatch.setattr(os, "fork", fake_fork)
+    monkeypatch.setattr(os, "setsid", lambda: None)
+    monkeypatch.setattr(os, "dup2", lambda *a, **k: None)
+    monkeypatch.setattr(os, "close", lambda fd: None)
+    monkeypatch.setattr(fcntl, "ioctl", lambda *a, **k: None)
+    monkeypatch.setattr(os, "execvpe", fake_execvpe)
+    monkeypatch.setattr(os, "execvp", fail_execvp)
+
+    try:
+        with pytest.raises(_StoppedAtExec):
+            mgr._fork_exec(["bash", "-lc", "true"])
+    finally:
+        for fd in opened_fds:
+            try:
+                real_close(fd)
+            except OSError:
+                pass
+
+    assert calls == ["child_env", "fork", "execvpe"], calls

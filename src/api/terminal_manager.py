@@ -1500,11 +1500,45 @@ class TerminalManager:
 
     # ---- PTY --------------------------------------------------------------
 
+    @staticmethod
+    def _child_env() -> dict[str, str]:
+        """The environment a PTY child runs under, built BEFORE the fork.
+
+        Everything here used to happen in the child, between ``fork()`` and
+        ``execvp()``. That window may only contain async-signal-safe work: the
+        child of a fork in a multi-threaded process inherits locks (glibc's
+        malloc arena above all) in whatever state the other threads left them,
+        and this module is now unavoidably multi-threaded — W7 gives every live
+        session an output pump, an input consumer and a consumer thread, where
+        before there was only the shared executor. ``pwd.getpwuid`` and
+        ``os.environ`` assignment both allocate, so on a bad day that was a
+        child wedged forever holding a PTY nobody could ever read: a terminal
+        that opens blank, the workspace's signature failure. Hoisted here, the
+        child does fd juggling and ``execvpe`` and nothing else.
+        """
+        env = dict(os.environ)
+        env["TERM"] = "xterm-256color"
+        env["COLORTERM"] = "truecolor"
+        # Ensure HOME/USER/LOGNAME so login shells don't warn about getpwuid().
+        try:
+            import pwd as _pwd
+            _pw = _pwd.getpwuid(os.getuid())
+            env.setdefault("USER", _pw.pw_name)
+            env.setdefault("LOGNAME", _pw.pw_name)
+            env.setdefault("HOME", _pw.pw_dir)
+        except (KeyError, ImportError):
+            _u = env.get("USER") or env.get("LOGNAME") or str(os.getuid())
+            env.setdefault("USER", _u)
+            env.setdefault("LOGNAME", _u)
+            env.setdefault("HOME", os.path.expanduser("~") or "/root")
+        return env
+
     def _fork_exec(self, cmd_parts: list[str], rows: int = 24, cols: int = 80) -> tuple[int, int]:
         """Fork a child connected to a PTY. Returns (master_fd, pid)."""
         master_fd, slave_fd = pty.openpty()
         winsize = struct.pack("HHHH", rows, cols, 0, 0)
         fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
+        child_env = self._child_env()
 
         pid = os.fork()
         if pid == 0:
@@ -1516,21 +1550,7 @@ class TerminalManager:
             os.dup2(slave_fd, 2)
             if slave_fd > 2:
                 os.close(slave_fd)
-            os.environ["TERM"] = "xterm-256color"
-            os.environ["COLORTERM"] = "truecolor"
-            # Ensure HOME/USER/LOGNAME so login shells don't warn about getpwuid().
-            try:
-                import pwd as _pwd
-                _pw = _pwd.getpwuid(os.getuid())
-                os.environ.setdefault("USER", _pw.pw_name)
-                os.environ.setdefault("LOGNAME", _pw.pw_name)
-                os.environ.setdefault("HOME", _pw.pw_dir)
-            except (KeyError, ImportError):
-                _u = os.environ.get("USER") or os.environ.get("LOGNAME") or str(os.getuid())
-                os.environ.setdefault("USER", _u)
-                os.environ.setdefault("LOGNAME", _u)
-                os.environ.setdefault("HOME", os.path.expanduser("~") or "/root")
-            os.execvp(cmd_parts[0], cmd_parts)
+            os.execvpe(cmd_parts[0], cmd_parts, child_env)
         else:
             # Register before anything can block: the SIGCHLD handler reaps
             # only pids in this set, so a child missing from it leaks as a
