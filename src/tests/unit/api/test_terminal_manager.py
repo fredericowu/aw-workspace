@@ -79,7 +79,14 @@ def test_default_cwd_is_workspace_root_not_home(tmp_path, monkeypatch):
 
     async def run():
         mgr = TerminalManager()
-        session = mgr.create(name="cwd-check", command="pwd", session_type="terminal")
+        # `pwd; sleep 30`, not a bare `pwd` (W5, 2026-09-04): the assertion
+        # needs the session to still exist while it reads, and a command that
+        # exits in microseconds was always racing that — screen-backed, the
+        # screen exits with its command and the race is simply lost more
+        # often. The sleep makes the timing deterministic; the cwd being
+        # asserted is unaffected.
+        session = mgr.create(name="cwd-check", command="pwd; sleep 30",
+                             session_type="terminal")
         try:
             session.start_reader(asyncio.get_running_loop())
             text = await _wait_for(session, str(tmp_path))
@@ -154,8 +161,16 @@ def test_insecure_state_reported_and_toggle_flips_it():
     sent — the toggle UI always showed "secure" and re-toggling did nothing."""
     async def run():
         mgr = TerminalManager()
+        # `|| sleep 30` (W5, 2026-09-04): this image ships no agent CLIs, so
+        # `claude` exits instantly with "command not found" and the session is
+        # gone before list_sessions() is asked about it — a race this test
+        # always had and only won by luck, which a screen-backed session (the
+        # screen exits with its command) loses. What is under test is the
+        # insecure-flag bookkeeping on the command STRING, so keeping the
+        # session alive changes nothing about it.
         session = mgr.create(
-            name="sec", command="claude --session-id x --dangerously-skip-permissions",
+            name="sec",
+            command="claude --session-id x --dangerously-skip-permissions || sleep 30",
             session_type="claude",
         )
         try:
@@ -214,7 +229,10 @@ def test_created_session_reports_real_agent_session_id():
         mgr = TerminalManager()
         session = mgr.create(
             name="claude - abcd",
-            command="claude --session-id real-uuid-1234 --dangerously-skip-permissions",
+            # `|| sleep 30` for the same reason as test_insecure_state_… above:
+            # no `claude` on this image, so the session must be kept alive for
+            # list_sessions() to be asked about it at all.
+            command="claude --session-id real-uuid-1234 --dangerously-skip-permissions || sleep 30",
             session_type="claude",
         )
         try:

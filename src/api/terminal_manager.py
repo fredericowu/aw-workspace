@@ -349,6 +349,17 @@ def _screen_sessions() -> dict[str, list[int]]:
     ``list_sessions()`` runs on every ``terminal_update`` broadcast and a
     per-session subprocess there would be N forks per keystroke-adjacent
     event.
+
+    ``(Dead ???)`` entries are EXCLUDED, and wiped. A screen server dies with
+    its container (a restart kills every process in it — a screen survives an
+    app-process restart, not a container one) and leaves its socket behind,
+    and ``screen -ls`` keeps listing that socket in the same shape as a live
+    one. Counting those as live is the terminal-shaped version of this
+    workspace's standard failure: every session from before a restart would
+    still be listed for the SPA, ``get()`` would attach to a socket with no
+    server, and the user would get a terminal that opens blank and never
+    responds — with nothing logged anywhere. Found 2026-09-04 by reading
+    ``screen -ls`` on the live workspace after a restart, which had four.
     """
     if not screen_backing_enabled():
         return {}
@@ -359,13 +370,25 @@ def _screen_sessions() -> dict[str, list[int]]:
     except Exception:
         return {}
     found: dict[str, list[int]] = {}
+    dead = 0
     for line in out.splitlines():
         s = line.strip()
         if not s or not s[0].isdigit():
             continue
+        if "(dead" in s.lower():
+            dead += 1
+            continue
         pid_str, _, nm = s.split()[0].partition(".")
         if nm and pid_str.isdigit():
             found.setdefault(nm, []).append(int(pid_str))
+    if dead:
+        # Reap the sockets so this stays O(live sessions) instead of growing
+        # by one stale entry per terminal per container restart, forever.
+        try:
+            subprocess.run([_SCREEN_BIN, "-wipe"], capture_output=True, timeout=5)
+        except Exception:
+            pass
+        logger.info("screen: wiped %d dead session socket(s)", dead)
     return found
 
 
@@ -403,7 +426,7 @@ def _create_screen(screen_name: str, inner: str) -> None:
         env.setdefault("HOME", os.path.expanduser("~") or "/root")
     env["TERM"] = "xterm-256color"
     env["COLORTERM"] = "truecolor"
-    subprocess.run(
+    proc = subprocess.run(
         [_SCREEN_BIN, "-c", screenrc, "-T", "xterm-256color", "-dmS",
          screen_name, "bash", "-lc", inner],
         capture_output=True, timeout=10, env=env,
@@ -412,9 +435,22 @@ def _create_screen(screen_name: str, inner: str) -> None:
     # attach that immediately follows can race it and find no such session.
     for _ in range(20):
         if _screen_exists(screen_name):
-            break
+            logger.info("Screen session created: %s", screen_name)
+            return
         time.sleep(0.1)
-    logger.info("Screen session created: %s", screen_name)
+    # Two very different things end up here and both are worth saying out
+    # loud, because the symptom either way is a terminal that opens blank:
+    # the command exited immediately (a screen dies with its command — normal
+    # for a one-shot, and the session really is over), or screen cannot run on
+    # this host at all. Deliberately NOT retried as a direct PTY: we cannot
+    # tell those apart after the fact, and re-running a command that already
+    # ran would repeat its side effects.
+    logger.warning(
+        "screen %s did not come up within 2s (rc=%s, stderr=%r). Either its "
+        "command exited immediately, or screen is broken on this host — in "
+        "which case terminals will open blank until it is fixed.",
+        screen_name, proc.returncode,
+        (proc.stderr or b"").decode(errors="replace")[:300])
 
 
 def _release_screen_creation(screen_name: str) -> None:
@@ -1087,7 +1123,15 @@ class TerminalManager:
         """
         session = self.sessions.get(session_id)
         if session is not None:
-            return session
+            if session.alive:
+                return session
+            # The reader flips `alive` on EOF, which is what a screen going
+            # away looks like from this side (its `screen -x` attach exits).
+            # Serving the stale object anyway would hand the SPA a PTY onto a
+            # closed fd — a terminal that opens blank. Drop it and re-resolve:
+            # if the screen is genuinely gone the honest answer is "not
+            # found", and if it is not, we simply attach again below.
+            self.sessions.pop(session_id, None)
         if not screen_backing_enabled():
             return None
         meta = self._meta.get(session_id)

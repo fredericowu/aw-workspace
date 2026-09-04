@@ -97,11 +97,28 @@ def screens():
 
 
 def _require_screen():
+    """Fail loudly unless screen is present AND actually works here.
+
+    Presence is not enough: a host can ship the binary and still be unable to
+    start a server (no writable socket dir, no /dev/pts, a screenrc its
+    version rejects). In that state terminal_manager degrades to a
+    worker-owned PTY and every test below would pass while asserting nothing
+    about W5 — a green run covering none of the card. So probe for real.
+    """
     assert screen_backing_enabled(), (
-        "no `screen` binary — terminal_manager silently falls back to a "
-        "worker-owned PTY, so this test would pass while asserting nothing "
-        "about W5. Install screen (CI does, in test.yml's apt line)."
+        "no `screen` binary — terminal_manager falls back to a worker-owned "
+        "PTY, so this test would pass while asserting nothing about W5. "
+        "Install screen (CI does, in test.yml's apt line)."
     )
+    probe = f"aw-terminal-w5test-probe-{uuid.uuid4().hex[:8]}"
+    try:
+        tm._create_screen(probe, "sleep 5")
+        assert _screen_exists(probe), (
+            "`screen` is installed but cannot start a server here — see the "
+            "warning terminal_manager logs with screen's own stderr."
+        )
+    finally:
+        tm._destroy_screen(probe)
 
 
 def _read_until(session, needle: bytes, timeout: float = 10.0) -> bytes:
@@ -448,6 +465,40 @@ def test_detaching_does_not_leak_a_defunct_screen_attach(screens):
     assert attach_pid not in tm._OWN_CHILD_PIDS
 
     mgr.remove(session_id)
+
+
+def test_a_dead_screen_socket_is_not_reported_as_a_live_session(screens):
+    """A container restart kills every screen server and leaves its socket,
+    which `screen -ls` still lists in the same shape as a live one. Counting
+    those as live would keep every pre-restart terminal in the SPA's list,
+    attachable to nothing — a terminal that opens blank and never responds.
+    Found on the live workspace, which had four of them after a restart.
+    """
+    _require_screen()
+    session_id = f"w5test-{uuid.uuid4().hex[:8]}"
+    screen_name = _screen_name_for(session_id, "terminal")
+    screens.append(screen_name)
+
+    worker_a, worker_b = TerminalManager(), TerminalManager()
+    worker_a.create(name="soon-dead", session_id=session_id, command="sleep 120")
+    pids = tm._screen_server_pids(screen_name)
+    assert pids, "screen should be live to begin with"
+
+    # SIGKILL the server: no chance to clean up, so the socket is left behind
+    # exactly as a container restart leaves it.
+    os.kill(pids[0], 9)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and _screen_exists(screen_name):
+        time.sleep(0.2)
+
+    assert not _screen_exists(screen_name), "dead socket counted as a live screen"
+    # worker_b holds no local PTY, so this is purely the discover-and-attach
+    # path — the one a restarted fleet actually takes for a pre-restart id.
+    assert worker_b.get(session_id) is None, "attached to a screen with no server"
+    assert session_id not in {s["id"] for s in worker_b.list_sessions()}
+    # And the worker that DID create it must stop listing it too, rather than
+    # keeping a ghost terminal in the SPA off its local cache.
+    assert session_id not in {s["id"] for s in worker_a.list_sessions()}
 
 
 def test_restart_reuses_the_name_within_the_claim_ttl(screens):
