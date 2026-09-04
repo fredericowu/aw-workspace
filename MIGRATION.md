@@ -68,11 +68,17 @@ single-tenant host; they get migrated as the BYOD product needs them.
 
 5. **Mind stateful routes + worker count.** In-memory session state (PTY fds,
    subscriber queues) only lives in ONE uvicorn worker, so create-on-worker-A /
-   WS-on-worker-B would miss. aw-workspace therefore runs **single-worker**
-   (`AW_WORKSPACE_WORKERS=1` in the Dockerfile/compose) — fine for a single-user
-   data-plane. If a future feature needs multiple workers, add a shared backing
-   store (the monolith's `screen` + Postgres model) before bumping the count.
-   Restart persistence is deferred for the same reason (in-memory only today).
+   WS-on-worker-B would miss. That is no longer true of terminals: **W5 restored
+   the `screen` backing** (`src/api/terminal_manager.py`), so a session lives in
+   a screen server outside every worker, its metadata lives in a Redis hash, and
+   any worker can `screen -x` into it. Restart persistence falls out of the same
+   change — a screen outlives the process that made it.
+   `AW_WORKSPACE_WORKERS` still **ships as 1** (Dockerfile/compose): the golden
+   rule for the whole W-series is that single-worker behaviour is unchanged, and
+   nothing yet requires the bump. If you add a stateful route, add its shared
+   backing store before raising the count — and check the fallbacks, because
+   this module degrades to a worker-owned PTY wherever `screen` or Redis is
+   missing rather than failing loudly.
 
 6. **Test.** Manager-level test for the real mechanics (a live PTY that actually
    runs a shell), TestClient test for the HTTP/WS contract + the identity gate.

@@ -460,12 +460,19 @@ def create_app() -> FastAPI:
         return {"key": await asyncio.to_thread(regenerate_workspace_api_key)}
 
     # Terminal feature (strangler migration #1): PTY shells on this BYOD host.
-    # In-memory session state, sharded by nothing — this is the one piece of
-    # boot/runtime state W1 (watchdog) and W2 (this module's boot path) did
-    # NOT make safe at AW_WORKSPACE_WORKERS>1, and the reason that default
-    # still ships as 1 (see AW_WORKSPACE_WORKERS in the Dockerfile/compose,
-    # src/api/terminal_manager.py, and MIGRATION.md). Do not read "we made
-    # boot multi-worker-safe" as "the whole app is" — this route still isn't.
+    # W5 made these safe at AW_WORKSPACE_WORKERS>1 by restoring the GNU
+    # `screen` backing: the shell lives in a screen server external to every
+    # worker, its metadata lives in a Redis hash, and any worker attaches with
+    # `screen -x`. So this is no longer the piece that pins the workspace to
+    # one worker — W1 (watchdog), W2 (boot), W3 (app lifecycle), W4 (WS
+    # registries) and W5 (here) together cover the boot/runtime state.
+    # AW_WORKSPACE_WORKERS still SHIPS as 1 (Dockerfile/compose): the
+    # W-series' golden rule is that single-worker behaviour is unchanged, and
+    # raising it is a separate, deliberate decision — not a side effect of
+    # this line. Caveat worth keeping in view: terminals degrade to a
+    # worker-owned PTY wherever `screen` or Redis is missing, so a bump also
+    # depends on the image actually shipping screen (it does — see the
+    # Dockerfile) and Redis being reachable.
     register_terminal_routes(app)
 
     # Notification engine (strangler migration): POST /api/notify + WS

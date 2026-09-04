@@ -271,7 +271,7 @@ def _proc_state(pid: int) -> str | None:
 
 
 @pytest.mark.integration
-def test_closed_terminal_does_not_leak_a_defunct_shell():
+def test_closed_terminal_does_not_leak_a_defunct_shell(monkeypatch):
     """Closing a terminal must actually reap its shell.
 
     ``kill()`` used to ``waitpid(WNOHANG)`` microseconds after sending SIGTERM
@@ -280,10 +280,22 @@ def test_closed_terminal_does_not_leak_a_defunct_shell():
     moment later, ``_reap_children`` no longer recognised the pid, and the
     shell stayed ``<defunct>`` for the life of the container. Found 2026-08-20
     with 25 leaked shells in a workspace up 2.7 days.
+
+    Pinned to the direct-PTY backing (W5, 2026-09-04). The race this test
+    creates depends on the PTY child ignoring SIGTERM, and it gets that from a
+    ``trap`` in the session's own command — which on a screen-backed session
+    runs INSIDE the screen, while ``session.pid`` is the ``screen -x`` attach
+    that has no such trap and dies instantly. The reaping code under test is
+    the same for both backings (``_OWN_CHILD_PIDS`` + ``kill()``'s waitpid),
+    so this pins the one where the race can be forced; the screen attach's own
+    reaping is covered by test_w5_terminal_multiworker.py.
     """
     import time
 
     from src.api import terminal_manager as tm
+
+    monkeypatch.setattr(tm, "_SCREEN_BIN", None)
+    monkeypatch.setattr(tm, "_find_screen", lambda: None)
 
     async def run():
         # The shell ignores both the SIGHUP from closing the PTY master and the

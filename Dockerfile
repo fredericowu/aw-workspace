@@ -15,8 +15,15 @@ ARG AW_WORKSPACE_VERSION=dev
 # want of it. Those now fall back to python3's stdlib zipfile so they work on
 # any base, but a 200KB package is cheaper than every future app rediscovering
 # this — and `unzip` in a terminal is table stakes.
+# screen → W5 restored the GNU screen backing for terminal sessions. A PTY's
+# master fd belongs to the process that forked it, so a screen server — which
+# is external to every uvicorn worker — is what lets any worker serve
+# /ws/terminal for any session, and what lets a session outlive a restart.
+# Without this binary src/api/terminal_manager.py falls back to a direct PTY
+# and terminals are worker-owned again (silently, and correctly, at
+# AW_WORKSPACE_WORKERS=1).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl build-essential libpq-dev procps git sudo unzip \
+        curl build-essential libpq-dev procps git sudo unzip screen \
     && rm -rf /var/lib/apt/lists/*
 
 # Headless-Chromium shared libraries. This image has no GUI stack, so a

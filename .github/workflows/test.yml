@@ -107,7 +107,7 @@ jobs:
             -e AWSERV_DB_URL="postgresql+psycopg://postgres:postgres@127.0.0.1:5432/awserv" \
             -e OTEL_SDK_DISABLED=true \
             -v "$PWD:/repo:ro" -w /repo docker.io/library/python:3.12-slim \
-            sh -c "apt-get -qq update && apt-get -qq install -y --no-install-recommends git procps >/dev/null && \
+            sh -c "apt-get -qq update && apt-get -qq install -y --no-install-recommends git procps screen >/dev/null && \
                    pip install -q -r requirements.txt pytest pytest-asyncio && \
                    python3 -m pytest src/tests \
                      --ignore=src/tests/integration/apps/test_f5_endpoints.py \
@@ -119,6 +119,14 @@ jobs:
           # FileNotFoundError: 'git' and had been red on master. Installing it
           # is the honest fix; skipping when git is absent would have made CI
           # green by dropping the only coverage that feature has.
+          # screen: W5 restored the GNU screen backing behind terminal
+          # sessions, and terminal_manager falls back to a direct PTY when no
+          # `screen` binary exists. python:3.12-slim ships none, so without
+          # this every screen-path test in test_w5_terminal_multiworker.py
+          # would take the fallback and assert nothing about the thing the
+          # card was about — the same skip-shaped hole the ephemeral Redis
+          # above was added to close, and the reason that file asserts
+          # screen_backing_enabled() up front instead of skipping quietly.
           # procps: python:3.12-slim ships without `ps` either, so
           # test_terminal_manager.py's process-tree tests (_ps_snapshot()
           # shells out to `ps -eo ...`) silently saw an empty process table

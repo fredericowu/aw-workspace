@@ -37,7 +37,7 @@ from fastapi.responses import JSONResponse
 from src.api.components import component_snapshot
 from src.api.identity import authorize_ws, require_identity
 from src.api.terminal_manager import (
-    TerminalManager, kill_proc_tree, session_child_procs,
+    TerminalManager, kill_proc_tree,
 )
 from src.libs.redis_coord import RedisBroadcaster
 
@@ -200,7 +200,9 @@ class TerminalRoutes:
         session = self.mgr.get(session_id)
         if not session:
             return {"error": "Session not found", "success": False}
-        session.name = data.get("name", session.name)
+        # Through the manager, not `session.name = ...`: the name has to reach
+        # Redis or the other workers keep serving the old one (W5 guarantee 2).
+        self.mgr.set_name(session_id, data.get("name", session.name))
         self._broadcast_terminals(session_id, "rename")
         return {"id": session.id, "name": session.name, "success": True}
 
@@ -264,7 +266,10 @@ class TerminalRoutes:
         session = self.mgr.get(session_id)
         if not session:
             return {"error": "Session not found", "success": False, "procs": []}
-        procs = await asyncio.to_thread(session_child_procs, session.pid)
+        # session.child_procs(), not session_child_procs(session.pid): on a
+        # screen-backed session the shell hangs off the screen SERVER, not off
+        # this worker's `screen -x` attach — see TerminalSession.proc_root_pid.
+        procs = await asyncio.to_thread(session.child_procs)
         return {"procs": procs, "count": len(procs)}
 
     async def kill_proc(self, session_id: str, pid: int,
@@ -272,7 +277,7 @@ class TerminalRoutes:
         session = self.mgr.get(session_id)
         if not session:
             return {"error": "Session not found", "success": False}
-        procs = await asyncio.to_thread(session_child_procs, session.pid)
+        procs = await asyncio.to_thread(session.child_procs)
         if not any(p["pid"] == pid for p in procs):
             return {"error": "PID does not belong to this session", "success": False}
         # kill_proc_tree, not a bare os.kill: `pid` can be a mid-tree node

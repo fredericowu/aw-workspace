@@ -5,9 +5,12 @@ The 2026-09-02 report: four unrelated GETs — apps status, contributions,
 200 but took 23-25s, right after a restart. ``/api/settings/mcp`` is served by
 the generic ``/api/settings/{key}`` route below, which read Postgres through
 the SYNCHRONOUS ``src.api.db.get_session`` directly inside its ``async def``.
-With ``AW_WORKSPACE_WORKERS=1`` (deliberate — terminal PTY sessions keep
-in-memory state) one asyncio thread serves every request, so that read froze
-all of them for its full duration.
+With ``AW_WORKSPACE_WORKERS=1`` (what ships) one asyncio thread serves every
+request, so that read froze all of them for its full duration. Note the reason
+for the 1 is no longer "terminal PTY sessions keep in-memory state" — W5 moved
+those behind a `screen` server and a Redis meta hash — but the blocking-IO bug
+this file guards is not about worker count anyway: at N workers it just freezes
+1/N of the fleet per call instead of all of it.
 
 Companion to ``src/tests/unit/apps/test_reconciler_does_not_block_loop.py``,
 which covers the boot-reconcile pass that actually triggered the freeze.

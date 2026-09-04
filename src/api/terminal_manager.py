@@ -5,16 +5,42 @@ Spawns interactive login-shell sessions in pseudo-terminals ON THIS machine
 (the BYOD workspace container) and fans PTY output out to one or more
 WebSocket subscribers.
 
-What was deliberately dropped vs. the monolith (see MIGRATION.md):
+W5 restored the GNU ``screen`` backing this port originally dropped. A PTY
+master fd is a *file descriptor*, so it cannot be handed to another process:
+whichever worker forked the shell was the only one that could ever serve
+``/ws/terminal/<id>`` for it. ``screen`` breaks that ownership because the
+screen server is a process external to every worker — any worker can
+``screen -x`` into it. The three guarantees ported from aw-backend's F5
+(``repos/aw-backend/src/api/terminal_manager.py``):
 
-* GNU ``screen`` backing + cross-restart reattach + the ``screen_sessions`` /
-  ``agent_sessions`` / ``window_sessions`` DB tables. Sessions here are
-  in-memory only and sharded by nothing — this is the reason
-  ``AW_WORKSPACE_WORKERS`` still ships as 1 (see the Dockerfile/compose)
-  even though the boot path (``src/api/app.py``'s ``create_app()``/
-  ``lifespan``) and the periodic watchdog tasks are themselves safe at
-  N>1 now. A worker bump only becomes safe end-to-end once this module's
-  sessions are sharded too — restart persistence is a later card.
+1. Attach is ALWAYS ``screen -x`` (shared, non-owning), never ``-r``
+   (which steals the session from whoever else is attached). Note the
+   semantics this buys: ``screen -x`` resizes the window to the SMALLEST
+   attached client, so two browsers on one terminal see the smaller one's
+   geometry.
+2. Session metadata lives in a Redis hash (``…:term:meta:<session_id>``),
+   not in per-process memory, so every worker can discover — and attach to
+   — a session it did not create.
+3. Concurrent creation of the same screen name is deduped with
+   ``SET …:term:creating:<name> NX EX 30``: two workers handed simultaneous
+   creates produce ONE screen.
+
+Both backings are kept, and which one runs is decided by whether a ``screen``
+binary exists (``screen_backing_enabled()``). That is not a hedge — the
+workspace image did not ship ``screen`` until this card added it, and
+``/opt/aw-workspace`` is a bind mount, so a core deploy lands new code on a
+*running, older* container (see the deploy path in MIGRATION.md). Falling back
+to the direct PTY there is what makes this change safe to ship ahead of the
+image rebuild, and it is byte-for-byte the pre-W5 behaviour. Same for Redis:
+with none reachable the meta store no-ops and the creation claim always
+succeeds, which is exactly single-worker behaviour.
+
+Still dropped vs. the monolith (see MIGRATION.md):
+
+* The ``screen_sessions`` / ``agent_sessions`` / ``window_sessions`` DB
+  tables. Session metadata lives in Redis now, not Postgres; sessions
+  survive a worker restart because the screen does, but the workspace does
+  not re-enumerate them into the SPA across a full restart.
 * Agent-CLI (claude/codex/cursor/gemini) session-id detection + ``--resume``
   reconstruction + the Claude ``PromptDetector``. The slim BYOD image ships
   no agent CLIs, so a terminal is just a shell (or an arbitrary command).
@@ -34,6 +60,7 @@ import pty
 import signal
 import struct
 import termios
+import threading as _threading_mod
 import time
 import uuid as _uuid_mod
 
@@ -78,6 +105,355 @@ signal.signal(signal.SIGCHLD, _reap_children)
 def _next_id() -> str:
     """Globally-unique terminal window ID (UUID4)."""
     return str(_uuid_mod.uuid4())
+
+
+# ---------------------------------------------------------------------------
+# W5: Redis-backed session metadata + screen-creation dedup
+# ---------------------------------------------------------------------------
+#
+# Keys are scoped under the same ``aw:ws:<slug>:`` prefix every other
+# cross-worker primitive in this workspace uses (see src/libs/redis_coord.py's
+# key layout) rather than aw-backend's flat ``aw:term:*`` — one shared Redis
+# can host several workspaces, and a terminal id colliding across them would
+# hand one workspace's shell to another.
+
+_META_SUFFIX = "term:meta:"
+_CREATING_SUFFIX = "term:creating:"
+_CREATING_TTL = 30
+
+_redis_client = None
+_redis_lock = _threading_mod.Lock()
+
+
+def _term_key(suffix: str, name: str) -> str:
+    from src.libs.redis_coord import get_workspace_slug
+    return f"aw:ws:{get_workspace_slug()}:{suffix}{name}"
+
+
+def _get_redis():
+    """Lazily-connected SYNC Redis client, best-effort (``None`` if absent).
+
+    Sync, not ``redis.asyncio``, on purpose: every caller here runs on the
+    fork/exec path, which is already blocking and is reached from
+    ``asyncio.to_thread``-able REST handlers — an async client would force
+    this module's whole surface to become async for no gain.
+
+    The address comes from ``redis_coord.get_workspace_redis_url()`` so this
+    store can never disagree with ``RedisBroadcaster``/``RedisLease`` about
+    which Redis it is on. Failure is deliberately silent-but-logged and
+    degrades to ``None``: a workspace with no Redis must still serve
+    terminals exactly as it does today, which is the card's golden rule.
+    """
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+    with _redis_lock:
+        if _redis_client is not None:
+            return _redis_client
+        try:
+            import redis
+            from src.libs.redis_coord import get_workspace_redis_url
+            client = redis.Redis.from_url(
+                get_workspace_redis_url(),
+                decode_responses=True, socket_connect_timeout=1)
+            client.ping()
+            _redis_client = client
+        except Exception as exc:
+            logger.warning("terminal_manager: Redis unavailable (%s) — session "
+                           "meta is process-local, so terminals only work on "
+                           "the worker that created them", exc)
+            _redis_client = None
+    return _redis_client
+
+
+def _reset_redis_client() -> None:
+    """Drop the cached client so the next call re-resolves the URL. Tests
+    only — they point ``AW_REDIS_URL`` at a throwaway instance after this
+    module has already been imported."""
+    global _redis_client
+    with _redis_lock:
+        _redis_client = None
+
+
+class SessionMetaStore:
+    """Per-session terminal metadata, one Redis hash per session.
+
+    This is the piece that makes a terminal discoverable from a worker that
+    did not create it: the PTY fd stays process-local forever, but
+    ``screen_name`` — the only thing a second worker needs in order to
+    ``screen -x`` its way in — does not.
+
+    Every method degrades to a no-op / empty read with no Redis rather than
+    raising, for the reason in ``_get_redis``: no Redis means one worker,
+    and one worker never needs this store.
+    """
+
+    _BOOL_FIELDS = {"insecure", "hidden"}
+
+    def get(self, session_id: str) -> dict:
+        client = _get_redis()
+        if client is None or not session_id:
+            return {}
+        try:
+            return self._decode(client.hgetall(_term_key(_META_SUFFIX, session_id)))
+        except Exception as exc:
+            logger.warning("SessionMetaStore.get(%s) failed: %s", session_id, exc)
+            return {}
+
+    def update(self, session_id: str, **fields) -> None:
+        client = _get_redis()
+        encoded = {k: self._encode(v) for k, v in fields.items() if v is not None}
+        if client is None or not session_id or not encoded:
+            return
+        try:
+            client.hset(_term_key(_META_SUFFIX, session_id), mapping=encoded)
+        except Exception as exc:
+            logger.warning("SessionMetaStore.update(%s) failed: %s", session_id, exc)
+
+    def delete(self, session_id: str) -> None:
+        client = _get_redis()
+        if client is None or not session_id:
+            return
+        try:
+            client.delete(_term_key(_META_SUFFIX, session_id))
+        except Exception as exc:
+            logger.warning("SessionMetaStore.delete(%s) failed: %s", session_id, exc)
+
+    def all(self) -> dict[str, dict]:
+        client = _get_redis()
+        if client is None:
+            return {}
+        prefix = _term_key(_META_SUFFIX, "")
+        result: dict[str, dict] = {}
+        try:
+            for key in client.scan_iter(match=f"{prefix}*"):
+                raw = client.hgetall(key)
+                if raw:
+                    result[key[len(prefix):]] = self._decode(raw)
+        except Exception as exc:
+            logger.warning("SessionMetaStore.all() failed: %s", exc)
+        return result
+
+    @staticmethod
+    def _encode(v) -> str:
+        if isinstance(v, bool):
+            return "1" if v else "0"
+        return str(v)
+
+    @classmethod
+    def _decode(cls, raw: dict) -> dict:
+        out = dict(raw)
+        for f in cls._BOOL_FIELDS:
+            if f in out:
+                out[f] = out[f] in ("1", "true", "True")
+        return out
+
+
+def _claim_screen_creation(screen_name: str) -> bool:
+    """``SET …:term:creating:<name> NX EX 30`` — True if THIS caller won the
+    race to create ``screen_name``.
+
+    Best-effort by design: with no Redis it always claims, which is the
+    single-worker behaviour that ships. The TTL (not a delete-on-success)
+    is what makes a worker that dies mid-creation self-healing — the claim
+    simply expires and the next create retries, instead of the name being
+    permanently unclaimable.
+    """
+    client = _get_redis()
+    if client is None:
+        return True
+    try:
+        return bool(client.set(_term_key(_CREATING_SUFFIX, screen_name), "1",
+                               nx=True, ex=_CREATING_TTL))
+    except Exception as exc:
+        logger.warning("_claim_screen_creation(%s) failed: %s", screen_name, exc)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# W5: GNU screen backing
+# ---------------------------------------------------------------------------
+
+
+def _find_screen() -> str | None:
+    """Path to a usable ``screen``, or ``None`` if this box has none.
+
+    ``None`` is a supported answer, not an error — see the module docstring
+    for why the direct-PTY fallback has to exist.
+    """
+    import shutil
+    return shutil.which("screen")
+
+
+_SCREEN_BIN = _find_screen()
+
+
+def screen_backing_enabled() -> bool:
+    """Whether terminals are screen-backed (and therefore cross-worker).
+
+    Re-resolved rather than read off the module constant so a workspace that
+    installs ``screen`` at runtime (``sudo apt install screen`` from a
+    terminal — this image gives every session sudo) picks it up on the next
+    create instead of needing a restart.
+    """
+    global _SCREEN_BIN
+    if _SCREEN_BIN is None:
+        _SCREEN_BIN = _find_screen()
+    return _SCREEN_BIN is not None
+
+
+def _screenrc_path() -> str:
+    """``.tmp/aw-screenrc`` under the workspace root — the shared scratch dir
+    this repo's AGENTS.md designates, not ``/tmp`` (which is process-scratch
+    and invisible to the screen server on a restart)."""
+    root = os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace")
+    return os.path.join(root, ".tmp", "aw-screenrc")
+
+
+def _ensure_screenrc() -> str:
+    """Write the screenrc every screen in this workspace runs under.
+
+    Ported verbatim in intent from aw-backend, whose comments record what
+    each line is load-bearing for. The short version: xterm.js is the only
+    client, and a default screen mangles what it sends.
+    """
+    path = _screenrc_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("defscrollback 10000\n")
+        # `screen-256color` is the canonical "inside screen" terminfo — apps
+        # look it up to pick escape sequences screen knows how to forward.
+        # Passing `xterm-256color` through instead works for plain ANSI and
+        # then breaks on truecolor/OSC/DCS, whose codes leak into the browser
+        # as visible `[38;5;XXm` text.
+        f.write("term screen-256color\n")
+        f.write("truecolor on\n")
+        f.write("startup_message off\n")
+        f.write("vbell off\n")
+        # Disable the alternate screen (ti/te) so xterm.js scrollback survives
+        # a vim/less. Matches both an xterm* and a screen* outer TERM.
+        f.write("termcapinfo xterm*|screen* ti@:te@\n")
+        f.write("mousetrack off\n")
+    return path
+
+
+def _screen_sessions() -> dict[str, list[int]]:
+    """Every live screen on this box: ``{name: [server pid, ...]}``.
+
+    ``screen -ls`` prints one tab-indented line per session,
+    ``\\t12345.aw-terminal-abc\\t(date)\\t(Detached)`` — the integer before the
+    first dot is the server pid. Its exit code is non-zero whenever sessions
+    exist, so it is deliberately never checked.
+
+    One parse of one ``screen -ls`` for the whole list, because
+    ``list_sessions()`` runs on every ``terminal_update`` broadcast and a
+    per-session subprocess there would be N forks per keystroke-adjacent
+    event.
+    """
+    if not screen_backing_enabled():
+        return {}
+    import subprocess
+    try:
+        out = subprocess.run([_SCREEN_BIN, "-ls"], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return {}
+    found: dict[str, list[int]] = {}
+    for line in out.splitlines():
+        s = line.strip()
+        if not s or not s[0].isdigit():
+            continue
+        pid_str, _, nm = s.split()[0].partition(".")
+        if nm and pid_str.isdigit():
+            found.setdefault(nm, []).append(int(pid_str))
+    return found
+
+
+def _screen_server_pids(screen_name: str) -> list[int]:
+    """PID(s) of the GNU screen *server* process(es) backing ``screen_name``."""
+    return _screen_sessions().get(screen_name, [])
+
+
+def _screen_exists(screen_name: str) -> bool:
+    return bool(_screen_server_pids(screen_name))
+
+
+def _create_screen(screen_name: str, inner: str) -> None:
+    """Spawn a detached screen (``-dmS``) running ``inner`` under ``bash -lc``.
+
+    Detached, then attached separately via ``_attach_screen``: that split is
+    the whole point — the screen outlives every attach, so the worker that
+    created it holds nothing the others need.
+    """
+    import subprocess
+    screenrc = _ensure_screenrc()
+    env = os.environ.copy()
+    # screen and `bash -l` both print "getpwuid() can't identify your account!"
+    # if these are missing, straight into the user's terminal.
+    try:
+        import pwd as _pwd
+        _pw = _pwd.getpwuid(os.getuid())
+        env.setdefault("USER", _pw.pw_name)
+        env.setdefault("LOGNAME", _pw.pw_name)
+        env.setdefault("HOME", _pw.pw_dir)
+    except (KeyError, ImportError):
+        _u = env.get("USER") or env.get("LOGNAME") or str(os.getuid())
+        env.setdefault("USER", _u)
+        env.setdefault("LOGNAME", _u)
+        env.setdefault("HOME", os.path.expanduser("~") or "/root")
+    env["TERM"] = "xterm-256color"
+    env["COLORTERM"] = "truecolor"
+    subprocess.run(
+        [_SCREEN_BIN, "-c", screenrc, "-T", "xterm-256color", "-dmS",
+         screen_name, "bash", "-lc", inner],
+        capture_output=True, timeout=10, env=env,
+    )
+    # screen -dmS returns before its server is listening; without this the
+    # attach that immediately follows can race it and find no such session.
+    for _ in range(20):
+        if _screen_exists(screen_name):
+            break
+        time.sleep(0.1)
+    logger.info("Screen session created: %s", screen_name)
+
+
+def _release_screen_creation(screen_name: str) -> None:
+    """Drop a name's creation claim, so the name can be created again.
+
+    Without this a ``restart`` is broken for the length of the claim TTL: it
+    destroys the screen and immediately re-creates it under the SAME name,
+    the still-held claim makes ``create`` take the "another worker is making
+    it" branch, and it then waits for a screen nobody is making and attaches
+    to nothing. Caught by test_insecure_state_reported_and_toggle_flips_it,
+    whose restart is well inside 30s. The claim only ever means "a creation
+    for this name is in flight"; once the screen is gone, none is.
+    """
+    client = _get_redis()
+    if client is None or not screen_name:
+        return
+    try:
+        client.delete(_term_key(_CREATING_SUFFIX, screen_name))
+    except Exception as exc:
+        logger.warning("_release_screen_creation(%s) failed: %s", screen_name, exc)
+
+
+def _destroy_screen(screen_name: str) -> None:
+    """``screen -X quit``, retried — a session with a still-dying process in
+    it ignores the first quit often enough to matter."""
+    if not screen_name or not screen_backing_enabled():
+        return
+    import subprocess
+    for _ in range(3):
+        try:
+            subprocess.run([_SCREEN_BIN, "-S", screen_name, "-X", "quit"],
+                           capture_output=True, timeout=5)
+        except Exception:
+            break
+        if not _screen_exists(screen_name):
+            break
+        time.sleep(0.3)
+    _release_screen_creation(screen_name)
+    logger.info("Screen session destroyed: %s", screen_name)
 
 
 def _ps_snapshot() -> dict[int, dict]:
@@ -202,6 +578,34 @@ _PENDING_ORPHANS: set[int] = set()
 def reap_pid1_orphans() -> list[int]:
     """Periodic safety net: reap zombies genuinely orphaned onto this process.
 
+    W5 MEASUREMENT — read this before trusting the name. The function selects
+    on ``ppid == os.getpid()``, and W5's card carried an (explicitly
+    unverified) hypothesis that multi-worker would break that, because the
+    uvicorn master is PID 1 and orphans reparent to it rather than to the
+    worker that registered the reaper. Measured on 2026-09-04 inside the real
+    workspace container, at BOTH worker counts, by forking a PTY shell that
+    backgrounds a SIGHUP-immune child and then exits::
+
+        workers=1  forking process = 40647   orphan ppid after orphaning = 1
+        workers=2  forking worker  = 40682   orphan ppid after orphaning = 1
+
+    So the hypothesis' *conclusion* is right and its *premise* is wrong: this
+    selector already matches nothing, and has since long before multi-worker.
+    ``os.getpid()`` is never 1 in this container — PID 1 is podman's
+    ``/run/podman-init`` and the server is PID 2 (``ps -p 1`` in
+    ``aw-remote-host-workspace``). Multi-worker changes nothing here; it was
+    never the cause.
+
+    Nothing leaks as a result, which is why this was invisible: podman-init
+    IS a reaper — collecting orphans is the entire job of ``--init`` — and it
+    reaps whatever lands on it regardless of worker count. The live container
+    showed 0 zombies after 2h28m of uptime. That is also why this function is
+    left in place rather than deleted or replaced with
+    ``PR_SET_CHILD_SUBREAPER``: on a host whose PID 1 is *not* an init (a bare
+    ``python -m src.start.workspace``, where ``os.getpid() == 1``) the
+    selector does match and this is the backstop. It is a correct no-op where
+    an init already does the job, and correct where one doesn't.
+
     Complements ``_reap_children`` (which only ever reaps ``_OWN_CHILD_PIDS``)
     and ``kill_proc_tree`` (which only cleans up after itself, and only for
     its own ``timeout``) — this is the general backstop for ANY process that
@@ -258,7 +662,8 @@ class TerminalSession:
 
     def __init__(self, session_id: str, fd: int, pid: int, name: str,
                  session_type: str = "terminal", command: str | None = None,
-                 insecure: bool = False, agent_session_id: str | None = None):
+                 insecure: bool = False, agent_session_id: str | None = None,
+                 screen_name: str | None = None):
         self.id = session_id
         self.fd = fd
         self.pid = pid
@@ -267,6 +672,9 @@ class TerminalSession:
         self.command = command
         self.insecure = insecure
         self.agent_session_id = agent_session_id
+        #: W5 — the GNU screen this PTY is an attach OF, or None when this
+        #: session is a direct PTY (no screen binary on this box).
+        self.screen_name = screen_name
         self.alive = True
         self._subscribers: set[asyncio.Queue] = set()
         self._reader_started = False
@@ -355,7 +763,47 @@ class TerminalSession:
         except OSError:
             self.alive = False
 
-    def kill(self):
+    def proc_root_pid(self) -> int | None:
+        """The pid whose descendants are "the processes in this terminal".
+
+        For a direct PTY that is our forked shell. For a screen-backed one it
+        is the SCREEN SERVER, not ``self.pid`` — ``self.pid`` is only the
+        ``screen -x`` attach client, and the shell is a child of the server,
+        not of the attach. Reading the tree from ``self.pid`` on a
+        screen-backed session finds nothing at all, which would quietly empty
+        the SPA's per-terminal process badge and make its "kill this process"
+        action refuse every pid as not belonging to the session.
+        """
+        if self.screen_name:
+            pids = _screen_server_pids(self.screen_name)
+            return pids[0] if pids else None
+        return self.pid
+
+    def child_procs(self, procs: dict[int, dict] | None = None) -> list[dict]:
+        """Processes running in this terminal, whichever backing it has.
+
+        The screen server and any nested screen are dropped from the result:
+        the caller wants the shell and what it launched, not the plumbing —
+        and since ``terminal.py``'s kill route only accepts a pid present in
+        this list, omitting them also stops the UI killing the screen out
+        from under every other attached client.
+        """
+        root = self.proc_root_pid()
+        if root is None:
+            return []
+        found = session_child_procs(root, procs)
+        if not self.screen_name:
+            return found
+        return [p for p in found if p["name"].lower() != "screen"]
+
+    def kill(self, destroy_screen: bool = False):
+        """Terminate this worker's PTY.
+
+        For a screen-backed session that is only a DETACH — the screen (and
+        everything running in it) stays up for other workers and for the next
+        attach. Passing ``destroy_screen=True`` is what actually ends the
+        session, and belongs only to explicit teardown (delete/restart).
+        """
         self.alive = False
         try:
             os.close(self.fd)
@@ -383,12 +831,24 @@ class TerminalSession:
             if reaped:
                 _OWN_CHILD_PIDS.discard(self.pid)
 
+        if destroy_screen:
+            _destroy_screen(self.screen_name)
+
 
 class TerminalManager:
-    """Manages multiple in-memory PTY sessions (single-worker)."""
+    """Manages PTY sessions.
+
+    Screen-backed (and therefore reachable from every worker) wherever a
+    ``screen`` binary exists; a direct per-process PTY where it doesn't. The
+    per-worker ``self.sessions`` dict is a CACHE of this worker's own attach
+    PTYs in either case — never the source of truth for which sessions exist.
+    That role belongs to ``self._meta`` plus the live screen list, which is
+    what lets ``get()`` attach to a session another worker created.
+    """
 
     def __init__(self):
         self.sessions: dict[str, TerminalSession] = {}
+        self._meta = SessionMetaStore()
 
     def _fork_exec(self, cmd_parts: list[str], rows: int = 24, cols: int = 80) -> tuple[int, int]:
         """Fork a child connected to a PTY. Returns (master_fd, pid)."""
@@ -437,6 +897,51 @@ class TerminalManager:
         import shutil
         return os.environ.get("SHELL") or shutil.which("bash") or "/bin/bash"
 
+    def _attach_screen(self, session_id: str, name: str, screen_name: str,
+                       command: str | None = None, session_type: str = "terminal",
+                       rows: int = 24, cols: int = 80) -> TerminalSession:
+        """Attach THIS worker to an existing screen through a fresh PTY.
+
+        ``-x`` (multi-attach, shared) and never ``-r``: no worker owns a
+        screen, and ``-r`` would detach whichever worker — or whichever other
+        browser tab — is already attached, turning a second viewer into a
+        session hijack. This is guarantee (1), and it is the single line that
+        makes a terminal serveable from any worker.
+        """
+        screenrc = _ensure_screenrc()
+        attach_cmd = [_SCREEN_BIN, "-c", screenrc, "-T", "xterm-256color",
+                      "-x", screen_name]
+        master_fd, pid = self._fork_exec(attach_cmd, rows, cols)
+        session = TerminalSession(
+            session_id, master_fd, pid, name,
+            session_type=session_type, command=command,
+            insecure=_is_insecure_command(command, session_type),
+            agent_session_id=_extract_agent_session_id(command),
+            screen_name=screen_name,
+        )
+        self.sessions[session_id] = session
+        logger.info("Attached to screen: %s -> %s (pid=%d)", session_id, screen_name, pid)
+        return session
+
+    def _adopt(self, session_id: str, meta: dict) -> TerminalSession | None:
+        """Attach to a session THIS worker never created, from its Redis meta.
+
+        The cross-worker path in one method: a ``/ws/terminal/<id>`` that
+        landed here instead of on the creating worker resolves the screen
+        name out of Redis and attaches to it locally. Returns ``None`` when
+        there is nothing to attach to — no screen name recorded, or the
+        screen is gone — so the caller still answers "session not found"
+        rather than handing back an empty PTY.
+        """
+        screen_name = meta.get("screen_name")
+        if not screen_name or not _screen_exists(screen_name):
+            return None
+        return self._attach_screen(
+            session_id, meta.get("name") or session_id, screen_name,
+            command=meta.get("command") or None,
+            session_type=meta.get("type") or "terminal",
+        )
+
     def create(self, name: str | None = None, rows: int = 24, cols: int = 80,
                command: str | None = None, session_type: str = "terminal",
                session_id: str | None = None, initial_prompt: str | None = None,
@@ -473,17 +978,54 @@ class TerminalManager:
             inner = f"cd {_sh_quote(effective_cwd)}; {command}"
         else:
             inner = f"cd {_sh_quote(effective_cwd)}; exec {_sh_quote(shell)} -l"
-        cmd_parts = ["bash", "-lc", inner]
 
-        master_fd, pid = self._fork_exec(cmd_parts, rows, cols)
-        session = TerminalSession(
-            session_id, master_fd, pid, name,
-            session_type=session_type, command=command,
-            insecure=_is_insecure_command(command, session_type),
-            agent_session_id=_extract_agent_session_id(command),
+        screen_name = None
+        if screen_backing_enabled():
+            screen_name = _screen_name_for(session_id, session_type)
+            if _claim_screen_creation(screen_name):
+                _create_screen(screen_name, inner)
+            else:
+                # Another worker won the race for this name. Wait for its
+                # screen to appear rather than spawning a second one — that
+                # is guarantee (3), and without the wait this worker would
+                # attach to a name that does not exist yet and get a dead PTY.
+                logger.info("Skipping screen creation for %s — another worker "
+                            "is creating it", screen_name)
+                for _ in range(30):
+                    if _screen_exists(screen_name):
+                        break
+                    time.sleep(0.1)
+                else:
+                    # Attaching anyway would hand back a PTY onto nothing,
+                    # which reads in the SPA as a terminal that opens blank
+                    # and never responds — the exact silent-degradation shape
+                    # this workspace's AGENTS.md warns about. Say so.
+                    logger.error(
+                        "create: waited 3s for screen %s and it never "
+                        "appeared — the worker that claimed it likely died "
+                        "mid-creation. This terminal will be dead; its claim "
+                        "expires in %ds.", screen_name, _CREATING_TTL)
+            session = self._attach_screen(
+                session_id, name, screen_name, command=command,
+                session_type=session_type, rows=rows, cols=cols)
+        else:
+            master_fd, pid = self._fork_exec(["bash", "-lc", inner], rows, cols)
+            session = TerminalSession(
+                session_id, master_fd, pid, name,
+                session_type=session_type, command=command,
+                insecure=_is_insecure_command(command, session_type),
+                agent_session_id=_extract_agent_session_id(command),
+            )
+            self.sessions[session_id] = session
+
+        self._meta.update(
+            session_id, name=name, type=session_type,
+            command=command or "", screen_name=screen_name or "",
+            insecure=session.insecure,
+            agent_session_id=session.agent_session_id or "",
         )
-        self.sessions[session_id] = session
-        logger.info("Terminal created: %s (%s, type=%s, pid=%d)", session_id, name, session_type, pid)
+        logger.info("Terminal created: %s (%s, type=%s, pid=%d, screen=%s)",
+                    session_id, name, session_type, session.pid, screen_name or "-")
 
         if initial_prompt:
             import threading
@@ -504,6 +1046,11 @@ class TerminalManager:
                 is_insecure: bool | None = None) -> TerminalSession | None:
         """Kill the existing session and spawn a fresh one with the same ID."""
         old = self.sessions.pop(session_id, None)
+        # Fall back to Redis for a restart that landed on a worker holding no
+        # PTY for this session — without it the restart would silently spawn a
+        # plain login shell instead of re-running the old command.
+        meta = self._meta.get(session_id) if old is None else {}
+        old_screen = old.screen_name if old else (meta.get("screen_name") or None)
         if old:
             try:
                 loop = asyncio.get_event_loop()
@@ -511,9 +1058,13 @@ class TerminalManager:
             except Exception:
                 pass
             old.kill()
-        old_type = old.type if old else "terminal"
-        old_name = name or (old.name if old else session_id)
-        old_command = command if command is not None else (old.command if old else None)
+        # A restart replaces what is RUNNING, so the old screen must go — a
+        # detach would leave the previous command alive and unreachable.
+        _destroy_screen(old_screen)
+        old_type = old.type if old else (meta.get("type") or "terminal")
+        old_name = name or (old.name if old else (meta.get("name") or session_id))
+        old_command = command if command is not None else (
+            old.command if old else (meta.get("command") or None))
         # `is_insecure` with no fresh `command` is the toggle UI's "detection
         # still pending" fallback (App.jsx's toggleInsecure) — flip the flag
         # in place on whatever command was already running instead of
@@ -526,10 +1077,37 @@ class TerminalManager:
         )
 
     def get(self, session_id: str) -> TerminalSession | None:
-        return self.sessions.get(session_id)
+        """This worker's PTY for ``session_id``, attaching one if it has none.
+
+        The local dict first, because that is the common case and costs
+        nothing. On a miss, and only when screen-backed, fall back to Redis
+        and adopt the session — that miss is precisely what a multi-worker
+        deployment produces N-1 times out of N, and answering "not found"
+        there is the whole W5 bug.
+        """
+        session = self.sessions.get(session_id)
+        if session is not None:
+            return session
+        if not screen_backing_enabled():
+            return None
+        meta = self._meta.get(session_id)
+        if not meta:
+            return None
+        return self._adopt(session_id, meta)
 
     def remove(self, session_id: str):
+        """End the session everywhere — not just detach this worker.
+
+        ``remove`` is the user closing a terminal, so the screen has to go
+        too; leaving it would keep the shell (and whatever it is running)
+        alive forever with no window pointing at it. Deliberately resolves
+        the screen name from Redis when this worker holds no PTY, so a delete
+        that lands on a non-owning worker still works.
+        """
         session = self.sessions.pop(session_id, None)
+        screen_name = session.screen_name if session else None
+        if screen_name is None:
+            screen_name = self._meta.get(session_id).get("screen_name") or None
         if session:
             try:
                 loop = asyncio.get_event_loop()
@@ -537,14 +1115,36 @@ class TerminalManager:
             except Exception:
                 pass
             session.kill()
+        _destroy_screen(screen_name)
+        self._meta.delete(session_id)
+        if session or screen_name:
             logger.info("Terminal removed: %s", session_id)
 
     def list_sessions(self, include_hidden: bool = False) -> list[dict]:
-        dead = [sid for sid, s in self.sessions.items() if not s.alive]
+        """Every live session in the FLEET, not just this worker's.
+
+        Local PTYs plus anything in Redis whose screen is still running, so
+        the SPA's terminal list is the same on whichever worker serves it.
+        A screen-backed entry with no live screen is dropped and its meta
+        deleted — a screen that died (crash, host reboot, ``screen -wipe``)
+        is how a session really ends, so that is the liveness check.
+        """
+        live_screens = _screen_sessions()
+
+        # A local PTY is stale two ways: its own shell exited (``alive``), or
+        # ANOTHER worker ended the session and destroyed the screen out from
+        # under this attach. Only the first was checked at first, and the
+        # second left a ghost terminal in the SPA's list forever — caught by
+        # test_list_sessions_shows_sessions_created_on_another_worker.
+        dead = [
+            sid for sid, s in self.sessions.items()
+            if not s.alive or (s.screen_name and s.screen_name not in live_screens)
+        ]
         for sid in dead:
             self.sessions.pop(sid, None)
-        return [
-            {
+
+        listed: dict[str, dict] = {
+            s.id: {
                 "id": s.id,
                 "name": s.name,
                 "type": s.type,
@@ -553,9 +1153,44 @@ class TerminalManager:
                 "agent_session_id": s.agent_session_id,
             }
             for s in self.sessions.values()
-        ]
+        }
+        if screen_backing_enabled():
+            for sid, meta in self._meta.all().items():
+                if sid in listed:
+                    continue
+                screen_name = meta.get("screen_name")
+                if not screen_name:
+                    continue
+                if screen_name not in live_screens:
+                    self._meta.delete(sid)
+                    continue
+                listed[sid] = {
+                    "id": sid,
+                    "name": meta.get("name") or sid,
+                    "type": meta.get("type") or "terminal",
+                    "alive": True,
+                    "insecure": bool(meta.get("insecure")),
+                    "agent_session_id": meta.get("agent_session_id") or None,
+                }
+        return list(listed.values())
+
+    def set_name(self, session_id: str, name: str) -> None:
+        """Rename, write-through to Redis so every worker sees it at once —
+        guarantee (2). A rename that only touched ``self.sessions`` would
+        show the new name on one worker and the old one on the rest."""
+        session = self.sessions.get(session_id)
+        if session:
+            session.name = name
+        self._meta.update(session_id, name=name)
 
     def cleanup(self):
+        """Shutdown: detach this worker, leave the screens running.
+
+        Deliberately NOT ``destroy_screen=True``. A screen surviving the
+        process is the point — it is what lets a restarted (or simply
+        different) worker pick the session back up, and killing them here
+        would throw away every user's live shell on every deploy.
+        """
         try:
             loop = asyncio.get_event_loop()
         except Exception:
@@ -570,6 +1205,17 @@ class TerminalManager:
 def _sh_quote(s: str) -> str:
     import shlex
     return shlex.quote(s)
+
+
+def _screen_name_for(session_id: str, session_type: str) -> str:
+    """Screen name for a session — ``aw-<type>-<session_id>``.
+
+    Derived from the session id rather than stored, so any worker can compute
+    it without a round-trip, and unique per session so two terminals never
+    collide on one screen. ``screen -ls`` matching is exact-string, so the
+    id's dashes are fine.
+    """
+    return f"aw-{session_type or 'terminal'}-{session_id}"
 
 
 # The flag each CLI's "insecure" mode maps to (mirrors aw-workspace-ui's
