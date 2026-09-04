@@ -610,6 +610,20 @@ class ContainerSupervisor:
             log.exception("apps: failed to stop container for %s on uninstall", app_id)
         self._containers.pop(app_id, None)
 
+    def forget_all_for(self, app_id: str) -> None:
+        """Drop the app's + its sidecars' registrations WITHOUT stopping (W3).
+
+        A Tier-2 container is external to every worker — podman owns it — so
+        it must be stopped exactly once, by the worker doing the provisioning
+        half. What every OTHER worker holds is this purely in-process registry
+        (plus a lazily-built docker client), and letting go of it is the whole
+        of its detach. Issuing N ``podman stop`` calls at one container would
+        turn a clean uninstall into a race whose losers log "no such
+        container". See src/apps/lifecycle.py.
+        """
+        for key in [*self.sidecar_keys(app_id), app_id]:
+            self._containers.pop(key, None)
+
     def _require(self, app_id: str) -> _Container:
         c = self._containers.get(app_id)
         if c is None:

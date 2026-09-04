@@ -218,13 +218,24 @@ class CommandInstaller:
 
     # ---- command shims (persistent bin dir) -----------------------------
 
+    @staticmethod
+    def shim_path(name: str) -> str:
+        """Where :meth:`install_shim` would put ``name``'s shim.
+
+        Split out for W3's attach path: a worker that is only converging must
+        not WRITE the shim (one shared bin dir, N writers), but still journals
+        the ``command:install`` entry so its own unload stays symmetric — and
+        that entry carries the path. See src/apps/lifecycle.py.
+        """
+        return os.path.join(paths.bin_dir(), name)
+
     def install_shim(self, name: str, package_dir: str, exec_path: str) -> str:
         """Write ``<bin>/<name>`` execing the app-provided ``exec_path``.
 
         Returns the shim's absolute path (journaled so ``remove_shim`` reverts).
         """
         target = _resolve(package_dir, exec_path)
-        shim_path = os.path.join(paths.bin_dir(), name)
+        shim_path = self.shim_path(name)
         script = (
             "#!/usr/bin/env bash\n"
             "# aw-apps command shim (F4) — auto-generated; do not edit.\n"

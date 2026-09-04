@@ -815,7 +815,8 @@ class AppRuntime:
     # ---- load / unload --------------------------------------------------
 
     async def load(self, package_dir: str, granted_permissions: list[str] | None = None,
-                   config: dict[str, Any] | None = None, signed: bool = False) -> Manifest:
+                   config: dict[str, Any] | None = None, signed: bool = False,
+                   provision: bool = True) -> Manifest:
         """Validate, import, and activate an app from its package dir (hot).
 
         ``signed`` reflects whether the package is trusted (marketplace-signed).
@@ -823,6 +824,21 @@ class AppRuntime:
         unsigned app (ADR Decision 4) — defence in depth on top of the same
         filter the cloud registry applies, so the runtime never hands out a
         high-risk facade to a side-loaded app even if the registry row lists it.
+
+        ``provision`` is W3's seam (see ``src/apps/lifecycle.py``). ``True``
+        (the default, and the only value at ``AW_WORKSPACE_WORKERS=1``) is the
+        whole load: side effects on the shared filesystem/Postgres/podman AND
+        the in-process attach. ``False`` is the attach half alone — import,
+        ``activate()``, mount, OpenAPI invalidation — for a worker converging
+        to a change another worker has already provisioned. Nothing reachable
+        from ``provision=False`` may run pip, git or podman.
+
+        A ``provision=False`` load is what an ``apps:changed`` broadcast
+        (``RedisBroadcaster``, ``src/libs/redis_coord.py``) ultimately turns
+        into on every other worker, via
+        ``Reconciler.converge_in_process`` → ``Reconciler.attach``. That is
+        the ONLY caller that passes ``False``; if you are adding another,
+        read ``src/apps/lifecycle.py``'s "Which half am I in?" first.
         """
         manifest = load_manifest(package_dir)
         slug = manifest.id
@@ -830,7 +846,8 @@ class AppRuntime:
             raise ValueError(f"app {slug!r} is already loaded")
         if manifest.tier == "container":
             return await self._load_container(
-                manifest, package_dir, granted_permissions, config or {}, signed)
+                manifest, package_dir, granted_permissions, config or {}, signed,
+                provision=provision)
         if manifest.tier != "inprocess":
             raise ValueError(f"runtime only loads tier=inprocess|container (got {manifest.tier!r})")
 
@@ -840,11 +857,18 @@ class AppRuntime:
             log.warning("apps: refused high-risk caps %s for unsigned app %s", refused, slug)
         cfg = config or {}
 
-        self._install_pip_requires(manifest)
+        # PROVISION: pip writes into the ONE venv this whole workspace shares.
+        # N workers doing it concurrently is W1's CLI-healer corruption class.
+        # An attaching worker is safe to skip it outright: the provisioning
+        # worker installed into the same venv, which is the same interpreter
+        # environment this process imports from.
+        if provision:
+            self._install_pip_requires(manifest)
         plugin, module_prefix = self._import_plugin(manifest, package_dir)
         ctx = AppContext(
             runtime=self, app_id=slug, version=manifest.version,
             granted_permissions=granted, config=cfg, package_dir=package_dir,
+            provision=provision,
         )
         loaded = LoadedApp(
             manifest=manifest, plugin=plugin, ctx=ctx, package_dir=package_dir,
@@ -871,27 +895,35 @@ class AppRuntime:
             raise
         self._loading = None
 
-        if "db:own-tables" in granted:
-            self._apply_migrations(manifest, package_dir)
-
         self._apps[slug] = loaded
-        self._render_mcp_template(loaded)
-        self._register_skills(loaded)
-        # ...and the pull half: skills that only exist after install, which a
-        # copy-at-activate push cannot see (src/apps/skill_sources.py). Runs
-        # here, where the plugin is live, because `agent sync` also runs from
-        # the CLI with no apps loaded and must reach the same skills/.
-        await skill_sources.refresh(slug, plugin, ctx)
-        self._register_tasks(loaded)
-        self._register_agents(loaded)
-        await self._register_repos(manifest)
+        # PROVISION: everything from here to _invalidate_openapi writes to
+        # state SHARED by every worker — the app's own package dir (mcp.json),
+        # the skills/ tree, the workspace Postgres (migrations, seeded tasks
+        # and agents) and repos/ (git clone). Each is idempotent on its own,
+        # so N workers repeating it is waste rather than corruption — except
+        # the migrations and the git clone, which are neither. One worker does
+        # it; the rest converge to the result. See src/apps/lifecycle.py.
+        if provision:
+            if "db:own-tables" in granted:
+                self._apply_migrations(manifest, package_dir)
+            self._render_mcp_template(loaded)
+            self._register_skills(loaded)
+            # ...and the pull half: skills that only exist after install, which a
+            # copy-at-activate push cannot see (src/apps/skill_sources.py). Runs
+            # here, where the plugin is live, because `agent sync` also runs from
+            # the CLI with no apps loaded and must reach the same skills/.
+            await skill_sources.refresh(slug, plugin, ctx)
+            self._register_tasks(loaded)
+            self._register_agents(loaded)
+            await self._register_repos(manifest)
         self._invalidate_openapi()
-        log.info("apps: loaded %s v%s (routes mounted=%s)",
+        log.info("apps: %s %s v%s (routes mounted=%s)",
+                 "loaded" if provision else "attached",
                  slug, manifest.version, loaded.mount is not None)
         return manifest
 
     async def unload(self, slug: str, drain_timeout: float | None = None,
-                     purge_secrets: bool = True) -> None:
+                     purge_secrets: bool = True, provision: bool = True) -> None:
         """Hot-unregister an app: unmount → drain → deactivate → unimport.
 
         Reverses every journaled side effect; leaves no residue.
@@ -901,6 +933,17 @@ class AppRuntime:
         unconditionally meant every version bump silently threw away whatever
         the app had stored there — the same shape as the config wipe fixed in
         3a37efb, one store over. Only a real uninstall purges.
+
+        ``provision`` is the mirror image of :meth:`load`'s (W3, see
+        ``src/apps/lifecycle.py``). ``False`` detaches this process only —
+        unmount, drain, deactivate, unimport, drop the per-process supervisor
+        registries — and reverts NOTHING shared. That distinction matters more
+        on the way out than on the way in: every worker replaying the journal
+        would run the app's ``uninstall.sh`` N times (one ``git`` removed for
+        the whole workspace, N times over), delete the shared skill files
+        under everyone's feet, and race N ``podman stop`` calls at the one
+        container. The provisioning worker does that once; the rest just let
+        go of their own handles.
         """
         loaded = self._apps.get(slug)
         if loaded is None:
@@ -949,7 +992,7 @@ class AppRuntime:
         #    not block the rest; the route Mount was already removed above.
         for entry in self.journal.reverse_for(slug):
             try:
-                await self._revert_entry(entry, loaded)
+                await self._revert_entry(entry, loaded, provision=provision)
             except Exception:
                 log.exception("apps: revert of %s %s failed for %s",
                               entry.kind, entry.target, slug)
@@ -957,7 +1000,11 @@ class AppRuntime:
         # written in a prior process whose in-memory journal is gone) — but
         # not when this unload is one half of an upgrade, which would delete
         # the app's own stored secrets on every version bump.
-        if purge_secrets:
+        # Also PROVISION-only: the secret store and the skill-source record are
+        # shared, so an attaching worker purging them would delete state the
+        # provisioning worker is the owner of (and, on an upgrade racing a
+        # convergence, state the app is about to need again).
+        if purge_secrets and provision:
             try:
                 self.secret_store.purge(slug)
             except Exception:
@@ -973,13 +1020,17 @@ class AppRuntime:
 
         # An uninstalled app's CLI is gone on purpose — stop the healer from
         # trying to resurrect it (system_cli:revert-hook already ran above).
+        # Per-process registry, so every worker drops it, provisioning or not:
+        # a follower that later wins W1's lease must not start healing a CLI
+        # for an app that no longer exists.
         self.commands.forget_system_clis_for(slug)
         self.journal.clear_app(slug)
         self._unimport(loaded.module_prefix)
         del self._apps[slug]
-        log.info("apps: unloaded %s", slug)
+        log.info("apps: %s %s", "unloaded" if provision else "detached", slug)
 
-    async def _revert_entry(self, entry: Any, loaded: LoadedApp) -> None:
+    async def _revert_entry(self, entry: Any, loaded: LoadedApp,
+                            provision: bool = True) -> None:
         """Reverse a single journaled side effect (uninstall replay, F4).
 
         reconcile()'s upgrade path is uninstall+install for a plain version
@@ -993,9 +1044,15 @@ class AppRuntime:
         """
         kind = entry.kind
         if kind == "command:install":
-            self.commands.remove_shim(entry.payload.get("bin_path", ""))
+            # Shared bin dir on PATH for the whole workspace — one removal.
+            if provision:
+                self.commands.remove_shim(entry.payload.get("bin_path", ""))
         elif kind == "system_cli:revert-hook":
-            await asyncio.to_thread(self.commands.run_revert, loaded.package_dir, entry.target)
+            # The app's uninstall.sh: `apt remove git` for the whole container.
+            # Running it once per worker is the uninstall-side twin of the
+            # ten-concurrent-pip-installs problem.
+            if provision:
+                await asyncio.to_thread(self.commands.run_revert, loaded.package_dir, entry.target)
         elif kind == "db:table":
             # Deliberately NOT dropped (2026-08-04 decision — see db_tables.py's
             # module docstring): reconcile()'s upgrade path is uninstall+install
@@ -1006,14 +1063,30 @@ class AppRuntime:
             # (src/apps/migrations.py), not an unload-time drop.
             pass
         elif kind == "service:register":
-            await asyncio.to_thread(self.services.stop_all_for, loaded.manifest.id)
+            # The subprocess.Popen lives in the provisioning worker alone (see
+            # _register_service_autostart). Everyone else only holds a registry
+            # entry, and forgetting it is the whole revert they owe.
+            if provision:
+                await asyncio.to_thread(self.services.stop_all_for, loaded.manifest.id)
+            else:
+                self.services.forget_all_for(loaded.manifest.id)
         elif kind == "container:register":
-            await asyncio.to_thread(self.containers.stop_all_for, loaded.manifest.id)
+            # The container is external to every worker, so exactly one
+            # `podman stop` is both necessary and sufficient; the per-process
+            # _containers registry (and its lazy docker client) is dropped
+            # everywhere, without issuing a stop.
+            if provision:
+                await asyncio.to_thread(self.containers.stop_all_for, loaded.manifest.id)
+            else:
+                self.containers.forget_all_for(loaded.manifest.id)
         elif kind == "watchdog:register":
             # Idempotent with the explicit cancel_all_for in unload() above.
             self.watchdog.cancel_all_for(loaded.manifest.id)
         elif kind == "skill:register":
-            self.skills.unregister(entry.payload.get("dest_path", ""))
+            # skills/ is one shared tree (and app containers bind-mount it
+            # read-only) — deleting an entry is a provisioning act.
+            if provision:
+                self.skills.unregister(entry.payload.get("dest_path", ""))
         # route:mount (already unmounted), system_cli:install (audit-only),
         # secret:write (namespace purged above), capability:denied → no-op.
 
@@ -1059,8 +1132,20 @@ class AppRuntime:
         # default str convertor doesn't exclude "." so it happily swallows the
         # rest of the hostname (workspace slug + domain) in one match.
         host_mount = Host(f"{app_id}.app.{{_:str}}", app=guarded)
-        # Mutation happens on the event loop (single process) — the list append
-        # is atomic w.r.t. request matching; no free-threading hazard.
+        # Mutation happens on the event loop — the list append is atomic
+        # w.r.t. request matching within THIS process; no free-threading
+        # hazard.
+        #
+        # W3: what is NOT true is the parenthetical this comment used to
+        # carry, "(single process)". At AW_WORKSPACE_WORKERS>1 there are N
+        # routers, one per worker, and appending here changes exactly one of
+        # them — so an app installed through whichever worker the load
+        # balancer picked answered on that worker and 404'd on the other N-1,
+        # permanently, until a restart. The fix is not a lock here (there is
+        # no shared object to lock): every worker has to run this same append
+        # for itself, which is what the `apps:changed` broadcast
+        # (RedisBroadcaster, src/libs/redis_coord.py) triggers via
+        # Reconciler.converge_in_process. See src/apps/lifecycle.py.
         self.host.router.routes.append(mount)
         self.host.router.routes.append(host_mount)
         loaded.mount = mount
@@ -1073,7 +1158,8 @@ class AppRuntime:
 
     async def _load_container(self, manifest: Manifest, package_dir: str,
                               granted_permissions: list[str] | None,
-                              config: dict[str, Any], signed: bool) -> Manifest:
+                              config: dict[str, Any], signed: bool,
+                              provision: bool = True) -> Manifest:
         """Load a ``tier: container`` app (Phase 6): spawn the image, reverse-proxy it.
 
         No Python entrypoint runs; the runtime brings up the container via the
@@ -1081,6 +1167,13 @@ class AppRuntime:
         at ``/api/apps/<slug>`` behind the same IdentityGuard as Tier-1. Enforces
         ``containers:manage`` (high-risk → the grant filter strips it from an
         unsigned app, so Tier-2 needs a signed/marketplace app).
+
+        W3 note on ``provision=False``: the container itself is external to
+        every worker (podman owns it), so a converging worker must rebuild its
+        own ``ContainerSupervisor`` registry — otherwise ``base_url()`` has
+        nothing to proxy to and the app's Settings/logs surfaces raise — but
+        must NOT issue a start. ``register()`` is pure bookkeeping; only
+        ``start()`` talks to the socket, and that is what gets skipped.
         """
         slug = manifest.id
         requested = granted_permissions if granted_permissions is not None else list(manifest.permissions)
@@ -1124,13 +1217,16 @@ class AppRuntime:
         env = expand_env(rt.get("env") or {}, config, manifest.id)
         # Before volumes, not after: a $AW_WORKSPACE_REPO bind refuses to
         # mount a checkout that isn't there, and for an app that declares the
-        # repo itself this is the step that puts it there.
-        await self._register_repos(manifest)
+        # repo itself this is the step that puts it there. PROVISION: a git
+        # clone into the shared repos/ tree.
+        if provision:
+            await self._register_repos(manifest)
         volumes = self._container_volumes(manifest, package_dir, granted=granted)
 
         ctx = AppContext(
             runtime=self, app_id=slug, version=manifest.version,
             granted_permissions=granted, config=config, package_dir=package_dir,
+            provision=provision,
         )
         loaded = LoadedApp(
             manifest=manifest, plugin=_ContainerPlugin(), ctx=ctx,
@@ -1159,7 +1255,7 @@ class AppRuntime:
         # them after it would make every boot's first tool call fail.
         self._register_sidecars(manifest, package_dir, config, granted)
         try:
-            if config.get("auto_start", True):
+            if config.get("auto_start", True) and provision:
                 for key in self.containers.sidecar_keys(slug):
                     await asyncio.to_thread(self.containers.start, key)
                 # Blocking docker/podman API call (image pull + container run) —
@@ -1185,19 +1281,25 @@ class AppRuntime:
                 self.host.router.routes.remove(loaded.mount)
             if loaded.host_mount is not None and loaded.host_mount in self.host.router.routes:
                 self.host.router.routes.remove(loaded.host_mount)
-            await asyncio.to_thread(self.containers.stop_all_for, slug)
+            if provision:
+                await asyncio.to_thread(self.containers.stop_all_for, slug)
+            else:
+                self.containers.forget_all_for(slug)
             self.journal.clear_app(slug)
             raise
 
         self._apps[slug] = loaded
-        self._render_mcp_template(loaded)
-        self._register_skills(loaded)
-        self._register_tasks(loaded)
-        self._register_agents(loaded)
-        # (repos were cloned before the volume resolution above)
+        # Same PROVISION block as the Tier-1 path — shared package dir, shared
+        # skills/ tree, shared Postgres. See load().
+        if provision:
+            self._render_mcp_template(loaded)
+            self._register_skills(loaded)
+            self._register_tasks(loaded)
+            self._register_agents(loaded)
+            # (repos were cloned before the volume resolution above)
         self._invalidate_openapi()
-        log.info("apps: loaded container app %s v%s (image=%s)",
-                 slug, manifest.version, image)
+        log.info("apps: %s container app %s v%s (image=%s)",
+                 "loaded" if provision else "attached", slug, manifest.version, image)
         return manifest
 
     def _register_sidecars(self, manifest: Manifest, package_dir: str,

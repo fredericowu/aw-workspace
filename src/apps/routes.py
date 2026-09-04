@@ -41,6 +41,7 @@ from src.apps import config_store
 from src.apps import hostpower
 from src.apps.catalog import get_catalog, is_marketplace_app, list_tags
 from src.apps.install_jobs import InstallJobs
+from src.apps.lifecycle import AppLifecycle
 from src.apps.manifest import ManifestError, load_manifest
 from src.apps.reconciler import AppSpec, Reconciler
 from src.apps.containers import ContainerError, expand_env
@@ -451,11 +452,19 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
     the :class:`Reconciler` is stored on ``app.state.app_reconciler``.
     """
     runtime = AppRuntime(app)
-    reconciler = Reconciler(runtime)
+    # W3: the provision/attach seam. The reconciler publishes apps:changed
+    # through it after every side-effecting half and takes the cross-worker
+    # provisioning mutex from it; src/api/app.py's lifespan starts its relay
+    # and points it back at reconciler.converge_in_process. Constructed even
+    # at AW_WORKSPACE_WORKERS=1 — with one worker there is simply nobody else
+    # subscribed, so behaviour is identical. See src/apps/lifecycle.py.
+    lifecycle = AppLifecycle()
+    reconciler = Reconciler(runtime, lifecycle=lifecycle)
     jobs = InstallJobs()
     app.state.app_runtime = runtime
     app.state.app_reconciler = reconciler
     app.state.app_install_jobs = jobs
+    app.state.app_lifecycle = lifecycle
 
     @app.get("/api/apps")
     async def list_apps(identity: dict = Depends(require_identity)):
@@ -517,7 +526,12 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 {"error": "app_id is required for a repo install"}, status_code=400)
         if runtime.is_loaded(app_id):
             return JSONResponse({"error": f"{app_id} already installed"}, status_code=409)
-        if jobs.is_installing(app_id):
+        # W3: the SHARED check, not the per-process one. At
+        # AW_WORKSPACE_WORKERS>1 a double-click reaches two different workers,
+        # and neither would see the other's in-flight job — two concurrent
+        # fetches + pip installs of the same app. (The provisioning mutex
+        # would serialize them, but serialized-and-duplicated is still wrong.)
+        if await jobs.is_installing_shared(app_id):
             # already in flight (double-click, retried "Failed to fetch") — don't
             # start a second install, just report the job already running.
             return JSONResponse({"app_id": app_id, "status": "installing"}, status_code=202)
@@ -581,10 +595,17 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
 
     @app.get("/api/apps/{slug}/install-status")
     async def install_status(slug: str, identity: dict = Depends(require_identity)):
-        """Poll the progress of a background install kicked off above."""
-        job = jobs.get(slug)
-        if job is not None:
-            return job.as_dict()
+        """Poll the progress of a background install kicked off above.
+
+        W3: reads the shared job state, so a poll that lands on a worker other
+        than the one running the install still answers. ``is_loaded`` is
+        checked second and is per-process on purpose — once this worker has
+        the app attached, "installed" is the truthful answer for the client
+        talking to it.
+        """
+        shared = await jobs.get_shared(slug)
+        if shared is not None:
+            return shared
         if runtime.is_loaded(slug):
             return {"app_id": slug, "status": "installed", "error": None, "summary": None}
         return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
@@ -1203,5 +1224,44 @@ async def reconcile_on_boot(app: FastAPI) -> None:
     # a boot reconcile is exactly the moment "auto" mode's answer can have
     # changed underneath a stale in-memory target (e.g. aw-app-signoz was
     # uninstalled while this process was down). See src/api/otel.py.
+    from src.api.otel import ensure_export_state
+    ensure_export_state(app.state.app_runtime)
+
+
+async def attach_on_boot(app: FastAPI) -> None:
+    """W3: boot for a worker that is NOT running this boot's reconcile.
+
+    The provisioning worker is doing the expensive, side-effecting pass
+    (fetch/pip/migrate/podman). This one just makes itself able to SERVE the
+    apps that are already installed, from the shared mirror + what is already
+    on disk — no network, no pip, no podman, nothing written. Anything the
+    provisioning worker adds or removes arrives afterwards as ``apps:changed``.
+
+    Everything below the converge is deliberately identical to
+    ``reconcile_on_boot``'s tail, minus the two shared side effects:
+
+    * the mcp-gateway ``/reload`` — one HTTP call that re-dials every upstream
+      for the whole workspace; the provisioning worker fires it once.
+    * ``sync_on_boot`` — its caller skips that (see src/api/app.py).
+
+    The three watchdog starters DO run here, in every worker, because that is
+    exactly how W1 designed them: each worker registers the tasks and only the
+    ``RedisLease("core")`` holder's supervisor actually spins them — so a
+    worker that later wins the lease on failover already has them registered.
+    """
+    reconciler: Reconciler = app.state.app_reconciler
+    try:
+        result = await asyncio.wait_for(reconciler.converge_in_process(),
+                                        timeout=_BOOT_RECONCILE_TIMEOUT)
+        log.info("apps: boot attach — %s", result)
+    except asyncio.TimeoutError:
+        log.error("apps: boot attach exceeded %ss — this worker may be serving "
+                  "only some of the installed apps until the next apps:changed",
+                  _BOOT_RECONCILE_TIMEOUT)
+    except Exception:
+        log.exception("apps: boot attach failed")
+    app.state.app_runtime.start_system_cli_healer()
+    app.state.app_runtime.start_mcp_gateway_rescan()
+    app.state.app_runtime.start_zombie_reaper()
     from src.api.otel import ensure_export_state
     ensure_export_state(app.state.app_runtime)

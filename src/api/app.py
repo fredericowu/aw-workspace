@@ -36,7 +36,8 @@ from src.api.workspace_api_key import (
     regenerate_workspace_api_key,
 )
 from src.api.workspace_url import publish_workspace_api_url
-from src.apps.routes import _redis_coord_status, reconcile_on_boot, register_apps_routes
+from src.apps.routes import (_redis_coord_status, attach_on_boot, reconcile_on_boot,
+                             register_apps_routes)
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +134,46 @@ def _write_setting(key: str, value: dict) -> None:
         session.commit()
 
 
+async def _is_boot_provisioner() -> bool:
+    """W3: does THIS worker run the side-effecting boot reconcile?
+
+    Two rules, in order:
+
+    1. **At ``AW_WORKSPACE_WORKERS<=1`` — which is what ships — always yes**,
+       without consulting Redis at all. There is no other worker to
+       coordinate with, so any coordination here could only ever subtract
+       behaviour, and the card's golden rule is that a single-worker
+       deployment behaves identically. Getting this wrong is not theoretical:
+       a plain ``cooldown_acquire`` gate made a single worker that restarted
+       twice inside the cooldown window skip its own boot reconcile AND its
+       ``agent sync`` — caught by ``test_skills_routes`` before this landed.
+
+    2. **At >1, one worker per FLEET BOOT wins the claim.** Keyed on the
+       parent pid, which is the uvicorn master every worker of one boot is
+       forked from (``src/start/workspace.py`` uses the factory import string
+       exactly when workers>1) — so a later restart is a different master and
+       gets its own claim, rather than inheriting a window opened by the boot
+       before it. The window only has to cover how far apart the workers of
+       ONE boot start; the provisioning mutex covers the reconcile's own
+       runtime.
+
+    Redis unreachable — the normal case in every environment today — falls
+    back to yes, i.e. today's behaviour: every worker converges independently,
+    wastefully but correctly.
+    """
+    if int(os.environ.get("AW_WORKSPACE_WORKERS", "1") or "1") <= 1:
+        return True
+    from src.libs.redis_coord import cooldown_acquire
+
+    try:
+        return await cooldown_acquire(
+            f"boot-apps-reconcile:{os.getppid()}", seconds=120.0)
+    except Exception:
+        log.exception("apps: could not claim the boot reconcile — this worker "
+                      "will run its own, as it did before W3")
+        return True
+
+
 async def _boot_reconcile_and_sync(app: FastAPI) -> None:
     """Background half of boot: converge apps to the cloud registry, then
     mirror their skills — split out of the lifespan itself so it can run
@@ -140,12 +181,35 @@ async def _boot_reconcile_and_sync(app: FastAPI) -> None:
     documented never to raise (best-effort by design), so this is safe as a
     bare background task. See the call site in ``lifespan`` for why this
     isn't inline anymore.
+
+    W3: only ONE worker runs the full (side-effecting) reconcile. It is the
+    single most expensive thing this workspace does — a cold pass over ~47
+    apps means ~47 GitHub fetches, pip installs, migrations and podman starts,
+    measured at 450s+ live — and at ``AW_WORKSPACE_WORKERS>1`` every worker
+    would otherwise run its own copy of it, concurrently, over the same venv
+    and the same podman socket. The rest attach to whatever is already on disk
+    (fast, no network, no side effects) and converge again off the
+    ``apps:changed`` that pass publishes at its end. See src/apps/lifecycle.py.
     """
-    await reconcile_on_boot(app)
+    provisioner = await _is_boot_provisioner()
+
+    if provisioner:
+        await reconcile_on_boot(app)
+    else:
+        log.info("apps: another worker is running this boot's app reconcile — "
+                 "attaching to what is already installed instead")
+        await attach_on_boot(app)
     # AFTER reconcile: an app's activate() copies its contributes.skills
     # into skills/ (AppRuntime._register_skills), so syncing earlier would
     # mirror a skills/ tree that's about to change.
-    await sync_on_boot()
+    #
+    # Skipped on a non-provisioning worker for the same reason its reconcile
+    # was: `agent sync` is an exact-mirror rewrite of the shared skills/ tree
+    # (and of the .claude/.cursor/.gemini mirrors), so N workers rewriting it
+    # concurrently — while the provisioning worker is still materializing new
+    # entries into it — produces a torn tree, not a redundant one.
+    if provisioner:
+        await sync_on_boot()
 
 
 def create_app() -> FastAPI:
@@ -256,6 +320,18 @@ def create_app() -> FastAPI:
         )
         await watchdog_lease.start()
         app.state.watchdog_lease = watchdog_lease
+        # W3: subscribe to apps:changed BEFORE the boot reconcile starts, so
+        # this worker cannot miss the broadcast the provisioning worker fires
+        # at the end of its pass. redis_coord's relay is subscribe-then-listen
+        # with no replay — a publish that lands before start_relay() is simply
+        # not delivered, and the worker would then serve a stale app set until
+        # its next restart. Never raises: with Redis unreachable it logs and
+        # returns False, which at AW_WORKSPACE_WORKERS=1 costs nothing (there
+        # is no other worker whose changes this would have carried).
+        async def _on_apps_changed(payload: dict) -> None:
+            await app.state.app_reconciler.converge_in_process()
+
+        await app.state.app_lifecycle.start(_on_apps_changed)
         # Converge the running app set to the cloud registry, then (only
         # after) mirror contributes.skills — a fresh/recreated workspace
         # auto-reinstalls the user's apps this way (F3). Backgrounded, NOT
@@ -300,6 +376,14 @@ def create_app() -> FastAPI:
             await app.state.watchdog_lease.stop()
         except Exception:
             log.exception("lifespan: watchdog_lease.stop() raised during shutdown")
+        # W3: drop the apps:changed subscription + the install-job mirror's
+        # client. Same best-effort posture as the lease above — a shutdown
+        # must not hang on a Redis that has already gone away.
+        try:
+            await app.state.app_lifecycle.stop()
+            await app.state.app_install_jobs.aclose()
+        except Exception:
+            log.exception("lifespan: app lifecycle teardown raised during shutdown")
 
     app = FastAPI(title="aw-workspace", version="0.1.0", lifespan=lifespan)
 

@@ -25,12 +25,13 @@ workspace's ``AppInstall`` PG mirror.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import shutil
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from src.apps import config_store
 from src.apps import fetch as fetch_mod
@@ -38,6 +39,9 @@ from src.apps import mcp_template
 from src.apps.manifest import load_manifest
 from src.apps.registry_client import CloudRegistry
 from src.apps.runtime import AppRuntime
+
+if TYPE_CHECKING:  # pragma: no cover
+    from src.apps.lifecycle import AppLifecycle
 
 log = logging.getLogger(__name__)
 
@@ -143,18 +147,35 @@ class Reconciler:
     def __init__(self, runtime: AppRuntime, *, cloud: CloudRegistry | None = None,
                  local: LocalMirror | None = None,
                  fetch: Callable[..., str] = fetch_mod.fetch_app_repo,
-                 remove: Callable[[str], bool] = fetch_mod.remove_app_repo) -> None:
+                 remove: Callable[[str], bool] = fetch_mod.remove_app_repo,
+                 lifecycle: "AppLifecycle | None" = None) -> None:
         self.runtime = runtime
         self.cloud = cloud if cloud is not None else CloudRegistry()
         self.local = local if local is not None else LocalMirror()
         self._fetch = fetch
         self._remove = remove
+        # W3: the apps:changed publisher + the cross-worker provisioning
+        # mutex. Optional so every existing unit test that builds a bare
+        # Reconciler keeps working unchanged (and behaves exactly as it did
+        # before — no broadcast, no shared lock, which is right for a single
+        # process). Wired for real in src/apps/routes.py.
+        self.lifecycle = lifecycle
         # Set while a reconcile() pass is running so the per-app install/
         # uninstall calls inside it COALESCE into one gateway reload at the
         # end instead of firing one HTTP rescan per app — a fresh workspace
         # reconciles ~20 apps at boot, and each /reload re-dials every
         # upstream. None = not in a pass (reload immediately).
         self._pending_gateway_reload: bool | None = None
+        # Same coalescing, same shape, for the apps:changed broadcast: one
+        # publish per logical change, or one per reconcile pass, never one per
+        # app inside a pass. None = not in a pass (publish immediately).
+        self._pending_broadcast: bool | None = None
+        # Re-entrancy depth for the provisioning mutex. install() calls itself
+        # for dependencies and reconcile() calls it per app, so the lock has
+        # to be taken at the OUTERMOST provisioning entry only —
+        # asyncio.Lock is not re-entrant and a nested acquire would deadlock
+        # the whole worker on its own install.
+        self._provision_depth = 0
 
     # ---- MCP gateway rescan triggers ---------------------------------------
 
@@ -258,6 +279,154 @@ class Reconciler:
         except OSError:
             log.exception("apps: failed to copy mcp.json for mcp-gateway scan "
                           "visibility (%s)", app_id)
+
+    # ---- W3: the provision/attach seam --------------------------------------
+
+    @contextlib.asynccontextmanager
+    async def _provisioning(self):
+        """Hold the cross-worker provisioning mutex for a side-effecting pass.
+
+        Re-entrant by depth: ``install`` recurses into itself for app
+        dependencies and ``reconcile`` calls it once per app, so only the
+        outermost call actually takes the lock. No lifecycle wired (unit
+        tests, the CLI) → a plain no-op, which is the correct single-process
+        behaviour and keeps this off the shipped ``workers=1`` path entirely.
+        """
+        if self.lifecycle is None or self._provision_depth > 0:
+            self._provision_depth += 1
+            try:
+                yield
+            finally:
+                self._provision_depth -= 1
+            return
+        async with self.lifecycle.provision_lock("apps"):
+            self._provision_depth += 1
+            try:
+                yield
+            finally:
+                self._provision_depth -= 1
+
+    async def _trigger_broadcast(self, reason: str, app_id: str | None = None) -> None:
+        """Publish ``apps:changed`` now, or mark it pending inside a pass.
+
+        Exactly the ``_trigger_gateway_reload`` pattern one method up, for
+        exactly the same reason: a boot reconcile over ~47 apps must not fan
+        out 47 broadcasts, each of which makes every OTHER worker walk its
+        whole loaded set.
+        """
+        if self._pending_broadcast is not None:
+            self._pending_broadcast = True
+            return
+        if self.lifecycle is not None:
+            await self.lifecycle.publish(reason, app_id)
+
+    async def attach(self, app_id: str, rows: dict[str, dict[str, Any]] | None = None,
+                     _stack: tuple[str, ...] = ()) -> None:
+        """The ATTACH half: make THIS process serve an app another worker has
+        already provisioned. Pure in-process — see ``src/apps/lifecycle.py``.
+
+        Deliberately does not touch ``self._fetch``, ``self.local.upsert``,
+        ``self.cloud``, ``config_store.save`` or the gateway reload. It reads
+        the shared mirror and loads what is already on disk; if the package
+        dir isn't there yet, the provisioning worker hasn't finished and this
+        raises rather than fetching it — a converge path that could fetch is
+        the failure mode this whole card exists to prevent.
+
+        Config and the granted-permission set come from the mirror row as
+        recorded, never re-derived: ``Manifest.generated_config`` would MINT A
+        NEW SECRET here (a fresh database password for an app whose datadir
+        already has the old one), and re-reading ``manifest.permissions``
+        would let two workers disagree about an app's effective grant.
+        """
+        if self.runtime.is_loaded(app_id):
+            return
+        if app_id in _stack:
+            raise ValueError(f"cyclic app dependency chain: {' -> '.join((*_stack, app_id))}")
+        if rows is None:
+            rows = {r["app_id"]: r for r in await asyncio.to_thread(self.local.list)
+                    if r.get("app_id")}
+        row = rows.get(app_id)
+        if row is None:
+            raise ValueError(f"app {app_id!r} has no local mirror row to attach from")
+        spec = AppSpec.from_row(row)
+        package_dir = spec.package_dir or fetch_mod.package_dir_for(app_id)
+        if not os.path.isdir(package_dir):
+            raise ValueError(
+                f"app {app_id!r} is not on disk at {package_dir!r} — the "
+                "provisioning worker has not fetched it (yet). Attaching must "
+                "never fetch; this converges on the next apps:changed.")
+        manifest = load_manifest(package_dir)
+        # Dependencies first, same ordering guarantee _install_dependencies
+        # gives the provisioning path — an app whose activate() calls into a
+        # dependency needs it loaded already. Resolved from the mirror alone:
+        # no cloud round-trip, no catalog lookup, no install.
+        for dep in self._required_app_dependencies(manifest):
+            await self.attach(dep["id"], rows, (*_stack, app_id))
+        await self.runtime.load(
+            package_dir, granted_permissions=spec.granted_permissions,
+            config=spec.config, signed=spec.signed, provision=False)
+
+    async def detach(self, app_id: str) -> None:
+        """The ATTACH half's inverse: stop serving an app in THIS process.
+
+        Reverts nothing shared — no repo removal, no mirror/registry row, no
+        ``uninstall.sh``, no ``podman stop``. The worker that ran
+        :meth:`uninstall` did all of that once.
+        """
+        if self.runtime.is_loaded(app_id):
+            await self.runtime.unload(app_id, provision=False)
+
+    async def converge_in_process(self) -> dict[str, Any]:
+        """Re-converge this worker's LOADED set to the shared mirror.
+
+        The ``apps:changed`` handler. Attaches what the mirror lists and this
+        process doesn't serve, detaches what it serves and the mirror no
+        longer lists, and re-attaches anything whose recorded version moved
+        under it (another worker's upgrade). By construction it cannot reach
+        pip, git or podman: every path in it goes through
+        :meth:`attach`/:meth:`detach`, which pass ``provision=False`` down.
+        """
+        rows = {r["app_id"]: r for r in await asyncio.to_thread(self.local.list)
+                if r.get("app_id")}
+        attached: list[str] = []
+        detached: list[str] = []
+        errors: list[dict[str, str]] = []
+
+        # Detach first: an app removed elsewhere must stop answering here
+        # before anything slower happens, and a version change is modelled as
+        # detach + attach exactly like reconcile()'s upgrade path.
+        for app_id in list(self.runtime.loaded_slugs()):
+            row = rows.get(app_id)
+            loaded = self.runtime.get(app_id)
+            stale = bool(row) and bool(row.get("version")) and bool(loaded) and \
+                row.get("version") != loaded.manifest.version
+            if row is not None and not stale:
+                continue
+            try:
+                await self.detach(app_id)
+                detached.append(app_id)
+            except Exception as e:  # noqa: BLE001 — one bad app must not block the rest
+                log.exception("apps: converge failed to detach %s", app_id)
+                errors.append({"app_id": app_id, "action": "detach", "error": str(e)})
+
+        for app_id in rows:
+            if self.runtime.is_loaded(app_id):
+                continue
+            try:
+                await self.attach(app_id, rows)
+                attached.append(app_id)
+            except Exception as e:  # noqa: BLE001
+                log.exception("apps: converge failed to attach %s", app_id)
+                errors.append({"app_id": app_id, "action": "attach", "error": str(e)})
+
+        # Routes moved in this process, so its OpenAPI/contributions views did
+        # too — but nothing SHARED changed, so no gateway reload and no
+        # re-broadcast (which would loop: every worker publishing on every
+        # received publish).
+        if attached or detached or errors:
+            log.info("apps: converged in-process — attached=%s detached=%s errors=%d",
+                     attached, detached, len(errors))
+        return {"attached": attached, "detached": detached, "errors": errors}
 
     # ---- resolve a package dir for a spec (fetch unless already on disk) ----
 
@@ -391,8 +560,12 @@ class Reconciler:
             if self.runtime.is_loaded(dep_id):
                 continue
             dep_spec = self._dependency_spec(dep, known_rows)
-            await self.install(dep_spec, write_cloud=write_cloud,
-                               _dependency_stack=(*stack, dep_id))
+            # _install_provisioned, not install: the caller already holds the
+            # provisioning mutex and will publish once for the whole install.
+            # One apps:changed per transitive dependency would make every
+            # other worker walk its full loaded set N times for one click.
+            await self._install_provisioned(dep_spec, write_cloud=write_cloud,
+                                            _dependency_stack=(*stack, dep_id))
             installed.append(dep_id)
         return installed
 
@@ -422,7 +595,27 @@ class Reconciler:
 
     async def install(self, spec: AppSpec, *, write_cloud: bool = True,
                       _dependency_stack: tuple[str, ...] = ()) -> dict[str, Any]:
-        """Fetch → validate → enforce → hot-load → persist. Returns a summary."""
+        """Fetch → validate → enforce → hot-load → persist. Returns a summary.
+
+        W3: this is the PROVISION half in full (see ``src/apps/lifecycle.py``)
+        — it fetches, pip-installs, migrates, starts containers and writes the
+        shared mirror/registry rows, and it must therefore run in exactly one
+        worker per change. It is serialized across workers by
+        :meth:`_provisioning` and announced to them by the ``apps:changed``
+        broadcast at the end. The other workers reach the same end state
+        through :meth:`attach`, which can do none of those things.
+        """
+        async with self._provisioning():
+            summary = await self._install_provisioned(
+                spec, write_cloud=write_cloud, _dependency_stack=_dependency_stack)
+        # Outside the lock: the shared state is already committed, so holding
+        # the mutex across the fan-out would only make every other worker's
+        # next install wait on this one's Redis round-trip.
+        await self._trigger_broadcast("install", summary.get("app_id"))
+        return summary
+
+    async def _install_provisioned(self, spec: AppSpec, *, write_cloud: bool = True,
+                                   _dependency_stack: tuple[str, ...] = ()) -> dict[str, Any]:
         # _resolve_package_dir does a synchronous tarball download + extract
         # (fetch.fetch_app_repo, httpx.stream + tarfile) when spec.repo is set
         # — offloaded to a thread so a reconcile pass fetching/upgrading an
@@ -561,7 +754,21 @@ class Reconciler:
         ``purge_secrets=False`` is what the upgrade path passes: an upgrade is
         uninstall + install, and an app's ``ctx.secrets`` namespace must not be
         emptied just because its version moved.
+
+        W3: the PROVISION half of a removal — same rules as :meth:`install`.
+        Every other worker stops serving the app via :meth:`detach`, which
+        removes its mount and nothing else.
         """
+        async with self._provisioning():
+            summary = await self._uninstall_provisioned(
+                app_id, remove_repo=remove_repo, write_cloud=write_cloud,
+                purge_secrets=purge_secrets)
+        await self._trigger_broadcast("uninstall", app_id)
+        return summary
+
+    async def _uninstall_provisioned(self, app_id: str, *, remove_repo: bool = True,
+                                     write_cloud: bool = True,
+                                     purge_secrets: bool = True) -> dict[str, Any]:
         # Probe BEFORE unloading: once the app is unloaded and its repo
         # removed, both the manifest and the on-disk mcp.json are gone and
         # there is no way left to tell whether the gateway needs a rescan.
@@ -618,7 +825,20 @@ class Reconciler:
     async def reconcile(self, desired: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Converge actual (loaded) → desired (registry). Install missing,
         uninstall extra. ``desired`` defaults to the cloud registry, falling
-        back to the local mirror when the cloud isn't configured/reachable."""
+        back to the local mirror when the cloud isn't configured/reachable.
+
+        W3: the heavyweight PROVISION pass — network fetches, pip installs and
+        podman starts, per app, serially. It must run in ONE worker; the
+        others converge to its result via :meth:`converge_in_process` off the
+        single ``apps:changed`` this publishes at the end. Callers decide who
+        that one worker is (see ``src/api/app.py``'s boot path); this method
+        just makes sure two of them can never overlap.
+        """
+        async with self._provisioning():
+            return await self._reconcile_provisioned(desired)
+
+    async def _reconcile_provisioned(
+            self, desired: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         source = "provided"
         if desired is None:
             if self.cloud.configured:
@@ -648,6 +868,9 @@ class Reconciler:
         # below — an app that failed halfway may still have written its
         # mcp.json before failing.
         self._pending_gateway_reload = False
+        # Same for the W3 apps:changed fan-out: one publish for the pass, not
+        # one per app (see _trigger_broadcast).
+        self._pending_broadcast = False
 
         # install missing (desired but not loaded) — don't re-write the desired
         # row we're converging TO. For apps present on both sides, a version
@@ -750,9 +973,17 @@ class Reconciler:
         if wanted_reload:
             await self._trigger_gateway_reload()
 
+        # Same clear-first ordering, same reason: leave the reconciler back in
+        # "not in a pass" state even if the publish raises.
+        wanted_broadcast = bool(self._pending_broadcast)
+        self._pending_broadcast = None
+        if wanted_broadcast:
+            await self._trigger_broadcast("reconcile")
+
         result = {"source": source, "desired": sorted(desired_active),
                   "installed": installed, "upgraded": upgraded, "removed": removed,
-                  "errors": errors, "mcp_gateway_reloaded": wanted_reload}
+                  "errors": errors, "mcp_gateway_reloaded": wanted_reload,
+                  "apps_changed_published": wanted_broadcast}
         log.info("apps: reconciled (%s) — installed=%s upgraded=%s removed=%s errors=%d "
                  "mcp_reload=%s",
                  source, installed, upgraded, removed, len(errors), wanted_reload)

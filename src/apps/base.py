@@ -203,12 +203,20 @@ class CommandsFacade(_Facade):
         prefix = f"{self._ctx.app_id}-"
         if not name.startswith(prefix):
             raise ValueError(f"command name {name!r} must be namespaced under {prefix!r}")
-        shim_path = self._ctx._runtime.commands.install_shim(
-            name, self._ctx.package_dir, exec_path)
+        # W3 PROVISION: one shim file in the workspace-wide bin dir. N workers
+        # writing the same path concurrently is a torn file on PATH, and the
+        # shim the provisioning worker wrote is already there for this one.
+        # The journal entry is still recorded so the local unload path stays
+        # symmetric — _revert_entry is what decides not to delete it.
+        if self._ctx.provision:
+            shim_path = self._ctx._runtime.commands.install_shim(
+                name, self._ctx.package_dir, exec_path)
+        else:
+            shim_path = self._ctx._runtime.commands.shim_path(name)
         self._ctx._runtime.journal.record(
             self._ctx.app_id, "command:install", name,
             {"exec": exec_path, "bin_path": shim_path})
-        return {"command": name, "installed": True, "bin_path": shim_path}
+        return {"command": name, "installed": self._ctx.provision, "bin_path": shim_path}
 
     def install_system_cli(self, name: str, installer: str,
                            uninstall: str | None = None,
@@ -223,8 +231,17 @@ class CommandsFacade(_Facade):
         meaningless, so the weakening is explicit rather than the default.
         """
         self._ctx._enforce("commands:install")
-        output = self._ctx._runtime.commands.run_installer(
-            self._ctx.package_dir, installer)
+        # W3 PROVISION: this runs the app's installer script — `apt install
+        # git` and friends — against the ONE filesystem every worker shares.
+        # This is the exact shape W1 gated the CLI healer for: N concurrent
+        # apt/npm runs is corruption, not waste. record_system_cli still runs
+        # everywhere, because it is per-process registry state that the healer
+        # reads, and a worker that later wins W1's lease must know about this
+        # CLI to be able to heal it.
+        output = ""
+        if self._ctx.provision:
+            output = self._ctx._runtime.commands.run_installer(
+                self._ctx.package_dir, installer)
         self._ctx._runtime.commands.record_system_cli(
             self._ctx.app_id, name, self._ctx.package_dir, installer, verify=verify)
         self._ctx._runtime.journal.record(
@@ -235,7 +252,7 @@ class CommandsFacade(_Facade):
             self._ctx._runtime.journal.record(
                 self._ctx.app_id, "system_cli:revert-hook", uninstall, {})
             self._revert_recorded = True
-        return {"cli": name, "installed": True, "output": output}
+        return {"cli": name, "installed": self._ctx.provision, "output": output}
 
 
 class SecretsFacade(_Facade):
@@ -357,12 +374,27 @@ class ServicesFacade(_Facade):
 
     def register(self, service_id: str, start: str, autostart: bool = False) -> dict[str, Any]:
         self._ctx._enforce("service:manage")
+        # W3: registration is bookkeeping and happens in every worker, so
+        # `status`/`logs`/`start` don't raise "not registered" on whichever
+        # worker a request lands on. AUTOSTART is the side effect — a real
+        # subprocess.Popen plus a reader thread — and belongs to the
+        # provisioning worker alone. Ten workers each spawning the app's
+        # daemon is ten copies of a thing meant to be a singleton.
+        #
+        # Known limitation, stated rather than hidden: `status()` on a
+        # non-provisioning worker reports running=False for a service that IS
+        # running in the provisioning one, because the Popen handle is
+        # per-process. Cross-worker service status is not in this card's
+        # scope; at AW_WORKSPACE_WORKERS=1 (what ships) there is one worker
+        # and the answer is exact.
         self._ctx._runtime.services.register(
-            self._ctx.app_id, service_id, start, self._ctx.package_dir, autostart)
+            self._ctx.app_id, service_id, start, self._ctx.package_dir,
+            autostart and self._ctx.provision)
         self._ctx._runtime.journal.record(
             self._ctx.app_id, "service:register", service_id,
             {"start": start, "autostart": autostart})
-        return {"service": service_id, "registered": True}
+        return {"service": service_id, "registered": True,
+                "started": bool(autostart and self._ctx.provision)}
 
     def start(self, service_id: str) -> dict[str, Any]:
         self._ctx._enforce("service:manage")
@@ -391,9 +423,14 @@ class ContainersFacade(_Facade):
                  env: dict[str, str] | None = None,
                  autostart: bool = False) -> dict[str, Any]:
         self._ctx._enforce("containers:manage")
+        # W3, same split as ServicesFacade: every worker registers (the
+        # reverse proxy needs base_url()), only the provisioning one starts.
+        # The container is external to all of them, so one start is enough and
+        # N concurrent ones race over the same container name.
         self._ctx._runtime.containers.register(
             self._ctx.app_id, image, port, run_flags=run_flags,
-            resources=resources, env=env, autostart=autostart)
+            resources=resources, env=env,
+            autostart=autostart and self._ctx.provision)
         self._ctx._runtime.journal.record(
             self._ctx.app_id, "container:register", image,
             {"port": port, "run_flags": run_flags or [], "resources": resources or {}})
@@ -440,13 +477,22 @@ class AppContext:
 
     def __init__(self, runtime: "AppRuntime", app_id: str,
                  version: str, granted_permissions: list[str],
-                 config: dict[str, Any], package_dir: str) -> None:
+                 config: dict[str, Any], package_dir: str,
+                 provision: bool = True) -> None:
         self._runtime = runtime
         self.app_id = app_id
         self.version = version
         self.granted_permissions = list(granted_permissions)
         self.config = dict(config)
         self.package_dir = package_dir
+        # W3: an app's own activate() is the one place where the two halves
+        # of a load are genuinely fused — it registers routes (per-process,
+        # every worker) in the same breath as it installs a system CLI or
+        # spawns a service (shared, exactly once). The app cannot be asked to
+        # know which worker it is on, so the FACADES carry the distinction:
+        # with provision=False the effect is skipped and only the bookkeeping
+        # the local process needs is kept. See src/apps/lifecycle.py.
+        self.provision = provision
         self._deactivate_hooks: list[Callable[[], Awaitable[None] | None]] = []
         # instantiate only the facades the app was actually granted
         self._facades: dict[str, _Facade] = {

@@ -162,6 +162,21 @@ class ServiceSupervisor:
                 log.exception("apps: failed to stop service %s/%s on uninstall", aid, sid)
             self._services.pop((aid, sid), None)
 
+    def forget_all_for(self, app_id: str) -> None:
+        """Drop every registration for an app WITHOUT stopping anything (W3).
+
+        The counterpart to :meth:`stop_all_for` for a worker that is merely
+        detaching. A managed service is a real ``subprocess.Popen`` plus a
+        reader thread living in exactly ONE process — the worker that
+        provisioned it — so a worker that never spawned it has nothing to
+        signal, and calling ``stop`` here would at best be a no-op and at
+        worst kill a process it does not own (the pid is recorded per-process,
+        but the process group is not). Forget the bookkeeping; leave the
+        process to its owner. See src/apps/lifecycle.py.
+        """
+        for key in [k for k in self._services if k[0] == app_id]:
+            self._services.pop(key, None)
+
     def _require(self, app_id: str, service_id: str) -> _Service:
         svc = self._services.get((app_id, service_id))
         if svc is None:
