@@ -44,6 +44,20 @@ Still dropped vs. the monolith (see MIGRATION.md):
 * Agent-CLI (claude/codex/cursor/gemini) session-id detection + ``--resume``
   reconstruction + the Claude ``PromptDetector``. The slim BYOD image ships
   no agent CLIs, so a terminal is just a shell (or an arbitrary command).
+* A session whose ``command`` exits is gone, not inspectable. A screen dies
+  with its command, so a one-shot — or, far more commonly, a
+  command-not-found — leaves no session to list, attach to, or read
+  scrollback from; the direct-PTY path kept the dead session around with its
+  output. This is a knowing, permanent exception to this card's "behaviour
+  identical at workers=1" rule, and it is NOT gated on worker count:
+  ``screen_backing_enabled()`` keys off the ``screen`` binary alone. Harmless
+  today, because every SPA terminal is a login shell that never exits and no
+  agent CLI ships in this image, but it turns a visible "command not found"
+  into a terminal that simply vanishes. ``_create_screen()`` logs the
+  ambiguity. Surfacing it to the *user* is a follow-up card
+  (3d15bf3b-9510-81ae-bce6-cd0efad541ef), and deliberately NOT
+  ``; exec $SHELL -l`` here — that would make every command-backed session
+  immortal and leak a screen server per launch.
 
 The PTY mechanics (fork/exec, non-blocking fan-out reader, resize, chunked
 write, scrollback) mirror the monolith exactly so the ``/ws/terminal`` byte
