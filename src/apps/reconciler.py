@@ -385,7 +385,17 @@ class Reconciler:
         under it (another worker's upgrade). By construction it cannot reach
         pip, git or podman: every path in it goes through
         :meth:`attach`/:meth:`detach`, which pass ``provision=False`` down.
+
+        Serialized against this process's own provisioning passes — see
+        ``AppLifecycle.in_process_exclusive`` for why detaching on absence
+        makes that mandatory rather than merely tidy.
         """
+        if self.lifecycle is not None:
+            async with self.lifecycle.in_process_exclusive():
+                return await self._converge_in_process()
+        return await self._converge_in_process()
+
+    async def _converge_in_process(self) -> dict[str, Any]:
         rows = {r["app_id"]: r for r in await asyncio.to_thread(self.local.list)
                 if r.get("app_id")}
         attached: list[str] = []

@@ -422,3 +422,71 @@ def test_multi_worker_claim_is_scoped_to_one_fleet_boot(monkeypatch):
 
     assert asyncio.run(three_workers()) == [True, False, False]
     assert len(set(keys)) == 1 and str(os.getppid()) in keys[0]
+
+
+def test_converge_cannot_interleave_with_this_worker_s_own_install(runtime, tmp_path,
+                                                                   monkeypatch):
+    """``install`` has a window between ``runtime.load`` (the app is LOADED)
+    and ``local.upsert`` (the app is LISTED). An apps:changed from another
+    worker landing inside it finds an app that is loaded-but-unlisted — which
+    is exactly ``converge_in_process``'s definition of "detach this" — and
+    would unmount an install that was succeeding.
+
+    So a convergence must hold the same in-process lock a provisioning pass
+    does. Asserted directly: park an install inside that window, fire a
+    converge, and require that it has NOT progressed and the mount is intact.
+    """
+    from src.apps.lifecycle import AppLifecycle
+    from src.apps.reconciler import AppSpec, Reconciler
+
+    fx = _Effects()
+    fx.wire(runtime, monkeypatch)
+    pkg = _pkg(tmp_path)
+    rows: list[dict] = []
+
+    class _Mirror:
+        def list(self):
+            return list(rows)
+
+        def upsert(self, spec, package_dir):
+            rows.append({"app_id": spec.app_id, "version": spec.version,
+                         "package_dir": package_dir,
+                         "granted_permissions": spec.granted_permissions,
+                         "config": spec.config, "signed": spec.signed})
+
+    reconciler = Reconciler(runtime, local=_Mirror(), lifecycle=AppLifecycle())
+    monkeypatch.setattr(type(reconciler.cloud), "configured", property(lambda self: False))
+
+    async def run():
+        in_window = asyncio.Event()
+        release = asyncio.Event()
+        real_load = runtime.load
+
+        async def _park_after_load(*a, **k):
+            result = await real_load(*a, **k)
+            in_window.set()          # loaded, not yet upserted
+            await release.wait()
+            return result
+
+        monkeypatch.setattr(runtime, "load", _park_after_load)
+        install = asyncio.create_task(
+            reconciler.install(AppSpec(app_id="w3app", package_dir=pkg),
+                               write_cloud=False))
+        await asyncio.wait_for(in_window.wait(), timeout=5)
+
+        # Mid-window: loaded here, absent from the mirror.
+        assert runtime.is_loaded("w3app") and rows == []
+        converge = asyncio.create_task(reconciler.converge_in_process())
+        done, _ = await asyncio.wait({converge}, timeout=1.0)
+
+        assert not done, "the converge ran inside the install window"
+        assert runtime.is_loaded("w3app"), "the converge detached a live install"
+
+        release.set()
+        await asyncio.wait_for(install, timeout=10)
+        result = await asyncio.wait_for(converge, timeout=10)
+        # It runs once the install has committed, and now agrees with it.
+        assert result == {"attached": [], "detached": [], "errors": []}
+        assert runtime.is_loaded("w3app")
+
+    asyncio.run(asyncio.wait_for(run(), timeout=40))

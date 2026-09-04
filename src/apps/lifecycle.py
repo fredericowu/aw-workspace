@@ -221,6 +221,27 @@ class AppLifecycle:
         return self._client
 
     @contextlib.asynccontextmanager
+    async def in_process_exclusive(self):
+        """The LOCAL half of :meth:`provision_lock`, without the shared claim.
+
+        Held by a convergence pass so it cannot interleave with a provisioning
+        pass in the same process. That is not tidiness — it is correctness:
+        ``converge_in_process`` detaches anything this worker has loaded but
+        the mirror does not list, and ``install`` necessarily has a window
+        between ``runtime.load`` (loaded) and ``local.upsert`` (listed). An
+        ``apps:changed`` from ANOTHER worker landing in that window would find
+        the app in exactly that state and unmount an install that was
+        succeeding.
+
+        Deliberately not the shared lock: a converge does no shared work, so
+        making every worker's convergence queue behind every other worker's
+        install would add cross-fleet latency to defend a purely local
+        invariant.
+        """
+        async with self._local_lock:
+            yield
+
+    @contextlib.asynccontextmanager
     async def provision_lock(self, name: str = "apps"):
         """Hold the cross-worker provisioning lock for the duration of a block.
 
