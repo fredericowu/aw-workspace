@@ -11,8 +11,8 @@ services:
       AW_WORKSPACE: "${AW_WORKSPACE:-demo}"
       AW_WORKSPACE_SCHEMA: "${AW_WORKSPACE_SCHEMA:-workspace_demo}"
       AW_PORT: "9030"
-      # 10 workers — safe since the W0-W6 multiworker chain (see MIGRATION.md).
-      AW_WORKSPACE_WORKERS: "10"
+      # Single worker — terminals hold in-process PTY state (see MIGRATION.md).
+      AW_WORKSPACE_WORKERS: "1"
       AWSERV_DB_URL: "${AWSERV_DB_URL:-postgresql+psycopg://postgres:postgres@127.0.0.1:5432/awserv}"
       AW_BACKEND_URL: "${AW_BACKEND_URL:-https://api.aw.tekflox.com}"
       AW_AUTH_PUBLIC_KEY: "${AW_AUTH_PUBLIC_KEY:-}"
