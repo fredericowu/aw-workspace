@@ -115,19 +115,27 @@ def _require_streams():
 def _clean_redis():
     """Wipe this file's own keys either side of every test.
 
-    Scoped to the ``w7test-`` prefix, never a flush: this Redis is shared with
-    the running workspace in local dev, and a FLUSHDB here would take out live
-    leases and broadcast state.
+    Scoped to THIS run's ``AW_WORKSPACE`` slug, never a flush: this Redis is
+    shared with the running workspace in local dev, and a FLUSHDB here would
+    take out live leases and broadcast state.
+
+    The slug has to be in the pattern, not just the ``w7test-`` session-id
+    prefix. Every ``_sid()`` starts with ``w7test-`` whatever slug the file
+    drew at import, so a bare ``*term:owner:w7test-*`` matches every OTHER
+    concurrent run of this same file too — and wipes its live owner/meta keys
+    mid-test. That is the flake QA measured (4 failures in 5 solo runs of
+    ``test_a_stale_owner_snapshot_does_not_prune_a_live_session``): the
+    private slug above stops the LIVE workspace colliding with us, and this
+    stops us colliding with ourselves.
     """
     client = _get_redis()
 
     def _wipe():
         if client is None:
             return
-        for pattern in ("*term:meta:w7test-*", "*term:creating:w7test-*",
-                        "*term:owner:w7test-*", "*term:out:w7test-*",
-                        "*term:in:w7test-*"):
-            for key in client.scan_iter(match=pattern):
+        for suffix in (tm._META_SUFFIX, tm._CREATING_SUFFIX, tm._OWNER_SUFFIX,
+                       tm._OUT_SUFFIX, tm._IN_SUFFIX):
+            for key in client.scan_iter(match=_term_key(suffix, "w7test-*")):
                 client.delete(key)
 
     _wipe()
