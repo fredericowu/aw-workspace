@@ -63,6 +63,26 @@ from src.api.terminal_manager import (
     streams_enabled,
 )
 
+# Scope this run's terminal keys under a slug nothing else answers to.
+#
+# `_term_key` prefixes with `aw:ws:<AW_WORKSPACE>:`, and in local development
+# the reachable Redis is the LIVE workspace's — same host, same default slug
+# (`aw:ws:default:`). Its workers run `list_sessions()` on every
+# `terminal_update` broadcast, so a workspace running any build other than the
+# one under test operates on this file's sessions as if they were its own.
+# That is not hypothetical: before the `_prune_session_meta` fix in
+# terminal_manager, a `MONITOR` on 2026-09-04 caught a bare
+# `DEL …:term:meta:<id>` from another client landing 1.6s after a healthy
+# create here, and it is what made this suite fail 4 runs in 5 with a
+# different trio of tests each time.
+#
+# The product fix stops a CURRENT-build fleet doing that to itself. It cannot
+# stop an OLDER build on the same Redis, and a test suite should not depend on
+# what else happens to be deployed on the box — so take a private slug. Set
+# before the first `_term_key` call rather than in a fixture, because the
+# module-scope probes below already reach Redis.
+os.environ["AW_WORKSPACE"] = f"w7test-{uuid.uuid4().hex[:8]}"
+
 pytestmark = [pytest.mark.integration]
 
 
@@ -206,7 +226,7 @@ def test_owner_writes_go_out_on_the_input_stream_not_straight_to_the_fd(managers
     session.write(b"hello")
 
     client = _get_redis()
-    assert client.xlen(_in_key(session_id)) == 1, \
+    assert client.xlen(_in_key(session_id, session.gen)) == 1, \
         "one write() must produce exactly one input-stream frame"
 
     deadline = time.monotonic() + 10
@@ -279,7 +299,7 @@ def test_the_owner_receives_its_own_output_through_the_stream(managers):
         assert marker.encode() in await _wait_for_bytes(session, marker.encode())
 
         client = _get_redis()
-        assert client.xlen(_out_key(session_id)) > 0, \
+        assert client.xlen(_out_key(session_id, session.gen)) > 0, \
             "the owner never published its PTY bytes to the output stream"
         assert fanned, "the owner's own consumer never delivered anything"
 
@@ -439,10 +459,11 @@ def test_concurrent_get_on_a_cold_session_id_yields_one_handle(managers, monkeyp
     # teardown) SIGKILLs a non-owned session's whole process tree, and seeding
     # `shell_pid` with os.getpid() makes the suite kill itself.
     stand_in = subprocess.Popen(["sleep", "120"])
+    gen = tm._new_gen()
     worker_b._meta.update(session_id, name="race", type="terminal", command="",
-                          shell_pid=stand_in.pid, insecure=False,
+                          shell_pid=stand_in.pid, insecure=False, gen=gen,
                           agent_session_id="")
-    tm._set_owner(session_id)
+    tm._set_owner(session_id, tm._new_owner_token())
     assert session_id not in worker_b.sessions
 
     adopts = []
@@ -726,6 +747,57 @@ def test_restart_does_not_replay_the_previous_shells_scrollback(managers):
     asyncio.run(run())
 
 
+def test_a_late_eof_from_the_previous_incarnation_cannot_kill_the_new_one(managers):
+    """The restart race, pinned.
+
+    ``restart()`` reuses the session id and cannot wait for the outgoing
+    owner's ``_out_pump_loop`` to notice its PTY has EOF'd — that pump may be
+    on another worker entirely. Its final two acts are an EOF frame on the
+    output stream and a clear of the owner key, and BOTH used to name only the
+    session id. Arriving late they hit the successor: every worker's output
+    consumer flips ``alive`` False on the EOF frame, and the cleared owner key
+    makes the next ``list_sessions()`` prune a terminal that is running fine —
+    within ``_OWNER_TTL`` of a restart the user did nothing wrong to trigger.
+
+    Reproduced here by replaying exactly those two acts, with the OLD
+    incarnation's generation and token, after a restart has completed.
+    """
+    _require_streams()
+    session_id = _sid()
+    mgr, other = managers(2)
+
+    old = mgr.create(name="incarnation-1", session_id=session_id,
+                     command="sleep 60")
+    old_gen, old_token = old.gen, old.owner_token
+    assert old_gen and old_token
+
+    fresh = mgr.restart(session_id, command="sleep 60")
+    assert fresh is not None
+    assert fresh.gen != old_gen, "a restart must mint a new stream generation"
+    assert fresh.owner_token != old_token, "a restart must mint a new token"
+
+    # Worker B holds a handle on the NEW incarnation, so the EOF frame below
+    # would reach a real consumer if it landed on the right stream.
+    remote = other.get(session_id)
+    assert remote is not None and remote.gen == fresh.gen
+    remote._start_out_consumer()
+
+    # The dying predecessor's last two acts, replayed late.
+    tm._xadd(tm._out_key(session_id, old_gen), tm._F_EOF, b"", tm._OUT_MAXLEN)
+    tm._clear_owner(session_id, old_token)
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        assert fresh.alive, "a stale EOF frame killed the new incarnation"
+        assert remote.alive, "a stale EOF frame killed a remote handle"
+        assert _owner_alive(session_id), \
+            "the predecessor's owner-key clear removed its successor's claim"
+        time.sleep(0.1)
+
+    assert session_id in {s["id"] for s in other.list_sessions()}, \
+        "the new incarnation was pruned after its predecessor's late teardown"
+
+
 # ---------------------------------------------------------------------------
 # 4. Liveness: prune on a conclusive read, NEVER on an inconclusive one
 # ---------------------------------------------------------------------------
@@ -740,7 +812,8 @@ def test_a_session_whose_owner_key_expired_is_pruned(managers):
     _require_streams()
     session_id = _sid()
     worker_a, worker_b = managers(2)
-    worker_a.create(name="orphan", session_id=session_id, command="sleep 60")
+    session = worker_a.create(name="orphan", session_id=session_id,
+                              command="sleep 60")
     assert session_id in {s["id"] for s in worker_b.list_sessions()}
 
     # Exactly what the TTL lapsing looks like to the rest of the fleet.
@@ -749,7 +822,7 @@ def test_a_session_whose_owner_key_expired_is_pruned(managers):
     assert session_id not in {s["id"] for s in worker_b.list_sessions()}, \
         "a session with no live owner is still being listed"
     assert worker_b._meta.get(session_id) == {}
-    assert _get_redis().exists(_out_key(session_id)) == 0, \
+    assert _get_redis().exists(_out_key(session_id, session.gen)) == 0, \
         "the pruned session's output stream leaked"
 
 
@@ -806,6 +879,48 @@ def test_list_sessions_prunes_nothing_when_the_owner_read_fails(managers, caplog
         "meta deleted on an inconclusive read — unrecoverable"
     assert session_id in {s["id"] for s in worker_b.list_sessions()}
     assert worker_b.get(session_id) is not None, "serving broken after recovery"
+
+
+def test_a_stale_owner_snapshot_does_not_prune_a_live_session(managers,
+                                                              monkeypatch):
+    """A CONCLUSIVE owner read can still be out of date, and must not delete.
+
+    ``list_sessions()`` decides what to prune from an ``_owner_map()``
+    snapshot, then scans every meta hash before acting on it — two full
+    ``SCAN``s, seconds apart on a busy Redis. A terminal created inside that
+    window is genuinely live and genuinely absent from the older snapshot, so
+    an unconditional delete destroys the only fleet-wide record of it: it
+    disappears from the SPA's list and no other worker can adopt it again.
+    At ``AW_WORKSPACE_WORKERS=10`` every worker runs this on every
+    ``terminal_update`` broadcast, so the window is open more or less
+    continuously.
+
+    Caught with ``MONITOR`` against the live workspace's Redis on 2026-09-04
+    (a bare ``DEL …:term:meta:<id>`` 1.6s after a healthy create) — this is the
+    same failure as an EMPTY snapshot, which is the strongest form of stale, so
+    that is what the test uses.
+    """
+    _require_streams()
+    session_id = _sid()
+    worker_a, worker_b = managers(2)
+    session = worker_a.create(name="created-mid-scan", session_id=session_id,
+                              command="sleep 60")
+    assert _owner_alive(session_id), "precondition: the session has an owner"
+
+    # Conclusive (not None) and empty — a snapshot taken before this session
+    # existed. Distinct from the inconclusive case above, which is already
+    # covered and prunes nothing by an entirely different route.
+    monkeypatch.setattr(tm, "_owner_map", lambda: {})
+
+    worker_b.list_sessions()
+
+    assert worker_b._meta.get(session_id).get("shell_pid"), \
+        "a live session's meta was deleted from a stale owner snapshot"
+    monkeypatch.undo()
+    assert session_id in {s["id"] for s in worker_b.list_sessions()}, \
+        "the live session stopped being listed after a stale-snapshot pass"
+    assert worker_b.get(session_id) is not None, \
+        "the session became unadoptable after a stale-snapshot pass"
 
 
 # ---------------------------------------------------------------------------

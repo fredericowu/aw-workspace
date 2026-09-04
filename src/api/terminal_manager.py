@@ -10,12 +10,19 @@ per session. The PTY is still forked by, and owned by, exactly ONE worker —
 a master fd cannot cross a process boundary and nothing changes that. What
 changed is how the OTHER workers reach it:
 
-* OUTPUT — ``aw:ws:<slug>:term:out:<session_id>``. The owner ``XADD``s PTY
-  bytes; EVERY worker (the owner included) ``XREAD BLOCK``s the stream and
+* OUTPUT — ``aw:ws:<slug>:term:out:<session_id>:<gen>``. The owner ``XADD``s
+  PTY bytes; EVERY worker (the owner included) ``XREAD BLOCK``s the stream and
   pushes what it reads to its own WebSocket subscribers.
-* INPUT — ``aw:ws:<slug>:term:in:<session_id>``. ANY worker ``XADD``s
+* INPUT — ``aw:ws:<slug>:term:in:<session_id>:<gen>``. ANY worker ``XADD``s
   keystrokes and resize frames; ONLY the owner consumes them and does the
   ``os.write(fd, …)``.
+
+``<gen>`` is a fresh uuid per INCARNATION of a session id, not per id.
+``restart()`` reuses the id deliberately, and the previous incarnation's owner
+— possibly on another worker, possibly still draining its dying PTY — cannot
+be waited for. Without a generation its late ``XADD``s, the EOF frame above
+all, land on the stream the NEW terminal is reading and kill a healthy session
+within ``_OWNER_TTL``. With one they land on keys nobody is listening to.
 
 Streams, not pub/sub, for three reasons in order of weight:
 
@@ -438,19 +445,76 @@ def _release_creation(session_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _set_owner(session_id: str) -> None:
-    """Publish/refresh ``…:term:owner:<id>`` = this worker's pid, EX 30."""
+# CAS'd against the owner's own token, mirroring ``redis_coord``'s
+# ``_RENEW_LUA``/``_RELEASE_LUA`` deliberately so the two stay one pattern.
+# The token carries a per-incarnation uuid and not just the pid, so a restart
+# that re-owns the same session on the SAME worker still cannot have its
+# predecessor's teardown delete the new owner key out from under it.
+_OWNER_RENEW_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('expire', KEYS[1], ARGV[2])
+else
+    return 0
+end
+"""
+
+_OWNER_RELEASE_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+"""
+
+# Prune-time CAS, KEYS = (meta, owner). See ``_prune_session_meta``.
+_PRUNE_META_LUA = """
+if redis.call('exists', KEYS[2]) == 0 then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+"""
+
+
+def _new_owner_token() -> str:
+    """This worker's claim on one incarnation of one session."""
+    return f"{os.getpid()}:{_uuid_mod.uuid4().hex[:8]}"
+
+
+def _set_owner(session_id: str, token: str) -> None:
+    """Publish ``…:term:owner:<id>`` = this incarnation's token, EX 30.
+
+    Plain ``SET``, not ``NX``: ``create()`` has already won
+    ``_claim_creation`` by the time this runs, and a restart deliberately
+    replaces the previous incarnation's owner.
+    """
     client = _get_redis()
     if client is None or not session_id:
         return
     try:
-        client.set(_term_key(_OWNER_SUFFIX, session_id), str(os.getpid()),
-                   ex=_OWNER_TTL)
+        client.set(_term_key(_OWNER_SUFFIX, session_id), token, ex=_OWNER_TTL)
     except Exception as exc:
         logger.warning("_set_owner(%s) failed: %s", session_id, exc)
 
 
-def _clear_owner(session_id: str) -> None:
+def _refresh_owner(session_id: str, token: str) -> None:
+    """Heartbeat: extend the owner key's TTL only while we still hold it.
+
+    Unconditional would be wrong in exactly the case the generation above
+    exists for — a straggler heartbeat from the previous incarnation would
+    keep renewing a key that now names its successor.
+    """
+    client = _get_redis()
+    if client is None or not session_id or not token:
+        return
+    try:
+        client.eval(_OWNER_RENEW_LUA, 1, _term_key(_OWNER_SUFFIX, session_id),
+                    token, _OWNER_TTL)
+    except Exception as exc:
+        logger.warning("_refresh_owner(%s) failed: %s", session_id, exc)
+
+
+def _clear_owner(session_id: str, token: str | None = None) -> None:
     """Drop the owner key immediately, rather than waiting out its TTL.
 
     Called on the paths where we KNOW the session ended (remove, restart, the
@@ -458,14 +522,65 @@ def _clear_owner(session_id: str) -> None:
     listing it at once instead of up to ``_OWNER_TTL`` seconds later. The TTL
     remains the backstop for the paths we don't get to run — a crash, a
     SIGKILL, a host reboot.
+
+    ``token`` makes it a compare-and-delete, and the two callers that pass one
+    are the two that can arrive LATE: a dying incarnation's EOF, and a worker
+    shutting down. Both mean "*my* session ended", which is not the same fact
+    as "this session id has no owner" once ``restart()`` has handed the id to
+    someone else. ``remove()`` and ``restart()`` pass none on purpose — they
+    are ending whatever currently holds the id, deliberately.
     """
     client = _get_redis()
     if client is None or not session_id:
         return
+    key = _term_key(_OWNER_SUFFIX, session_id)
     try:
-        client.delete(_term_key(_OWNER_SUFFIX, session_id))
+        if token:
+            client.eval(_OWNER_RELEASE_LUA, 1, key, token)
+        else:
+            client.delete(key)
     except Exception as exc:
         logger.warning("_clear_owner(%s) failed: %s", session_id, exc)
+
+
+def _prune_session_meta(session_id: str) -> bool:
+    """Delete a session's meta hash, but ONLY if it has no owner key *now*.
+
+    ``list_sessions`` decides what to prune from an ``_owner_map()`` snapshot,
+    and that snapshot is a full ``SCAN`` plus a ``GET`` per key — on a busy
+    Redis it is seconds old by the time the ``_meta.all()`` scan after it has
+    finished too. A terminal created inside that window is present in the meta
+    scan and absent from the older owner snapshot, so an unconditional delete
+    reads a live session as an orphan and destroys the only fleet-wide record
+    of it: it vanishes from the SPA's list and no other worker can ever adopt
+    it again.
+
+    Not theoretical, and not a test artefact — caught on 2026-09-04 with
+    ``MONITOR`` against the live workspace's shared Redis, a bare
+    ``DEL …:term:meta:<id>`` landing 1.6s after a healthy ``create()`` whose
+    owner key was present throughout. At ``AW_WORKSPACE_WORKERS``=10 every
+    worker runs ``list_sessions()`` on every ``terminal_update`` broadcast, so
+    the window is open more or less continuously.
+
+    Re-checking the owner key in the same round trip as the delete closes it:
+    the only thing that can now delete the meta is the absence of an owner at
+    the instant of deletion, which is precisely the condition that was meant.
+
+    Returns True when the meta was actually deleted, so the caller knows
+    whether the streams should go with it.
+    """
+    client = _get_redis()
+    if client is None or not session_id:
+        return False
+    try:
+        return bool(client.eval(
+            _PRUNE_META_LUA, 2,
+            _term_key(_META_SUFFIX, session_id),
+            _term_key(_OWNER_SUFFIX, session_id),
+        ))
+    except Exception as exc:
+        logger.warning("_prune_session_meta(%s) failed: %s", session_id, exc)
+        return False
 
 
 def _owner_alive(session_id: str) -> bool:
@@ -486,8 +601,12 @@ def _owner_alive(session_id: str) -> bool:
         return False
 
 
-def _owner_map() -> dict[str, int] | None:
-    """Every session with a live owner: ``{session_id: owner worker pid}``.
+def _owner_map() -> dict[str, str] | None:
+    """Every session with a live owner: ``{session_id: owner token}``.
+
+    Only the KEYS are load-bearing — every caller asks "is this id in here?".
+    The token is carried for logging and for anyone who later needs to tell
+    two incarnations apart.
 
     ``None`` — not ``{}`` — when the read did not complete. The two are not
     the same fact and callers that prune on this MUST tell them apart: ``{}``
@@ -503,13 +622,13 @@ def _owner_map() -> dict[str, int] | None:
     if client is None:
         return {}
     prefix = _term_key(_OWNER_SUFFIX, "")
-    found: dict[str, int] = {}
+    found: dict[str, str] = {}
     try:
         for key in client.scan_iter(match=f"{prefix}*"):
             value = client.get(key)
             if value is None:
                 continue  # expired between SCAN and GET — conclusively gone
-            found[key[len(prefix):]] = int(value) if str(value).isdigit() else 0
+            found[key[len(prefix):]] = str(value)
     except Exception as exc:
         logger.warning("owner-key scan failed (%s) — terminal liveness is "
                        "unknown for this read", exc)
@@ -552,12 +671,17 @@ def _pid_alive(pid: int | None) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _out_key(session_id: str) -> str:
-    return _term_key(_OUT_SUFFIX, session_id)
+def _new_gen() -> str:
+    """A fresh stream generation — one per INCARNATION of a session id."""
+    return _uuid_mod.uuid4().hex[:8]
 
 
-def _in_key(session_id: str) -> str:
-    return _term_key(_IN_SUFFIX, session_id)
+def _out_key(session_id: str, gen: str) -> str:
+    return _term_key(_OUT_SUFFIX, f"{session_id}:{gen}")
+
+
+def _in_key(session_id: str, gen: str) -> str:
+    return _term_key(_IN_SUFFIX, f"{session_id}:{gen}")
 
 
 def _xadd(key: str, frame: bytes, data: bytes, maxlen: int) -> bool:
@@ -574,30 +698,33 @@ def _xadd(key: str, frame: bytes, data: bytes, maxlen: int) -> bool:
         return False
 
 
-def _delete_streams(session_id: str) -> None:
-    """Drop both streams for a session that has genuinely ended.
+def _delete_streams(session_id: str, gen: str) -> None:
+    """Drop both streams of ONE incarnation that has genuinely ended.
 
     Not optional bookkeeping: a restart re-creates under the SAME id, and a
     surviving output stream would replay the PREVIOUS shell's scrollback into
-    the new one.
+    the new one. A missing ``gen`` means the caller could not resolve which
+    incarnation it is talking about — deleting "the" streams on a guess is how
+    a live terminal loses its scrollback, so do nothing and let
+    ``_STREAM_EOF_TTL`` collect them.
     """
     client = _get_redis_bytes()
-    if client is None or not session_id:
+    if client is None or not session_id or not gen:
         return
     try:
-        client.delete(_out_key(session_id), _in_key(session_id))
+        client.delete(_out_key(session_id, gen), _in_key(session_id, gen))
     except Exception as exc:
         logger.warning("_delete_streams(%s) failed: %s", session_id, exc)
 
 
-def _expire_streams(session_id: str, ttl: int) -> None:
-    """Put a TTL on both of a session's streams (see ``_STREAM_EOF_TTL``)."""
+def _expire_streams(session_id: str, gen: str, ttl: int) -> None:
+    """Put a TTL on both of an incarnation's streams (see ``_STREAM_EOF_TTL``)."""
     client = _get_redis_bytes()
-    if client is None or not session_id:
+    if client is None or not session_id or not gen:
         return
     try:
-        client.expire(_out_key(session_id), ttl)
-        client.expire(_in_key(session_id), ttl)
+        client.expire(_out_key(session_id, gen), ttl)
+        client.expire(_in_key(session_id, gen), ttl)
     except Exception as exc:
         logger.warning("_expire_streams(%s) failed: %s", session_id, exc)
 
@@ -831,9 +958,18 @@ class TerminalSession:
     def __init__(self, session_id: str, fd: int | None, pid: int | None, name: str,
                  session_type: str = "terminal", command: str | None = None,
                  insecure: bool = False, agent_session_id: str | None = None,
-                 shell_pid: int | None = None, is_owner: bool = True):
+                 shell_pid: int | None = None, is_owner: bool = True,
+                 gen: str = "", owner_token: str | None = None):
         self.id = session_id
         self.fd = fd
+        #: Which INCARNATION of ``session_id`` this handle is bound to — the
+        #: suffix on both stream keys. Read from the session's Redis meta on a
+        #: worker that did not create it, so every handle onto one incarnation
+        #: agrees on which pair of streams it means.
+        self.gen = gen
+        #: Set on the owner only: its claim on the owner key, for the CAS'd
+        #: release in ``_clear_owner``.
+        self.owner_token = owner_token
         self.pid = pid
         self.name = name
         self.type = session_type
@@ -932,10 +1068,11 @@ class TerminalSession:
         off the event loop via ``asyncio.to_thread``.
         """
         client = _get_redis_bytes()
-        if client is None:
+        if client is None or not self.gen:
             return
         try:
-            entries = client.xrevrange(_out_key(self.id), count=self._scrollback_max)
+            entries = client.xrevrange(_out_key(self.id, self.gen),
+                                       count=self._scrollback_max)
         except Exception as exc:
             logger.warning("prime_scrollback(%s) failed: %s", self.id, exc)
             return
@@ -966,7 +1103,7 @@ class TerminalSession:
         the owner" is that bug wearing a different hat.
         """
         if streams_enabled():
-            _xadd(_in_key(self.id), _F_INPUT, data, _IN_MAXLEN)
+            _xadd(_in_key(self.id, self.gen), _F_INPUT, data, _IN_MAXLEN)
             return
         self._write_fd(data)
 
@@ -980,7 +1117,8 @@ class TerminalSession:
         sets the geometry for everyone.
         """
         if streams_enabled():
-            _xadd(_in_key(self.id), _F_RESIZE, f"{rows}x{cols}".encode(), _IN_MAXLEN)
+            _xadd(_in_key(self.id, self.gen), _F_RESIZE,
+                  f"{rows}x{cols}".encode(), _IN_MAXLEN)
             return
         self._resize_fd(rows, cols)
 
@@ -1058,12 +1196,16 @@ class TerminalSession:
         # Skip whatever is already on the input stream: this is a fresh shell,
         # and replaying a previous one's keystrokes into it would be worse
         # than losing them.
-        self._in_cursor = _stream_last_id(_in_key(self.id))
+        self._in_cursor = _stream_last_id(_in_key(self.id, self.gen))
         self._spawn(self._out_pump_loop, "out-pump")
         self._spawn(self._in_consumer_loop, "in-consumer")
 
     def _start_out_consumer(self) -> None:
-        if self._out_consumer_started or not streams_enabled():
+        # No generation, no stream to read: the only handles that reach here
+        # gen-less are the ones `create()` already logged as dead (it waited
+        # out its 3s for a winner that never published). Reading `…out:<id>:`
+        # would just mint a junk key nobody writes.
+        if self._out_consumer_started or not streams_enabled() or not self.gen:
             return
         self._out_consumer_started = True
         self._spawn(self._out_consumer_loop, "out-consumer")
@@ -1090,7 +1232,7 @@ class TerminalSession:
         whichever comes first, then split the flush into ``_OUT_CHUNK_MAX``
         entries so the stream's ``MAXLEN ~`` implies a byte bound too.
         """
-        key = _out_key(self.id)
+        key = _out_key(self.id, self.gen)
         while not self._stopping:
             self._out_wake.wait(0.5)
             self._out_wake.clear()
@@ -1112,13 +1254,13 @@ class TerminalSession:
                 # every worker (this one included) — single delivery path, so
                 # the last real bytes are guaranteed to be delivered first.
                 _xadd(key, _F_EOF, b"", _OUT_MAXLEN)
-                _expire_streams(self.id, _STREAM_EOF_TTL)
-                _clear_owner(self.id)
+                _expire_streams(self.id, self.gen, _STREAM_EOF_TTL)
+                _clear_owner(self.id, self.owner_token)
                 return
 
     def _in_consumer_loop(self) -> None:
         """Owner only: drain the input stream into the PTY."""
-        key = _in_key(self.id)
+        key = _in_key(self.id, self.gen)
         while not self._stopping:
             client = _get_redis_bytes()
             if client is None:
@@ -1148,7 +1290,7 @@ class TerminalSession:
 
     def _out_consumer_loop(self) -> None:
         """Every worker: read the output stream and fan out locally."""
-        key = _out_key(self.id)
+        key = _out_key(self.id, self.gen)
         while not self._stopping:
             client = _get_redis_bytes()
             if client is None:
@@ -1354,7 +1496,7 @@ class TerminalManager:
                 continue
             idle_ticks = 0
             for session in owned:
-                _set_owner(session.id)
+                _refresh_owner(session.id, session.owner_token)
 
     # ---- PTY --------------------------------------------------------------
 
@@ -1421,12 +1563,12 @@ class TerminalManager:
             session_type=meta.get("type") or "terminal", command=command,
             insecure=_is_insecure_command(command, meta.get("type") or "terminal"),
             agent_session_id=meta.get("agent_session_id") or None,
-            shell_pid=shell_pid, is_owner=False,
+            shell_pid=shell_pid, is_owner=False, gen=meta.get("gen") or "",
         )
         session.prime_scrollback()
         self.sessions[session_id] = session
-        logger.info("Adopted remote terminal: %s (owner shell pid=%s)",
-                    session_id, shell_pid)
+        logger.info("Adopted remote terminal: %s (owner shell pid=%s, gen=%s)",
+                    session_id, shell_pid, session.gen)
         return session
 
     def _adopt(self, session_id: str, meta: dict) -> TerminalSession | None:
@@ -1438,6 +1580,15 @@ class TerminalManager:
         found" rather than handing back a terminal onto nothing.
         """
         if not _owner_alive(session_id):
+            return None
+        # No generation means no way to know WHICH pair of streams this
+        # session's bytes are on. A handle built on a guess would read an old
+        # incarnation's scrollback and write keystrokes nobody consumes, which
+        # is worse than the "not found" the caller already handles.
+        if streams_enabled() and not (meta.get("gen") or ""):
+            logger.warning("adopt(%s): meta carries no stream generation — "
+                           "refusing to build a handle onto an unknown "
+                           "incarnation", session_id)
             return None
         shell_pid = _meta_int(meta, "shell_pid")
         if shell_pid is not None and not _pid_alive(shell_pid):
@@ -1509,43 +1660,65 @@ class TerminalManager:
         # race `self.sessions` exactly like two get()s would.
         with self._lock_for(session_id):
             if _claim_creation(session_id):
+                # A fresh generation, and the PREVIOUS one's streams dropped
+                # before the new shell can write a byte: this is the id being
+                # reused (restart), and the old incarnation's owner may still
+                # be draining its dying PTY on another worker. Its late frames
+                # now land on keys nobody reads.
+                gen = _new_gen()
+                old_gen = (self._meta.get(session_id) or {}).get("gen") or ""
+                if old_gen and old_gen != gen:
+                    _delete_streams(session_id, old_gen)
+                token = _new_owner_token()
                 master_fd, pid = self._fork_exec(["bash", "-lc", inner], rows, cols)
                 session = TerminalSession(
                     session_id, master_fd, pid, name,
                     session_type=session_type, command=command,
                     insecure=_is_insecure_command(command, session_type),
                     agent_session_id=_extract_agent_session_id(command),
-                    shell_pid=pid, is_owner=True,
+                    shell_pid=pid, is_owner=True, gen=gen, owner_token=token,
                 )
                 self.sessions[session_id] = session
                 # Meta BEFORE the owner key, always: a racing _adopt() gates on
                 # the owner key, so publishing that first would let another
                 # worker read an empty hash and build a handle with no
-                # shell_pid.
+                # shell_pid. The reverse gate — meta present, owner absent,
+                # i.e. exactly this window — is a prune condition elsewhere;
+                # see ``_prune_session_meta`` for why that is safe anyway.
                 self._meta.update(
                     session_id, name=name, type=session_type,
-                    command=command or "", shell_pid=pid,
+                    command=command or "", shell_pid=pid, gen=gen,
                     insecure=session.insecure,
                     agent_session_id=session.agent_session_id or "",
                 )
-                _set_owner(session_id)
+                _set_owner(session_id, token)
                 self._ensure_heartbeat()
                 # Before returning: the input consumer must be up, or the
                 # `initial_prompt` thread below (and the REST /write fallback)
                 # would XADD keystrokes nobody is reading yet.
                 session._start_owner_io()
                 logger.info("Terminal created: %s (%s, type=%s, shell pid=%d, "
-                            "streams=%s)", session_id, name, session_type, pid,
-                            streams_enabled())
+                            "gen=%s, streams=%s)", session_id, name,
+                            session_type, pid, gen, streams_enabled())
             else:
                 # Another worker won the race for this id. Wait for its owner
                 # key rather than forking a second shell — without the wait
                 # this worker would hand back a terminal onto nothing.
                 logger.info("Skipping shell creation for %s — another worker "
                             "is creating it", session_id)
+                meta = {}
                 for _ in range(30):
+                    # BOTH, not just the owner key. The winner publishes meta
+                    # first and the owner key second, so an owner-only gate
+                    # can be satisfied while the hash is still the PREVIOUS
+                    # incarnation's — or absent entirely — and the handle
+                    # built from it lands on another incarnation's streams
+                    # with no shell_pid. That is the "the loser built a handle
+                    # onto a different shell" failure, verbatim.
                     if _owner_alive(session_id):
-                        break
+                        meta = self._meta.get(session_id)
+                        if meta.get("gen") and meta.get("shell_pid"):
+                            break
                     time.sleep(0.1)
                 else:
                     # Returning a handle anyway reads in the SPA as a terminal
@@ -1553,13 +1726,15 @@ class TerminalManager:
                     # silent-degradation shape this workspace's AGENTS.md
                     # warns about. Say so.
                     logger.error(
-                        "create: waited 3s for an owner of %s and none "
-                        "appeared — the worker that claimed it likely died "
-                        "mid-creation. This terminal will be dead; its claim "
-                        "expires in %ds.", session_id, _CREATING_TTL)
-                meta = self._meta.get(session_id) or {
-                    "name": name, "type": session_type, "command": command or "",
-                }
+                        "create: waited 3s for a published owner+meta of %s "
+                        "and none appeared — the worker that claimed it likely "
+                        "died mid-creation. This terminal will be dead; its "
+                        "claim expires in %ds.", session_id, _CREATING_TTL)
+                if not meta:
+                    meta = self._meta.get(session_id) or {
+                        "name": name, "type": session_type,
+                        "command": command or "",
+                    }
                 session = self._remote_session(session_id, meta)
 
         if initial_prompt:
@@ -1641,11 +1816,15 @@ class TerminalManager:
             meta = self._meta.get(session_id) if old is None else {}
             shell_pid = old.shell_pid if old else _meta_int(meta, "shell_pid")
             self._end_session(session_id, old, shell_pid, loop, kill_tree=True)
-            # Both streams go too: the id is about to be reused, and a
-            # surviving output stream would replay the OLD shell's scrollback
-            # into the new one.
+            # The OUTGOING incarnation's streams go too. `create()` below
+            # mints a new generation, so this is belt-and-braces rather than
+            # the thing that keeps the two apart — but leaving them would
+            # strand a full scrollback's worth of entries until their EOF TTL.
+            # Unconditional owner clear: restart is ending whatever holds the
+            # id right now, which is exactly the case the CAS must NOT gate.
             _clear_owner(session_id)
-            _delete_streams(session_id)
+            _delete_streams(session_id,
+                            (old.gen if old else meta.get("gen")) or "")
             _release_creation(session_id)
             old_type = old.type if old else (meta.get("type") or "terminal")
             old_name = name or (old.name if old else (meta.get("name") or session_id))
@@ -1718,7 +1897,8 @@ class TerminalManager:
             shell_pid = session.shell_pid if session else _meta_int(meta, "shell_pid")
             self._end_session(session_id, session, shell_pid, loop, kill_tree=False)
             _clear_owner(session_id)
-            _delete_streams(session_id)
+            _delete_streams(session_id,
+                            (session.gen if session else meta.get("gen")) or "")
             _release_creation(session_id)
             self._meta.delete(session_id)
             if session or shell_pid:
@@ -1793,11 +1973,22 @@ class TerminalManager:
                 continue
             if sid not in owners:
                 if conclusive:
-                    self._meta.delete(sid)
-                    _delete_streams(sid)
-                    continue
-                # Inconclusive: keep listing it from its last known meta
-                # rather than deleting the only record of it.
+                    # Re-checked against the owner key inside the delete, not
+                    # against the `owners` snapshot above: that snapshot is two
+                    # full SCANs old by now, and a terminal created inside that
+                    # window is live but absent from it. See
+                    # ``_prune_session_meta``. The streams follow the meta only
+                    # if the meta actually went.
+                    if _prune_session_meta(sid):
+                        _delete_streams(sid, meta.get("gen") or "")
+                        continue
+                    logger.info(
+                        "Terminal list: %s acquired an owner while this pass "
+                        "was running — keeping it rather than pruning a live "
+                        "session", sid)
+                # Kept: either the read was inconclusive (never delete the only
+                # record of a session on a read that failed), or the session
+                # turned out to be alive after all.
             listed[sid] = {
                 "id": sid,
                 "name": meta.get("name") or sid,
@@ -1833,8 +2024,10 @@ class TerminalManager:
             session.close_streams()
             if session.is_owner:
                 session.kill()
-                _clear_owner(session.id)
-                _delete_streams(session.id)
+                # CAS'd: a shutdown racing a restart that already handed this
+                # id to another worker must retire OUR incarnation, not theirs.
+                _clear_owner(session.id, session.owner_token)
+                _delete_streams(session.id, session.gen)
                 self._meta.delete(session.id)
         self.sessions.clear()
 

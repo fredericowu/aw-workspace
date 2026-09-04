@@ -83,6 +83,20 @@ single-tenant host; they get migrated as the BYOD product needs them.
    degrades to a worker-owned PTY wherever Redis is unreachable rather than
    failing loudly.
 
+   **Two rules that fall out of sharing one keyspace across 10 workers**, both
+   learned the expensive way and both worth copying into any new shared-state
+   route rather than rediscovering:
+   - *Name the incarnation, not just the entity.* Stream keys carry a
+     per-incarnation `gen` (`…:term:out:<id>:<gen>`) and the owner key a
+     per-incarnation token, because `restart()` reuses the session id while the
+     PREVIOUS owner — possibly on another worker — is still shutting down. A
+     teardown that names only the id reaches its own successor.
+   - *A snapshot is not a fact.* Anything that DELETES shared state on the
+     strength of an earlier `SCAN` must re-check the condition inside the
+     delete (see `_prune_session_meta`'s Lua). Between a scan and the delete it
+     informs, 10 workers create and destroy sessions continuously — an
+     unconditional delete there destroys live state, silently.
+
    **The price W7 charges, and it is broader than "on deploy":** a PTY now dies
    with its owning worker — a deploy, a crash, or a worker recycle. A `screen`
    used to survive an app-process restart; **nothing does now.** Every terminal
