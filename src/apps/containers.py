@@ -327,6 +327,8 @@ class ContainerSupervisor:
         self._network = network if network is not None else (os.environ.get("AW_CONTAINER_NETWORK") or None)
         self._proxy_host = os.environ.get("AW_CONTAINER_PROXY_HOST", "127.0.0.1")
         self._client = client  # injectable for tests; else built lazily
+        self._injected_client = client is not None
+        self._pull_client = None  # built lazily, own timeout — see _docker_for_pull
         self._containers: dict[str, _Container] = {}
 
     @property
@@ -334,14 +336,47 @@ class ContainerSupervisor:
         """True when a container engine socket is configured (or a client injected)."""
         return bool(self._socket) or self._client is not None
 
+    def _new_client(self, timeout: int):
+        if not self._socket:
+            raise ContainerError(
+                "no container engine socket configured (set AW_CONTAINER_SOCKET)")
+        import docker  # lazy — slim image only imports it for Tier-2 apps
+        return docker.DockerClient(base_url="unix://" + self._socket, timeout=timeout)
+
     def _docker(self):
+        """The shared client, capped for the short calls — status, get, stop.
+
+        docker-py defaults to 60s PER request and never times out at all if the
+        socket accepts but never answers; a status read is two of those
+        (``containers.get()`` + ``reload()``) per registered container, so one
+        unresponsive podman socket scaled straight to minutes of stall for
+        whoever was waiting on a snapshot. That is what made a ``/ws/status``
+        handshake hang with no close and no error (2026-09-04). The cap turns
+        it into a failure the caller can report; keeping it off the event loop
+        is still the caller's job.
+        """
         if self._client is None:
-            if not self._socket:
-                raise ContainerError(
-                    "no container engine socket configured (set AW_CONTAINER_SOCKET)")
-            import docker  # lazy — slim image only imports it for Tier-2 apps
-            self._client = docker.DockerClient(base_url="unix://" + self._socket)
+            self._client = self._new_client(
+                int(os.environ.get("AW_CONTAINER_CLIENT_TIMEOUT", "10")))
         return self._client
+
+    def _docker_for_pull(self):
+        """A second client, for ``images.pull`` only.
+
+        A pull legitimately runs for minutes, so the short cap above does not
+        apply to it — and it must not, because ``start`` deliberately swallows
+        a failed pull and falls back to the cached image: a timeout there would
+        not surface as an error, it would silently start the app from the stale
+        image the pull exists to replace. Its own client rather than widening
+        the shared one's timeout, so a status read concurrent with a pull keeps
+        the short cap.
+        """
+        if self._injected_client:
+            return self._client
+        if self._pull_client is None:
+            self._pull_client = self._new_client(
+                int(os.environ.get("AW_CONTAINER_PULL_TIMEOUT", "900")))
+        return self._pull_client
 
     def docker(self):
         """Return the underlying Docker-compatible client for read-only helpers."""
@@ -470,7 +505,7 @@ class ContainerSupervisor:
         # than-broken fallback (see ``src.apps.catalog.get_catalog``).
         try:
             log.info("apps: pulling image %s for %s", c.image, c.name)
-            client.images.pull(c.image, auth_config=_registry_auth(c.image))
+            self._docker_for_pull().images.pull(c.image, auth_config=_registry_auth(c.image))
         except Exception:  # noqa: BLE001 — registry unreachable, fall back to cache
             try:
                 client.images.get(c.image)

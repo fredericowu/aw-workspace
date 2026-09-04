@@ -342,7 +342,7 @@ class TerminalRoutes:
         # (incl. Starlette's TestClient) never surface as a disconnect. Accept
         # first, then close with a code — no PTY is spawned and no input is
         # read, so nothing is exposed.
-        claims = authorize_ws(websocket)
+        claims = await authorize_ws(websocket)
         if not claims:
             await websocket.accept()
             await websocket.close(code=4401, reason="unauthorized")
@@ -418,7 +418,7 @@ class TerminalRoutes:
         broadcasts. Send-nothing from the client (pure server push), matching
         the monolith's ``/ws/status`` shape for the terminal-relevant subset.
         """
-        claims = authorize_ws(websocket)
+        claims = await authorize_ws(websocket)
         if not claims:
             await websocket.accept()
             await websocket.close(code=4401, reason="unauthorized")
@@ -428,7 +428,7 @@ class TerminalRoutes:
         try:
             await websocket.send_text(json.dumps({
                 "type": "init",
-                "components": component_snapshot(self.app),
+                "components": await asyncio.to_thread(component_snapshot, self.app),
                 "terminals": await asyncio.to_thread(self.mgr.list_sessions),
             }))
             while True:

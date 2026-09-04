@@ -125,7 +125,7 @@ async def require_identity(request: Request, authorization: str = Header(default
     return claims
 
 
-def authorize_ws(websocket: WebSocket) -> dict | None:
+async def authorize_ws(websocket: WebSocket) -> dict | None:
     """Verify a WebSocket handshake, returning claims or None.
 
     Checked in order: the workspace-wide ``X-Api-Key`` header (mirrors
@@ -139,10 +139,20 @@ def authorize_ws(websocket: WebSocket) -> dict | None:
     on, since it can't set custom headers). Returns the verified claims
     dict, or ``None`` if nothing valid is present — the caller closes the
     socket. Never raises.
+
+    ``async def`` for the same reason ``require_identity`` above is: both of
+    the checks below block. ``_workspace_api_key_authorized`` reads the stored
+    key out of Postgres through the synchronous ``src.api.db.get_session``, and
+    ``decode_identity_jwt`` can, on a worker's first authenticated request,
+    fall through to ``_fetch_public_key_pem``'s synchronous ``httpx.get``
+    (3 retries x 10s ≈ 31.5s worst case) when ``AW_AUTH_PUBLIC_KEY`` is unset.
+    Run inline, either one freezes that worker's ONE loop thread and every
+    other in-flight request with it — the HTTP sibling was fixed for exactly
+    this, the WS path was not.
     """
-    if _workspace_api_key_authorized(websocket):
+    if await asyncio.to_thread(_workspace_api_key_authorized, websocket):
         return {"sub": "workspace-api-key", "api_key": True}
     token = websocket.query_params.get("token") or websocket.cookies.get(COOKIE_NAME, "")
     if not token:
         return None
-    return decode_identity_jwt(token)
+    return await asyncio.to_thread(decode_identity_jwt, token)

@@ -238,7 +238,7 @@ class NotificationRoutes:
 
     async def notification_stream(self, websocket: WebSocket):
         """WebSocket — sends pending notifications on connect, then live updates."""
-        claims = authorize_ws(websocket)
+        claims = await authorize_ws(websocket)
         if not claims:
             await websocket.accept()
             await websocket.close(code=4401, reason="unauthorized")

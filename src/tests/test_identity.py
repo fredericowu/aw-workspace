@@ -190,14 +190,14 @@ class TestAuthorizeWs:
         _private_pem, public_pem = _pem_pair()
         monkeypatch.setenv("AW_AUTH_PUBLIC_KEY", public_pem)
 
-        assert identity_mod.authorize_ws(_fake_websocket()) is None
+        assert asyncio.run(identity_mod.authorize_ws(_fake_websocket())) is None
 
     def test_query_token_is_accepted(self, monkeypatch):
         private_pem, public_pem = _pem_pair()
         monkeypatch.setenv("AW_AUTH_PUBLIC_KEY", public_pem)
         token = _sign(private_pem)
 
-        claims = identity_mod.authorize_ws(_fake_websocket(query_token=token))
+        claims = asyncio.run(identity_mod.authorize_ws(_fake_websocket(query_token=token)))
         assert claims["sub"] == "1"
 
     def test_cookie_token_is_accepted(self, monkeypatch):
@@ -205,7 +205,7 @@ class TestAuthorizeWs:
         monkeypatch.setenv("AW_AUTH_PUBLIC_KEY", public_pem)
         token = _sign(private_pem)
 
-        claims = identity_mod.authorize_ws(_fake_websocket(token))
+        claims = asyncio.run(identity_mod.authorize_ws(_fake_websocket(token)))
         assert claims["sub"] == "1"
 
 
@@ -223,11 +223,11 @@ class TestAuthorizeWsWithWorkspaceApiKey:
         monkeypatch.setattr(api_key_mod, "verify_workspace_api_key", lambda presented: presented == "good-key")
 
         ws = _fake_websocket(extra_headers={api_key_mod.HEADER_NAME: "good-key"})
-        assert identity_mod.authorize_ws(ws) == {"sub": "workspace-api-key", "api_key": True}
+        assert asyncio.run(identity_mod.authorize_ws(ws)) == {"sub": "workspace-api-key", "api_key": True}
 
     def test_invalid_api_key_falls_through_to_none(self, monkeypatch):
         import src.api.workspace_api_key as api_key_mod
         monkeypatch.setattr(api_key_mod, "verify_workspace_api_key", lambda presented: presented == "good-key")
 
         ws = _fake_websocket(extra_headers={api_key_mod.HEADER_NAME: "wrong-key"})
-        assert identity_mod.authorize_ws(ws) is None
+        assert asyncio.run(identity_mod.authorize_ws(ws)) is None

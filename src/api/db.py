@@ -51,6 +51,17 @@ def get_workspace_schema() -> str:
 
 _engine: Engine | None = None
 
+# Server-side upper bounds on how long any ONE statement this process issues
+# may run, and how long it may sit waiting for a lock. Not a fix for anything
+# — every caller still has to keep its blocking session off the event loop
+# (see get_session) — but without them a query wedged behind a lock or a
+# saturated server has no bound at all, which is what turns "slow" into the
+# indefinite hang reported on 2026-09-04. 30s is well past any request-path
+# query this workspace issues and well short of a user waiting forever.
+# The boot-path DDL in create_all_tables opts out of both; see there.
+_STATEMENT_TIMEOUT_MS = int(os.environ.get("AW_WORKSPACE_DB_STATEMENT_TIMEOUT_MS", "30000"))
+_LOCK_TIMEOUT_MS = int(os.environ.get("AW_WORKSPACE_DB_LOCK_TIMEOUT_MS", "10000"))
+
 
 def get_engine() -> Engine:
     """Shared Engine, scoped to this process's workspace schema.
@@ -67,6 +78,12 @@ def get_engine() -> Engine:
             pool_pre_ping=True,
             pool_size=pool_size,
             max_overflow=pool_size * 2,
+            connect_args={
+                "options": (
+                    f"-c statement_timeout={_STATEMENT_TIMEOUT_MS} "
+                    f"-c lock_timeout={_LOCK_TIMEOUT_MS}"
+                ),
+            },
         )
         _engine = engine.execution_options(
             schema_translate_map={None: get_workspace_schema()}
@@ -114,20 +131,35 @@ def create_all_tables() -> None:
     unlock_expr = text("SELECT pg_advisory_unlock(hashtext(:schema)::bigint)")
 
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        conn.execute(lock_expr, {"schema": schema})
+        # This connection is the one legitimate exception to the engine-wide
+        # caps (see ``_STATEMENT_TIMEOUT_MS``). The advisory lock below is
+        # *designed* to block — at ``AW_WORKSPACE_WORKERS>1`` every worker
+        # queues on it at the same instant — and ``create_all`` takes an
+        # ACCESS EXCLUSIVE catalog lock per table. Capping either would turn a
+        # slow boot into a crash loop, which is strictly worse than the
+        # unbounded request-path wait the caps exist to bound. Restored before
+        # the connection goes back to the pool, since neither SQLAlchemy's
+        # rollback-on-return nor the ``with`` resets a session GUC.
+        conn.execute(text("SET statement_timeout = 0"))
+        conn.execute(text("SET lock_timeout = 0"))
         try:
-            if os.environ.get("AW_WORKSPACE_DB_URL"):
-                # BYOD host — the runtime owns its local DB, so provision the schema.
-                conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
-                _log.info("db: ensured BYOD schema %s exists", schema)
+            conn.execute(lock_expr, {"schema": schema})
+            try:
+                if os.environ.get("AW_WORKSPACE_DB_URL"):
+                    # BYOD host — the runtime owns its local DB, so provision the schema.
+                    conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+                    _log.info("db: ensured BYOD schema %s exists", schema)
 
-            SQLModel.metadata.create_all(conn, checkfirst=True)
-            conn.execute(text(
-                f'ALTER TABLE "{schema}".app_installs '
-                'ADD COLUMN IF NOT EXISTS signed BOOLEAN NOT NULL DEFAULT FALSE'
-            ))
+                SQLModel.metadata.create_all(conn, checkfirst=True)
+                conn.execute(text(
+                    f'ALTER TABLE "{schema}".app_installs '
+                    'ADD COLUMN IF NOT EXISTS signed BOOLEAN NOT NULL DEFAULT FALSE'
+                ))
+            finally:
+                conn.execute(unlock_expr, {"schema": schema})
         finally:
-            conn.execute(unlock_expr, {"schema": schema})
+            conn.execute(text(f"SET statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+            conn.execute(text(f"SET lock_timeout = {_LOCK_TIMEOUT_MS}"))
     _log.info("db: schema %s up to date", schema)
 
 

@@ -85,7 +85,19 @@ def _service_snapshot(app: FastAPI) -> list[dict]:
 
 def component_snapshot(app: FastAPI) -> list[dict]:
     """Return Tier-2 app containers + Tier-1 managed services in the legacy
-    frontend component shape."""
+    frontend component shape.
+
+    **Blocking — never call this directly inside an ``async def``.** The loop
+    below runs ``rt.containers.status(app_id)`` once per registered Tier-2
+    container, and each of those is two serial round-trips to the podman
+    socket (``containers.get()`` + ``reload()``). With dozens of apps
+    installed that is seconds to minutes of a worker's ONE loop thread, which
+    freezes every other in-flight request — including a ``/ws/status``
+    handshake that never gets far enough to be accepted or closed (found live
+    2026-09-04). ``src/apps/containers.py`` caps a single stuck socket call,
+    but the only thing that keeps the loop turning is the thread hop: every
+    call site does ``await asyncio.to_thread(component_snapshot, app)``.
+    """
     rt = _runtime(app)
     if rt is None:
         return []
@@ -121,6 +133,9 @@ def component_snapshot(app: FastAPI) -> list[dict]:
 
 
 def _component_for(app: FastAPI, key: str) -> tuple[str, dict] | tuple[None, JSONResponse]:
+    """Blocking — it goes through ``component_snapshot``. Every caller is an
+    ``async def``, so all of them thread it in one hop rather than threading
+    inside; see ``component_snapshot``'s own note."""
     rt = _runtime(app)
     if rt is None:
         return None, JSONResponse({"error": f"Unknown component: {key}"}, status_code=404)
@@ -149,10 +164,10 @@ class ComponentRoutes:
         app.websocket("/ws/logs/{key:path}")(self.log_stream)
 
     async def list_components(self, identity: dict = Depends(require_identity)):
-        return component_snapshot(self.app)
+        return await asyncio.to_thread(component_snapshot, self.app)
 
     async def get_status(self, key: str, identity: dict = Depends(require_identity)):
-        app_id, row = _component_for(self.app, key)
+        app_id, row = await asyncio.to_thread(_component_for, self.app, key)
         if app_id is None:
             return row
         return row
@@ -184,7 +199,7 @@ class ComponentRoutes:
         return await self._mutate(key, "restarted", restart)
 
     async def _mutate(self, key: str, action: str, fn):
-        app_id, row = _component_for(self.app, key)
+        app_id, row = await asyncio.to_thread(_component_for, self.app, key)
         if app_id is None:
             return row
         rt = _runtime(self.app)
@@ -195,7 +210,8 @@ class ComponentRoutes:
         except ContainerError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
 
-        updated = next((c for c in component_snapshot(self.app) if c["component"] == app_id), row)
+        rows = await asyncio.to_thread(component_snapshot, self.app)
+        updated = next((c for c in rows if c["component"] == app_id), row)
         payload = {"key": updated["key"], "action": action, **updated, "result": result}
         hub = getattr(self.app.state, "status_hub", None)
         if hub is not None:
@@ -203,7 +219,7 @@ class ComponentRoutes:
         return payload
 
     async def _mutate_service(self, key: str, action: str, fn):
-        _, row = _component_for(self.app, key)
+        _, row = await asyncio.to_thread(_component_for, self.app, key)
         if row is None:
             return JSONResponse({"error": f"Unknown component: {key}"}, status_code=404)
         parts = key.split(":", 2)
@@ -226,12 +242,12 @@ class ComponentRoutes:
         return payload
 
     async def log_stream(self, websocket: WebSocket, key: str):
-        claims = authorize_ws(websocket)
+        claims = await authorize_ws(websocket)
         if not claims:
             await websocket.accept()
             await websocket.close(code=4401, reason="unauthorized")
             return
-        app_id, row = _component_for(self.app, key)
+        app_id, row = await asyncio.to_thread(_component_for, self.app, key)
         if app_id is None:
             await websocket.accept()
             await websocket.close(code=4004, reason="Component not found")

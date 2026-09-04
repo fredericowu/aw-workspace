@@ -1107,7 +1107,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         message for every subsequent status transition (installing → installed
         | failed). ``AppsMarketplace.jsx`` falls back to polling
         ``GET /api/apps/{slug}/install-status`` if this connection drops."""
-        claims = authorize_ws(websocket)
+        claims = await authorize_ws(websocket)
         if not claims:
             await websocket.accept()
             await websocket.close(code=4401, reason="unauthorized")
