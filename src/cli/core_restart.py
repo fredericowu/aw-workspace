@@ -59,6 +59,15 @@ PREFLIGHT_TIMEOUT_S = 15.0
 DEFAULT_WAIT_DEADLINE_S = 180.0
 POLL_INTERVAL_S = 3.0
 
+# Once boot_id has changed but git_head doesn't match yet, keep polling this
+# many more POLL_INTERVAL_S ticks before treating it as a genuinely wrong
+# deploy — a live restart has been observed to report a stale git_head on
+# the very first post-restart poll and settle to the correct one on the
+# next (see Kanban card 3d15bf3b-9510-81c0-ac61-f5b15ac11b90). Not a second
+# timeout: just extra iterations of the same loop, still bounded by the
+# overall --timeout deadline below.
+HEAD_MISMATCH_GRACE_POLLS = 3
+
 
 def _receipts_dir() -> str:
     d = os.path.join(workspace_root(), ".tmp", "core-restart")
@@ -276,9 +285,16 @@ def _wait_for_restart(expected_head: str, boot_id_before: str, deadline_s: float
     """Poll ``/api/health`` until ``boot_id`` changes and ``git_head``
     matches. Disposable: all durable state is the receipt plus
     ``/api/health`` itself, so killing this loop loses nothing but the exit
-    code. Three distinguishable outcomes, three distinct exit codes."""
+    code. Three distinguishable outcomes, three distinct exit codes.
+
+    A ``git_head`` mismatch right after ``boot_id`` changes is tolerated for
+    ``HEAD_MISMATCH_GRACE_POLLS`` more ticks before it's treated as final —
+    see that constant's docstring for why a single mismatched poll isn't
+    trustworthy on its own.
+    """
     deadline = time.monotonic() + deadline_s
     last_health: dict = {}
+    mismatch_polls_remaining: int | None = None
     while time.monotonic() < deadline:
         last_health = _poll_health()
         new_boot_id = last_health.get("boot_id", "")
@@ -287,10 +303,21 @@ def _wait_for_restart(expected_head: str, boot_id_before: str, deadline_s: float
                 print(f"restart core: succeeded — boot_id {boot_id_before!r} -> "
                       f"{new_boot_id!r}, git_head {expected_head!r}")
                 return 0
-            print(f"restart core: came back on the WRONG code — expected "
-                  f"git_head {expected_head!r}, got {last_health.get('git_head')!r}")
-            return 2
+            if mismatch_polls_remaining is None:
+                mismatch_polls_remaining = HEAD_MISMATCH_GRACE_POLLS
+                print(f"restart core: boot_id changed but git_head is "
+                      f"{last_health.get('git_head')!r}, expected {expected_head!r} — "
+                      f"tolerating a transient mismatch, rechecking...")
+            if mismatch_polls_remaining <= 0:
+                print(f"restart core: came back on the WRONG code — expected "
+                      f"git_head {expected_head!r}, got {last_health.get('git_head')!r}")
+                return 2
+            mismatch_polls_remaining -= 1
         time.sleep(POLL_INTERVAL_S)
+    if mismatch_polls_remaining is not None:
+        print(f"restart core: came back on the WRONG code — expected "
+              f"git_head {expected_head!r}, got {last_health.get('git_head')!r}")
+        return 2
     print(f"restart core: the restart never happened — boot_id is still "
           f"{boot_id_before!r} after {deadline_s:.0f}s")
     return 1

@@ -81,6 +81,25 @@ def test_wait_reports_wrong_code_when_head_mismatches(monkeypatch):
     assert rc == 2
 
 
+def test_wait_tolerates_a_transient_head_mismatch_that_self_corrects(monkeypatch):
+    _health_sequence(monkeypatch, [
+        {"boot_id": "after", "git_head": "stale-sha"},
+        {"boot_id": "after", "git_head": "expected-sha"},
+    ])
+
+    rc = core_restart._wait_for_restart("expected-sha", "before", deadline_s=5)
+    assert rc == 0
+
+
+def test_wait_reports_wrong_code_when_head_never_converges_within_grace(monkeypatch):
+    _health_sequence(monkeypatch, [
+        {"boot_id": "after", "git_head": "some-other-sha"},
+    ])  # repeats forever — never self-corrects
+
+    rc = core_restart._wait_for_restart("expected-sha", "before", deadline_s=5)
+    assert rc == 2
+
+
 def test_wait_reports_never_happened_at_deadline(monkeypatch):
     _health_sequence(monkeypatch, [
         {"boot_id": "before", "git_head": "old"},
