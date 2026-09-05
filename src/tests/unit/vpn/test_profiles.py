@@ -410,3 +410,112 @@ def test_nord_import_rejects_a_traversing_hostname(mgr):
 def test_nord_import_rejects_an_unknown_protocol(mgr):
     with pytest.raises(VpnProfileError):
         mgr.nord_import("pt121.nordvpn.com", "sctp")
+
+
+# --- wireguard_dial_fields ----------------------------------------------------
+#
+# The only function that returns real key material. What matters here is not
+# the happy path alone: a hand-dropped file that never went through
+# save_config's validation (list_configs reconciles disk files without
+# validating them) must still be refused, not dialed.
+
+WG_FULL = """
+[Interface]
+PrivateKey = aGVsbG8gd29ybGQgdGhpcyBpcyBub3QgYSBrZXk9
+Address = 10.5.0.2/32, fd00::2/128
+DNS = 10.5.0.1, 1.1.1.1
+MTU = 1420
+
+[Peer]
+PublicKey = cHVibGljIGtleSB0aGF0IGlzIG5vdCByZWFsIGE9
+PresharedKey = cHJlc2hhcmVkIGtleSBub3QgcmVhbCE9
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = vpn.example.com:51820
+PersistentKeepalive = 25
+""".strip()
+
+
+def test_wireguard_dial_fields_happy_path(mgr):
+    mgr.save_config("wg0", "wireguard", WG_FULL)
+
+    fields = mgr.wireguard_dial_fields("wg0")
+
+    assert fields == {
+        "type": "wireguard",
+        "iface": "wg0",
+        "private_key": "aGVsbG8gd29ybGQgdGhpcyBpcyBub3QgYSBrZXk9",
+        "address": ["10.5.0.2/32", "fd00::2/128"],
+        "dns": ["10.5.0.1", "1.1.1.1"],
+        "mtu": 1420,
+        "peer": {
+            "public_key": "cHVibGljIGtleSB0aGF0IGlzIG5vdCByZWFsIGE9",
+            "preshared_key": "cHJlc2hhcmVkIGtleSBub3QgcmVhbCE9",
+            "endpoint": "vpn.example.com:51820",
+            "allowed_ips": ["0.0.0.0/0", "::/0"],
+            "persistent_keepalive": 25,
+        },
+    }
+
+
+def test_wireguard_dial_fields_unknown_profile(mgr):
+    with pytest.raises(VpnProfileNotFound):
+        mgr.wireguard_dial_fields("nope")
+
+
+def test_wireguard_dial_fields_refuses_an_openvpn_profile(mgr):
+    mgr.save_config("nord1", "openvpn", OVPN_OK)
+
+    with pytest.raises(VpnProfileError, match="openvpn"):
+        mgr.wireguard_dial_fields("nord1")
+
+
+@pytest.mark.parametrize("directive", ["PostUp", "PostDown", "PreUp", "PreDown",
+                                       "Table", "FwMark"])
+def test_wireguard_dial_fields_refuses_a_forbidden_directive_even_off_disk(mgr, directive):
+    """save_config would have refused this profile outright — but a file
+    dropped directly into vpn_dir() (a workspace terminal can write there)
+    skips that validation, and list_configs reconciles it in regardless. The
+    dialer must not trust that a stored profile was ever actually validated.
+    """
+    content = WG_FULL.replace(
+        "MTU = 1420", f"MTU = 1420\n{directive} = /bin/sh -c 'id > /tmp/pwned'"
+    )
+    with open(os.path.join(mod.vpn_dir(), "hand-dropped.conf"), "w", encoding="utf-8") as f:
+        f.write(content)
+    mgr.list_configs()  # reconciles the on-disk file into the index
+
+    with pytest.raises(VpnRejectedError) as exc:
+        mgr.wireguard_dial_fields("hand-dropped")
+    assert exc.value.directive == directive
+
+
+def test_wireguard_dial_fields_rejects_a_second_peer(mgr):
+    two_peers = WG_FULL + "\n\n[Peer]\nPublicKey = c2Vjb25kIHBlZXIga2V5IQ==\n"
+    mgr.save_config("wg0", "wireguard", two_peers)
+
+    with pytest.raises(VpnProfileError, match="single-peer"):
+        mgr.wireguard_dial_fields("wg0")
+
+
+def test_wireguard_dial_fields_requires_a_private_key(mgr):
+    no_key = WG_FULL.replace(
+        "PrivateKey = aGVsbG8gd29ybGQgdGhpcyBpcyBub3QgYSBrZXk9\n", ""
+    )
+    with open(os.path.join(mod.vpn_dir(), "wg0.conf"), "w", encoding="utf-8") as f:
+        f.write(no_key)
+    mgr.list_configs()
+
+    with pytest.raises(VpnProfileError, match="PrivateKey"):
+        mgr.wireguard_dial_fields("wg0")
+
+
+def test_wireguard_dial_fields_rejects_a_name_too_long_for_an_interface(mgr):
+    """A disk-reconciled profile skips save_config's own WG_IFACE_MAX check —
+    the dialer must not hand a >15-char name to ``--iface`` regardless."""
+    long_name = "a" * (mod.WG_IFACE_MAX + 1)
+    with open(os.path.join(mod.vpn_dir(), f"{long_name}.conf"), "w", encoding="utf-8") as f:
+        f.write(WG_FULL)
+    mgr.list_configs()
+
+    with pytest.raises(VpnProfileError, match="interface"):
+        mgr.wireguard_dial_fields(long_name)

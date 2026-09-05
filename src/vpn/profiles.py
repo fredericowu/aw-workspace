@@ -169,16 +169,27 @@ def _strip_comment(line: str) -> str:
     return line.strip()
 
 
-def _validate_wireguard(content: str) -> dict:
-    """Parse a WireGuard config, refuse the dangerous keys, return metadata."""
-    endpoint = None
-    seen_section = False
+def _iter_wg_kv(content: str):
+    """Shared WireGuard line parser: yields ``(lineno, section, key, value)``
+    for every ``Key = Value`` line, comment-stripped, with the current
+    ``[section]`` header (lowercased, no brackets) tracked alongside it.
+    Raises ``VpnRejectedError`` the moment a forbidden key appears and
+    ``VpnProfileError`` if the file never had a section header at all.
+
+    Both ``_validate_wireguard`` and ``_parse_wireguard_fields`` (the field
+    extraction dial fields go through) walk this exact sequence — a second,
+    hand-rolled parser is how the two drift and a directive gets refused by
+    one and accepted by the other.
+    """
+    section: str | None = None
+    any_section = False
     for lineno, raw in enumerate(content.splitlines(), start=1):
         line = _strip_comment(raw)
         if not line:
             continue
         if line.startswith("["):
-            seen_section = True
+            section = line.strip("[]").strip().lower()
+            any_section = True
             continue
         if "=" not in line:
             raise VpnProfileError(
@@ -196,13 +207,91 @@ def _validate_wireguard(content: str) -> dict:
                 f"this workspace would set up. Remove the line and re-submit — "
                 f"it is not stripped for you, and nothing was saved.",
             )
-        if key.lower() == "endpoint" and not endpoint:
-            endpoint = value
-    if not seen_section:
+        yield lineno, section, key, value
+    if not any_section:
         raise VpnProfileError(
             "not a WireGuard config: no [Interface] section found"
         )
+
+
+def _validate_wireguard(content: str) -> dict:
+    """Parse a WireGuard config, refuse the dangerous keys, return metadata."""
+    endpoint = None
+    for _lineno, _section, key, value in _iter_wg_kv(content):
+        if key.lower() == "endpoint" and not endpoint:
+            endpoint = value
     return {"endpoint": endpoint}
+
+
+def _parse_int(value: str, field: str, lineno: int) -> int:
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise VpnProfileError(f"line {lineno}: {field} must be an integer ({value!r})") from exc
+
+
+def _parse_wireguard_fields(content: str) -> dict:
+    """Structured dial fields for a STORED WireGuard profile — the only
+    parser here that returns key material. Walks the same ``_iter_wg_kv``
+    sequence ``_validate_wireguard`` does, forbidden-key rejection included,
+    so a hand-dropped file that skipped ``save_config``'s validation
+    (``list_configs`` reconciles disk files without validating them) is
+    still refused here rather than handed to the dialer.
+
+    Single-peer only, matching ``validate()``'s own model of a client
+    profile: a second ``PublicKey`` line raises rather than silently
+    merging two peers' fields together.
+    """
+    address: list[str] = []
+    dns: list[str] = []
+    mtu: int | None = None
+    private_key: str | None = None
+    peer: dict | None = None
+
+    for lineno, section, key, value in _iter_wg_kv(content):
+        lkey = key.lower()
+        if section == "interface":
+            if lkey == "privatekey":
+                private_key = value
+            elif lkey == "address":
+                address.extend(p.strip() for p in value.split(",") if p.strip())
+            elif lkey == "dns":
+                dns.extend(p.strip() for p in value.split(",") if p.strip())
+            elif lkey == "mtu":
+                mtu = _parse_int(value, "MTU", lineno)
+        elif section == "peer":
+            if peer is None:
+                peer = {"public_key": None, "preshared_key": None, "endpoint": None,
+                        "allowed_ips": [], "persistent_keepalive": None}
+            if lkey == "publickey":
+                if peer["public_key"] is not None:
+                    raise VpnProfileError(
+                        f"line {lineno}: a second [Peer] section was found — "
+                        f"the dialer only supports a single-peer client profile"
+                    )
+                peer["public_key"] = value
+            elif lkey == "presharedkey":
+                peer["preshared_key"] = value
+            elif lkey == "endpoint":
+                peer["endpoint"] = value
+            elif lkey == "allowedips":
+                peer["allowed_ips"].extend(p.strip() for p in value.split(",") if p.strip())
+            elif lkey == "persistentkeepalive":
+                peer["persistent_keepalive"] = _parse_int(value, "PersistentKeepalive", lineno)
+
+    if not private_key:
+        raise VpnProfileError("stored WireGuard profile has no PrivateKey")
+    if peer is None or not peer.get("public_key"):
+        raise VpnProfileError("stored WireGuard profile has no [Peer] section with a PublicKey")
+
+    return {
+        "type": "wireguard",
+        "private_key": private_key,
+        "address": address,
+        "dns": dns,
+        "mtu": mtu,
+        "peer": peer,
+    }
 
 
 def _validate_openvpn(content: str) -> dict:
@@ -449,6 +538,44 @@ class VpnProfiles:
             self._save_state(state)
             log.info("vpn: stored profile %s (%s, %s)", name, ctype, source)
             return {"name": name, **meta}
+
+    def wireguard_dial_fields(self, name: str) -> dict:
+        """Structured WireGuard fields, straight off the stored (unredacted)
+        profile — the ONLY function in this module that returns real key
+        material. ``src/vpn/dialer.py`` is the one caller, and it writes the
+        result straight to a 0600 file it hands the host CLI by path; nothing
+        here is safe to put in an HTTP response.
+
+        ``iface`` is the profile name itself — ``save_config`` already caps a
+        wireguard profile's name at ``WG_IFACE_MAX`` for exactly this reason,
+        but a profile reconciled off disk (``list_configs`` does not validate
+        those) may not have gone through that check, so it is re-asserted here.
+        """
+        with self._locked():
+            meta = self._load_state()["configs"].get(name)
+            if not meta:
+                raise VpnProfileNotFound(f"no profile named {name!r}")
+            if meta["type"] != "wireguard":
+                raise VpnProfileError(
+                    f"profile {name!r} is a {meta['type']} profile — the dialer "
+                    f"only supports WireGuard/NordLynx today, not OpenVPN"
+                )
+            if len(name) > WG_IFACE_MAX:
+                raise VpnProfileError(
+                    f"profile name {name!r} is longer than the Linux interface "
+                    f"limit ({WG_IFACE_MAX} chars) — cannot use it as a "
+                    f"WireGuard interface name"
+                )
+            path = self._profile_path(name, meta["type"])
+            try:
+                with open(path, encoding="utf-8") as f:
+                    content = f.read()
+            except FileNotFoundError as exc:
+                raise VpnProfileNotFound(f"no profile named {name!r}") from exc
+
+        fields = _parse_wireguard_fields(content)
+        fields["iface"] = name
+        return fields
 
     def delete_config(self, name: str) -> None:
         with self._locked():

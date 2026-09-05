@@ -1,12 +1,21 @@
-"""``/api/vpn*`` — VPN profile manager on the WORKSPACE plane (phase 1).
+"""``/api/vpn*`` — VPN profile manager (phase 1) plus the dialer (phase 2),
+both on the WORKSPACE plane.
 
 Backs Settings NEW › General › VPNs. Upload, list, inspect, edit and delete VPN
-config profiles, plus NordVPN credential storage and server lookup/import.
-**Nothing dials.** There is no start, no stop, no ``wg-quick``, no ``openvpn``,
-no iptables and no poller — see ``src/vpn/profiles.py``'s docstring and
-``docs/architecture/vpn-profiles-in-general.md`` §2.3 for what stayed behind in
-``aw-backend``'s copy and why. ``GET /api/vpn/status`` says so honestly rather
-than fabricating an up/down.
+config profiles, plus NordVPN credential storage and server lookup/import —
+none of that dials anything, still true. ``POST /api/vpn/connect`` and
+``/disconnect`` do dial, but not from THIS process: there is still no
+``wg-quick``, no ``openvpn``, no iptables and no poller running here (see
+``src/vpn/profiles.py``'s docstring for why not, and why that stays true even
+now). Dialing happens on the aw-remote-host side, reached through
+``src/vpn/dialer.py``'s exec-bridge client — see that module's docstring for
+the full mechanism and ``vpn-profiles-in-general.md`` §2.7 for why it lives
+there and not in a Tier-2 app holding a ``tun`` host-power grant (the earlier,
+superseded design). ``GET /api/vpn/status`` reports both halves honestly:
+this container's own inability to dial (unchanged), and the last dial this
+process asked the remote host to do plus whether it succeeded — never a
+fabricated live up/down, because no verb in the CLI contract can re-check
+that.
 
 Why these routes are here and not on ``aw-backend``, where 17 ``/api/vpn/*``
 routes already exist: ``apiBase.js:176-183`` rewrites every relative ``/api/*``
@@ -30,6 +39,7 @@ import httpx
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, UploadFile
 
 from src.api.identity import require_identity
+from src.vpn import dialer
 from src.vpn.profiles import (
     VpnProfileError,
     VpnProfileNotFound,
@@ -144,7 +154,40 @@ def register_vpn_routes(app: FastAPI, mgr: VpnProfiles | None = None) -> None:
 
     @app.get("/api/vpn/status")
     async def status(identity: dict = Depends(require_identity)):
-        return await asyncio.to_thread(mgr.status)
+        body = await asyncio.to_thread(mgr.status)
+        # Additive only — the fields above are still literally true (this
+        # process still cannot dial); "dial" is the honest report of what
+        # was last asked of the REMOTE host, per dialer.read_dial_state's
+        # docstring on why that is the most this endpoint can claim.
+        body["dial"] = await asyncio.to_thread(dialer.read_dial_state)
+        return body
+
+    @app.post("/api/vpn/connect")
+    async def connect(payload: dict = Body(...), identity: dict = Depends(require_identity)):
+        name = payload.get("name")
+        if not name:
+            raise HTTPException(status_code=400, detail="name is required")
+        try:
+            return await asyncio.to_thread(dialer.connect, mgr, name, payload.get("container"))
+        except dialer.VpnRefused as exc:
+            raise HTTPException(
+                status_code=409, detail={"refused": True, "refusal": exc.sentence}
+            ) from exc
+        except dialer.DialerError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except (VpnProfileError, VpnProfileNotFound) as exc:
+            raise _http_error(exc) from exc
+
+    @app.post("/api/vpn/disconnect")
+    async def disconnect(identity: dict = Depends(require_identity)):
+        try:
+            return await asyncio.to_thread(dialer.disconnect)
+        except dialer.VpnRefused as exc:
+            raise HTTPException(
+                status_code=409, detail={"refused": True, "refusal": exc.sentence}
+            ) from exc
+        except dialer.DialerError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     # -- NordVPN --------------------------------------------------------------
 

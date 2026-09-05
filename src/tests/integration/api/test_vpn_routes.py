@@ -105,6 +105,8 @@ def test_the_routes_are_registered_on_the_core_app(monkeypatch, tmp_path):
     assert "/api/vpn/configs/{name}" in paths
     assert "/api/vpn/configs/upload" in paths
     assert "/api/vpn/status" in paths
+    assert "/api/vpn/connect" in paths
+    assert "/api/vpn/disconnect" in paths
     assert "/api/vpn/nord/credentials" in paths
     assert "/api/vpn/nord/countries" in paths
     assert "/api/vpn/nord/recommendations" in paths
@@ -328,3 +330,127 @@ def test_nord_import_stores_the_profile(client, monkeypatch):
 
 def test_nord_import_without_a_hostname_is_400(client):
     assert client.post("/api/vpn/nord/import", json={}).status_code == 400
+
+
+# --- connect / disconnect ------------------------------------------------
+#
+# The dialer itself (src/vpn/dialer.py) has its own unit tests, including the
+# constraint-(A) test that no exec command string ever carries a private key.
+# What matters at the HTTP boundary is that the route wires errors to the
+# right status codes and never puts a profile body in the response.
+
+
+def test_connect_requires_a_name(client):
+    assert client.post("/api/vpn/connect", json={}).status_code == 400
+
+
+def test_connect_calls_the_dialer_and_returns_its_result(client, monkeypatch):
+    from src.api import vpn as vpn_mod
+
+    seen = {}
+
+    def fake_connect(mgr, name, container):
+        seen["name"] = name
+        seen["container"] = container
+        return {"up": {"ok": True}, "route": {"ok": True}}
+
+    monkeypatch.setattr(vpn_mod.dialer, "connect", fake_connect)
+
+    res = client.post("/api/vpn/connect", json={"name": "wg0", "container": "c1"})
+
+    assert res.status_code == 200, res.text
+    assert res.json() == {"up": {"ok": True}, "route": {"ok": True}}
+    assert seen == {"name": "wg0", "container": "c1"}
+
+
+def test_connect_surfaces_a_refusal_as_409_with_the_verbatim_sentence(client, monkeypatch):
+    from src.api import vpn as vpn_mod
+
+    def fake_connect(mgr, name, container):
+        raise vpn_mod.dialer.VpnRefused("the host declined and touched nothing")
+
+    monkeypatch.setattr(vpn_mod.dialer, "connect", fake_connect)
+
+    res = client.post("/api/vpn/connect", json={"name": "wg0"})
+
+    assert res.status_code == 409
+    assert res.json()["detail"] == {
+        "refused": True, "refusal": "the host declined and touched nothing",
+    }
+
+
+def test_connect_surfaces_a_dialer_error_as_502(client, monkeypatch):
+    from src.api import vpn as vpn_mod
+
+    def fake_connect(mgr, name, container):
+        raise vpn_mod.dialer.DialerError("could not reach aw-backend's exec bridge")
+
+    monkeypatch.setattr(vpn_mod.dialer, "connect", fake_connect)
+
+    res = client.post("/api/vpn/connect", json={"name": "wg0"})
+
+    assert res.status_code == 502
+
+
+def test_connect_surfaces_an_unknown_profile_as_404(client, monkeypatch):
+    from src.api import vpn as vpn_mod
+    from src.vpn.profiles import VpnProfileNotFound
+
+    def fake_connect(mgr, name, container):
+        raise VpnProfileNotFound(f"no profile named {name!r}")
+
+    monkeypatch.setattr(vpn_mod.dialer, "connect", fake_connect)
+
+    res = client.post("/api/vpn/connect", json={"name": "nope"})
+
+    assert res.status_code == 404
+
+
+def test_disconnect_calls_the_dialer_and_returns_its_result(client, monkeypatch):
+    from src.api import vpn as vpn_mod
+
+    monkeypatch.setattr(
+        vpn_mod.dialer, "disconnect",
+        lambda: {"unroute": {"ok": True}, "down": {"ok": True}},
+    )
+
+    res = client.post("/api/vpn/disconnect")
+
+    assert res.status_code == 200
+    assert res.json() == {"unroute": {"ok": True}, "down": {"ok": True}}
+
+
+def test_disconnect_surfaces_a_refusal_as_409(client, monkeypatch):
+    from src.api import vpn as vpn_mod
+
+    def fake_disconnect():
+        raise vpn_mod.dialer.VpnRefused("the dead-man switch is still armed")
+
+    monkeypatch.setattr(vpn_mod.dialer, "disconnect", fake_disconnect)
+
+    res = client.post("/api/vpn/disconnect")
+
+    assert res.status_code == 409
+    assert res.json()["detail"]["refusal"] == "the dead-man switch is still armed"
+
+
+def test_status_reports_the_dial_state_additively(client, monkeypatch):
+    """Extends, never contradicts: the phase-1 fields (nothing dials FROM
+    THIS process) stay exactly as ``test_status_never_fabricates_a_connection``
+    asserts — "dial" is new, additive information about what was last asked
+    of the remote host."""
+    from src.api import vpn as vpn_mod
+
+    monkeypatch.setattr(
+        vpn_mod.dialer, "read_dial_state",
+        lambda: {"action": "connect", "ok": True, "profile": "wg0"},
+    )
+
+    body = client.get("/api/vpn/status").json()
+
+    assert body["connected"] is False  # unchanged phase-1 claim about THIS process
+    assert body["dial"] == {"action": "connect", "ok": True, "profile": "wg0"}
+
+
+def test_status_dial_defaults_to_empty(client):
+    assert client.get("/api/vpn/status").json()["dial"] == {}
