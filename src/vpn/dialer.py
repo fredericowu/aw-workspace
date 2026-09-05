@@ -262,9 +262,16 @@ def configured() -> bool:
     return bool(os.environ.get("AW_WORKSPACE") and os.environ.get("AW_WORKSPACE_HOST_TOKEN"))
 
 
-def query_status(iface: str | None = None) -> dict:
+def query_status() -> dict:
     """``aw-remote-host vpn external-status --json`` — the live measurement
     that makes a "connected" answer trustworthy.
+
+    Takes no ``--iface``: the Go contract for this verb specifies only the
+    output shape, not an input flag, and there is one external tunnel at a
+    time (the UI enforces it) — external-status reports the tunnel this
+    host has up, it does not need to be told which. Passing an unrequested
+    flag here would exit non-zero on the Go side and silently degrade every
+    "connected" answer to "unknown".
 
     Degrades to ``{"state": "unknown"}`` cleanly whenever the answer cannot
     be trusted: the dialer isn't configured, the host is unreachable, the
@@ -280,11 +287,8 @@ def query_status(iface: str | None = None) -> dict:
     except DialerError:
         return {"state": "unknown"}
 
-    args = ["vpn", "external-status", "--json"]
-    if iface:
-        args += ["--iface", iface]
     try:
-        payload = _run_cli(exec_client, args)
+        payload = _run_cli(exec_client, ["vpn", "external-status", "--json"])
     except (VpnRefused, DialerError):
         return {"state": "unknown"}
 
@@ -309,8 +313,7 @@ def status() -> dict:
     """
     dial_state = read_dial_state()
     connecting = dial_state.get("action") == "connecting"
-    iface = dial_state.get("iface") if dial_state.get("action") == "connect" else None
-    live = query_status(iface)
+    live = query_status()
 
     if live.get("state") == "unknown":
         if connecting:
@@ -344,7 +347,13 @@ def status() -> dict:
         "connected": connected,
         "active": dial_state.get("profile") if connected else None,
         "container": live.get("container"),
-        "egress_ip": live.get("container_egress_ip") or live.get("host_egress_ip"),
+        # NEVER host_egress_ip: by this feature's own invariant that address
+        # is the one guaranteed NOT to have changed (a host whose address
+        # moved is a failed apply that reverts) — falling back to it here
+        # would show a real, un-tunneled ISP address labelled as the VPN
+        # egress. Missing is a gap the UI can show; this would be a
+        # confidently wrong answer the user could act on.
+        "egress_ip": live.get("container_egress_ip"),
         "since": live.get("since"),
         "deadman_armed": bool(live.get("deadman_armed")),
         "detail": (

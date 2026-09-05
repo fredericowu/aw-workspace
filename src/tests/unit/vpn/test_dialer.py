@@ -319,18 +319,28 @@ def test_query_status_reports_connected_with_the_live_payload(monkeypatch, env):
     commands: list[str] = []
     _install_exec_fake(monkeypatch, commands, stdout_for)
 
-    result = dialer.query_status("wg0")
+    result = dialer.query_status()
 
     assert result["state"] == "connected"
     assert result["up"] is True
     assert result["container_egress_ip"] == "203.0.113.9"
-    up_cmd = next(c for c in commands if "external-status" in c)
-    assert "--iface wg0" in up_cmd
+
+
+def test_query_status_takes_no_iface_flag(monkeypatch, env):
+    """The Go contract for external-status specifies only the output shape,
+    not an input flag — there is one external tunnel at a time."""
+    commands: list[str] = []
+    _install_exec_fake(monkeypatch, commands, lambda c: json.dumps({"up": True}))
+
+    dialer.query_status()
+
+    status_cmd = next(c for c in commands if "external-status" in c)
+    assert status_cmd == "aw-remote-host vpn external-status --json"
 
 
 def test_query_status_reports_disconnected_when_the_host_says_down(monkeypatch, env):
     _install_exec_fake(monkeypatch, [], lambda c: json.dumps({"iface": "wg0", "up": False}))
-    assert dialer.query_status("wg0")["state"] == "disconnected"
+    assert dialer.query_status()["state"] == "disconnected"
 
 
 def test_status_lets_a_live_down_override_a_recorded_connect(monkeypatch, env):
@@ -375,6 +385,43 @@ def test_status_reports_connected_with_the_profile_name_at_the_top_level(monkeyp
     assert result["container"] == "aw-remote-host-workspace"
     assert result["egress_ip"] == "203.0.113.9"
     assert result["deadman_armed"] is True
+
+
+def test_status_never_sends_an_iface_flag_to_external_status(monkeypatch, env):
+    """external-status takes no --iface argument in the Go contract — only
+    the output shape was specified, so the Go side has no reason to accept
+    one. Passing it anyway means the CLI exits non-zero on an unrecognized
+    flag and every "connected" answer silently degrades to "unknown"."""
+    dialer._write_dial_state({
+        "action": "connect", "ok": True, "profile": "wg0", "iface": "wg0",
+        "container": "aw-remote-host-workspace", "at": "then",
+    })
+    commands: list[str] = []
+    _install_exec_fake(monkeypatch, commands, lambda c: json.dumps({"up": True}))
+
+    dialer.status()
+
+    status_cmd = next(c for c in commands if "external-status" in c)
+    assert "--iface" not in status_cmd
+
+
+def test_status_egress_ip_never_falls_back_to_the_host_address(monkeypatch, env):
+    """host_egress_ip is, by the feature's own invariant, the address that
+    did NOT change — the real, un-tunneled ISP address. Showing it as the
+    VPN egress would be confidently wrong, not merely incomplete: a user
+    would act on it."""
+    dialer._write_dial_state({
+        "action": "connect", "ok": True, "profile": "wg0", "iface": "wg0",
+        "container": "aw-remote-host-workspace", "at": "then",
+    })
+    _install_exec_fake(monkeypatch, [], lambda c: json.dumps({
+        "up": True, "container_egress_ip": None, "host_egress_ip": "198.51.100.7",
+    }))
+
+    result = dialer.status()
+
+    assert result["egress_ip"] is None
+    assert result["egress_ip"] != "198.51.100.7"
 
 
 def test_status_is_unknown_rather_than_stale_when_the_query_verb_is_unavailable(monkeypatch, env):
