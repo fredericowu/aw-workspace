@@ -11,11 +11,15 @@ now). Dialing happens on the aw-remote-host side, reached through
 ``src/vpn/dialer.py``'s exec-bridge client — see that module's docstring for
 the full mechanism and ``vpn-profiles-in-general.md`` §2.7 for why it lives
 there and not in a Tier-2 app holding a ``tun`` host-power grant (the earlier,
-superseded design). ``GET /api/vpn/status`` reports both halves honestly:
-this container's own inability to dial (unchanged), and the last dial this
-process asked the remote host to do plus whether it succeeded — never a
-fabricated live up/down, because no verb in the CLI contract can re-check
-that.
+superseded design). ``GET /api/vpn/status`` answers "is the VPN on" at the
+top level, from ``dialer.status()``'s live measurement (``aw-remote-host vpn
+external-status``) — not from what this process merely remembers asking for,
+because the dead-man's switch (``internal/vpn/deadman.go``) reverts a tunnel
+autonomously and without telling anyone. When the live verb can't be reached
+or hasn't shipped yet, the answer is ``state: "unknown"``, never a stale
+"connected". ``mgr.status()``'s own claim (this process's own inability to
+dial) survives underneath but is superseded field-by-field at this route —
+see both modules' ``status()`` docstrings.
 
 Why these routes are here and not on ``aw-backend``, where 17 ``/api/vpn/*``
 routes already exist: ``apiBase.js:176-183`` rewrites every relative ``/api/*``
@@ -154,11 +158,19 @@ def register_vpn_routes(app: FastAPI, mgr: VpnProfiles | None = None) -> None:
 
     @app.get("/api/vpn/status")
     async def status(identity: dict = Depends(require_identity)):
-        body = await asyncio.to_thread(mgr.status)
-        # Additive only — the fields above are still literally true (this
-        # process still cannot dial); "dial" is the honest report of what
-        # was last asked of the REMOTE host, per dialer.read_dial_state's
-        # docstring on why that is the most this endpoint can claim.
+        # Two different owners, flattened into ONE contract the UI reads at
+        # the top level (pinned by the architect): mgr.status() is the
+        # static fact of how many profiles exist; dialer.status() is the
+        # live answer to "is the VPN on", measured on the aw-remote-host
+        # side via external-status. dialer's fields are spread LAST so its
+        # "detail" (and state/connected/active/...) win outright — this
+        # process's own inability to dial is real but not what a person
+        # reading this screen is asking about. "dial" stays underneath as
+        # the raw last-action record, in case that detail is ever useful.
+        base = await asyncio.to_thread(mgr.status)
+        live = await asyncio.to_thread(dialer.status)
+        body = {**base, **live}
+        body["can_dial"] = dialer.configured()
         body["dial"] = await asyncio.to_thread(dialer.read_dial_state)
         return body
 

@@ -232,12 +232,16 @@ def test_nord_credentials_put_validates(client):
 
 
 def test_status_never_fabricates_a_connection(client):
+    """No AW_BACKEND_URL/AW_WORKSPACE/AW_WORKSPACE_HOST_TOKEN in this fixture
+    -> the dialer cannot even be asked, so the honest answer is "unknown",
+    never a fabricated "disconnected" (which would itself be a live claim)
+    and never a stale "connected"."""
     body = client.get("/api/vpn/status").json()
 
+    assert body["state"] == "unknown"
     assert body["connected"] is False
-    assert body["can_dial"] is False
-    assert body["state"] == "no_tunnel_host"
-    assert "nothing dials" in body["detail"]
+    assert body["active"] is None
+    assert "unknown" in body["detail"] or "could not" in body["detail"]
 
 
 def test_there_are_no_lifecycle_routes(client):
@@ -434,23 +438,74 @@ def test_disconnect_surfaces_a_refusal_as_409(client, monkeypatch):
     assert res.json()["detail"]["refusal"] == "the dead-man switch is still armed"
 
 
-def test_status_reports_the_dial_state_additively(client, monkeypatch):
-    """Extends, never contradicts: the phase-1 fields (nothing dials FROM
-    THIS process) stay exactly as ``test_status_never_fabricates_a_connection``
-    asserts — "dial" is new, additive information about what was last asked
-    of the remote host."""
+def test_status_surfaces_the_live_measurement_at_the_top_level(client, monkeypatch):
+    """The defect this pins: Connect succeeds, the tunnel comes up, and the
+    screen must NOT still read "disconnected" with an empty profile name.
+    connected/active/state/container/... live at the TOP LEVEL — that is
+    the contract the UI reads, not something nested under "dial"."""
+    from src.api import vpn as vpn_mod
+
+    monkeypatch.setattr(
+        vpn_mod.dialer, "read_dial_state",
+        lambda: {"action": "connect", "ok": True, "profile": "wg0", "iface": "wg0",
+                 "container": "aw-remote-host-workspace"},
+    )
+    monkeypatch.setattr(
+        vpn_mod.dialer, "status",
+        lambda: {
+            "state": "connected", "connected": True, "active": "wg0",
+            "container": "aw-remote-host-workspace", "egress_ip": "203.0.113.9",
+            "since": "2026-09-05T12:00:00Z", "deadman_armed": True,
+            "detail": "aw-remote-host measured the tunnel up live, via external-status.",
+        },
+    )
+
+    body = client.get("/api/vpn/status").json()
+
+    assert body["state"] == "connected"
+    assert body["connected"] is True
+    assert body["active"] == "wg0"
+    assert body["container"] == "aw-remote-host-workspace"
+    assert body["egress_ip"] == "203.0.113.9"
+    assert body["deadman_armed"] is True
+
+
+def test_status_is_unknown_rather_than_stale_when_the_query_verb_is_unavailable(client, monkeypatch):
+    """This process last recorded a successful connect, but the live verb
+    being unreachable/unshipped must yield "unknown" — never the stale
+    "connected" recollection, and never a fabricated "disconnected"."""
     from src.api import vpn as vpn_mod
 
     monkeypatch.setattr(
         vpn_mod.dialer, "read_dial_state",
         lambda: {"action": "connect", "ok": True, "profile": "wg0"},
     )
+    monkeypatch.setattr(
+        vpn_mod.dialer, "status",
+        lambda: {
+            "state": "unknown", "connected": False, "active": None,
+            "container": None, "egress_ip": None, "since": None,
+            "deadman_armed": False,
+            "detail": "The host could not be asked for the tunnel's live state.",
+        },
+    )
 
     body = client.get("/api/vpn/status").json()
 
-    assert body["connected"] is False  # unchanged phase-1 claim about THIS process
-    assert body["dial"] == {"action": "connect", "ok": True, "profile": "wg0"}
+    assert body["state"] == "unknown"
+    assert body["connected"] is False
+    assert body["active"] is None
 
 
 def test_status_dial_defaults_to_empty(client):
     assert client.get("/api/vpn/status").json()["dial"] == {}
+
+
+def test_status_can_dial_reflects_dialer_configuration(client, monkeypatch):
+    from src.api import vpn as vpn_mod
+
+    monkeypatch.setattr(vpn_mod.dialer, "configured", lambda: True)
+    assert client.get("/api/vpn/status").json()["can_dial"] is True
+
+    monkeypatch.setattr(vpn_mod.dialer, "configured", lambda: False)
+    assert client.get("/api/vpn/status").json()["can_dial"] is False

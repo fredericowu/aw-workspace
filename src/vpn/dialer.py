@@ -243,17 +243,115 @@ def _write_dial_state(state: dict) -> None:
 
 def read_dial_state() -> dict:
     """What THIS process last asked the aw-remote-host CLI to do, and
-    whether it reported success — never a live re-check of the tunnel. There
-    is no query verb in the CLI contract (external-up/down/route/unroute are
-    all one-shot actions), so ``GET /api/vpn/status`` must report exactly
-    this and nothing more confident: a dead-man revert or a host restart
-    would not be reflected here.
+    whether it reported success. Used as a fallback / cross-check by
+    ``status()`` below, never as its own answer to "is the VPN on" — the
+    dead-man's switch (``internal/vpn/deadman.go``) reverts a tunnel
+    autonomously, without telling anyone, so a merely-recorded "connected"
+    can be stale in exactly the case that matters most.
     """
     try:
         with open(_dial_state_path(), encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+
+
+def configured() -> bool:
+    """Whether this process has everything it needs to even REACH the exec
+    bridge — distinct from whether a tunnel happens to be up right now."""
+    return bool(os.environ.get("AW_WORKSPACE") and os.environ.get("AW_WORKSPACE_HOST_TOKEN"))
+
+
+def query_status(iface: str | None = None) -> dict:
+    """``aw-remote-host vpn external-status --json`` — the live measurement
+    that makes a "connected" answer trustworthy.
+
+    Degrades to ``{"state": "unknown"}`` cleanly whenever the answer cannot
+    be trusted: the dialer isn't configured, the host is unreachable, the
+    verb is refused, or the CLI doesn't recognize it yet (the Go side has
+    not shipped it — a plain non-zero exit, same as any other unknown
+    subcommand). NEVER falls back to ``read_dial_state()`` here — that is
+    exactly the stale-but-confident answer this verb exists to replace.
+    """
+    if not configured():
+        return {"state": "unknown"}
+    try:
+        exec_client = _ExecClient()
+    except DialerError:
+        return {"state": "unknown"}
+
+    args = ["vpn", "external-status", "--json"]
+    if iface:
+        args += ["--iface", iface]
+    try:
+        payload = _run_cli(exec_client, args)
+    except (VpnRefused, DialerError):
+        return {"state": "unknown"}
+
+    if not isinstance(payload, dict) or "up" not in payload:
+        return {"state": "unknown"}
+
+    payload = dict(payload)
+    payload["state"] = "connected" if payload["up"] else "disconnected"
+    return payload
+
+
+def status() -> dict:
+    """The top-level answer to "is the VPN on?" — what ``GET /api/vpn/status``
+    actually needs, letting ``query_status``'s live measurement win over
+    ``read_dial_state``'s mere recollection whenever the two disagree.
+
+    A connect this process itself has in flight (``dial_state["action"] ==
+    "connecting"``) is the one case ``read_dial_state`` gets to speak on
+    its own: the live verb may still report the old (pre-connect) state for
+    the brief window between the HTTP request landing and the host actually
+    finishing ``external-up``/``external-route``.
+    """
+    dial_state = read_dial_state()
+    connecting = dial_state.get("action") == "connecting"
+    iface = dial_state.get("iface") if dial_state.get("action") == "connect" else None
+    live = query_status(iface)
+
+    if live.get("state") == "unknown":
+        if connecting:
+            return {
+                "state": "connecting", "connected": False,
+                "active": dial_state.get("profile"), "container": None,
+                "egress_ip": None, "since": None, "deadman_armed": False,
+                "detail": ("A connect is in progress; the host could not yet "
+                           "be asked for the tunnel's live state."),
+            }
+        return {
+            "state": "unknown", "connected": False, "active": None,
+            "container": None, "egress_ip": None, "since": None,
+            "deadman_armed": False,
+            "detail": ("The host could not be asked for the tunnel's live "
+                       "state (external-status is unavailable, or the host "
+                       "could not be reached) — reporting unknown rather "
+                       "than a stale recollection."),
+        }
+
+    connected = bool(live.get("up"))
+    if not connected and connecting:
+        return {
+            "state": "connecting", "connected": False,
+            "active": dial_state.get("profile"), "container": None,
+            "egress_ip": None, "since": None, "deadman_armed": False,
+            "detail": "A connect is in progress and the tunnel is not up yet.",
+        }
+    return {
+        "state": "connected" if connected else "disconnected",
+        "connected": connected,
+        "active": dial_state.get("profile") if connected else None,
+        "container": live.get("container"),
+        "egress_ip": live.get("container_egress_ip") or live.get("host_egress_ip"),
+        "since": live.get("since"),
+        "deadman_armed": bool(live.get("deadman_armed")),
+        "detail": (
+            f"aw-remote-host measured the tunnel {'up' if connected else 'down'} "
+            f"live, via external-status."
+        ),
+    }
 
 
 def _run_cli(exec_client: _ExecClient, cli_args: list[str]) -> dict:
@@ -284,6 +382,7 @@ def connect(profiles: VpnProfiles, name: str, container: str | None = None) -> d
     workspace's own container (Frederico's stated first test: connect, and
     the workspace itself exits through it)."""
     exec_client = _ExecClient()
+    _write_dial_state({"action": "connecting", "profile": name, "at": _now()})
     try:
         fields = profiles.wireguard_dial_fields(name)
         container_info = _discover_workspace_container(exec_client)

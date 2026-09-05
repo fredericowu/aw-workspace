@@ -323,16 +323,34 @@ def test_an_access_token_is_exchanged_for_service_credentials(mgr, monkeypatch):
     assert "svcpass" not in json.dumps(state)
 
 
-# --- rule: nothing dials, and the status endpoint says so --------------------
+# --- rule: this process's own claim stays honest, and stays scoped to itself --
+#
+# Whether a tunnel is actually up is no longer this method's claim to make —
+# that moved to src/vpn/dialer.py's own status(), which measures the remote
+# host live (see that module). What's left here is the one fact this process
+# still owns directly: the profile count, and its own (still true) inability
+# to dial locally.
 
 
-def test_status_is_honest_about_having_no_tunnel_host(mgr):
+def test_status_no_longer_claims_a_connection_state(mgr):
     status = mgr.status()
 
-    assert status["connected"] is False
-    assert status["can_dial"] is False
-    assert status["state"] == "no_tunnel_host"
-    assert status["active"] is None
+    assert status["phase"] == 2
+    assert "connected" not in status, "connection state is dialer.status()'s claim now, not this one"
+    assert "state" not in status
+    assert "active" not in status
+    assert "can_dial" not in status
+
+
+def test_status_detail_reflects_the_current_architecture(mgr):
+    """The Tier-2 aw-app-vpn / tun host-power design was superseded — this
+    process's own explanation of why it can't dial must not describe an
+    architecture that no longer exists."""
+    detail = mgr.status()["detail"]
+
+    assert "tun" not in detail.lower()
+    assert "separate app" not in detail.lower()
+    assert "aw-remote-host" in detail
 
 
 def test_the_manager_exposes_no_lifecycle_surface(mgr):

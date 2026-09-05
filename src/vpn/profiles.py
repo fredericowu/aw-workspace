@@ -592,29 +592,31 @@ class VpnProfiles:
     # -- status ---------------------------------------------------------------
 
     def status(self) -> dict:
-        """What is true: profiles are stored here and **nothing dials**.
-
-        Never a fabricated up/down. The aw-backend copy of this endpoint
-        answers from a poller that has never run in a container with no ``wg``
-        binary — an inert route that reads as a live one. This one says what it
-        is, and the UI repeats it.
+        """The static facts this process owns directly: how many profiles
+        are stored. **Not** whether a tunnel is up — that used to be a
+        permanent, hardcoded ``False`` here (phase 1: nothing anywhere could
+        dial), but phase 2's dialer runs on the aw-remote-host side and can
+        genuinely bring a tunnel up, so this method no longer claims to know.
+        ``state``/``connected``/``active``/``container``/``egress_ip``/
+        ``since``/``deadman_armed`` are now owned by ``src/vpn/dialer.py``'s
+        own ``status()``, which measures the remote host live instead of
+        recording a belief — ``src/api/vpn.py``'s route merges the two, live
+        always winning. This method's own ``detail`` describes only itself
+        (correct for a caller of ``VpnProfiles.status()`` directly) and is
+        expected to be overridden by the dialer's ``detail`` at that merge.
         """
         try:
             profiles = len(self._load_state()["configs"])
         except OSError:
             profiles = 0
         return {
-            "phase": 1,
-            "state": "no_tunnel_host",
-            "connected": False,
-            "active": None,
-            "can_dial": False,
+            "phase": 2,
             "profiles": profiles,
             "detail": (
-                "Profiles are stored and validated on the workspace, but no "
-                "tunnel host is configured — nothing dials from here. The "
-                "dialer is a separate app holding the 'tun' host-power grant "
-                "(phase 2)."
+                "This process still cannot dial — no wg-quick, no "
+                "CAP_NET_ADMIN here. The dialer runs on the aw-remote-host "
+                "side instead, reached over the exec bridge (see "
+                "src/vpn/dialer.py)."
             ),
         }
 

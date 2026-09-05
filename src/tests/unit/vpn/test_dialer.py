@@ -271,3 +271,169 @@ def test_exec_client_requires_workspace_env_vars(monkeypatch, env):
     monkeypatch.delenv("AW_WORKSPACE", raising=False)
     with pytest.raises(dialer.DialerError, match="AW_WORKSPACE"):
         dialer._ExecClient()
+
+
+# --- configured / query_status / status ---------------------------------
+#
+# The dead-man's switch (internal/vpn/deadman.go) reverts a tunnel
+# autonomously and without telling anyone — so read_dial_state() alone is
+# not a safe answer to "is the VPN on". These tests pin the two failure
+# modes that matter: a live "down" must override a recorded "connect, ok",
+# and an unavailable query verb must yield "unknown", never a stale
+# "connected" and never a fabricated "disconnected".
+
+
+def test_configured_reflects_env_vars(monkeypatch, env):
+    assert dialer.configured() is True
+    monkeypatch.delenv("AW_WORKSPACE_HOST_TOKEN", raising=False)
+    assert dialer.configured() is False
+
+
+def test_query_status_is_unknown_when_not_configured(monkeypatch):
+    monkeypatch.delenv("AW_WORKSPACE", raising=False)
+    monkeypatch.delenv("AW_WORKSPACE_HOST_TOKEN", raising=False)
+    assert dialer.query_status() == {"state": "unknown"}
+
+
+def test_query_status_degrades_to_unknown_when_the_verb_is_not_recognized(monkeypatch, env):
+    """The Go side has not shipped external-status yet (or any future CLI
+    that doesn't recognize it) — a plain non-zero exit, same as any other
+    unknown subcommand. Must degrade cleanly, not raise."""
+    def fake_run(self, command, timeout_s=dialer.EXEC_TIMEOUT_S):
+        return {"status": "exited", "exit_code": 2, "stdout": "", "stderr": "unknown command"}
+
+    monkeypatch.setattr(dialer._ExecClient, "run", fake_run)
+
+    assert dialer.query_status() == {"state": "unknown"}
+
+
+def test_query_status_reports_connected_with_the_live_payload(monkeypatch, env):
+    def stdout_for(command):
+        assert "external-status" in command
+        return json.dumps({
+            "iface": "wg0", "up": True, "container": "aw-remote-host-workspace",
+            "container_egress_ip": "203.0.113.9", "deadman_armed": True,
+            "since": "2026-09-05T12:00:00Z",
+        })
+
+    commands: list[str] = []
+    _install_exec_fake(monkeypatch, commands, stdout_for)
+
+    result = dialer.query_status("wg0")
+
+    assert result["state"] == "connected"
+    assert result["up"] is True
+    assert result["container_egress_ip"] == "203.0.113.9"
+    up_cmd = next(c for c in commands if "external-status" in c)
+    assert "--iface wg0" in up_cmd
+
+
+def test_query_status_reports_disconnected_when_the_host_says_down(monkeypatch, env):
+    _install_exec_fake(monkeypatch, [], lambda c: json.dumps({"iface": "wg0", "up": False}))
+    assert dialer.query_status("wg0")["state"] == "disconnected"
+
+
+def test_status_lets_a_live_down_override_a_recorded_connect(monkeypatch, env):
+    """The exact scenario the dead-man's switch creates: the last thing this
+    process asked for succeeded, but the tunnel has since reverted. The live
+    measurement must win."""
+    dialer._write_dial_state({
+        "action": "connect", "ok": True, "profile": "wg0", "iface": "wg0",
+        "container": "aw-remote-host-workspace", "at": "then",
+    })
+    _install_exec_fake(monkeypatch, [], lambda c: json.dumps({"iface": "wg0", "up": False}))
+
+    result = dialer.status()
+
+    assert result["state"] == "disconnected"
+    assert result["connected"] is False
+    assert result["active"] is None
+
+
+def test_status_reports_connected_with_the_profile_name_at_the_top_level(monkeypatch, env):
+    """The defect this pins: a live "up" tunnel must surface connected=True
+    and the profile name directly — not nested, not defaulted to False."""
+    dialer._write_dial_state({
+        "action": "connect", "ok": True, "profile": "wg0", "iface": "wg0",
+        "container": "aw-remote-host-workspace", "at": "then",
+    })
+
+    def stdout_for(command):
+        return json.dumps({
+            "iface": "wg0", "up": True, "container": "aw-remote-host-workspace",
+            "container_egress_ip": "203.0.113.9", "deadman_armed": True,
+            "since": "2026-09-05T12:00:00Z",
+        })
+
+    _install_exec_fake(monkeypatch, [], stdout_for)
+
+    result = dialer.status()
+
+    assert result["state"] == "connected"
+    assert result["connected"] is True
+    assert result["active"] == "wg0"
+    assert result["container"] == "aw-remote-host-workspace"
+    assert result["egress_ip"] == "203.0.113.9"
+    assert result["deadman_armed"] is True
+
+
+def test_status_is_unknown_rather_than_stale_when_the_query_verb_is_unavailable(monkeypatch, env):
+    """A recorded "connect, ok" must NOT leak through as "connected" just
+    because the live verb couldn't be reached — that is precisely the stale
+    answer the dead-man's switch makes dangerous."""
+    dialer._write_dial_state({
+        "action": "connect", "ok": True, "profile": "wg0", "iface": "wg0",
+        "container": "aw-remote-host-workspace", "at": "then",
+    })
+
+    def fake_run(self, command, timeout_s=dialer.EXEC_TIMEOUT_S):
+        return {"status": "exited", "exit_code": 2, "stdout": "", "stderr": "unknown command"}
+
+    monkeypatch.setattr(dialer._ExecClient, "run", fake_run)
+
+    result = dialer.status()
+
+    assert result["state"] == "unknown"
+    assert result["connected"] is False
+
+
+def test_status_is_unknown_with_no_prior_dial_and_no_query_verb(monkeypatch, env):
+    def fake_run(self, command, timeout_s=dialer.EXEC_TIMEOUT_S):
+        return {"status": "exited", "exit_code": 2, "stdout": "", "stderr": "unknown command"}
+
+    monkeypatch.setattr(dialer._ExecClient, "run", fake_run)
+
+    result = dialer.status()
+
+    assert result["state"] == "unknown"
+    assert result["connected"] is False
+    assert result["active"] is None
+
+
+def test_status_reports_connecting_while_a_connect_is_in_flight(monkeypatch, env, profiles):
+    """A connect() in progress writes "connecting" before it does anything
+    else — a concurrent status() poll (a different worker, a different
+    request) must not report "unknown" or a stale "disconnected" for that
+    window."""
+    profiles.save_config("wg0", "wireguard", WG_OK)
+    root = paths.workspace_root()
+
+    def stdout_for(command):
+        if command.startswith("podman inspect"):
+            return _podman_inspect_stdout(root, FAKE_HOST_ROOT)
+        if "external-status" in command:
+            # the host hasn't caught up yet — still reports the old state
+            return json.dumps({"iface": "wg0", "up": False})
+        return json.dumps({"ok": True})
+
+    commands: list[str] = []
+    _install_exec_fake(monkeypatch, commands, stdout_for)
+
+    # Simulate the in-flight window by writing the "connecting" marker
+    # connect() itself would write, without running the whole flow.
+    dialer._write_dial_state({"action": "connecting", "profile": "wg0", "at": "now"})
+
+    result = dialer.status()
+
+    assert result["state"] == "connecting"
+    assert result["active"] == "wg0"
