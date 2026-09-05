@@ -293,17 +293,28 @@ def query_status() -> dict:
     """
     if not configured():
         return {"state": "unknown"}
+    # Every "unknown" below is LOGGED with its reason. Reporting unknown is
+    # correct — this function must never guess — but discarding *why* is what
+    # made a one-line JSON-parsing bug undiagnosable from outside the process
+    # for hours: the API answered "the host could not be asked" while the host
+    # was answering every call perfectly.
     try:
         exec_client = _ExecClient()
-    except DialerError:
+    except DialerError as exc:
+        log.warning("vpn: status unknown — exec client unavailable: %s", exc)
         return {"state": "unknown"}
 
     try:
         payload = _run_cli(exec_client, ["vpn", "external-status", "--json"])
-    except (VpnRefused, DialerError):
+    except (VpnRefused, DialerError) as exc:
+        log.warning("vpn: status unknown — external-status failed: %s", exc)
         return {"state": "unknown"}
 
     if not isinstance(payload, dict) or "up" not in payload:
+        log.warning(
+            "vpn: status unknown — external-status returned no 'up' key "
+            "(keys=%s)", sorted(payload) if isinstance(payload, dict) else type(payload).__name__
+        )
         return {"state": "unknown"}
 
     payload = dict(payload)
@@ -388,23 +399,62 @@ def status() -> dict:
     }
 
 
+def _parse_cli_json(stdout: str) -> tuple[dict, str | None]:
+    """Parse the CLI's ``--json`` output. Returns ``(payload, error)``.
+
+    The CLI **pretty-prints** its JSON across several lines, because a human
+    runs these same verbs on the host. This used to read
+    ``stdout.splitlines()[-1]``, and the last line of an indented object is
+    ``}`` — not parseable JSON. Every live call therefore degraded silently to
+    ``{}``, and ``GET /api/vpn/status`` reported ``unknown`` while the host was
+    answering perfectly (measured 2026-09-05, the first time this path ran
+    against a deployed binary).
+
+    So: parse the WHOLE payload. The fall back to the outermost ``{...}`` span
+    is what the single-line assumption was really reaching for — tolerating a
+    banner or a warning line printed before the object — and it keeps that
+    tolerance without assuming the object occupies exactly one line.
+    """
+    if not stdout:
+        return {}, None
+    try:
+        parsed = json.loads(stdout)
+        return (parsed if isinstance(parsed, dict) else {}), None
+    except json.JSONDecodeError as exc:
+        first, last = stdout.find("{"), stdout.rfind("}")
+        if first != -1 and last > first:
+            try:
+                parsed = json.loads(stdout[first:last + 1])
+                return (parsed if isinstance(parsed, dict) else {}), None
+            except json.JSONDecodeError:
+                pass
+        return {}, str(exc)
+
+
 def _run_cli(exec_client: _ExecClient, cli_args: list[str]) -> dict:
-    """Run one ``aw-remote-host`` CLI verb, parse its single JSON stdout
-    line, and turn a refusal into ``VpnRefused`` so callers repeat the host's
-    own sentence verbatim instead of composing a new one."""
+    """Run one ``aw-remote-host`` CLI verb, parse its JSON stdout, and turn a
+    refusal into ``VpnRefused`` so callers repeat the host's own sentence
+    verbatim instead of composing a new one.
+
+    Output that cannot be parsed is an ERROR, never an empty dict. Returning
+    ``{}`` here is indistinguishable from "the host said nothing", which is
+    precisely how a working host got reported as unreachable for hours.
+    """
     command = "aw-remote-host " + " ".join(cli_args)
     result = exec_client.run(command)
     stdout = (result.get("stdout") or "").strip()
-    try:
-        payload = json.loads(stdout.splitlines()[-1]) if stdout else {}
-    except (json.JSONDecodeError, IndexError):
-        payload = {}
+    payload, parse_error = _parse_cli_json(stdout)
     if payload.get("refused"):
         raise VpnRefused(payload.get("refusal") or "the host declined and touched nothing")
     if result.get("exit_code") != 0:
         raise DialerError(
             f"{' '.join(cli_args)} exited {result.get('exit_code')}: "
             f"{result.get('stderr') or stdout}"
+        )
+    if parse_error:
+        raise DialerError(
+            f"{' '.join(cli_args)} exited 0 but its output could not be parsed as "
+            f"JSON ({parse_error}). First 200 chars of stdout: {stdout[:200]!r}"
         )
     return payload
 

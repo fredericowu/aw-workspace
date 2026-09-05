@@ -586,3 +586,79 @@ def test_status_reports_connecting_while_a_connect_is_in_flight(monkeypatch, env
 
     assert result["state"] == "connecting"
     assert result["active"] == "wg0"
+
+
+# --- the CLI pretty-prints its JSON --------------------------------------
+#
+# Regression for the defect that made the whole feature look dead on its first
+# real deployment (2026-09-05): `_run_cli` parsed `stdout.splitlines()[-1]`,
+# and the last line of an INDENTED JSON object is `}`. Every live call
+# degraded silently to `{}`, so `GET /api/vpn/status` answered "the host could
+# not be asked" while the host was answering every call with exit 0 and a
+# perfectly good payload.
+#
+# The fixture below is the VERBATIM stdout of `aw-remote-host vpn
+# external-status --json` captured from the deployed v0.1.79 binary — not a
+# hand-written approximation, because a hand-written one-line approximation is
+# exactly what hid this bug in the first place.
+_REAL_EXTERNAL_STATUS_STDOUT = """{
+  "container": null,
+  "container_egress_ip": null,
+  "deadman_armed": false,
+  "deadman_expires_at": null,
+  "dns_tunneled": false,
+  "host_egress_ip": "65.109.66.88",
+  "iface": "wg0",
+  "kill_switch": false,
+  "rule_installed": false,
+  "since": null,
+  "table": 200,
+  "up": false,
+  "warnings": []
+}
+"""
+
+
+def test_pretty_printed_cli_json_is_parsed_not_silently_dropped(monkeypatch, env):
+    """The real multi-line payload must parse. Reading only the last line
+    yields `}` and a silent empty dict."""
+    commands: list = []
+    _install_exec_fake(monkeypatch, commands, lambda cmd: _REAL_EXTERNAL_STATUS_STDOUT)
+
+    live = dialer.query_status()
+
+    assert live["state"] == "disconnected", (
+        "a host that answered cleanly was reported as unreachable — this is the "
+        "silent-degradation defect the whole card exists to prevent"
+    )
+    assert live["up"] is False
+    assert live["host_egress_ip"] == "65.109.66.88"
+    assert live["dns_tunneled"] is False
+    assert live["warnings"] == []
+
+
+def test_a_json_object_preceded_by_a_banner_still_parses(monkeypatch, env):
+    """Tolerating leading noise is what the old last-line heuristic was really
+    reaching for; keep that without assuming one line."""
+    commands: list = []
+    noisy = "warning: something chatty on stdout\n" + _REAL_EXTERNAL_STATUS_STDOUT
+    _install_exec_fake(monkeypatch, commands, lambda cmd: noisy)
+
+    assert dialer.query_status()["state"] == "disconnected"
+
+
+def test_unparseable_output_raises_instead_of_returning_an_empty_dict(monkeypatch, env):
+    """Exit 0 with garbage is an error, never `{}`. An empty dict is
+    indistinguishable from 'the host said nothing', which is how a working
+    host got reported as unreachable."""
+    commands: list = []
+    _install_exec_fake(monkeypatch, commands, lambda cmd: "not json at all")
+
+    with pytest.raises(dialer.DialerError) as excinfo:
+        dialer._run_cli(dialer._ExecClient(), ["vpn", "external-status", "--json"])
+
+    assert "could not be parsed as JSON" in str(excinfo.value)
+    assert "not json at all" in str(excinfo.value), (
+        "the failing output must appear in the message — discarding it is what "
+        "made this undiagnosable from outside the process"
+    )
