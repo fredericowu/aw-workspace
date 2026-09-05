@@ -279,6 +279,17 @@ def query_status() -> dict:
     not shipped it — a plain non-zero exit, same as any other unknown
     subcommand). NEVER falls back to ``read_dial_state()`` here — that is
     exactly the stale-but-confident answer this verb exists to replace.
+
+    Never passes ``--skip-egress``: it exists and halves the round trips,
+    but the measured egress IP is the entire proof this feature worked — a
+    status screen without it looks identical whether the tunnel carries
+    traffic or not.
+
+    Passes ``dns_tunneled``/``kill_switch``/``warnings`` straight through
+    from the host's own payload, unexamined — they are measurements only
+    the host can make (DNS Layer 2 is currently dropped; the kill switch is
+    a best-effort control-plane pin that can silently produce zero
+    exclusions) and their sentences are the host's own, never composed here.
     """
     if not configured():
         return {"state": "unknown"}
@@ -310,6 +321,14 @@ def status() -> dict:
     its own: the live verb may still report the old (pre-connect) state for
     the brief window between the HTTP request landing and the host actually
     finishing ``external-up``/``external-route``.
+
+    ``dns_tunneled``/``kill_switch`` come ONLY from the live measurement,
+    never from ``dial_state`` — the same "don't answer with a recollection
+    when the host can be asked directly" rule ``connected`` already follows.
+    Both are ``None`` (not ``False``) whenever they were not actually
+    measured: "not measured" and "measured as off" are different claims, and
+    ``False`` would assert a fact this process does not have. ``warnings``
+    defaults to ``[]``, never ``None``.
     """
     dial_state = read_dial_state()
     connecting = dial_state.get("action") == "connecting"
@@ -321,6 +340,7 @@ def status() -> dict:
                 "state": "connecting", "connected": False,
                 "active": dial_state.get("profile"), "container": None,
                 "egress_ip": None, "since": None, "deadman_armed": False,
+                "dns_tunneled": None, "kill_switch": None, "warnings": [],
                 "detail": ("A connect is in progress; the host could not yet "
                            "be asked for the tunnel's live state."),
             }
@@ -328,6 +348,7 @@ def status() -> dict:
             "state": "unknown", "connected": False, "active": None,
             "container": None, "egress_ip": None, "since": None,
             "deadman_armed": False,
+            "dns_tunneled": None, "kill_switch": None, "warnings": [],
             "detail": ("The host could not be asked for the tunnel's live "
                        "state (external-status is unavailable, or the host "
                        "could not be reached) — reporting unknown rather "
@@ -340,6 +361,7 @@ def status() -> dict:
             "state": "connecting", "connected": False,
             "active": dial_state.get("profile"), "container": None,
             "egress_ip": None, "since": None, "deadman_armed": False,
+            "dns_tunneled": None, "kill_switch": None, "warnings": [],
             "detail": "A connect is in progress and the tunnel is not up yet.",
         }
     return {
@@ -356,6 +378,9 @@ def status() -> dict:
         "egress_ip": live.get("container_egress_ip"),
         "since": live.get("since"),
         "deadman_armed": bool(live.get("deadman_armed")),
+        "dns_tunneled": live.get("dns_tunneled"),
+        "kill_switch": live.get("kill_switch"),
+        "warnings": live.get("warnings") or [],
         "detail": (
             f"aw-remote-host measured the tunnel {'up' if connected else 'down'} "
             f"live, via external-status."
@@ -416,7 +441,14 @@ def connect(profiles: VpnProfiles, name: str, container: str | None = None) -> d
         "action": "connect", "ok": True, "profile": name, "container": route_container,
         "iface": fields["iface"], "at": _now(),
     })
-    return {"up": up_result, "route": route_result}
+    # external-up and external-route each carry their own "warnings" (per
+    # the pinned contract) — merged here, deduped but order-preserving, so
+    # a caller reading this response sees every warning the apply produced
+    # without having to dig into both "up" and "route" separately.
+    warnings = list(dict.fromkeys(
+        (up_result.get("warnings") or []) + (route_result.get("warnings") or [])
+    ))
+    return {"up": up_result, "route": route_result, "warnings": warnings}
 
 
 def disconnect() -> dict:

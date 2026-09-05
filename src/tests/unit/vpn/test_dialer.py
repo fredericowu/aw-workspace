@@ -119,7 +119,7 @@ def test_connect_happy_path_translates_the_path_and_routes_the_own_container(mon
 
     result = dialer.connect(profiles, "wg0")
 
-    assert result == {"up": {"ok": True}, "route": {"ok": True}}
+    assert result == {"up": {"ok": True}, "route": {"ok": True}, "warnings": []}
     up_cmd = next(c for c in commands if "external-up" in c)
     assert FAKE_HOST_ROOT in up_cmd, "the exec command must carry the TRANSLATED (host-side) path"
     assert "--iface wg0" in up_cmd
@@ -422,6 +422,108 @@ def test_status_egress_ip_never_falls_back_to_the_host_address(monkeypatch, env)
 
     assert result["egress_ip"] is None
     assert result["egress_ip"] != "198.51.100.7"
+
+
+# --- dns_tunneled / kill_switch / warnings --------------------------------
+#
+# DNS Layer 2 is dropped (podman 4.3.1 predates `network update`, no
+# aardvark upstream field, no revertable rewrite of 129 containers' netns
+# resolvers) — dns_tunneled is genuinely false today, and that must reach
+# the screen, not a footnote. kill_switch is a best-effort control-plane
+# pin that can silently produce zero exclusions, so it must be reported
+# too. Both are measurements only the host can make: None means "not
+# measured", never a guessed False.
+
+
+def test_status_surfaces_dns_tunneled_kill_switch_and_warnings_from_the_live_payload(monkeypatch, env):
+    dialer._write_dial_state({
+        "action": "connect", "ok": True, "profile": "wg0", "iface": "wg0",
+        "container": "aw-remote-host-workspace", "at": "then",
+    })
+    _install_exec_fake(monkeypatch, [], lambda c: json.dumps({
+        "up": True, "dns_tunneled": False, "kill_switch": True,
+        "warnings": ["DNS resolves outside the tunnel — Layer 2 could not be applied."],
+    }))
+
+    result = dialer.status()
+
+    assert result["dns_tunneled"] is False
+    assert result["kill_switch"] is True
+    assert result["warnings"] == ["DNS resolves outside the tunnel — Layer 2 could not be applied."]
+
+
+def test_status_dns_tunneled_and_kill_switch_are_none_not_false_when_unreachable(monkeypatch, env):
+    """The tempting default is False (a falsy "nothing wrong here" value).
+    None is the honest one: "not measured" and "measured as off" are
+    different claims, and a stale record must not fill in the gap either."""
+    dialer._write_dial_state({
+        "action": "connect", "ok": True, "profile": "wg0", "iface": "wg0",
+        "container": "aw-remote-host-workspace", "at": "then",
+    })
+
+    def fake_run(self, command, timeout_s=dialer.EXEC_TIMEOUT_S):
+        return {"status": "exited", "exit_code": 2, "stdout": "", "stderr": "unknown command"}
+
+    monkeypatch.setattr(dialer._ExecClient, "run", fake_run)
+
+    result = dialer.status()
+
+    assert result["state"] == "unknown"
+    assert result["dns_tunneled"] is None
+    assert result["kill_switch"] is None
+    assert result["dns_tunneled"] is not False
+    assert result["kill_switch"] is not False
+    assert result["warnings"] == []
+
+
+def test_status_warnings_defaults_to_empty_list_never_none(monkeypatch, env):
+    """An older host binary (or one that simply has nothing to warn about)
+    may omit "warnings" or send it explicitly null — either way the
+    contract promises a list."""
+    dialer._write_dial_state({
+        "action": "connect", "ok": True, "profile": "wg0", "iface": "wg0",
+        "container": "aw-remote-host-workspace", "at": "then",
+    })
+    _install_exec_fake(monkeypatch, [], lambda c: json.dumps({"up": True, "warnings": None}))
+
+    result = dialer.status()
+
+    assert result["warnings"] == []
+    assert result["warnings"] is not None
+
+
+def test_query_status_never_sends_skip_egress(monkeypatch, env):
+    commands: list[str] = []
+    _install_exec_fake(monkeypatch, commands, lambda c: json.dumps({"up": True}))
+
+    dialer.query_status()
+
+    status_cmd = next(c for c in commands if "external-status" in c)
+    assert "--skip-egress" not in status_cmd
+
+
+def test_connect_merges_warnings_from_up_and_route(monkeypatch, env, profiles):
+    profiles.save_config("wg0", "wireguard", WG_OK)
+    root = paths.workspace_root()
+
+    def stdout_for(command):
+        if command.startswith("podman inspect"):
+            return _podman_inspect_stdout(root, FAKE_HOST_ROOT)
+        if "external-up" in command:
+            return json.dumps({"ok": True, "warnings": ["DNS resolves outside the tunnel."]})
+        if "external-route" in command:
+            return json.dumps({"ok": True, "warnings": [
+                "DNS resolves outside the tunnel.", "kill switch could not be verified.",
+            ]})
+        return json.dumps({"ok": True})
+
+    _install_exec_fake(monkeypatch, [], stdout_for)
+
+    result = dialer.connect(profiles, "wg0")
+
+    assert result["warnings"] == [
+        "DNS resolves outside the tunnel.", "kill switch could not be verified.",
+    ]
 
 
 def test_status_is_unknown_rather_than_stale_when_the_query_verb_is_unavailable(monkeypatch, env):

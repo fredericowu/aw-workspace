@@ -456,6 +456,8 @@ def test_status_surfaces_the_live_measurement_at_the_top_level(client, monkeypat
             "state": "connected", "connected": True, "active": "wg0",
             "container": "aw-remote-host-workspace", "egress_ip": "203.0.113.9",
             "since": "2026-09-05T12:00:00Z", "deadman_armed": True,
+            "dns_tunneled": False, "kill_switch": True,
+            "warnings": ["DNS resolves outside the tunnel — Layer 2 could not be applied."],
             "detail": "aw-remote-host measured the tunnel up live, via external-status.",
         },
     )
@@ -468,12 +470,16 @@ def test_status_surfaces_the_live_measurement_at_the_top_level(client, monkeypat
     assert body["container"] == "aw-remote-host-workspace"
     assert body["egress_ip"] == "203.0.113.9"
     assert body["deadman_armed"] is True
+    assert body["dns_tunneled"] is False
+    assert body["kill_switch"] is True
+    assert body["warnings"] == ["DNS resolves outside the tunnel — Layer 2 could not be applied."]
 
 
 def test_status_is_unknown_rather_than_stale_when_the_query_verb_is_unavailable(client, monkeypatch):
     """This process last recorded a successful connect, but the live verb
     being unreachable/unshipped must yield "unknown" — never the stale
-    "connected" recollection, and never a fabricated "disconnected"."""
+    "connected" recollection, and never a fabricated "disconnected". Same
+    for dns_tunneled/kill_switch: None (not measured), never False."""
     from src.api import vpn as vpn_mod
 
     monkeypatch.setattr(
@@ -486,6 +492,7 @@ def test_status_is_unknown_rather_than_stale_when_the_query_verb_is_unavailable(
             "state": "unknown", "connected": False, "active": None,
             "container": None, "egress_ip": None, "since": None,
             "deadman_armed": False,
+            "dns_tunneled": None, "kill_switch": None, "warnings": [],
             "detail": "The host could not be asked for the tunnel's live state.",
         },
     )
@@ -495,6 +502,11 @@ def test_status_is_unknown_rather_than_stale_when_the_query_verb_is_unavailable(
     assert body["state"] == "unknown"
     assert body["connected"] is False
     assert body["active"] is None
+    assert body["dns_tunneled"] is None
+    assert body["kill_switch"] is None
+    assert body["dns_tunneled"] is not False
+    assert body["kill_switch"] is not False
+    assert body["warnings"] == []
 
 
 def test_status_dial_defaults_to_empty(client):
