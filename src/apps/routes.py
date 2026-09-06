@@ -670,7 +670,13 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         incoming = data.get("config") if isinstance(data.get("config"), dict) else data
         merged = _merge_config(loaded.config or {}, incoming or {})
         loaded.config = loaded.manifest.config_with_defaults(_coerce_config(schema, merged))
-        loaded.ctx.config = dict(loaded.config)
+        # In place, NOT rebound: AppContext copies the dict it is handed, so a
+        # plugin that captured ctx.config at activate time holds that exact
+        # object and a rebind leaves it reading dead values forever. The
+        # converge path (Reconciler._refresh_config) mutates in place for the
+        # same reason — the request worker and the other nine must not diverge.
+        loaded.ctx.config.clear()
+        loaded.ctx.config.update(loaded.config)
 
         # Keep the durable snapshot current, so an uninstall + install (or a
         # reconcile that resolves this app from a config-less catalog row)
@@ -715,6 +721,18 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         # already-updated file rather than racing it. Duck-typed getattr,
         # not a hard dependency on the Plugin base class — some in-repo test
         # plugins predate this hook and don't subclass Plugin.
+        # The ATTACH half first, and on this worker too: every OTHER worker
+        # runs on_config_reloaded off the apps:changed broadcast below, so the
+        # worker that served the request has to run the identical hook or it
+        # is the one process with stale derived state. It is also what keeps
+        # the feature working with Redis down — nobody gets the broadcast, and
+        # this call alone reproduces exactly today's single-worker behaviour
+        # (src/apps/lifecycle.py's degradation rule). Ordered BEFORE
+        # on_config_saved so an app that regenerates its mcp.json there sees
+        # already-refreshed state.
+        on_config_reloaded = getattr(loaded.plugin, "on_config_reloaded", None)
+        if callable(on_config_reloaded):
+            await on_config_reloaded(loaded.ctx)
         on_config_saved = getattr(loaded.plugin, "on_config_saved", None)
         if callable(on_config_saved):
             await on_config_saved(loaded.ctx)
@@ -728,6 +746,19 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         # ones that remembered to set contributes.mcp.reload_on_save.
         if reconciler._app_touches_mcp(loaded.manifest, loaded.package_dir):
             await _reload_mcp_gateway(runtime)
+
+        # This worker is one of AW_WORKSPACE_WORKERS; the other nine still hold
+        # the OLD config, and answer GET /api/apps/{slug}/config from it. Tell
+        # them the mirror moved — same transport install/uninstall use, no new
+        # topic and no payload contract: the handler
+        # (Reconciler._converge_in_process) always re-reads the full mirror and
+        # treats the payload as a logging hint (src/apps/lifecycle.py).
+        # Published LAST, after every shared effect above, so a worker that
+        # converges immediately reads a row that is already final. Redis down
+        # (or workers=1) → no delivery and no error: the inline
+        # on_config_reloaded above already did this worker's half, which is the
+        # whole of the single-worker case.
+        await reconciler._trigger_broadcast("config", slug)
 
         return _app_config_payload(loaded)
 

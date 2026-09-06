@@ -115,6 +115,85 @@ def test_plugin_without_the_hook_is_not_a_hard_error(tmp_path, monkeypatch):
     assert res.json()["config"]["enabled"] is False
 
 
+PLUGIN_RECORDING_BOTH_HOOKS = """
+    class AppPlugin:
+        async def activate(self, ctx):
+            ctx.order = []
+            # Captured once, at activate — see Reconciler._refresh_config.
+            ctx.captured = ctx.config
+        async def deactivate(self):
+            return None
+        async def on_config_reloaded(self, ctx):
+            ctx.order.append(("reloaded", ctx.config["enabled"]))
+        async def on_config_saved(self, ctx):
+            ctx.order.append(("saved", ctx.config["enabled"]))
+"""
+
+
+def test_on_config_reloaded_runs_before_on_config_saved(tmp_path, monkeypatch):
+    """The request worker must run the SAME in-process refresh hook the other
+    nine workers get off apps:changed — otherwise it is the one process with
+    stale derived state, and with Redis down nobody refreshes at all. Ordered
+    first so an app regenerating its mcp.json in on_config_saved sees
+    already-refreshed state."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    pkg = _write_app(tmp_path, "bothhooks", reload_on_save=False,
+                     plugin_src=PLUGIN_RECORDING_BOTH_HOOKS)
+    app, runtime, client = _client()
+    _async(runtime.load(pkg, granted_permissions=[]))
+
+    res = client.post("/api/apps/bothhooks/config", json={"config": {"enabled": False}})
+    assert res.status_code == 200
+    assert runtime.get("bothhooks").ctx.order == [("reloaded", False), ("saved", False)]
+
+
+def test_save_mutates_ctx_config_in_place(tmp_path, monkeypatch):
+    """A plugin that captured ctx.config at activate time must read the new
+    values from that same object. Rebinding ctx.config leaves it holding a dead
+    dict forever — the bug that made one app invent its own _live_config
+    cache — and the converge path mutates in place, so the request worker has
+    to as well or the two diverge."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    pkg = _write_app(tmp_path, "identityapp", reload_on_save=False,
+                     plugin_src=PLUGIN_RECORDING_BOTH_HOOKS)
+    app, runtime, client = _client()
+    _async(runtime.load(pkg, granted_permissions=[]))
+    loaded = runtime.get("identityapp")
+    captured = loaded.ctx.captured
+    # load() hands the app its stored config as-is (schema defaults are filled
+    # in by the save path, not by load) — so this starts out empty.
+    assert "enabled" not in captured
+
+    client.post("/api/apps/identityapp/config", json={"config": {"enabled": False}})
+
+    assert loaded.ctx.config is captured
+    assert captured["enabled"] is False
+
+
+def test_save_publishes_apps_changed_for_the_other_workers(tmp_path, monkeypatch):
+    """The publish is the whole cross-worker half: without it the other nine
+    workers keep answering GET /config — and running their watchdogs — from the
+    config this save replaced, until the next restart."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    pkg = _write_app(tmp_path, "pubapp", reload_on_save=False, plugin_src=PLUGIN_NO_HOOK)
+    app, runtime, client = _client()
+    _async(runtime.load(pkg, granted_permissions=[]))
+
+    published: list[tuple[str, str]] = []
+
+    async def _publish(reason, app_id=None):
+        published.append((reason, app_id))
+
+    # The real AppLifecycle.publish is already a no-op here (no lifespan ran,
+    # so no broadcaster) — which is also what keeps this test off the LIVE
+    # Redis this workspace's own workers are subscribed to.
+    monkeypatch.setattr(app.state.app_lifecycle, "publish", _publish)
+
+    assert client.post("/api/apps/pubapp/config",
+                       json={"config": {"enabled": False}}).status_code == 200
+    assert published == [("config", "pubapp")]
+
+
 def test_gateway_reload_skipped_when_app_does_not_contribute_mcp(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(routes_mod, "_reload_mcp_gateway", lambda runtime: calls.append(1))

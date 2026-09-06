@@ -381,10 +381,13 @@ class Reconciler:
 
         The ``apps:changed`` handler. Attaches what the mirror lists and this
         process doesn't serve, detaches what it serves and the mirror no
-        longer lists, and re-attaches anything whose recorded version moved
-        under it (another worker's upgrade). By construction it cannot reach
-        pip, git or podman: every path in it goes through
-        :meth:`attach`/:meth:`detach`, which pass ``provision=False`` down.
+        longer lists, re-attaches anything whose recorded version moved under
+        it (another worker's upgrade), and refreshes the in-process config of
+        anything whose mirror row's ``config`` moved under it (another
+        worker's ``POST /api/apps/{slug}/config``). By construction it cannot
+        reach pip, git or podman: every path in it goes through
+        :meth:`attach`/:meth:`detach`/:meth:`_refresh_config`, none of which
+        provision.
 
         Serialized against this process's own provisioning passes — see
         ``AppLifecycle.in_process_exclusive`` for why detaching on absence
@@ -400,6 +403,7 @@ class Reconciler:
                 if r.get("app_id")}
         attached: list[str] = []
         detached: list[str] = []
+        reconfigured: list[str] = []
         errors: list[dict[str, str]] = []
 
         # Detach first: an app removed elsewhere must stop answering here
@@ -429,14 +433,73 @@ class Reconciler:
                 log.exception("apps: converge failed to attach %s", app_id)
                 errors.append({"app_id": app_id, "action": "attach", "error": str(e)})
 
+        # Third case, beside attach and detach: an app that stays loaded at the
+        # same version whose CONFIG moved under this worker — another worker
+        # served POST /api/apps/{slug}/config and only updated its OWN
+        # in-memory copy. The mirror row has carried `config` all along
+        # (LocalMirror.list, above); this is the one place that reads it.
+        for app_id, row in rows.items():
+            loaded = self.runtime.get(app_id)
+            if loaded is None:  # not served here (or just detached) — nothing to refresh
+                continue
+            try:
+                if await self._refresh_config(loaded, row.get("config")):
+                    reconfigured.append(app_id)
+            except Exception as e:  # noqa: BLE001 — one bad app must not block the rest
+                log.exception("apps: converge failed to refresh config for %s", app_id)
+                errors.append({"app_id": app_id, "action": "config", "error": str(e)})
+
         # Routes moved in this process, so its OpenAPI/contributions views did
         # too — but nothing SHARED changed, so no gateway reload and no
         # re-broadcast (which would loop: every worker publishing on every
         # received publish).
-        if attached or detached or errors:
-            log.info("apps: converged in-process — attached=%s detached=%s errors=%d",
-                     attached, detached, len(errors))
-        return {"attached": attached, "detached": detached, "errors": errors}
+        if attached or detached or reconfigured or errors:
+            log.info("apps: converged in-process — attached=%s detached=%s "
+                     "reconfigured=%s errors=%d",
+                     attached, detached, reconfigured, len(errors))
+        return {"attached": attached, "detached": detached,
+                "reconfigured": reconfigured, "errors": errors}
+
+    async def _refresh_config(self, loaded, row_config: dict[str, Any] | None) -> bool:
+        """Bring ONE loaded app's in-process config up to the mirror row's.
+        True if it actually moved. The ATTACH half of a config save: it
+        refreshes what this process needs to answer correctly and nothing
+        shared — no ``config_store.save``, no ``local.update_config``, no
+        ``cloud.put_desired``, no ``_apply_runtime_config``, no
+        ``_render_mcp_template``, no gateway reload and no ``on_config_saved``.
+        Every one of those is PROVISION and the request worker already did each
+        exactly once.
+
+        Both sides go through ``config_with_defaults`` before comparing, and
+        that normalization is load-bearing rather than tidy: a save persists
+        the POST-defaults dict (``routes.save_app_config``) while an install
+        persists ``spec.config`` PRE-defaults (:meth:`install`'s ``upsert``).
+        Compared raw, an app installed with a defaults-bearing schema differs
+        from its own mirror row forever — so every converge would "see a
+        change", refresh, and call the app's hook on every ``apps:changed``,
+        for as long as the workspace is up. A unit test whose manifest
+        declares no defaults cannot catch that (see
+        ``test_lifecycle_split.py``'s config cases, which declare one).
+        """
+        desired = loaded.manifest.config_with_defaults(dict(row_config or {}))
+        if desired == loaded.manifest.config_with_defaults(loaded.config or {}):
+            return False
+        loaded.config = desired
+        # In place, NOT rebound: AppContext copies the dict it is handed
+        # (src/apps/base.py), so anything that captured ctx.config at activate
+        # time holds that exact object — rebinding leaves it reading dead
+        # values forever, which is the very bug that made one app invent its
+        # own `_live_config` cache. routes.save_app_config mutates in place for
+        # the same reason; the two paths must not diverge.
+        loaded.ctx.config.clear()
+        loaded.ctx.config.update(desired)
+        # Duck-typed, exactly like on_config_saved's call site: some in-repo
+        # test plugins predate the Plugin base class, and a Tier-2 app has no
+        # plugin at all.
+        on_config_reloaded = getattr(loaded.plugin, "on_config_reloaded", None)
+        if callable(on_config_reloaded):
+            await on_config_reloaded(loaded.ctx)
+        return True
 
     # ---- resolve a package dir for a spec (fetch unless already on disk) ----
 

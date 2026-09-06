@@ -255,7 +255,7 @@ def test_converge_in_process_attaches_and_detaches_from_the_mirror(runtime, tmp_
 
     # idempotent — a second apps:changed for an unchanged mirror is a no-op
     assert asyncio.run(reconciler.converge_in_process()) == {
-        "attached": [], "detached": [], "errors": []}
+        "attached": [], "detached": [], "reconfigured": [], "errors": []}
 
     # mirror row gone -> converge detaches it
     rows.clear()
@@ -297,6 +297,182 @@ def test_converge_reattaches_when_another_worker_upgraded_the_version(runtime, t
     assert result["detached"] == ["w3app"] and result["attached"] == ["w3app"], result
     assert runtime.get("w3app").manifest.version == "2.0.0"
     assert fx.shared_total == 0
+
+
+CONFIG_PLUGIN = """
+class AppPlugin:
+    async def activate(self, ctx):
+        ctx.reloaded = []
+        ctx.saved = []
+        # Captured ONCE, at activate — the shape every app that reads its
+        # config lazily ends up with, and the thing a rebind would kill.
+        ctx.captured = ctx.config
+
+    async def deactivate(self):
+        pass
+
+    async def on_config_reloaded(self, ctx):
+        ctx.reloaded.append(dict(ctx.config))
+
+    async def on_config_saved(self, ctx):
+        ctx.saved.append(dict(ctx.config))
+"""
+
+
+def _cfg_pkg(tmp_path, slug="cfgapp", version="1.0.0"):
+    """Like ``_pkg`` but with a config_schema that DECLARES A DEFAULT and a
+    plugin recording both config hooks. The default is the point: the mirror
+    row written by an install holds pre-defaults config while a save writes
+    post-defaults, so a converge that compares them raw sees a difference
+    forever. A fixture without a default cannot catch that."""
+    pkg = tmp_path / slug
+    pkg.mkdir(parents=True, exist_ok=True)
+    (pkg / "aw-app.json").write_text(json.dumps({
+        "manifest_version": 1,
+        "id": slug,
+        "name": slug,
+        "version": version,
+        "tier": "inprocess",
+        "runtime": {"entrypoint": "plugin:AppPlugin"},
+        "permissions": [],
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "sweep_enabled": {"type": "boolean", "default": False},
+                "interval": {"type": "integer", "default": 30},
+            },
+        },
+    }))
+    (pkg / "plugin.py").write_text(CONFIG_PLUGIN)
+    return str(pkg)
+
+
+def _cfg_reconciler(runtime, rows, monkeypatch):
+    from src.apps.reconciler import Reconciler
+
+    class _Mirror:
+        def list(self):
+            return [dict(r) for r in rows]
+
+    reconciler = Reconciler(runtime, local=_Mirror())
+    reconciler._fetch = lambda *a, **k: pytest.fail("converge fetched from the network")
+    monkeypatch.setattr(type(reconciler.cloud), "configured", property(lambda self: False))
+    return reconciler
+
+
+def test_converge_refreshes_config_another_worker_saved(runtime, tmp_path, monkeypatch):
+    """The third converge case. A config saved on ANOTHER worker only moved
+    that worker's in-memory copy and the shared mirror row; this worker has to
+    pick it up off apps:changed, or it answers GET /config — and runs its
+    watchdogs — from a stale dict until the next restart."""
+    fx = _Effects()
+    fx.wire(runtime, monkeypatch)
+    pkg = _cfg_pkg(tmp_path)
+    rows = [{"app_id": "cfgapp", "version": "1.0.0", "package_dir": pkg,
+             "granted_permissions": [], "config": {"sweep_enabled": False},
+             "signed": False}]
+    reconciler = _cfg_reconciler(runtime, rows, monkeypatch)
+
+    asyncio.run(reconciler.converge_in_process())
+    loaded = runtime.get("cfgapp")
+    captured = loaded.ctx.captured
+    assert loaded.ctx.reloaded == [], "attaching is not a config change"
+
+    # another worker served POST /api/apps/cfgapp/config
+    rows[0]["config"] = {"sweep_enabled": True, "interval": 30}
+    result = asyncio.run(reconciler.converge_in_process())
+
+    assert result["reconfigured"] == ["cfgapp"], result
+    assert loaded.config["sweep_enabled"] is True
+    assert loaded.ctx.config["sweep_enabled"] is True
+    # ...in the SAME dict the plugin captured at activate time.
+    assert loaded.ctx.captured is captured and captured["sweep_enabled"] is True
+    assert loaded.ctx.reloaded == [{"sweep_enabled": True, "interval": 30}]
+    # on_config_saved is the once-per-save PROVISION half — running it here
+    # would restart a managed service in all ten workers (the measured reason
+    # this hook exists at all).
+    assert loaded.ctx.saved == []
+    assert fx.shared_total == 0, f"converge reached a shared side effect: {vars(fx)}"
+
+
+def test_converge_does_not_refire_the_config_hook_for_schema_defaults(runtime, tmp_path,
+                                                                      monkeypatch):
+    """Both sides of the comparison must go through ``config_with_defaults``.
+    The two writers disagree about defaults: a save persists the POST-defaults
+    dict, while ``install``'s ``upsert`` persists ``spec.config`` PRE-defaults.
+    So a worker holding the normalized form and a row holding the raw one
+    describe the SAME configuration — and comparing them raw makes every
+    apps:changed in the workspace (one per install, uninstall and save of ANY
+    app) 'see a change': it re-fires every app's hook and strips the defaults
+    back out of ``loaded.config``."""
+    fx = _Effects()
+    fx.wire(runtime, monkeypatch)
+    pkg = _cfg_pkg(tmp_path)
+    # exactly what upsert(spec, ...) stores: no defaults filled in
+    rows = [{"app_id": "cfgapp", "version": "1.0.0", "package_dir": pkg,
+             "granted_permissions": [], "config": {"interval": 5}, "signed": False}]
+    reconciler = _cfg_reconciler(runtime, rows, monkeypatch)
+
+    asyncio.run(reconciler.converge_in_process())
+    loaded = runtime.get("cfgapp")
+    # ...and this worker holds the normalized form of those same values, which
+    # is what a save (or an earlier refresh) leaves behind.
+    loaded.config = loaded.manifest.config_with_defaults({"interval": 5})
+    assert loaded.config == {"sweep_enabled": False, "interval": 5}
+
+    for _ in range(3):
+        assert asyncio.run(reconciler.converge_in_process()) == {
+            "attached": [], "detached": [], "reconfigured": [], "errors": []}
+    assert loaded.ctx.reloaded == []
+    assert loaded.config == {"sweep_enabled": False, "interval": 5}
+
+
+def test_converge_config_refresh_is_idempotent_under_repeated_delivery(runtime, tmp_path,
+                                                                       monkeypatch):
+    """Delivery is not once per worker — each RedisBroadcaster in a process
+    starts its own relay (40 subscribers were measured for 10 workers), so the
+    handler fires more than once per publish. The second delivery must be a
+    no-op, not a second hook call."""
+    fx = _Effects()
+    fx.wire(runtime, monkeypatch)
+    pkg = _cfg_pkg(tmp_path)
+    rows = [{"app_id": "cfgapp", "version": "1.0.0", "package_dir": pkg,
+             "granted_permissions": [], "config": {}, "signed": False}]
+    reconciler = _cfg_reconciler(runtime, rows, monkeypatch)
+    asyncio.run(reconciler.converge_in_process())
+    loaded = runtime.get("cfgapp")
+
+    rows[0]["config"] = {"interval": 5}
+    for _ in range(4):
+        asyncio.run(reconciler.converge_in_process())
+
+    assert loaded.ctx.reloaded == [{"sweep_enabled": False, "interval": 5}]
+
+
+def test_converge_survives_an_app_whose_config_hook_raises(runtime, tmp_path, monkeypatch):
+    """One bad app must not block the rest — same contract attach/detach have."""
+    fx = _Effects()
+    fx.wire(runtime, monkeypatch)
+    pkg = _cfg_pkg(tmp_path, slug="badcfg")
+    (tmp_path / "badcfg" / "plugin.py").write_text(
+        "class AppPlugin:\n"
+        "    async def activate(self, ctx):\n        pass\n"
+        "    async def deactivate(self):\n        pass\n"
+        "    async def on_config_reloaded(self, ctx):\n"
+        "        raise RuntimeError('app hook blew up')\n")
+    rows = [{"app_id": "badcfg", "version": "1.0.0", "package_dir": pkg,
+             "granted_permissions": [], "config": {}, "signed": False}]
+    reconciler = _cfg_reconciler(runtime, rows, monkeypatch)
+    asyncio.run(reconciler.converge_in_process())
+
+    rows[0]["config"] = {"interval": 9}
+    result = asyncio.run(reconciler.converge_in_process())
+
+    assert result["reconfigured"] == []
+    assert result["errors"] == [{"app_id": "badcfg", "action": "config",
+                                 "error": "app hook blew up"}]
+    # the refresh itself still landed — only the app's reaction to it failed
+    assert runtime.get("badcfg").ctx.config["interval"] == 9
 
 
 def test_attach_refuses_when_the_package_is_not_on_disk_yet(runtime, tmp_path, monkeypatch):
@@ -486,7 +662,8 @@ def test_converge_cannot_interleave_with_this_worker_s_own_install(runtime, tmp_
         await asyncio.wait_for(install, timeout=10)
         result = await asyncio.wait_for(converge, timeout=10)
         # It runs once the install has committed, and now agrees with it.
-        assert result == {"attached": [], "detached": [], "errors": []}
+        assert result == {"attached": [], "detached": [], "reconfigured": [],
+                          "errors": []}
         assert runtime.is_loaded("w3app")
 
     asyncio.run(asyncio.wait_for(run(), timeout=40))

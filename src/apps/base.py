@@ -42,8 +42,43 @@ class Plugin:
         POST /reload — triggered right after this returns, see
         routes.save_app_config — then picks up).
 
+        Runs on the ONE worker that served the POST — it is the PROVISION half
+        of a config save (see ``src/apps/lifecycle.py``). Anything that would
+        be wrong to do ten times over (restart a managed service, rebind a
+        socket, write a shared file, call out to the network) belongs here.
+        In-process state that every worker needs refreshed belongs in
+        :meth:`on_config_reloaded`, which core calls just before this one.
+
         No-op by default; a plugin only needs to override this if a config
         change has some side effect to apply beyond the config dict itself.
+        """
+        return None
+
+    async def on_config_reloaded(self, ctx: "AppContext") -> None:
+        """Called when ``ctx.config`` has just changed under this process —
+        the ATTACH half of a config save, and the counterpart to
+        :meth:`on_config_saved`.
+
+        Refresh IN-PROCESS DERIVED STATE ONLY: a cached copy of the config, a
+        recomputed index, a pool's sizing. **Never** touch disk, podman, the
+        network or a managed service here — this runs in EVERY worker
+        (``AW_WORKSPACE_WORKERS`` of them), so a restart in here is ten
+        restarts and a socket rebind is a port conflict. Those belong in
+        ``on_config_saved``, which runs exactly once.
+
+        Called from two places, in both cases after ``ctx.config`` has been
+        updated in place (its dict identity is stable for the life of a load,
+        so a value captured at ``activate`` time stays live):
+
+        * ``Reconciler._converge_in_process`` — on the other workers, off the
+          ``apps:changed`` broadcast; and
+        * ``routes.save_app_config`` — inline on the request worker, right
+          before ``on_config_saved``, so an app's refresh logic lives in one
+          place and still runs when Redis is down (``src/apps/lifecycle.py``'s
+          degradation rule) rather than only on the nine workers that got the
+          broadcast.
+
+        No-op by default.
         """
         return None
 
