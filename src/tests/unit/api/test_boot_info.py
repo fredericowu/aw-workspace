@@ -7,11 +7,15 @@ before ``uvicorn.run(workers=N)`` forks/spawns workers (see
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from src.api import boot_info
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 def test_compute_git_head_returns_head_of_this_checkout():
-    head = boot_info.compute_git_head("/opt/aw-workspace")
+    head = boot_info.compute_git_head(str(_REPO_ROOT))
     assert head
     assert len(head) == 40
     assert all(c in "0123456789abcdef" for c in head)
