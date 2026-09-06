@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 
 import pytest
 from fastapi import FastAPI
@@ -576,11 +575,15 @@ def test_multi_worker_falls_back_to_provisioning_when_redis_is_down(monkeypatch)
 
 def test_multi_worker_claim_is_scoped_to_one_fleet_boot(monkeypatch):
     """Exactly one worker of a boot provisions, and the claim key is the
-    uvicorn master they were forked from — so the NEXT boot gets its own
-    claim instead of inheriting this one's window."""
+    boot-nonce minted once by the parent process (``boot_info.boot_id()``)
+    and inherited by every worker of that one boot — so the NEXT boot gets
+    its own claim instead of inheriting this one's window."""
+    from src.api import boot_info
     from src.api.app import _is_boot_provisioner
 
     monkeypatch.setenv("AW_WORKSPACE_WORKERS", "3")
+    monkeypatch.setattr(boot_info, "compute_git_head", lambda: "")
+    boot_info.mint_boot_identity()
     claimed: set[str] = set()
     keys: list[str] = []
 
@@ -597,7 +600,54 @@ def test_multi_worker_claim_is_scoped_to_one_fleet_boot(monkeypatch):
         return [await _is_boot_provisioner() for _ in range(3)]
 
     assert asyncio.run(three_workers()) == [True, False, False]
-    assert len(set(keys)) == 1 and str(os.getppid()) in keys[0]
+    assert len(set(keys)) == 1 and boot_info.boot_id() in keys[0]
+
+
+def test_restart_in_place_with_pid_reuse_gets_a_fresh_claim(monkeypatch):
+    """Regression test for the W3 boot-provisioner bug fixed 2026-09-06
+    (Kanban card ``aw-workspace-multiworker:proxy-app-auto-start-not-running``).
+
+    The cooldown key used to be ``f"boot-apps-reconcile:{os.getppid()}"``, on
+    the assumption that a restart is always a different master process and so
+    always gets its own claim. That assumption is false when the container
+    restarts IN PLACE (no recreation, same PID namespace): a fresh master
+    reliably gets reassigned the same low pid, so a second boot 12s after the
+    first — well inside the 120s TTL — saw the first (already-dead) boot's
+    still-live claim and every one of its fresh workers deferred to it,
+    leaving ``ctx.provision=False`` fleet-wide and no ``autostart=True``
+    service ever spawned that boot.
+
+    Simulated here by minting a boot-nonce for "boot #1", running its
+    fleet, then minting an entirely new one for "boot #2" (what
+    ``mint_boot_identity()`` does on every real restart, independent of
+    ``os.getppid()``) against a fake Redis claim store that never expires —
+    the worst case, a claim that outlives the whole test. Boot #2 must still
+    get its own provisioner, because its key differs from boot #1's.
+    """
+    from src.api import boot_info
+    from src.api.app import _is_boot_provisioner
+
+    monkeypatch.setenv("AW_WORKSPACE_WORKERS", "3")
+    monkeypatch.setattr(boot_info, "compute_git_head", lambda: "")
+    claimed: set[str] = set()
+
+    async def _claim(key, seconds=0.0, redis_url=None):
+        if key in claimed:
+            return False
+        claimed.add(key)
+        return True
+
+    monkeypatch.setattr("src.libs.redis_coord.cooldown_acquire", _claim)
+
+    async def fleet():
+        return [await _is_boot_provisioner() for _ in range(3)]
+
+    boot_info.mint_boot_identity()  # boot #1
+    assert asyncio.run(fleet()) == [True, False, False]
+
+    boot_info.mint_boot_identity()  # boot #2, restarted in place — same pid,
+                                     # new boot_id
+    assert asyncio.run(fleet()) == [True, False, False]
 
 
 def test_converge_cannot_interleave_with_this_worker_s_own_install(runtime, tmp_path,

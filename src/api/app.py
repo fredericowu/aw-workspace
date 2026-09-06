@@ -149,14 +149,24 @@ async def _is_boot_provisioner() -> bool:
        twice inside the cooldown window skip its own boot reconcile AND its
        ``agent sync`` — caught by ``test_skills_routes`` before this landed.
 
-    2. **At >1, one worker per FLEET BOOT wins the claim.** Keyed on the
-       parent pid, which is the uvicorn master every worker of one boot is
-       forked from (``src/start/workspace.py`` uses the factory import string
-       exactly when workers>1) — so a later restart is a different master and
-       gets its own claim, rather than inheriting a window opened by the boot
-       before it. The window only has to cover how far apart the workers of
-       ONE boot start; the provisioning mutex covers the reconcile's own
-       runtime.
+    2. **At >1, one worker per FLEET BOOT wins the claim.** Keyed on
+       ``boot_info.boot_id()`` — a uuid4 minted once by the parent process
+       in ``mint_boot_identity()`` before ``uvicorn.run(workers=N)``
+       forks/spawns workers, and inherited via ``os.environ`` by every
+       worker of that one boot (see ``src/start/workspace.py::main`` and
+       ``src/api/boot_info.py``) — so a later restart always mints a fresh
+       id and gets its own claim, rather than inheriting a window opened by
+       the boot before it. This used to be keyed on ``os.getppid()`` under
+       the assumption that a restart is always a different master process;
+       that's false when the container restarts in place (no recreation,
+       same PID namespace) — a fresh master reliably gets reassigned the
+       same low pid, so two boots 12s apart both keyed on parent pid 2 and
+       the second one's 10 fresh workers all deferred to the first (already
+       dead) boot's still-live 120s cooldown claim, leaving every worker
+       with ``ctx.provision=False`` and no ``autostart=True`` service ever
+       spawned that boot. The window only has to cover how far apart the
+       workers of ONE boot start; the provisioning mutex covers the
+       reconcile's own runtime.
 
     Redis unreachable — the normal case in every environment today — falls
     back to yes, i.e. today's behaviour: every worker converges independently,
