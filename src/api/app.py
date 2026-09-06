@@ -178,7 +178,7 @@ async def _is_boot_provisioner() -> bool:
 
     try:
         return await cooldown_acquire(
-            f"boot-apps-reconcile:{os.getppid()}", seconds=120.0)
+            f"boot-apps-reconcile:{boot_info.boot_id()}", seconds=120.0)
     except Exception:
         log.exception("apps: could not claim the boot reconcile — this worker "
                       "will run its own, as it did before W3")
