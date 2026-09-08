@@ -1,8 +1,13 @@
 # Runbook — prune, repoint podman's graphroot, rebuild the `aw-remote-host` image
 
-**Status:** written 2026-09-03, **NOT YET EXECUTED**. Review before dispatch.
+**Status:** written 2026-09-03, **EXECUTED 2026-09-04 → 2026-09-08 — do not
+re-run it.** Every phase below has landed; see [What actually
+happened](#0-what-actually-happened-and-how-it-differed-from-this-plan) for
+the delivery path, which is **not** the one this document describes.
 **Authorized by:** Frederico, Telegram 2026-09-03.
 **Design context:** [`../architecture/vpn-profiles-in-general.md`](../architecture/vpn-profiles-in-general.md) §2.7.
+**Successor:** [`podman-5-upgrade-aw-remote-host.md`](./podman-5-upgrade-aw-remote-host.md) — the
+work that remained after this one finished.
 **Cards:** V0 `3d05bf3b-9510-81c5-aae7-c3a14d99f89d`, VPNs #3 `3d05bf3b-9510-81f4-8c3e-f92dd7c241e5`.
 
 This operation destroys and re-creates the container that hosts **130 running
@@ -10,6 +15,45 @@ containers and every agent session** on the production bare metal. The
 2026-09-02 incident (`byod-postgres-lost-bind-mount-2026-09-02`) was this exact
 operation going wrong by accident. Every number below was measured on
 2026-09-03; **re-measure before acting — do not trust these as current.**
+
+---
+
+## 0. What actually happened, and how it differed from this plan
+
+Kept because the *reasoning* below is still the reasoning — the safety case, what
+survives a recreate, why the graphroot had to move. Only the mechanics changed.
+Read this section before you read anything else here, and read nothing here as
+an instruction.
+
+| Phase as written | Landed | How |
+|---|---|---|
+| §3.1 move the Dockerfile into `repos/aw-remote-host` | 2026-09-04 | see its header comment |
+| §3.2 bake `iproute2 wireguard-tools openvpn` | 2026-09-04 | live on the host's PATH today |
+| §3.3 bake tailscale | 2026-09-04 | live on the host's PATH today |
+| §5 repoint podman's graphroot off the ephemeral layer | 2026-09-08 | `podman info` → `/home/aw-remote-host/.local/share/containers/storage`; `/etc/containers/storage.conf` carries graphroot **and** runroot |
+| the container recreate itself | 2026-09-08 13:07 | the aw-stack cutover; 25 nested containers came back |
+
+**The delivery path was different, and that difference is the point.** This
+document assumes a bare-metal `docker compose build` — building the image on the
+box from a local checkout. That is exactly the failure it was trying to fix: the
+live image turned out to have been built on 2026-09-05 from a checkout nine
+commits behind `origin/main`, from an unnamed commit. So `a535ef2` gave
+`release.yml` an `image` job instead. **CI builds and publishes the image, and
+`/opt/aw-stack/.env` pins it by digest** through `AW_REMOTE_HOST_IMAGE` with no
+`:latest` fallback. There is no longer a supported way to build this image on the
+metal, and doing it by hand would un-pin the one property that makes a rollback
+nameable.
+
+`d99cab1` added the podman version floor and taught `bootstrap/podman/verify.sh`
+to assert it, closing the "verify.sh only checks *is it up*" hole that let a
+re-provision skip `install.sh` — and with it `configure_podman_graphroot`.
+
+**Nothing here remains to be executed as a separate step.** In particular, do
+not schedule a standalone "add the VPN packages to the image" phase: those
+packages are baked and live. What was genuinely left over — podman is still
+4.3.1, because it is `apt-get install`ed from whatever the base image offers —
+is a different change to a different line, and it has its own runbook (see
+**Successor** above).
 
 ---
 
