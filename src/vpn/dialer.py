@@ -490,11 +490,22 @@ def connect(profiles: VpnProfiles, name: str, container: str | None = None) -> d
             # up through the LOCAL container resolver are forwarded from the
             # host — aardvark forwards with the host's own source address, so
             # the ``ip rule`` anchored on the container never matches them.
-            # The Go side owns every part of this: it installs a main-table
-            # route to the resolver, moves the podman network's aardvark
-            # upstream, proves both, and compiles the undo into the dead-man's
-            # switch. If any of that cannot be proven it routes anyway and
-            # reports ``dns_tunneled: false`` — never a claim.
+            # The Go side owns every part of this: it installs one `ip rule`
+            # per resolver per transport, scoped to `ipproto {udp,tcp} dport
+            # 53` so it moves the resolver's QUERIES and nothing else about
+            # that address, moves the podman network's aardvark upstream,
+            # proves both directions — the DNS flow went onto the tunnel AND
+            # everything else to that address did not — and compiles the undo
+            # into the dead-man's switch. If any of that cannot be proven it
+            # routes anyway and reports ``dns_tunneled: false`` — never a
+            # claim.
+            #
+            # It deliberately writes NOTHING to any route table. An earlier
+            # version put a `<dns>/32` in the main table, which also captured
+            # this host's own HTTPS egress-confirmation probe to the same
+            # address (the only configured profile's resolver is 1.1.1.1,
+            # which is also the first endpoint that probe tries) and reverted
+            # every connect. Port-scoping the rule is what separates the two.
             #
             # THIS FLAG IS THE FEATURE'S KILL SWITCH, and it lives here on
             # purpose: the change is network-wide (every container on the
@@ -521,6 +532,22 @@ def connect(profiles: VpnProfiles, name: str, container: str | None = None) -> d
     warnings = list(dict.fromkeys(
         (up_result.get("warnings") or []) + (route_result.get("warnings") or [])
     ))
+    # ...except the DNS one, when the ROUTE proved otherwise.
+    #
+    # `external-up` does not do the DNS half at all, so it ALWAYS reports
+    # dns_tunneled=false and always emits this warning. That was harmless while
+    # the DNS half could never succeed; now that it can, a merged list carrying
+    # both "DNS IS NOT FULLY TUNNELLED" and route.dns_tunneled=true is a
+    # contradiction, and the surfaces that read this (VpnNav's tooltip,
+    # /api/vpn/status) would show the alarm next to the guarantee.
+    #
+    # The route is the authority here: it is the only half that measures the
+    # resolver, and it only sets the flag once both flow proofs and the
+    # end-to-end resolution have passed. Measured live on the host 2026-09-08 —
+    # a real gl-inet connect returned route.dns_tunneled=true alongside up's
+    # stale warning, which is what this drops.
+    if route_result.get("dns_tunneled"):
+        warnings = [w for w in warnings if not w.startswith("DNS IS NOT FULLY TUNNELLED")]
     return {"up": up_result, "route": route_result, "warnings": warnings}
 
 

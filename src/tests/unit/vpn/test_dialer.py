@@ -190,6 +190,76 @@ def test_connect_asks_the_host_to_tunnel_dns_and_sends_only_the_profile_PATH(mon
     )
 
 
+# The DNS-not-tunnelled warning is emitted by `external-up` on EVERY connect,
+# because external-up does not do the DNS half at all and so always reports
+# dns_tunneled=false. That was harmless while the DNS half could never
+# succeed. Once it can — v0.1.91 moved the resolver's queries onto the tunnel
+# with a port-scoped `ip rule` — a merged list carrying both that warning and
+# route.dns_tunneled=true is a flat contradiction, and it is the surfaces that
+# read this (VpnNav's tooltip, /api/vpn/status) that would show the alarm
+# sitting next to the guarantee.
+#
+# Measured live on the production host 2026-09-08: a real gl-inet connect came
+# back with route.dns_tunneled=true AND up's stale warning in the merged list.
+# The route is the authority — it is the half that measures the resolver, and
+# it only sets the flag after both flow proofs and the end-to-end resolution.
+def test_a_tunnelled_dns_route_drops_external_ups_stale_not_tunnelled_warning(monkeypatch, env, profiles):
+    profiles.save_config("wg0", "wireguard", WG_OK)
+    root = paths.workspace_root()
+    commands: list[str] = []
+    warning = (
+        "DNS IS NOT FULLY TUNNELLED. Traffic goes through the VPN, but names looked up "
+        "through this machine's local container resolver are still resolved outside it."
+    )
+
+    def stdout_for(command: str) -> str:
+        if command.startswith("podman inspect"):
+            return _podman_inspect_stdout(root, FAKE_HOST_ROOT)
+        if "external-up" in command:
+            return json.dumps({"ok": True, "dns_tunneled": False, "warnings": [warning]})
+        if "external-route" in command:
+            return json.dumps({"ok": True, "dns_tunneled": True, "warnings": []})
+        return json.dumps({"ok": True})
+
+    _install_exec_fake(monkeypatch, commands, stdout_for)
+    result = dialer.connect(profiles, "wg0")
+
+    assert result["route"]["dns_tunneled"] is True
+    assert result["warnings"] == [], (
+        "the merged warnings still claim DNS is not tunnelled while the route proved it is: "
+        f"{result['warnings']}"
+    )
+    # The per-half payloads are NOT rewritten — only the merged view is
+    # reconciled, so an operator can still see exactly what each half said.
+    assert result["up"]["warnings"] == [warning]
+
+
+# ...and when the route did NOT tunnel DNS, the warning must survive intact.
+# This is the direction that actually protects the user, so it gets its own
+# assertion rather than riding on the one above.
+def test_a_route_that_did_not_tunnel_dns_keeps_the_warning(monkeypatch, env, profiles):
+    profiles.save_config("wg0", "wireguard", WG_OK)
+    root = paths.workspace_root()
+    commands: list[str] = []
+    warning = "DNS IS NOT FULLY TUNNELLED. Traffic goes through the VPN, but names ..."
+
+    def stdout_for(command: str) -> str:
+        if command.startswith("podman inspect"):
+            return _podman_inspect_stdout(root, FAKE_HOST_ROOT)
+        if "external-up" in command:
+            return json.dumps({"ok": True, "dns_tunneled": False, "warnings": [warning]})
+        if "external-route" in command:
+            return json.dumps({"ok": True, "dns_tunneled": False, "warnings": [warning]})
+        return json.dumps({"ok": True})
+
+    _install_exec_fake(monkeypatch, commands, stdout_for)
+    result = dialer.connect(profiles, "wg0")
+
+    assert result["warnings"] == [warning], (
+        "DNS was NOT tunnelled and the honest warning was dropped anyway"
+    )
+
+
 def test_the_exec_command_string_never_carries_the_private_key(monkeypatch, env, profiles):
     """Constraint (A) as a test: a WireGuard private key must never transit
     aw-backend, which records exec job command strings."""
