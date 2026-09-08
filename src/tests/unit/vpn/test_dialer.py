@@ -31,6 +31,14 @@ Endpoint = vpn.example.com:51820
 
 PRIVATE_KEY = "aGVsbG8gd29ybGQgdGhpcyBpcyBub3QgYSBrZXk9"
 
+# A profile that carries a resolver, which is what --tunnel-dns needs and what
+# a real commercial profile always has. WG_OK deliberately has none, so the two
+# fixtures also cover the "nothing to point aardvark at" shape.
+PROFILE_DNS = "10.5.0.1"
+WG_OK_WITH_DNS = WG_OK.replace(
+    "Address = 10.5.0.2/32", f"Address = 10.5.0.2/32\nDNS = {PROFILE_DNS}"
+)
+
 FAKE_HOST_ROOT = "/srv/fake-remote-host-root"
 
 
@@ -143,6 +151,43 @@ def test_connect_lets_an_explicit_container_override_the_default(monkeypatch, en
 
     route_cmd = next(c for c in commands if "external-route" in c)
     assert "--container some-other-container" in route_cmd
+
+
+def test_connect_asks_the_host_to_tunnel_dns_and_sends_only_the_profile_PATH(monkeypatch, env, profiles):
+    """The DNS half of the route, as it is actually requested.
+
+    Two separate things are asserted because they fail separately. ``--tunnel-dns``
+    is what turns the feature on at all — without it the host routes traffic and
+    leaves name lookups going out through the machine, which is the leak this
+    exists to close. ``--profile-json`` is HOW the resolver reaches the host, and
+    it carries the same constraint the private key does: the exec command string
+    is recorded in aw-backend's job log, so the address travels as a path to a
+    0600 file and never as a literal.
+
+    Rolling the feature back is deleting these two arguments — the kill switch is
+    on this side because a core deploy is far faster than rebuilding and
+    reinstalling the Go binary on the host.
+    """
+    profiles.save_config("wg0", "wireguard", WG_OK_WITH_DNS)
+    root = paths.workspace_root()
+    commands: list[str] = []
+    _install_exec_fake(monkeypatch, commands, _happy_stdout_for(root, FAKE_HOST_ROOT))
+
+    dialer.connect(profiles, "wg0")
+
+    route_cmd = next(c for c in commands if "external-route" in c)
+    assert "--tunnel-dns" in route_cmd
+    # The SAME translated path external-up was given — not a second file, and
+    # not a recomputed one.
+    up_cmd = next(c for c in commands if "external-up" in c)
+    profile_path = up_cmd.split("--profile-json ")[1].split(" ")[0]
+    assert f"--profile-json {profile_path}" in route_cmd
+    assert FAKE_HOST_ROOT in profile_path, "the host-side path, not this container's"
+    # The resolver itself must never appear on a command line.
+    assert PROFILE_DNS not in route_cmd, (
+        "the resolver address reached the exec command string; it must travel "
+        "inside the 0600 profile JSON, whose path is all aw-backend's job log sees"
+    )
 
 
 def test_the_exec_command_string_never_carries_the_private_key(monkeypatch, env, profiles):

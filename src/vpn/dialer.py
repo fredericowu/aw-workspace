@@ -480,7 +480,30 @@ def connect(profiles: VpnProfiles, name: str, container: str | None = None) -> d
 
         route_container = container or container_info["name"]
         route_result = _run_cli(exec_client, [
-            "vpn", "external-route", "--container", route_container, "--json",
+            # ``--profile-json`` is the SAME path ``external-up`` was just
+            # given, and it is passed rather than a ``--dns <ip>`` flag for the
+            # reason this module's docstring gives about key material: only a
+            # path ever reaches the exec command string, so the resolver
+            # address never lands in aw-backend's job log.
+            #
+            # ``--tunnel-dns`` closes the leak where names the container looks
+            # up through the LOCAL container resolver are forwarded from the
+            # host — aardvark forwards with the host's own source address, so
+            # the ``ip rule`` anchored on the container never matches them.
+            # The Go side owns every part of this: it installs a main-table
+            # route to the resolver, moves the podman network's aardvark
+            # upstream, proves both, and compiles the undo into the dead-man's
+            # switch. If any of that cannot be proven it routes anyway and
+            # reports ``dns_tunneled: false`` — never a claim.
+            #
+            # THIS FLAG IS THE FEATURE'S KILL SWITCH, and it lives here on
+            # purpose: the change is network-wide (every container on the
+            # routed container's podman network resolves through the VPN while
+            # the tunnel is up), and backing it out by deleting this argument
+            # is a core deploy — far faster than rebuilding and reinstalling
+            # the Go binary on the host.
+            "vpn", "external-route", "--container", route_container,
+            "--profile-json", host_path, "--tunnel-dns", "--json",
         ])
     except (VpnRefused, DialerError, VpnProfileError, VpnProfileNotFound) as exc:
         _write_dial_state({"action": "connect", "ok": False, "profile": name, "at": _now(),
