@@ -1,6 +1,9 @@
 # Runbook — podman 4.3.1 → 5.4.2 on `aw-remote-host` (trixie rebase)
 
-**Status:** written 2026-09-08, **NOT YET EXECUTED**.
+**Status:** written 2026-09-08, **EXECUTED 2026-09-08 ~17:00–17:40Z — do not re-run it.**
+The host is trixie + podman 5.4.2 today; §5's window is spent. See
+[§9](#9-what-actually-happened) for what the execution did that this plan did not
+predict, and for the one piece of follow-up it left open (now also closed).
 **Authorized by:** Frederico, Telegram 2026-09-08 (*"sim, vamos que vamos, para não, segue até o fim"*).
 **Card:** `3d25bf3b-9510-8156-a87a-f337960a2b36` — Architect rounds 1–3 live in its comments; this
 document is round 4 and supersedes their Phase-B section only.
@@ -348,3 +351,71 @@ dialer design change and is not addressed by any version of podman.** Designing 
 that cannot run the verb is guesswork; it should be a separate round once §5.2 step 12 passes.
 
 **Whether "até o fim" includes that dialer rewrite is Frederico's call, not the Architect's.**
+
+---
+
+## 9. What actually happened
+
+Recorded 2026-09-08 ~23:35Z, after the fact, from the live host and the git history —
+not from the executing session's own report. §§0–8 above are left as written so the
+*reasoning* survives; read this section before treating any of it as an instruction.
+
+| Plan | Outcome |
+|---|---|
+| §5.0 image gate | Passed on the v0.1.87 build (`a70bc5a`, trixie rebase) |
+| §5.1 the window | **Ran ~17:00–17:40Z.** Container recreated from that image |
+| §5.2 verify | Host is `Debian 13 (trixie)`, `podman 5.4.2`, 40 nested containers Up |
+| §5.3 rollback | Not needed. The old container survives as `aw-remote-host-legacy-prepin-20260905` (Exited 137) |
+
+### 9.1 The thing the plan did not predict — netavark
+
+trixie ships **netavark 1.14.0-2**, which hits a known nftables bug on this kernel
+(missing `fib` support in the `inet` table — same class as containers/netavark#1411).
+**Every container network on the freshly-recreated host failed to come up**, taking
+podman, Postgres, Redis and the workspace down with it. This is not in §4's abort
+criteria and was not foreseen anywhere in §§0–8.
+
+The live fix was `firewall_driver = "iptables"` in `/etc/containers/containers.conf`,
+falling back to the older, unaffected backend. Two things about it matter:
+
+- **Ordering.** `podman system service` reads `containers.conf` once at startup and
+  never again. A CLI `podman` call rereads it every time — so the post-hoc fix worked
+  for `podman start` immediately while the *running daemon* stayed on the broken driver
+  until it was killed and restarted by hand.
+- **It was runtime-only**, written straight into the running container: untracked, and
+  living in the writable layer that a recreate discards.
+
+### 9.2 The follow-up that fix left open, and how it was closed
+
+`386caa1` persisted it properly — `bootstrap/lib/podman_firewall.sh`, sourced from
+`bootstrap/podman/install.sh` *before* `podman_socket.sh` starts the daemon, mirroring
+the `storage.conf`/graphroot fix exactly, plus a drift check in `verify.sh`. Released in
+**v0.1.88**.
+
+**But the running container was built at 15:12Z, before that commit at 17:54Z.** Verified
+live: `grep -ac podman_firewall /usr/local/bin/aw-remote-host` → `0`, and no
+`podman_firewall.sh` in this host's extracted `~/.aw-remote-host/bootstrap-scripts/lib/`.
+So the host was healthy *only* by virtue of the runtime edit, and
+`AW_REMOTE_HOST_IMAGE` in `/opt/aw-stack/.env` still pinned the digest without the fix —
+leaving the host **one recreate away from repeating the outage**, planned or not.
+
+Closed 23:34Z by repinning that variable to **v0.1.91**
+(`sha256:ef8f3b60...`), after gating the image: trixie base, `podman` apt candidate
+`5.4.2+ds1-2+b2`, all five baked binaries (`ip`/`wg`/`wg-quick`/`openvpn`/`tailscale`),
+and `podman_firewall` embedded in the binary (10 refs). Backup at
+`/opt/aw-stack/.env.bak-prepodman5repin-20260908`.
+
+**This was deliberately zero-downtime: the pin is only read on the next `docker compose
+up`, and nothing on this host runs one automatically** (no watchtower, no healer, no
+compose timer — checked). The running container was not touched and is still the 15:12Z
+image. So:
+
+> **The next recreate of `aw-remote-host` — for any reason — will come up on v0.1.91 and
+> write `firewall_driver` itself during bootstrap. Until that recreate happens, the live
+> host is still relying on the untracked runtime edit. Do not "clean up"
+> `/etc/containers/containers.conf` on the running container.**
+
+That recreate still needs a human at a browser to press **bootstrap** in the console
+(§5.1's constraint is unchanged: the lean link installs nothing, and the host's only
+token — AP-MT's `RUNNER_CALLER_TOKEN` — lacks the identity `POST
+/api/workspaces/aw/bootstrap` requires).
