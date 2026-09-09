@@ -591,6 +591,29 @@ def test_status_dns_tunneled_and_kill_switch_are_none_not_false_when_unreachable
     assert result["warnings"] == []
 
 
+def test_status_dns_tunneled_and_kill_switch_are_none_not_false_when_disconnected(monkeypatch, env):
+    """The other gap the same rule has to cover: genuinely disconnected (no
+    error, the host answered cleanly, there is just nothing dialed). The Go
+    host's ExternalGuarantees fields are plain bools, not pointers, so it
+    reports a concrete False for both even with no tunnel to measure them
+    against (see externalguarantees.go's newExternalGuarantees — only
+    `warnings` is gated on `inForce`). Passing that False through would tell
+    the topbar/VpnsTab "DNS is not tunneled" while nothing is even trying,
+    the exact bug this pins: it must read as not-measured, same as the
+    unreachable case above."""
+    _install_exec_fake(monkeypatch, [], lambda c: json.dumps({
+        "up": False, "dns_tunneled": False, "kill_switch": False, "warnings": [],
+    }))
+
+    result = dialer.status()
+
+    assert result["state"] == "disconnected"
+    assert result["dns_tunneled"] is None
+    assert result["kill_switch"] is None
+    assert result["dns_tunneled"] is not False
+    assert result["kill_switch"] is not False
+
+
 def test_status_warnings_defaults_to_empty_list_never_none(monkeypatch, env):
     """An older host binary (or one that simply has nothing to warn about)
     may omit "warnings" or send it explicitly null — either way the

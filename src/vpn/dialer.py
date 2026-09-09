@@ -389,8 +389,15 @@ def status() -> dict:
         "egress_ip": live.get("container_egress_ip"),
         "since": live.get("since"),
         "deadman_armed": bool(live.get("deadman_armed")),
-        "dns_tunneled": live.get("dns_tunneled"),
-        "kill_switch": live.get("kill_switch"),
+        # The Go host's own dns_tunneled/kill_switch fields are plain bools,
+        # not tri-state — with nothing dialed there is nothing to measure
+        # them against, and it reports `false` for both regardless (see
+        # newExternalGuarantees(inForce, ...) in externalguarantees.go: only
+        # `warnings` is gated on `inForce`, the two booleans are not). This
+        # is the tri-state translation this docstring already promises:
+        # "not measured" while disconnected must not read as "measured off".
+        "dns_tunneled": live.get("dns_tunneled") if connected else None,
+        "kill_switch": live.get("kill_switch") if connected else None,
         "warnings": live.get("warnings") or [],
         "detail": (
             f"aw-remote-host measured the tunnel {'up' if connected else 'down'} "
