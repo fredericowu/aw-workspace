@@ -142,6 +142,67 @@ def test_app_without_skills_is_a_noop(tmp_path, monkeypatch):
     _async(run())
 
 
+def test_register_repairs_a_stale_mirror_left_by_the_cross_worker_journal_gap(tmp_path, monkeypatch):
+    """Reproduces the live bug (AW_WORKSPACE_WORKERS>1): an /update request can
+    land on a worker whose in-memory Action Journal never saw this app's
+    original ``skill:register``, so ``unload()`` silently no-ops the mirror
+    deletion and a directory-existence-only check would keep serving stale
+    content forever. Simulate that directly: a dest dir already on disk
+    (same owner, old content, no ``.aw-skill-source-hash`` — as if copied by
+    code that predates this fix, or via the cross-worker gap itself), then
+    the app ships new content. ``register()`` must overwrite, not no-clobber."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
+    from src.apps import paths
+    from src.apps.skills import OWNER_MARKER, SkillsRegistry
+
+    dest_path = os.path.join(paths.skills_dir(), "how-to")
+    os.makedirs(dest_path)
+    with open(os.path.join(dest_path, "SKILL.md"), "w") as f:
+        f.write("old content")
+    with open(os.path.join(dest_path, OWNER_MARKER), "w") as f:
+        f.write("notes")
+    # deliberately no HASH_MARKER — matches both the pre-fix on-disk shape
+    # and the cross-worker gap where the copying worker never wrote one.
+
+    pkg = _write_app(tmp_path, "notes", with_skill=True)  # ships "# How to\n"
+    SkillsRegistry().register("notes", "how-to", pkg, "skills/how-to/SKILL.md")
+
+    assert "old content" not in open(os.path.join(dest_path, "SKILL.md")).read()
+    assert "# How to" in open(os.path.join(dest_path, "SKILL.md")).read()
+
+
+def test_register_overwrites_on_version_bump_but_skips_when_content_is_unchanged(tmp_path, monkeypatch):
+    """The content hash, not mere directory existence, decides no-clobber vs
+    overwrite: a real version bump (new SKILL.md content) must overwrite the
+    live mirror even though a dir already exists there and is journaled, but
+    calling register() again with the *same* content must still leave it
+    alone (this is what keeps a user's live edit safe across a no-op reboot,
+    per test_reregister_does_not_clobber_a_users_live_edit above)."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
+    from src.apps.skills import SkillsRegistry
+
+    pkg = _write_app(tmp_path, "notes", with_skill=True)
+    registry = SkillsRegistry()
+    dest_path = registry.register("notes", "how-to", pkg, "skills/how-to/SKILL.md")
+
+    # Same content again (e.g. a no-op reboot re-register) — must not touch it.
+    with open(os.path.join(dest_path, "SKILL.md"), "a") as f:
+        f.write("\nUser's own note.\n")
+    edited = open(os.path.join(dest_path, "SKILL.md")).read()
+    registry.register("notes", "how-to", pkg, "skills/how-to/SKILL.md")
+    assert open(os.path.join(dest_path, "SKILL.md")).read() == edited
+
+    # A real version bump — new source content — must overwrite.
+    skill_md = os.path.join(pkg, "skills", "how-to", "SKILL.md")
+    with open(skill_md, "w") as f:
+        f.write("---\nname: how-to\ndescription: How to use this app.\n---\n\n# How to v2\n")
+    registry.register("notes", "how-to", pkg, "skills/how-to/SKILL.md")
+    assert "How to v2" in open(os.path.join(dest_path, "SKILL.md")).read()
+    assert "own note" not in open(os.path.join(dest_path, "SKILL.md")).read()
+
+
 def test_two_apps_with_the_same_skill_id_collide_instead_of_clobbering(tmp_path, monkeypatch):
     """Skill ids are unprefixed at the destination now (no more <app>__<id>),
     so two apps declaring the same id land at the same path. The second
