@@ -76,6 +76,41 @@ say it was not definitive.
 | `/ws/notifications` | `src/api/notifications.py:182` | `{"type":"ninja_init"}` then `{"type":"ninja_notification"}` (`notifications.py:261`, `:129`) |
 | `/ws/apps/install-status` | `src/apps/routes.py:1132` | `{"type":"app_install_status","job":{...}}` (`routes.py:1148`) |
 
+#### 1.1.1 Why `/ws/status` and `/ws/notifications` are two sockets
+
+They look redundant — two core sockets that both push "something happened"
+into the same SPA — and the recurring instinct is to merge them. They are
+not redundant, and the difference is **persistence**, not payload:
+
+| | `/ws/notifications` | `/ws/status` |
+|---|---|---|
+| Backing store | Postgres (`NotificationDB`, `src/api/notification_db.py`) | **none** — `StatusHub` holds a `set[WebSocket]` and nothing else (`src/api/terminal.py:63`) |
+| Missing the frame | recoverable — `get_pending()`/`get_recent()` replay it on reconnect (`notification_db.py:136`, `:146`) | **the event is simply gone** |
+| Per-message state | read / delivered / dismissed / superseded (`mark_read`, `dismiss`, `supersedes`) | none — a frame is a nudge, not a record |
+| What the user sees | the bell + toast UI, with history | a panel re-rendering itself |
+| Relay topic | `notifications` (`notifications.py:33`) | `terminal-status` (`terminal.py:50`) |
+
+So `/ws/notifications` is the **transport for a persisted object** — the
+socket is an accelerator, and the REST/DB surface is the source of truth a
+client falls back to. `/ws/status` is **ephemeral plumbing**: a client that
+was not connected at broadcast time misses the frame and is expected to
+re-fetch current state over REST on reconnect, which is exactly why it needs
+no store, no read state and no replay.
+
+Merging them would force the union of both: every terminal-status tick would
+either become a persisted row (a write per keystroke-adjacent event, and a
+bell that fills with noise) or the notification stream would lose its history
+and read state. **The two topics are also separate for the same reason** —
+they fan out to different listener sets, and a notification listener has no
+use for `terminal_update`.
+
+**The rule this gives a new socket:** decide first whether your events are
+recoverable state or ephemeral nudges. If a client that was offline for the
+event must still learn about it, the event belongs in a store and the socket
+only accelerates it. If re-fetching current state over REST on reconnect is
+sufficient, build the `/ws/status` kind — no persistence, and keep the frame
+small enough that losing one costs nothing.
+
 ### 1.2 Tier-1 in-process app sockets — mounted under `/api/apps/<slug>`
 
 | Path | Declared at | Discriminator | Payload |
@@ -427,11 +462,19 @@ Ordered by value, not by repo. Each is a separate card.
 1. **Shared client hook + close-code handling** (`aw-workspace-ui`). Fixes the
    §0.4 reconnect loop for every existing client. **Do this first** — it is the
    only item with a user-visible bug behind it, and it is independent of every
-   server change.
+   server change. **In flight** as Kanban
+   `bug:ws-clients-ignore-4401-infinite-reconnect`
+   (`3d65bf3b-9510-8186-b22d-f1c583cdd0f1`).
 2. **Template** (`aw-app-template`). Make `/ws/echo` speak `aw-ws/1` and carry
    this document's §8 in its docstring. Every new app is born from it.
+   **In flight** under `feat:tasks-window-push-update-own-ws`
+   (`3d65bf3b-9510-817d-bbd1-fad15c5c4727`), which carries it alongside §9.3's
+   first real consumer.
 3. **New sockets only.** From here, any new WS surface conforms. No existing
-   socket is migrated on a schedule.
+   socket is migrated on a schedule. The first one is
+   `/api/apps/tasks/ws/updates` (same card as §9.2) — an `/ws/status`-kind
+   ephemeral socket per §1.1.1, replacing the 4s poll `aw-app-tasks` v0.23.0
+   shipped as a stopgap.
 4. **Opportunistic conformance.** `cmd`→`type` (devctl tab relay), `op`→`type`
    (remote-host-terminal), `detail`→`data.code`/`data.message` (devctl), the
    `github_init` spread (§3), the `/api/apps/git/github/stream` path (§1.5),
