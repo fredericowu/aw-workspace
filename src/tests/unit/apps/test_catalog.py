@@ -3,6 +3,8 @@ cache fallback on total fetch failure."""
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import httpx
 import pytest
@@ -147,6 +149,72 @@ def test_multi_source_merge_and_dedup(monkeypatch):
     shared = next(a for a in result["apps"] if a["id"] == "shared")
     assert shared["name"] == "Shared (store wins)"  # first source wins
     assert result["sources"] == ["acme/store@main", "acme/extra"]
+
+
+def test_sources_are_fetched_concurrently_not_serially(monkeypatch):
+    """A serial fetch loop blocks the FIRST source's ``httpx.get`` on a
+    3-party barrier that the other two sources' fetches would never reach
+    (a serial loop doesn't start source 2 until source 1 returns) — it times
+    out and that source (then, once broken, every other one too) is marked
+    failed. Only genuinely concurrent fetches let all three threads arrive
+    at the barrier together and release each other."""
+    monkeypatch.setenv("AW_MARKETPLACE_SOURCES", "acme/one,acme/two,acme/three")
+    payloads = {
+        "https://raw.githubusercontent.com/acme/one/master/apps.json": {"apps": [{"id": "one"}]},
+        "https://raw.githubusercontent.com/acme/two/master/apps.json": {"apps": [{"id": "two"}]},
+        "https://raw.githubusercontent.com/acme/three/master/apps.json": {"apps": [{"id": "three"}]},
+    }
+    barrier = threading.Barrier(3, timeout=3)
+
+    def fake_get(url, headers=None, timeout=None):
+        if url.endswith("apps.json"):
+            barrier.wait()
+            return _resp(payloads[url])
+        # the API-contents attempt made first for each source: fail it so
+        # fetch_source falls back to the raw URL above, same as every other
+        # test in this file that doesn't care about the API/raw split.
+        return httpx.Response(404, text="nope", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(catalog_mod.httpx, "get", fake_get)
+
+    result = catalog_mod.get_catalog(force=True)
+    assert result["failed_sources"] == []
+    assert sorted(a["id"] for a in result["apps"]) == ["one", "three", "two"]
+
+
+def test_manifest_fetches_are_concurrent_not_serial(monkeypatch):
+    """Same shape of proof as the source-level test above, but for the
+    per-app manifest enrichment fan-out: a serial loop would spend the
+    barrier's full timeout stuck on the first app alone."""
+    catalog_payload = {"apps": [
+        {"id": "a", "name": "A", "repo": "acme/app-a", "ref": "main"},
+        {"id": "b", "name": "B", "repo": "acme/app-b", "ref": "main"},
+        {"id": "c", "name": "C", "repo": "acme/app-c", "ref": "main"},
+    ]}
+    barrier_timeout = 3
+    barrier = threading.Barrier(3, timeout=barrier_timeout)
+
+    def fake_get(url, headers=None, timeout=None):
+        # Only the per-app manifest fetches (``.../aw-app.json``) should hit
+        # the barrier — the catalog fetch itself must resolve immediately
+        # (via the API attempt) or its own barrier.wait() would dominate the
+        # timing this test measures, unrelated to manifest concurrency.
+        if url.endswith("aw-app.json"):
+            barrier.wait()
+            return httpx.Response(404, text="no manifest", request=httpx.Request("GET", url))
+        return _resp(catalog_payload)
+
+    monkeypatch.setattr(catalog_mod.httpx, "get", fake_get)
+
+    started = time.monotonic()
+    result = catalog_mod.get_catalog(force=True)
+    elapsed = time.monotonic() - started
+
+    assert [a["id"] for a in result["apps"]] == ["a", "b", "c"]
+    assert elapsed < barrier_timeout, (
+        "manifest fetches took as long as a fully serial loop would — "
+        "they are not running concurrently"
+    )
 
 
 def test_explicit_raw_url_source_used_as_is(monkeypatch):

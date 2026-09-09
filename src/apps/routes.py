@@ -33,6 +33,7 @@ import logging
 import os
 import re
 
+import anyio
 from fastapi import Body, Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -784,8 +785,9 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
 
         async def _run_update() -> None:
             try:
+                catalog_data = await anyio.to_thread.run_sync(get_catalog, True)
                 catalog_entry = next(
-                    (a for a in get_catalog(force=True).get("apps", [])
+                    (a for a in catalog_data.get("apps", [])
                      if (a.get("id") or a.get("slug")) == slug),
                     None,
                 )
@@ -877,8 +879,9 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         if loaded is None:
             return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
 
+        catalog_data = await anyio.to_thread.run_sync(get_catalog)
         catalog_entry = next(
-            (a for a in get_catalog().get("apps", [])
+            (a for a in catalog_data.get("apps", [])
              if (a.get("id") or a.get("slug")) == slug),
             None,
         )
@@ -906,8 +909,9 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             return JSONResponse({"error": "ref is required"}, status_code=400)
         version = data.get("version") or ref
 
+        catalog_data = await anyio.to_thread.run_sync(get_catalog)
         catalog_entry = next(
-            (a for a in get_catalog().get("apps", [])
+            (a for a in catalog_data.get("apps", [])
              if (a.get("id") or a.get("slug")) == slug),
             None,
         )
@@ -1126,8 +1130,13 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
     @app.get("/api/apps/-/catalog")
     async def catalog(identity: dict = Depends(require_identity),
                       refresh: bool = False):
-        """The marketplace catalog (available apps) for the Marketplace panel."""
-        return get_catalog(force=refresh)
+        """The marketplace catalog (available apps) for the Marketplace panel.
+
+        ``get_catalog`` is synchronous and, on a cache miss/``refresh=true``,
+        fetches every configured source plus a manifest per app — offloaded
+        to a worker thread so a slow/large catalog never freezes this
+        worker's event loop for other requests while it runs."""
+        return await anyio.to_thread.run_sync(get_catalog, refresh)
 
     @app.websocket("/ws/apps/install-status")
     async def install_status_stream(websocket: WebSocket):

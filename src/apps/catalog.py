@@ -53,6 +53,8 @@ there's no usable in-memory cache, the on-disk cache is served instead
 """
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -320,24 +322,53 @@ def _enrich_with_manifest(app: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _merge_sources(
+# Cap on in-flight fetches (sources, then per-app manifests) during a merge.
+# fetch_source already tries the GitHub API first with a raw-URL fallback, so
+# most of these are cheap CDN reads — this just keeps a large catalog from
+# opening dozens of sockets at once, not from hitting a rate limit.
+_MAX_CONCURRENT_FETCHES = 8
+
+
+async def _merge_sources(
     sources: list[tuple[str, str]],
 ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
-    """Fetch + merge every ``(source_id, spec)``.
+    """Fetch + merge every ``(source_id, spec)``, concurrently.
+
+    Both the per-source catalog fetch and the per-app manifest enrichment
+    used to run in a plain sequential ``for`` loop — one blocking
+    ``httpx.get`` per source, plus one more per app for manifest enrichment.
+    At this workspace's catalog size (52 apps, 2 sources) that was 50+
+    sequential outbound requests, 30s+ end to end, long enough to trip the
+    tunnel edge's ~30s hard timeout on every ``marketplace install --update``.
+    Fanning both stages out through ``asyncio.gather`` (bounded by a
+    semaphore) over ``asyncio.to_thread`` — rather than a second HTTP client
+    stack — keeps ``fetch_source``/``_fetch_app_manifest`` as the only two
+    places that touch the network, which is what lets a single
+    ``monkeypatch.setattr(catalog_mod.httpx, "get", ...)`` still cover every
+    call site in tests (see ``src/tests/conftest.py``).
 
     Returns (merged_apps, ok_specs, failed_specs). Each merged app carries
     ``_source`` (the spec, for display) and ``_source_id`` (the registry row,
     so a later fetch of that app can reuse the right credential).
     """
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_FETCHES)
+
+    async def _fetch_one(source_id: str, spec: str):
+        async with sem:
+            try:
+                return await asyncio.to_thread(fetch_source, spec, source_id=source_id), None
+            except Exception as e:  # noqa: BLE001 — one bad source shouldn't break the rest
+                return None, e
+
+    fetched = await asyncio.gather(*[_fetch_one(sid, spec) for sid, spec in sources])
+
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
     ok: list[str] = []
     failed: list[str] = []
-    for source_id, spec in sources:
-        try:
-            apps = fetch_source(spec, source_id=source_id)
-        except Exception as e:  # noqa: BLE001 — one bad source shouldn't break the rest
-            log.warning("apps: catalog source %s fetch failed: %s", spec, e)
+    for (source_id, spec), (apps, err) in zip(sources, fetched):
+        if err is not None:
+            log.warning("apps: catalog source %s fetch failed: %s", spec, err)
             failed.append(spec)
             continue
         ok.append(spec)
@@ -346,9 +377,31 @@ def _merge_sources(
             if not app_id or app_id in seen:
                 continue
             seen.add(app_id)
-            merged.append(_enrich_with_manifest({**app, "_source": spec,
-                                                 "_source_id": source_id}))
-    return merged, ok, failed
+            merged.append({**app, "_source": spec, "_source_id": source_id})
+
+    async def _enrich_one(app: dict[str, Any]) -> dict[str, Any]:
+        async with sem:
+            return await asyncio.to_thread(_enrich_with_manifest, app)
+
+    enriched = await asyncio.gather(*[_enrich_one(app) for app in merged])
+    return list(enriched), ok, failed
+
+
+def _run_sync(coro: Any) -> Any:
+    """Run an async coroutine to completion from synchronous code.
+
+    Always hands the coroutine to a fresh thread rather than calling
+    ``asyncio.run`` directly, so this is safe even when the caller is itself
+    running inside another event loop — several ``get_catalog`` call sites
+    still call it synchronously from within an ``async def`` FastAPI route
+    (a pre-existing pattern this fix doesn't need to unwind everywhere to be
+    correct). A fresh thread runs a fresh loop instead of colliding with the
+    caller's, avoiding "asyncio.run() cannot be called from a running event
+    loop" — the trade is one extra worker thread per catalog refresh, not a
+    hot path (a 300s TTL cache sits in front of it).
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 
 def _write_disk_cache(result: dict[str, Any]) -> None:
@@ -381,7 +434,7 @@ def get_catalog(force: bool = False) -> dict[str, Any]:
         return _cache["data"]
 
     sources = marketplace_sources()
-    apps, ok_sources, failed_sources = _merge_sources(sources)
+    apps, ok_sources, failed_sources = _run_sync(_merge_sources(sources))
 
     if ok_sources:
         result = {
