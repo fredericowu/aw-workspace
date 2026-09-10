@@ -99,25 +99,66 @@ def app_data_owner(app_id: str) -> tuple[int, int]:
     value makes that outer chown a no-op: it chowns the tree to the uid
     ``abc`` is already going to be.
 
-    Walks up to the app data root's ancestors because ``expand_env`` runs
-    before ``_container_volumes`` has ``makedirs``'d the per-app dir, so on a
-    first install the app's own directory does not exist yet. Its ancestors
-    are inside the same swept mount and carry the same ownership, so they
-    answer the question just as well.
+    Reads the CONTENTS, not the directory itself, and that distinction is the
+    whole correctness of this function. A linuxserver.io image chowns its
+    ``/config`` mount point to ``PUID:PGID`` on every boot, so the top-level
+    directory always reports back the uid the container was last started
+    with — statting it yields a self-fulfilling loop that re-derives the
+    stale value forever and never converges on what the files underneath
+    actually are. Measured live on 2026-09-10: after the sweep left all 418
+    entries under aw-app-blender's data dir at 1001, its mount point had
+    already been chowned back to 1000 by the image's own init, so statting it
+    re-derived ``PUID=1000`` while every file the desktop needed stayed
+    unreadable. The files are what ``abc`` must be able to read, so the files
+    are what the answer has to come from.
 
-    Falls back to the calling process's own uid rather than giving up.
-    ``expand_env`` drops an unresolved placeholder entirely, and a
-    linuxserver image with no ``PUID`` defaults to **911** — a third uid that
-    owns nothing, which is a worse failure than a stale guess. The workspace
+    Modal rather than first-found: a boot chowns a handful of paths it
+    manages (``/config/.config``, ``/config/.XDG``) to ``abc`` while the rest
+    of the tree keeps whatever the sweep left, so any single entry can be
+    unrepresentative. The majority owner is the one the app has to match.
+    Direct children only — bounded work on every container start, and a
+    recursive walk of a desktop's whole home directory would not change the
+    verdict.
+
+    Falls back through the empty-directory case (a first install has no
+    contents yet, so the directory's own owner is the best signal), then the
+    app data root's ancestors (``expand_env`` runs at ``runtime.py:1217``,
+    before ``_container_volumes`` ``makedirs``'s the per-app dir at
+    ``runtime.py:1597``, so on a first install it does not exist at all;
+    ancestors sit in the same swept mount and carry the same ownership), and
+    finally the calling process's own uid. That last fallback is not
+    decoration: ``expand_env`` drops an unresolved placeholder entirely, and
+    a linuxserver image with no ``PUID`` defaults to **911** — a third uid
+    that owns nothing, strictly worse than the bug this fixes. The workspace
     process's uid is also the value the outer chown applies, so it is the
-    right answer whenever the stat could not be taken.
+    right answer whenever nothing could be stat'ed.
     """
+    from collections import Counter
+
     from src.apps import paths
 
     # workspace_home_path(), not workspace_home(): expansion must not have the
     # side effect of creating directories.
     home = paths.workspace_home_path()
-    for probe in (os.path.join(home, "data", app_id), os.path.join(home, "data"), home):
+    data_dir = os.path.join(home, "data", app_id)
+
+    owners: Counter = Counter()
+    try:
+        with os.scandir(data_dir) as entries:
+            for entry in entries:
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                owners[(st.st_uid, st.st_gid)] += 1
+    except OSError:
+        pass
+    if owners:
+        # Ties broken by lowest uid so the answer is stable across boots — an
+        # arbitrary winner would flip PUID between restarts.
+        return min(owners.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+
+    for probe in (data_dir, os.path.join(home, "data"), home):
         try:
             st = os.stat(probe)
         except OSError:

@@ -131,9 +131,100 @@ def app_data(tmp_path, monkeypatch):
 
 
 def test_data_uid_and_gid_resolve_to_the_app_data_dirs_owner(app_data):
-    st = os.stat(app_data / "data" / "blender")
+    (app_data / "data" / "blender" / "prefs").write_text("")
+    st = os.stat(app_data / "data" / "blender" / "prefs")
     assert expand_env({"PUID": "${data.uid}", "PGID": "${data.gid}"}, {}, "blender") == {
         "PUID": str(st.st_uid), "PGID": str(st.st_gid)}
+
+
+def _fake_dir(tmp_path, monkeypatch, *, dir_owner, child_owners):
+    """A data dir whose mount point and contents have DIFFERENT owners.
+
+    chown needs root, so ownership is faked at the stat boundary rather than
+    on disk — the real bug is entirely about which path gets stat'ed.
+    """
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path))
+    data_dir = tmp_path / "data" / "blender"
+    data_dir.mkdir(parents=True)
+    for i, _owner in enumerate(child_owners):
+        (data_dir / f"entry{i}").write_text("")
+
+    owners = {str(data_dir): dir_owner}
+    owners.update({str(data_dir / f"entry{i}"): o for i, o in enumerate(child_owners)})
+
+    class FakeStat:
+        def __init__(self, uid, gid):
+            self.st_uid, self.st_gid = uid, gid
+
+    real_stat, real_scandir = os.stat, os.scandir
+
+    def fake_stat(path, *a, **kw):
+        return FakeStat(*owners[str(path)]) if str(path) in owners else real_stat(path, *a, **kw)
+
+    def fake_scandir(path, *a, **kw):
+        # Sorted, unlike the real scandir: readdir order is arbitrary, which
+        # would let a first-found implementation pass or fail by luck.
+        with real_scandir(path, *a, **kw) as it:
+            paths = sorted(e.path for e in it)
+
+        class Wrapper:
+            def __enter__(self): return self
+            def __exit__(self, *e): return False
+            def __iter__(self):
+                for p in paths:
+                    yield type("E", (), {
+                        "path": p,
+                        "stat": lambda s=None, follow_symlinks=True, p=p: fake_stat(p),
+                    })()
+        return Wrapper()
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+
+
+def test_the_mount_points_own_owner_is_ignored_in_favour_of_the_contents(
+        tmp_path, monkeypatch):
+    """The 2026-09-10 regression, caught in live verification and not by the
+    original tests.
+
+    A linuxserver image chowns its /config mount point to PUID:PGID on every
+    boot, so the top-level directory reports back the uid the container was
+    last started with. Statting it re-derives the stale value forever: after
+    the sweep left blender's 418 entries at 1001, the mount point had already
+    been chowned back to 1000, so PUID resolved to 1000 and every file the
+    desktop needed stayed unreadable.
+    """
+    _fake_dir(tmp_path, monkeypatch, dir_owner=(1000, 1000),
+              child_owners=[(1001, 1001)] * 4)
+    assert app_data_owner("blender") == (1001, 1001)
+
+
+def test_a_minority_of_boot_chowned_entries_does_not_win(tmp_path, monkeypatch):
+    """A boot chowns the few paths it manages (/config/.config, /config/.XDG)
+    to abc and leaves the rest — so first-found would pick the wrong uid
+    depending on readdir order. The majority owner is the one to match."""
+    _fake_dir(tmp_path, monkeypatch, dir_owner=(1000, 1000),
+              child_owners=[(1000, 1000), (1001, 1001), (1001, 1001), (1001, 1001)])
+    assert app_data_owner("blender") == (1001, 1001)
+
+
+def test_a_tie_resolves_to_the_lowest_uid_not_an_arbitrary_one(tmp_path, monkeypatch):
+    """Stability matters more than which side wins: an arbitrary winner would
+    flip PUID between restarts, recreating the drift it exists to prevent."""
+    _fake_dir(tmp_path, monkeypatch, dir_owner=(0, 0),
+              child_owners=[(1001, 1001), (1000, 1000)])
+    assert app_data_owner("blender") == (1000, 1000)
+    _fake_dir(tmp_path / "b", monkeypatch, dir_owner=(0, 0),
+              child_owners=[(1000, 1000), (1001, 1001)])
+    assert app_data_owner("blender") == (1000, 1000)
+
+
+def test_an_empty_data_dir_falls_back_to_its_own_owner(app_data):
+    """A first install has no contents yet, so there is nothing to take a
+    majority of — the directory itself is then the best signal."""
+    assert app_data_owner("blender") == (
+        os.stat(app_data / "data" / "blender").st_uid,
+        os.stat(app_data / "data" / "blender").st_gid)
 
 
 def test_data_uid_falls_back_to_an_ancestor_before_the_dir_exists(tmp_path, monkeypatch):
