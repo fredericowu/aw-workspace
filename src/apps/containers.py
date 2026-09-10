@@ -429,6 +429,7 @@ class ContainerSupervisor:
         self._client = client  # injectable for tests; else built lazily
         self._injected_client = client is not None
         self._pull_client = None  # built lazily, own timeout — see _docker_for_pull
+        self._create_client = None  # ditto — see _docker_for_create
         self._containers: dict[str, _Container] = {}
 
     @property
@@ -477,6 +478,36 @@ class ContainerSupervisor:
             self._pull_client = self._new_client(
                 int(os.environ.get("AW_CONTAINER_PULL_TIMEOUT", "900")))
         return self._pull_client
+
+    def _docker_for_create(self):
+        """A third client, for the ``start`` lifecycle path only.
+
+        ``_docker`` caps at 10s because a *status read* that hangs freezes the
+        worker's event loop (2026-09-04). Creating a container is the opposite
+        kind of call: it legitimately takes longer than a read, and it is not
+        on the ``/ws/status`` path at all, so the cap that protects that path
+        only ever fires here as a false failure.
+
+        Nested podman is where that stopped being theoretical. In a hosted
+        workspace the engine is podman inside podman, and container *create*
+        there routinely runs past 10s — so when the reconciler converges two
+        Tier-2 apps in one pass, whichever one creates SECOND reliably lost the
+        race and failed, while the first succeeded. Measured deterministically
+        on 2026-09-10 provisioning ``kb`` + ``browser`` into a hosted
+        workspace: alternating success/failure, always the second app in the
+        pass. That is the whole reason a hosted workspace could not converge
+        more than one Tier-2 app unattended.
+
+        Its own client rather than widening the shared one, for the same reason
+        ``_docker_for_pull`` has one: a status read concurrent with an install
+        must keep the short cap.
+        """
+        if self._injected_client:
+            return self._client
+        if self._create_client is None:
+            self._create_client = self._new_client(
+                int(os.environ.get("AW_CONTAINER_CREATE_TIMEOUT", "120")))
+        return self._create_client
 
     def docker(self):
         """Return the underlying Docker-compatible client for read-only helpers."""
@@ -585,7 +616,9 @@ class ContainerSupervisor:
 
     def start(self, app_id: str) -> dict:
         c = self._require(app_id)
-        client = self._docker()
+        # Not _docker(): every call below is a mutating lifecycle op whose
+        # honest duration is far past the 10s status cap under nested podman.
+        client = self._docker_for_create()
         from docker.errors import ImageNotFound, NotFound
 
         # Remove any stale container from a previous run so the name is free.
