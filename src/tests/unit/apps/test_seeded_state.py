@@ -211,6 +211,36 @@ def test_a_new_manifest_field_does_not_replace_a_nonempty_live_value():
     assert changes == {}
 
 
+def test_a_new_manifest_boolean_field_fills_the_false_platform_default():
+    """``False`` is the platform's untouched default for a new boolean field,
+    same as ``None``/``""``/``[]``/``{}`` for other types — a manifest that
+    starts seeding e.g. ``disable_harness_tools: true`` on an existing row
+    must not be skipped forever just because Python's ``False == ""`` is
+    itself ``False``, unlike every other empty-sentinel comparison here.
+    """
+    old = {"slug": "phone", "name": "Phone"}
+    seeded_state.record("app", "tasks", "phone", old)
+    live = {**old, "disable_harness_tools": False}
+
+    changes = seeded_state.updatable_fields(
+        "app", "tasks", "phone",
+        {**old, "disable_harness_tools": True}, live)
+
+    assert changes == {"disable_harness_tools": True}
+
+
+def test_a_new_manifest_boolean_field_does_not_replace_a_true_live_value():
+    old = {"slug": "phone", "name": "Phone"}
+    seeded_state.record("app", "tasks", "phone", old)
+    live = {**old, "disable_harness_tools": True}
+
+    changes = seeded_state.updatable_fields(
+        "app", "tasks", "phone",
+        {**old, "disable_harness_tools": False}, live)
+
+    assert changes == {}
+
+
 # --- the caller, where the bootstrap deadlock actually lived ------------------
 
 
