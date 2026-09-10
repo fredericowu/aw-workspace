@@ -59,12 +59,46 @@ def test_successful_update_posts_with_bearer_token(tmp_path, monkeypatch, capsys
             return {"status": "triggered"}
 
     def fake_post(url, headers=None, timeout=None):
-        calls.append((url, headers))
+        calls.append((url, headers, timeout))
         return _FakeResponse()
 
     monkeypatch.setattr(update_cmd.httpx, "post", fake_post)
 
     assert update_cmd.run(["workspace", "--token", "abc123"]) == 0
-    assert calls == [("http://backend.example/api/workspaces/my-slug/update",
-                       {"Authorization": "Bearer abc123"})]
+    assert len(calls) == 1
+    url, headers, timeout = calls[0]
+    assert url == "http://backend.example/api/workspaces/my-slug/update"
+    assert headers == {"Authorization": "Bearer abc123"}
     assert "update triggered" in capsys.readouterr().out
+
+
+def test_read_timeout_outlasts_the_backends_dispatch_plus_verify_window(
+    tmp_path, monkeypatch,
+):
+    # The backend's own worst case is up to 900s dispatch + 300s verify.
+    # A read timeout at or below that guarantees the CLI reports a false
+    # failure on a real, still-healthy update.
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path))
+    monkeypatch.setenv("AW_BACKEND_URL", "http://backend.example")
+    monkeypatch.setenv("AW_WORKSPACE", "my-slug")
+
+    captured = {}
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"status": "triggered"}
+
+    def fake_post(url, headers=None, timeout=None):
+        captured["timeout"] = timeout
+        return _FakeResponse()
+
+    monkeypatch.setattr(update_cmd.httpx, "post", fake_post)
+
+    assert update_cmd.run(["workspace", "--token", "abc123"]) == 0
+    timeout = captured["timeout"]
+    assert timeout.read > 900.0 + 300.0
+    # Connect stays short so an unreachable backend fails fast rather than
+    # hanging for the full read window.
+    assert timeout.connect <= 30.0

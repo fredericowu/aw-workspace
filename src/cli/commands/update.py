@@ -92,8 +92,16 @@ def run(args: list[str]) -> int:
         return 1
 
     url = f"{backend_url}/api/workspaces/{workspace}/{_TARGET_PATHS[ns.target]}"
+    # aw-backend's own worst case for this call is the dispatch window plus
+    # the verify window — 300+300s today, up to 900+300s after aw-backend's
+    # own timeout fix (card aw-backend:workspace-update-verify-timeout-is
+    # -misreported-as-hang). A 120s read timeout guarantees a false failure
+    # on any update slower than two minutes. Connect stays short so a
+    # genuinely unreachable backend still fails fast instead of hanging for
+    # the full read window.
+    timeout = httpx.Timeout(10.0, read=1260.0)
     try:
-        resp = httpx.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=120.0)
+        resp = httpx.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
     except httpx.HTTPError as e:
         print(f"error: could not reach aw-backend: {e}")
         return 1
