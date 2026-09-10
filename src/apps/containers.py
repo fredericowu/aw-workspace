@@ -45,11 +45,11 @@ class ContainerError(RuntimeError):
     pass
 
 
-_ENV_PLACEHOLDER = re.compile(r"^\$\{(config|env|app)\.([A-Za-z_][A-Za-z0-9_.]*)\}$")
+_ENV_PLACEHOLDER = re.compile(r"^\$\{(config|env|app|data)\.([A-Za-z_][A-Za-z0-9_.]*)\}$")
 #: ``${a.b|c.d}`` — try each source left to right, first non-empty wins.
 _ENV_PLACEHOLDER_CHAIN = re.compile(
-    r"^\$\{((?:config|env|app)\.[A-Za-z_][A-Za-z0-9_.]*"
-    r"(?:\|(?:config|env|app)\.[A-Za-z_][A-Za-z0-9_.]*)+)\}$")
+    r"^\$\{((?:config|env|app|data)\.[A-Za-z_][A-Za-z0-9_.]*"
+    r"(?:\|(?:config|env|app|data)\.[A-Za-z_][A-Za-z0-9_.]*)+)\}$")
 
 
 def app_public_url(app_id: str) -> str:
@@ -77,6 +77,55 @@ def app_public_url(app_id: str) -> str:
     return f"https://{app_id}.app.{slug}.{workspace_url.base_domain()}"
 
 
+def app_data_owner(app_id: str) -> tuple[int, int]:
+    """``(uid, gid)`` currently owning this app's ``$AW_APP_DATA`` directory.
+
+    Exists so an image that runs its payload as a fixed non-root user
+    (linuxserver.io's ``abc``, driven by ``PUID``/``PGID``) can be told which
+    uid its bind-mounted ``/config`` actually belongs to, instead of the
+    manifest hardcoding a number that is only right on the host it was
+    written on.
+
+    It has to be derived because that number is not stable. ``$AW_APP_DATA``
+    lives at ``<AW_WORKSPACE_HOME>/data/<app_id>``, i.e. INSIDE the
+    ``/opt/aw-workspace`` bind mount, and the layer that creates the
+    workspace container recursively chowns that whole mount to the
+    workspace's own uid on every boot/redeploy (2026-09-10 08:04 did exactly
+    that; the chown itself is outside this repo, tracked on
+    ``core:workspace-redeploy-chowns-app-data-dirs``). A manifest saying
+    ``PUID=1000`` therefore describes ownership that the next redeploy
+    silently invalidates — which is how aw-app-blender ended up with 367
+    files under ``/config`` its own desktop user could not read. Deriving the
+    value makes that outer chown a no-op: it chowns the tree to the uid
+    ``abc`` is already going to be.
+
+    Walks up to the app data root's ancestors because ``expand_env`` runs
+    before ``_container_volumes`` has ``makedirs``'d the per-app dir, so on a
+    first install the app's own directory does not exist yet. Its ancestors
+    are inside the same swept mount and carry the same ownership, so they
+    answer the question just as well.
+
+    Falls back to the calling process's own uid rather than giving up.
+    ``expand_env`` drops an unresolved placeholder entirely, and a
+    linuxserver image with no ``PUID`` defaults to **911** — a third uid that
+    owns nothing, which is a worse failure than a stale guess. The workspace
+    process's uid is also the value the outer chown applies, so it is the
+    right answer whenever the stat could not be taken.
+    """
+    from src.apps import paths
+
+    # workspace_home_path(), not workspace_home(): expansion must not have the
+    # side effect of creating directories.
+    home = paths.workspace_home_path()
+    for probe in (os.path.join(home, "data", app_id), os.path.join(home, "data"), home):
+        try:
+            st = os.stat(probe)
+        except OSError:
+            continue
+        return st.st_uid, st.st_gid
+    return os.getuid(), os.getgid()
+
+
 def expand_env(env: dict[str, Any] | None, config: dict[str, Any] | None,
                app_id: str = "") -> dict[str, str]:
     """Resolve ``runtime.env`` placeholders against an app's config.
@@ -97,6 +146,11 @@ def expand_env(env: dict[str, Any] | None, config: dict[str, Any] | None,
       URL, its host token).
     * ``${app.url}``      — this app's own external URL, composed from the
       workspace slug and base domain (see :func:`app_public_url`).
+    * ``${data.uid}`` / ``${data.gid}`` — who owns this app's
+      ``$AW_APP_DATA`` directory right now, for images that take a ``PUID``/
+      ``PGID`` (see :func:`app_data_owner`). Derived rather than declared,
+      because the host uid owning that directory is rewritten on every
+      workspace redeploy.
 
     Sources can be chained with ``|`` and the first non-empty one wins:
     ``${config.site_url|app.url}`` lets a user override the derived URL
@@ -144,6 +198,11 @@ def expand_value(raw: str, config: dict[str, Any] | None,
             return os.environ.get(name)
         if kind == "app":
             return app_public_url(app_id) if name == "url" else None
+        if kind == "data":
+            if name not in ("uid", "gid"):
+                return None
+            uid, gid = app_data_owner(app_id)
+            return uid if name == "uid" else gid
         return None
 
     stripped = raw.strip()
