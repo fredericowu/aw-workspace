@@ -994,3 +994,138 @@ def test_a_failed_upgrade_rolls_back_to_the_running_version(tmp_path, monkeypatc
         assert err.get("rolled_back_to") == "1.0.0", err
 
     _async(run())
+
+
+# ---- boot ordering (BOOT_PRIORITY) ---------------------------------------
+#
+# The 2026-09-10 incident: a cold recreate left mcp-gateway — the whole
+# workspace's MCP surface — unstarted 11 minutes in, and a human had to run
+# `aw-workspace-cli start mcp-gateway` by hand. The install loop is serial and
+# was unordered, and `LocalMirror.list` has no ORDER BY, so the gateway's
+# position in a 450s+ pass was effectively random from one boot to the next.
+
+
+def _desired_row(slug, repo):
+    return {"app_id": slug, "version": "1.0.0", "repo": repo, "ref": "main",
+            "granted_permissions": ["routes:register"], "config": {},
+            "state": "installed"}
+
+
+def test_reconcile_installs_the_boot_priority_app_first_then_alphabetically(
+        tmp_path, monkeypatch):
+    """mcp-gateway goes first; everything else falls in behind it by app_id."""
+    _patch_reload(monkeypatch, [])
+    slugs = ["zeta", "mcp-gateway", "alpha", "middle"]
+    repos = {s: _make_app_repo(tmp_path, s) for s in slugs}
+    # Deliberately neither alphabetical nor gateway-first — with no ORDER BY
+    # upstream this permutation is exactly as legitimate an input as any other.
+    desired = [_desired_row(s, repos[s])
+               for s in ["zeta", "middle", "mcp-gateway", "alpha"]]
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, FakeCloud())
+
+    async def run():
+        result = await rc.reconcile(desired)
+        assert result["errors"] == []
+        assert result["installed"] == ["mcp-gateway", "alpha", "middle", "zeta"]
+        # ...and the runtime really did load them in that order, not just the
+        # summary list.
+        assert rt.loaded_slugs() == ["mcp-gateway", "alpha", "middle", "zeta"]
+
+    _async(run())
+
+
+def test_reconcile_install_order_is_identical_across_shuffled_desired_lists(
+        tmp_path, monkeypatch):
+    """The bug was NONDETERMINISM, not just a missing priority: the same
+    workspace with the same apps could put mcp-gateway at position 3 one boot
+    and position 40 the next. Two different permutations of one desired set
+    must now converge to the same install order."""
+    _patch_reload(monkeypatch, [])
+    slugs = ["delta", "mcp-gateway", "bravo", "echo", "charlie"]
+    repos = {s: _make_app_repo(tmp_path, s) for s in slugs}
+    first = ["echo", "mcp-gateway", "bravo", "delta", "charlie"]
+    second = ["charlie", "delta", "bravo", "echo", "mcp-gateway"]
+
+    async def install_order(root, order):
+        _, rt, rc = _reconciler(root, monkeypatch, FakeCloud())
+        result = await rc.reconcile([_desired_row(s, repos[s]) for s in order])
+        assert result["errors"] == []
+        return result["installed"]
+
+    async def run():
+        a = await install_order(tmp_path / "ws_a", first)
+        b = await install_order(tmp_path / "ws_b", second)
+        assert a == b == ["mcp-gateway", "bravo", "charlie", "delta", "echo"]
+
+    _async(run())
+
+
+def test_boot_starts_the_gateway_rescan_watchdog_while_the_pass_is_still_running(
+        tmp_path, monkeypatch):
+    """The half an ordering test cannot prove.
+
+    Sorting the loop only helps if something re-dials the gateway while the
+    other 40-odd apps trickle up behind it. The 60s rescan watchdog is that
+    something, and it used to be started only AFTER the whole 450s+ pass
+    returned — so it sat idle through the entire window it exists for.
+
+    Asserting it is registered once ``reconcile_on_boot`` has returned proves
+    nothing (that was already true before the fix). The claim under test is
+    that it starts MID-pass, so this holds the reconcile open and asserts the
+    registration lands while it is demonstrably still in flight.
+    """
+    from types import SimpleNamespace
+
+    from src.apps import routes as routes_mod
+    from src.apps.runtime import _MCP_RESCAN_TASK_ID, _SYSTEM_APP_ID
+
+    reloads = []
+    _patch_reload(monkeypatch, reloads)
+    monkeypatch.setattr("src.api.otel.ensure_export_state", lambda _rt: None)
+
+    gw_repo = _make_app_repo(tmp_path, "mcp-gateway")
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, FakeCloud())
+
+    async def run():
+        gateway_up = asyncio.Event()
+        release = asyncio.Event()
+
+        class SlowPass:
+            """Stands in for the real boot pass: brings mcp-gateway up first
+            (as BOOT_PRIORITY now guarantees), then keeps running for a long
+            time — the other 46 apps."""
+
+            async def reconcile(self):
+                await rc.install(AppSpec(app_id="mcp-gateway", repo=gw_repo, ref="main"),
+                                 write_cloud=False)
+                gateway_up.set()
+                await release.wait()
+                return {"installed": ["mcp-gateway"]}
+
+        app = SimpleNamespace(state=SimpleNamespace(
+            app_reconciler=SlowPass(), app_runtime=rt))
+
+        task = asyncio.ensure_future(routes_mod.reconcile_on_boot(app))
+        await asyncio.wait_for(gateway_up.wait(), timeout=10)
+
+        registered = False
+        for _ in range(1000):  # the waiter polls is_loaded on a 2s cadence
+            if _MCP_RESCAN_TASK_ID in rt.watchdog.task_ids_for(_SYSTEM_APP_ID):
+                registered = True
+                break
+            await asyncio.sleep(0.01)
+
+        assert registered, "rescan watchdog never started during the reconcile pass"
+        # Without this the test would pass just as happily against the old
+        # after-the-pass behaviour.
+        assert not task.done(), ("the reconcile pass had already finished — this "
+                                 "test proves nothing unless it is still in flight")
+        # Gated on a real /reload, not merely on is_loaded: is_loaded means the
+        # container was created, and a watchdog whose first ticks fail backs off
+        # to ~8 minutes (src/apps/watchdog.py), i.e. worse than doing nothing.
+        assert reloads, "the watchdog started without probing that the gateway answers"
+
+        release.set()
+        await asyncio.wait_for(task, timeout=10)
+
+    _async(run())

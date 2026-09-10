@@ -45,6 +45,13 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
+# Apps the FRAMEWORK ITSELF cannot function without, in the order they must be
+# installed; everything else follows behind them sorted by ``app_id``. Applied
+# to ``desired_active`` in :meth:`Reconciler._reconcile_provisioned` — see the
+# comment there for the full reasoning, including why this is deliberately NOT
+# the place to express an ordinary app-to-app dependency.
+BOOT_PRIORITY: tuple[str, ...] = ("mcp-gateway",)
+
 
 @dataclass
 class AppSpec:
@@ -964,6 +971,47 @@ class Reconciler:
 
         specs = [AppSpec.from_row(r) for r in desired]
         desired_active = {s.app_id: s for s in specs if s.state != "disabled"}
+        # BOOT_PRIORITY first, everything else alphabetically behind it. Two
+        # separate reasons, both real:
+        #
+        # * mcp-gateway is the entire workspace's MCP surface — every agent
+        #   session is blind until that one container is up. On a cold recreate
+        #   this pass is 450s+ of serial fetch/pip/podman (see
+        #   ``reconcile_on_boot``'s own timeout comment in routes.py), and on
+        #   2026-09-10 the gateway landed late enough in it that a human had to
+        #   run ``aw-workspace-cli start mcp-gateway`` by hand 11 minutes after
+        #   boot. Being first is worth more here than any amount of parallelism.
+        # * The order was not merely unprioritised, it was NONDETERMINISTIC:
+        #   ``LocalMirror.list`` is a plain select() with no ORDER BY and the
+        #   cloud path returns whatever aw-backend's query yields, so the same
+        #   workspace put mcp-gateway at a different position every boot. That
+        #   is why this went unnoticed for months and then cost 11 minutes once
+        #   — and why the ``app_id`` secondary key earns its place on its own,
+        #   independently of the priority lane.
+        #
+        # NOT a general ordering mechanism, and please don't grow it into one.
+        # A genuine inter-app ordering need — app A must be active before app B
+        # — belongs in ``dependencies.apps`` (:meth:`_install_dependencies`),
+        # which already installs dependencies first and, crucially, says so in
+        # the manifest where the next reader will find it. BOOT_PRIORITY is a
+        # core-owned answer to a different question: what the framework itself
+        # cannot boot without. Known cost of the alphabetical key: it freezes an
+        # order that is random today, so someone will eventually come to depend
+        # on app A activating before app B without ever declaring it.
+        #
+        # This sort also reorders the UPGRADE branch below, which is
+        # uninstall-then-install — so a gateway version bump now takes the
+        # gateway DOWN at the front of the pass, with every later app's
+        # coalesced reload landing on a gateway that may still be re-pulling its
+        # image. Not worse than today (today it happens at an arbitrary position
+        # instead), but it is now deterministic, so it is worth saying out loud.
+        desired_active = dict(sorted(
+            desired_active.items(),
+            key=lambda kv: (
+                BOOT_PRIORITY.index(kv[0]) if kv[0] in BOOT_PRIORITY else len(BOOT_PRIORITY),
+                kv[0],
+            ),
+        ))
         actual_before = set(self.runtime.loaded_slugs())
 
         installed: list[str] = []

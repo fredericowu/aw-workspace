@@ -1215,6 +1215,47 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
 _BOOT_RECONCILE_TIMEOUT = 1200.0
 
 
+async def _start_gateway_rescan_when_loaded(app: FastAPI, *, poll_s: float = 2.0) -> None:
+    """Start the periodic gateway rescan watchdog the moment mcp-gateway comes
+    up — MID-reconcile — instead of only after the whole pass returns.
+
+    The boot pass is 450s+ of serial fetch/pip/podman (see
+    ``_BOOT_RECONCILE_TIMEOUT`` above). Starting the watchdog only at the end of
+    it means nothing re-dials the gateway while the other 40-odd apps trickle up
+    behind it, each one registering MCP surface the gateway scanned before it
+    existed. The watchdog's whole job is closing exactly that gap, at 60s
+    granularity (``DEFAULT_MCP_RESCAN_INTERVAL_S``), and it was sitting idle
+    through the entire window where it was most useful.
+
+    THE ORDER HERE IS THE WHOLE POINT — get it wrong and this is a regression,
+    not a fix. ``_rescan_mcp_gateway`` raises on failure on purpose, to feed the
+    supervisor's ``min(interval * 2**n, 1800s)`` backoff (src/apps/watchdog.py).
+    Start the watchdog against a gateway that is not answering yet and its first
+    ticks fail: three in a row push the next retry out past 8 minutes, i.e.
+    later than doing nothing at all. So two gates, not one:
+
+    * ``is_loaded`` — but that only means the CONTAINER was created
+      (``containers.start()`` returned), not that the gateway's own FastAPI app
+      is listening; ``_reload_mcp_gateway``'s docstring documents losing exactly
+      that race live.
+    * a real ``/reload`` that succeeded. The boot reload's patient 20-attempt
+      budget (~85s worst case) doubles as the readiness probe: it is
+      best-effort, so it never feeds the backoff itself, and by the time it
+      returns the gateway has either answered or is far enough gone that one
+      more failing tick changes nothing.
+
+    Cancelled by the caller when the pass ends — an mcp-gateway that is simply
+    not installed would otherwise leave this polling forever. Nothing is lost
+    when that happens: ``start_mcp_gateway_rescan`` is idempotent and
+    ``reconcile_on_boot``'s tail calls it unconditionally anyway.
+    """
+    runtime: AppRuntime = app.state.app_runtime
+    while not runtime.is_loaded("mcp-gateway"):
+        await asyncio.sleep(poll_s)
+    await _reload_mcp_gateway(runtime, attempts=20)
+    runtime.start_mcp_gateway_rescan()
+
+
 async def reconcile_on_boot(app: FastAPI) -> None:
     """Reconcile to the cloud registry on startup (ADR Decision 5).
 
@@ -1227,6 +1268,11 @@ async def reconcile_on_boot(app: FastAPI) -> None:
     network path can't run forever either.
     """
     reconciler: Reconciler = app.state.app_reconciler
+    # Armed BEFORE the pass, not after it: mcp-gateway now installs first
+    # (BOOT_PRIORITY in src/apps/reconciler.py), so it is up within the first
+    # seconds of a pass that runs for minutes. This lets the 60s rescan
+    # watchdog start ticking then, covering every app that comes up behind it.
+    rescan_starter = asyncio.ensure_future(_start_gateway_rescan_when_loaded(app))
     try:
         result = await asyncio.wait_for(reconciler.reconcile(), timeout=_BOOT_RECONCILE_TIMEOUT)
         log.info("apps: boot reconcile — %s", result)
@@ -1240,6 +1286,12 @@ async def reconcile_on_boot(app: FastAPI) -> None:
         )
     except Exception:
         log.exception("apps: boot reconcile failed")
+    finally:
+        # The pass is over, so the waiter has no one left to wait for: an
+        # mcp-gateway that never got installed would keep it polling forever.
+        # Cancelling can only lose a rescan start that the tail below performs
+        # unconditionally two lines later anyway.
+        rescan_starter.cancel()
     # Boot reconcile only (re)installs apps that aren't currently loaded; an
     # already-loaded app's system CLIs are never re-checked otherwise. Start
     # the runtime-owned healer so drift (a CLI removed outside the app's own
