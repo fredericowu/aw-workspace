@@ -210,6 +210,41 @@ class Reconciler:
             return
         from src.apps.routes import _reload_mcp_gateway
         await _reload_mcp_gateway(self.runtime)
+        await self._notify_workspace_mcp_changed()
+
+    async def _notify_workspace_mcp_changed(self) -> None:
+        """Tell every loaded plugin that this workspace's shared MCP surface
+        moved (``Plugin.on_workspace_mcp_changed``).
+
+        Fired from inside ``_trigger_gateway_reload`` rather than from its
+        three callers, so it inherits that method's coalescing for free: every
+        caller already means "the surface moved", and inside a reconcile()
+        pass the reload is deferred to one flush at the end — a boot over ~50
+        apps therefore notifies ONCE, not fifty times.
+
+        Every loaded plugin is told, including the app that triggered the
+        change. Deliberately not special-cased: a subscriber's answer is the
+        same whichever app moved, and the triggering app's own ``activate()``
+        has already run by the time we get here — a second, idempotent
+        notification is redundant, not wrong.
+
+        Each plugin gets its own try/except. This is awaited on the install
+        critical path, so one bad plugin must not fail an unrelated app's
+        install."""
+        for slug in self.runtime.loaded_slugs():
+            loaded = self.runtime.get(slug)
+            if loaded is None:  # unloaded from under us mid-walk
+                continue
+            # Duck-typed, exactly like on_config_reloaded's call site above:
+            # some in-repo test plugins predate the Plugin base class, and a
+            # Tier-2 app has no plugin at all.
+            hook = getattr(loaded.plugin, "on_workspace_mcp_changed", None)
+            if not callable(hook):
+                continue
+            try:
+                await hook(loaded.ctx)
+            except Exception:  # noqa: BLE001
+                log.exception("apps: %s.on_workspace_mcp_changed failed", slug)
 
     def _ensure_mcp_scan_visible(self, app_id: str, package_dir: str) -> None:
         """A sideloaded app's ``package_dir`` (a dev checkout, e.g. under

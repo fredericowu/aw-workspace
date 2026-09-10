@@ -746,7 +746,12 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         # any app whose config change can rewrite its mcp.json, not just the
         # ones that remembered to set contributes.mcp.reload_on_save.
         if reconciler._app_touches_mcp(loaded.manifest, loaded.package_dir):
-            await _reload_mcp_gateway(runtime)
+            # Not _reload_mcp_gateway directly: outside a reconcile() pass
+            # _trigger_gateway_reload IS that call, so this is behaviour-
+            # preserving — but it also fans Plugin.on_workspace_mcp_changed
+            # out, which is why all three _app_touches_mcp-gated sites go
+            # through the one method instead of this being a fourth caller.
+            await reconciler._trigger_gateway_reload()
 
         # This worker is one of AW_WORKSPACE_WORKERS; the other nine still hold
         # the OLD config, and answer GET /api/apps/{slug}/config from it. Tell

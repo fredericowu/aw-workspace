@@ -551,6 +551,164 @@ def test_uninstall_does_not_reload_gateway_for_a_plain_app(tmp_path, monkeypatch
     assert calls == []
 
 
+# ---- Plugin.on_workspace_mcp_changed fan-out ------------------------------
+#
+# The gateway reload tells the GATEWAY the surface moved. These tests cover the
+# other half: telling every loaded PLUGIN, so an app whose own long-lived
+# clients were built against the old surface can invalidate them. The fan-out
+# lives inside _trigger_gateway_reload precisely so it inherits that method's
+# coalescing — a boot reconcile over ~50 apps must notify once, not fifty
+# times.
+
+
+def _make_subscriber_repo(tmp_path, slug, *, body="ctx.mcp_changed.append(1)"):
+    """A plain (non-MCP) app that implements the hook. Non-MCP on purpose: it
+    must be notified about OTHER apps moving the surface, which is the whole
+    point — its own install triggers nothing."""
+    src = tmp_path / f"src_{slug}"
+    src.mkdir(exist_ok=True)
+    (src / "aw-app.json").write_text(textwrap.dedent(f"""
+    {{
+      "manifest_version": 1,
+      "id": "{slug}",
+      "name": "{slug}",
+      "version": "1.0.0",
+      "tier": "inprocess",
+      "runtime": {{"entrypoint": "plugin:AppPlugin"}},
+      "permissions": [],
+      "contributes": {{}}
+    }}
+    """))
+    (src / "plugin.py").write_text(textwrap.dedent(f"""
+        class AppPlugin:
+            async def activate(self, ctx):
+                ctx.mcp_changed = []
+            async def deactivate(self):
+                return None
+            async def on_workspace_mcp_changed(self, ctx):
+                {body}
+    """))
+    return str(src)
+
+
+def _with_subscriber(tmp_path, monkeypatch, calls, slug="watcher", **kw):
+    _patch_reload(monkeypatch, calls)
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+    _async(rc.install(AppSpec(
+        app_id=slug, repo=_make_subscriber_repo(tmp_path, slug, **kw), ref="main")))
+    # The subscriber is plain, so installing IT moved nothing.
+    assert calls == []
+    assert rt.get(slug).ctx.mcp_changed == []
+    return host, rt, rc, cloud
+
+
+def test_another_apps_install_notifies_every_loaded_plugin(tmp_path, monkeypatch):
+    """The card's own title case: app B is installed, and app A — which never
+    changed — is the one that has to hear about it."""
+    calls = []
+    host, rt, rc, cloud = _with_subscriber(tmp_path, monkeypatch, calls)
+
+    repo = _make_app_repo(tmp_path, "widget-mcp", reload_mcp_gateway_on_save=True)
+    _async(rc.install(AppSpec(app_id="widget-mcp", repo=repo, ref="main")))
+
+    assert rt.get("watcher").ctx.mcp_changed == [1]
+
+
+def test_another_apps_uninstall_notifies_every_loaded_plugin(tmp_path, monkeypatch):
+    calls = []
+    host, rt, rc, cloud = _with_subscriber(tmp_path, monkeypatch, calls)
+    repo = _make_app_repo(tmp_path, "widget-mcp", reload_mcp_gateway_on_save=True)
+    _async(rc.install(AppSpec(app_id="widget-mcp", repo=repo, ref="main")))
+    rt.get("watcher").ctx.mcp_changed.clear()
+
+    _async(rc.uninstall("widget-mcp"))
+
+    assert rt.get("watcher").ctx.mcp_changed == [1]
+
+
+def test_a_plain_apps_install_notifies_nobody(tmp_path, monkeypatch):
+    """Gated on _app_touches_mcp, same as the reload it rides on. Installing a
+    pure-UI app must not condemn anything — a subscriber's response is not
+    free (for the warm pool it costs a CLI cold start on the next turn)."""
+    calls = []
+    host, rt, rc, cloud = _with_subscriber(tmp_path, monkeypatch, calls)
+
+    repo = _make_app_repo(tmp_path, "widget-plain", reload_mcp_gateway_on_save=False)
+    _async(rc.install(AppSpec(app_id="widget-plain", repo=repo, ref="main")))
+
+    assert calls == []
+    assert rt.get("watcher").ctx.mcp_changed == []
+
+
+def test_a_reconcile_pass_coalesces_the_notification_to_exactly_one(
+        tmp_path, monkeypatch):
+    """Three MCP apps installed in ONE pass → one reload and ONE notification.
+    Without the coalescing (i.e. if the fan-out sat in _trigger_gateway_reload's
+    three CALLERS instead of inside it) a boot over ~50 apps would fire ~50
+    times, and every warm container would be condemned repeatedly for a single
+    logical change."""
+    calls = []
+    host, rt, rc, cloud = _with_subscriber(tmp_path, monkeypatch, calls)
+
+    cloud.rows = [
+        {"app_id": "watcher", "version": "1.0.0",
+         "repo": _make_subscriber_repo(tmp_path, "watcher"), "ref": "main",
+         "granted_permissions": [], "config": {}, "state": "installed"},
+    ] + [
+        {"app_id": f"mcp{i}", "version": "1.0.0",
+         "repo": _make_app_repo(tmp_path, f"mcp{i}", reload_mcp_gateway_on_save=True),
+         "ref": "main", "granted_permissions": ["routes:register"], "config": {},
+         "state": "installed"}
+        for i in range(3)
+    ]
+    result = _async(rc.reconcile())
+
+    assert sorted(result["installed"]) == ["mcp0", "mcp1", "mcp2"]
+    assert not result["errors"]
+    assert len(calls) == 1
+    assert rt.get("watcher").ctx.mcp_changed == [1]
+
+
+def test_a_plugin_that_raises_does_not_break_the_install(tmp_path, monkeypatch):
+    """The fan-out is awaited on the install critical path, so one bad
+    subscriber must not fail an unrelated app's install — nor stop the walk
+    before the subscribers after it."""
+    calls = []
+    _patch_reload(monkeypatch, calls)
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+    # Installed FIRST, so it is walked first: loaded_slugs() is install order.
+    _async(rc.install(AppSpec(
+        app_id="badsub", ref="main",
+        repo=_make_subscriber_repo(tmp_path, "badsub", body='raise RuntimeError("boom")'))))
+    _async(rc.install(AppSpec(
+        app_id="goodsub", repo=_make_subscriber_repo(tmp_path, "goodsub"), ref="main")))
+
+    repo = _make_app_repo(tmp_path, "widget-mcp", reload_mcp_gateway_on_save=True)
+    res = _async(rc.install(AppSpec(app_id="widget-mcp", repo=repo, ref="main")))
+
+    assert res["app_id"] == "widget-mcp"
+    assert rt.is_loaded("widget-mcp")
+    assert rt.get("goodsub").ctx.mcp_changed == [1]
+
+
+def test_a_plugin_without_the_hook_is_skipped(tmp_path, monkeypatch):
+    """Duck-typed, like on_config_reloaded's call site: every app predating
+    this hook has no such method, and a Tier-2 app has no plugin at all."""
+    calls = []
+    _patch_reload(monkeypatch, calls)
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+    _async(rc.install(AppSpec(
+        app_id="oldapp", repo=_make_app_repo(tmp_path, "oldapp"), ref="main")))
+
+    repo = _make_app_repo(tmp_path, "widget-mcp", reload_mcp_gateway_on_save=True)
+    _async(rc.install(AppSpec(app_id="widget-mcp", repo=repo, ref="main")))
+
+    assert len(calls) == 1  # got as far as the reload, no AttributeError
+
+
 # ---- sideloaded package_dir outside the gateway's scan root (2026-08-26) --
 #
 # A sideloaded app's package_dir (POST /api/apps/install {"package_dir": ...},

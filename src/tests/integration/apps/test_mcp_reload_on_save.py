@@ -223,6 +223,67 @@ def test_gateway_reload_triggered_when_app_contributes_mcp(tmp_path, monkeypatch
     assert calls == [1]
 
 
+PLUGIN_WATCHING_WORKSPACE_MCP = """
+    class AppPlugin:
+        async def activate(self, ctx):
+            ctx.mcp_changed = []
+        async def deactivate(self):
+            return None
+        async def on_workspace_mcp_changed(self, ctx):
+            ctx.mcp_changed.append(1)
+"""
+
+
+def test_another_apps_config_save_notifies_workspace_mcp_changed(tmp_path, monkeypatch):
+    """The third _app_touches_mcp-gated site (install and uninstall are covered
+    in test_reconciler.py). A config save can rewrite the saving app's own
+    mcp.json, which moves the shared surface for everyone — so the OTHER app,
+    which nobody touched, is the one that has to hear about it.
+
+    This route now goes through Reconciler._trigger_gateway_reload rather than
+    calling _reload_mcp_gateway directly. Outside a reconcile pass those are
+    the same call, so the assertion on `calls` below is the behaviour-
+    preserving half; ctx.mcp_changed is the new half."""
+    calls = []
+
+    async def fake_reload(runtime, **kwargs):
+        calls.append(1)
+
+    monkeypatch.setattr(routes_mod, "_reload_mcp_gateway", fake_reload)
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    watcher = _write_app(tmp_path, "watcher", reload_on_save=False,
+                         plugin_src=PLUGIN_WATCHING_WORKSPACE_MCP)
+    saver = _write_app(tmp_path, "mcpsaver", reload_on_save=True,
+                       plugin_src=PLUGIN_NO_HOOK)
+    app, runtime, client = _client()
+    _async(runtime.load(watcher, granted_permissions=[]))
+    _async(runtime.load(saver, granted_permissions=[]))
+
+    assert client.post("/api/apps/mcpsaver/config",
+                       json={"config": {"enabled": False}}).status_code == 200
+
+    assert calls == [1]
+    assert runtime.get("watcher").ctx.mcp_changed == [1]
+
+
+def test_a_plain_apps_config_save_notifies_nobody(tmp_path, monkeypatch):
+    """Same gate as the reload it rides on: a save that cannot have moved the
+    MCP surface must not condemn anybody's long-lived clients."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    watcher = _write_app(tmp_path, "watcher2", reload_on_save=False,
+                         plugin_src=PLUGIN_WATCHING_WORKSPACE_MCP)
+    saver = _write_app(tmp_path, "plainsaver", reload_on_save=False,
+                       plugin_src=PLUGIN_NO_HOOK)
+    app, runtime, client = _client()
+    _async(runtime.load(watcher, granted_permissions=[]))
+    _async(runtime.load(saver, granted_permissions=[]))
+
+    assert client.post("/api/apps/plainsaver/config",
+                       json={"config": {"enabled": False}}).status_code == 200
+
+    assert runtime.get("watcher2").ctx.mcp_changed == []
+
+
 def test_on_config_saved_runs_before_gateway_reload_is_triggered(tmp_path, monkeypatch):
     """The ordering the whole feature depends on: the app must have already
     rewritten its own mcp.json (via on_config_saved) BEFORE the gateway is

@@ -82,6 +82,35 @@ class Plugin:
         """
         return None
 
+    async def on_workspace_mcp_changed(self, ctx: "AppContext") -> None:
+        """Called when the WORKSPACE's shared MCP surface moved — some app was
+        installed, updated or uninstalled, or saved a config that can rewrite
+        its own mcp.json. Not about this app: the plugin being called is
+        almost never the one that changed.
+
+        Runs on the ONE worker that provisioned or served the change, exactly
+        like :meth:`on_config_saved` and unlike :meth:`on_config_reloaded` —
+        the other ``AW_WORKSPACE_WORKERS`` processes are never told. So a
+        subscriber may only do work that is **shared, idempotent and cheap**:
+        one write to a store every worker reads, a flag flipped, a generation
+        counter bumped. Anything whose effect is per-process is simply wrong
+        here — nine workers will not have done it, and there is no second
+        broadcast coming that would fix that up.
+
+        Concretely, and for the same reason: **never restart a managed service,
+        rebind a socket, or block**. This is awaited on the install critical
+        path (``Reconciler._trigger_gateway_reload``), so a slow hook stalls
+        somebody else's install. Core wraps each plugin's call in its own
+        try/except, which contains a raise but cannot contain a hang.
+
+        Fired once per logical change, not once per app: inside a
+        ``reconcile()`` pass the gateway reload coalesces, so a boot over ~50
+        apps calls this ONCE.
+
+        No-op by default.
+        """
+        return None
+
     async def list_skill_sources(self, ctx: "AppContext") -> dict | None:
         """Directories of skills this app contributes that ``contributes.skills``
         cannot describe — optional hook, called right after ``activate``.
