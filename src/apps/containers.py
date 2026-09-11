@@ -413,6 +413,43 @@ class _Container:
         return self._name or f"aw-app-{self.app_id}"
 
 
+def _discard(container, name: str) -> None:
+    """Remove ``container`` so its name is free, even when podman still
+    believes it is running something that is already dead.
+
+    ``remove(force=True)`` alone is not enough, which is not obvious and cost
+    a real outage to learn. podman keeps container metadata in the graphroot
+    (which survives its host container being recreated) but runtime state in
+    the runroot (which does not), and it detects "new boot" from the HOST
+    kernel's boot_id — unchanged by a container restart. So after the
+    aw-remote-host container is recreated or restarted, every nested container
+    is recorded as running with a pid that no longer exists, and a forced
+    remove fails trying to stop it:
+
+        cannot remove container ... as it could not be stopped:
+        conmon exited prematurely, exit code could not be retrieved
+
+    A stop FIRST reconciles that record to "exited" (it errors too, loudly,
+    and that is fine — the process is already gone, the call only corrects
+    podman's bookkeeping), after which the remove succeeds. On 2026-09-11 this
+    is what 19 app containers needed, by hand, one batch at a time, because
+    this path raised instead.
+
+    Same fix as bootstrap/lib/container.sh's start_or_discard on the host
+    side, for the same reason and the same failure.
+    """
+    try:
+        container.remove(force=True)
+        return
+    except Exception:  # noqa: BLE001 — any removal failure gets the same repair
+        log.info("apps: %s would not remove — reconciling its state first", name)
+    try:
+        container.stop(timeout=2)
+    except Exception:  # noqa: BLE001 — expected: the process is already gone
+        pass
+    container.remove(force=True)
+
+
 class ContainerSupervisor:
     """Runtime-owned registry + lifecycle for apps' Tier-2 containers."""
 
@@ -624,7 +661,7 @@ class ContainerSupervisor:
         # Remove any stale container from a previous run so the name is free.
         try:
             stale = client.containers.get(c.name)
-            stale.remove(force=True)
+            _discard(stale, c.name)
         except NotFound:
             pass
 
