@@ -29,11 +29,13 @@ container (reverse replay) — no orphan containers survive an uninstall.
 """
 from __future__ import annotations
 
+import grp
 import logging
 import os
 import re
 import shlex
 import socket
+import subprocess
 from typing import Any
 
 from src.apps import hostpower
@@ -478,8 +480,47 @@ class ContainerSupervisor:
         if not self._socket:
             raise ContainerError(
                 "no container engine socket configured (set AW_CONTAINER_SOCKET)")
+        self._ensure_socket_accessible()
         import docker  # lazy — slim image only imports it for Tier-2 apps
         return docker.DockerClient(base_url="unix://" + self._socket, timeout=timeout)
+
+    def _ensure_socket_accessible(self) -> None:
+        """Self-heal a container-engine socket this process can't reach.
+
+        Since the 2026-08-01 switch to running this image as ``ubuntu``
+        (uid 1001) instead of root, the BYOD podman socket — bind-mounted
+        from the host VM, owned by whatever uid rootless podman runs under
+        there — is routinely unreadable by our own process: connecting
+        raises docker-py's ``PermissionError(13)`` with no hint of why.
+        ``ubuntu`` carries NOPASSWD ``sudo`` in this image for exactly this
+        class of problem, so best-effort ``chgrp`` the socket to our own
+        group before giving up.
+
+        The ownership reset is a live property of the mount (it happens
+        again every time ``podman.socket``/the VM restarts on the host
+        side), not a one-shot boot condition — so this runs lazily on every
+        client build rather than once at startup.
+        """
+        if os.access(self._socket, os.R_OK | os.W_OK):
+            return
+        try:
+            group = grp.getgrgid(os.getgid()).gr_name
+            subprocess.run(
+                ["sudo", "-n", "chgrp", group, self._socket],
+                capture_output=True, timeout=5, check=False)
+        except Exception:  # noqa: BLE001 — best-effort; the re-check below decides
+            pass
+        if os.access(self._socket, os.R_OK | os.W_OK):
+            return
+        try:
+            st = os.stat(self._socket)
+            detail = f"mode={oct(st.st_mode & 0o777)} owner uid={st.st_uid} gid={st.st_gid}"
+        except OSError as exc:
+            detail = f"stat failed: {exc}"
+        raise ContainerError(
+            f"container engine socket {self._socket} is not accessible to this "
+            f"process (uid={os.getuid()} gid={os.getgid()}) even after a "
+            f"best-effort chgrp — {detail}")
 
     def _docker(self):
         """The shared client, capped for the short calls — status, get, stop.
