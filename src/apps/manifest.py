@@ -258,6 +258,22 @@ class Manifest:
         return list(expand(self.runtime.get("host_power") or []))
 
     @property
+    def host_power_optional(self) -> list[str]:
+        """``runtime.host_power_optional`` — elevated host access the app can
+        run without.
+
+        Same shape and the same two validate-time legs as :attr:`host_power`
+        (grant name known, matching ``host:*`` permission held) — the one
+        difference is the third leg, the host's own opt-in: a host that
+        hasn't granted an optional request DROPS it instead of failing the
+        install. GPU render acceleration is the motivating case — a host
+        with no ``/dev/dri`` must still run the app exactly as it does
+        today. See :func:`src.apps.hostpower.resolve_optional`.
+        """
+        from src.apps.hostpower import expand
+        return list(expand(self.runtime.get("host_power_optional") or []))
+
+    @property
     def ui_sidecar(self) -> str:
         """``runtime.ui_sidecar`` — the sidecar that serves this app's UI.
 
@@ -774,13 +790,19 @@ def _parse_version(value: str) -> tuple[int, ...] | None:
 
 def _validate_host_power(runtime: dict[str, Any], tier: str,
                          permissions: list[str]) -> None:
-    """``runtime.host_power`` — shape + the two legs checkable at validate time.
+    """``runtime.host_power`` / ``runtime.host_power_optional`` — shape + the
+    two legs checkable at validate time.
 
-    The third leg (does THIS host offer it?) is deliberately not checked here:
-    a manifest is validated when it is authored and released, not only where
-    it installs, and failing validation on a laptop with no ``/dev/kvm`` would
-    make the app unreleasable rather than uninstallable-here. The host check
-    happens at load, in :func:`src.apps.hostpower.resolve`.
+    Both keys share identical rules here — shape, unknown-grant, tier,
+    capability — because the only thing that tells them apart is the third
+    leg, the host's own opt-in, which is deliberately not checked at
+    validate time for either: a manifest is validated when it is authored
+    and released, not only where it installs, and failing validation on a
+    laptop with no ``/dev/kvm`` would make the app unreleasable rather than
+    uninstallable-here. The host check happens at load, in
+    :func:`src.apps.hostpower.resolve` (``host_power``, raises) and
+    :func:`src.apps.hostpower.resolve_optional` (``host_power_optional``,
+    drops).
     """
     from src.apps.hostpower import HostPowerError, expand, required_capabilities
 
@@ -789,38 +811,41 @@ def _validate_host_power(runtime: dict[str, Any], tier: str,
     # manifest read as correct — the exact failure this whole feature exists
     # to make impossible. Refuse it instead, and say so.
     for spec in runtime.get("sidecars") or []:
-        if isinstance(spec, dict) and spec.get("host_power"):
+        if isinstance(spec, dict) and (spec.get("host_power") or spec.get("host_power_optional")):
             raise ManifestError(
                 f"runtime.sidecars[{spec.get('name')!r}].host_power is not "
                 f"supported — only an app's own container can be elevated today"
             )
 
-    declared = runtime.get("host_power")
-    if declared is None:
-        return
-    if not isinstance(declared, list) or not all(isinstance(g, str) for g in declared):
-        raise ManifestError("runtime.host_power must be a list of grant-name strings")
-    try:
-        grants = expand(declared)
-    except HostPowerError as exc:
-        raise ManifestError(f"runtime.host_power: {exc}") from exc
-    if not grants:
-        return
-    # Only a Tier-2 app HAS a container to elevate. A Tier-1 app runs inside
-    # the workspace process and already has exactly the workspace's own
-    # access — granting it "kvm" would be a manifest key that reads as a
-    # privilege and changes nothing, which is worse than an error.
-    if tier != "container":
-        raise ManifestError(
-            "runtime.host_power only applies to tier=container apps — a Tier-1 "
-            "app runs in the workspace process and cannot be elevated separately"
-        )
-    missing = [c for c in required_capabilities(grants) if c not in permissions]
-    if missing:
-        raise ManifestError(
-            f"runtime.host_power {list(grants)} requires the "
-            f"{sorted(missing)} permission(s)"
-        )
+    for key in ("host_power", "host_power_optional"):
+        declared = runtime.get(key)
+        if declared is None:
+            continue
+        if not isinstance(declared, list) or not all(isinstance(g, str) for g in declared):
+            raise ManifestError(f"runtime.{key} must be a list of grant-name strings")
+        try:
+            grants = expand(declared)
+        except HostPowerError as exc:
+            raise ManifestError(f"runtime.{key}: {exc}") from exc
+        if not grants:
+            continue
+        # Only a Tier-2 app HAS a container to elevate. A Tier-1 app runs
+        # inside the workspace process and already has exactly the
+        # workspace's own access — granting it "kvm" would be a manifest key
+        # that reads as a privilege and changes nothing, which is worse than
+        # an error.
+        if tier != "container":
+            raise ManifestError(
+                f"runtime.{key} only applies to tier=container apps — a "
+                f"Tier-1 app runs in the workspace process and cannot be "
+                f"elevated separately"
+            )
+        missing = [c for c in required_capabilities(grants) if c not in permissions]
+        if missing:
+            raise ManifestError(
+                f"runtime.{key} {list(grants)} requires the "
+                f"{sorted(missing)} permission(s)"
+            )
 
 
 def _validate_sidecars(runtime: dict[str, Any], permissions: list[str]) -> None:

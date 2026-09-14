@@ -92,6 +92,32 @@ def _autostart_disabled(runtime) -> list[dict]:
     return out
 
 
+def _unmet_optional_host_power(runtime, host_offers) -> list[dict]:
+    """``runtime.host_power_optional`` requests this host did not grant.
+
+    Unlike ``runtime.host_power``, these apps loaded anyway —
+    ``hostpower.resolve_optional`` drops the grant instead of failing the
+    load (see its docstring). That makes this the only place an unmet
+    optional request is visible at all: not a failure (nothing below folds
+    it into ``ok``), just the information ``doctor`` exists to surface.
+    """
+    effective_offers = set(host_offers)
+    # Same ceiling resolve_optional() applies at load time: a host that
+    # granted `privileged` covers any narrower optional request too.
+    if "privileged" in effective_offers:
+        effective_offers.update(hostpower.GRANULAR)
+
+    out: list[dict] = []
+    for slug in runtime.loaded_slugs():
+        loaded = runtime.get(slug)
+        if loaded is None:
+            continue
+        for name in loaded.manifest.host_power_optional:
+            if name not in effective_offers:
+                out.append({"app": slug, "grant": name})
+    return out
+
+
 async def _app_doctor_checks(runtime) -> list[dict]:
     """Ask every loaded app the self-checks it declared in ``contributes.doctor``.
 
@@ -1037,7 +1063,10 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
           manifest asks for one cannot be loaded at all (the load raises), so
           what this catches is the subtler shape: a host that granted power
           nothing is using, and — once ``all`` is in play — a host offering
-          less than it was asked for.
+          less than it was asked for. ``unmet_optional`` covers
+          ``runtime.host_power_optional`` instead: those DO load without the
+          grant (see ``hostpower.resolve_optional``), so this is the only
+          place an unmet optional request is visible at all.
         * ``redis`` — whether ``src/libs/redis_coord.py``'s resolved Redis
           URL (W0) actually answers PING. That module has zero consumers
           today, so nothing else would ever surface it silently resolving
@@ -1093,6 +1122,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             if loaded is None or not loaded.manifest.host_power:
                 continue
             host_apps.append({"app": slug, "grants": list(loaded.manifest.host_power)})
+        unmet_optional = _unmet_optional_host_power(runtime, host_offers)
         claimed = {g for row in host_apps for g in row["grants"]}
         # Not a "problem" (it breaks nothing), but it is the one thing about
         # this feature nobody can see otherwise: a machine still carrying an
@@ -1124,6 +1154,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 "summary": hostpower.describe(host_offers),
                 "apps": host_apps,
                 "unused": unused,
+                "unmet_optional": unmet_optional,
             },
             "mcp": {
                 "apps_contributing_tools": mcp_apps,

@@ -1367,4 +1367,4 @@ def test_privileged_run_flag_still_rejected_and_points_at_host_power():
 def test_unknown_host_power_grant_fails_at_register():
     sup = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
     with pytest.raises(Exception, match="unknown host power grant"):
-        sup.register("app", "img", 8080, host_power=("gpu",))
+        sup.register("app", "img", 8080, host_power=("webcam",))

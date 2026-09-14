@@ -16,6 +16,9 @@ class TestExpand:
     def test_all_expands_to_every_granular_grant(self):
         assert hostpower.expand(["all"]) == hostpower.GRANULAR
 
+    def test_all_now_includes_gpu(self):
+        assert "gpu" in hostpower.expand(["all"])
+
     def test_all_does_not_include_privileged(self):
         """"Every device my host can offer" and "dissolve the container
         boundary" are different decisions. A convenience keyword must not make
@@ -37,7 +40,7 @@ class TestExpand:
 
     def test_unknown_grant_raises_rather_than_being_dropped(self):
         with pytest.raises(HostPowerError, match="unknown host power grant"):
-            hostpower.expand(["kvm", "gpu"])
+            hostpower.expand(["kvm", "webcam"])
 
     def test_empty_and_none_are_empty(self):
         assert hostpower.expand(None) == ()
@@ -133,6 +136,44 @@ class TestResolveTheThreeLegs:
                               {hostpower.ENV_VAR: "privileged"})
 
 
+class TestResolveOptional:
+    """``runtime.host_power_optional`` — same capability leg as resolve(),
+    but the host leg drops instead of raising."""
+
+    ENV = {hostpower.ENV_VAR: "kvm,tun"}
+    PERMS = ["host:device-gpu"]
+
+    def test_host_not_offering_it_drops_rather_than_raises(self):
+        """The whole point of the optional variant: a host with no GPU must
+        not fail the load the way resolve() would."""
+        assert hostpower.resolve_optional("app", ["gpu"], self.PERMS, self.ENV) == ()
+
+    def test_host_offering_it_grants_it(self):
+        env = {hostpower.ENV_VAR: "gpu"}
+        assert hostpower.resolve_optional("app", ["gpu"], self.PERMS, env) == ("gpu",)
+
+    def test_missing_capability_still_raises(self):
+        """The capability leg is an authoring bug, not a host-availability
+        question — softening it too would let an unentitled app quietly
+        probe for host devices."""
+        with pytest.raises(HostPowerError, match="missing the matching permission"):
+            hostpower.resolve_optional("app", ["gpu"], [], {hostpower.ENV_VAR: "gpu"})
+
+    def test_no_request_needs_nothing(self):
+        assert hostpower.resolve_optional("app", [], [], {}) == ()
+        assert hostpower.resolve_optional("app", None, None, None) == ()
+
+    def test_host_privileged_satisfies_an_optional_request_too(self):
+        assert hostpower.resolve_optional(
+            "app", ["gpu"], self.PERMS, {hostpower.ENV_VAR: "privileged"}
+        ) == ("gpu",)
+
+    def test_partial_mix_grants_what_the_host_offers_and_drops_the_rest(self):
+        env = {hostpower.ENV_VAR: "gpu"}
+        perms = ["host:device-gpu", "host:device-kvm"]
+        assert hostpower.resolve_optional("app", ["gpu", "kvm"], perms, env) == ("gpu",)
+
+
 class TestDockerKwargs:
     def test_nothing_granted_adds_nothing(self):
         """The default path for every app installed today — it must stay
@@ -141,6 +182,12 @@ class TestDockerKwargs:
 
     def test_kvm_passes_the_device_through(self):
         assert hostpower.docker_kwargs(["kvm"]) == {"devices": ["/dev/kvm:/dev/kvm:rwm"]}
+
+    def test_gpu_passes_the_render_node_directory_through(self):
+        """``/dev/dri`` is a DIRECTORY, not a device node — verified live
+        that docker-py + this workspace's podman accept and expand a
+        directory device (podman enumerates every node inside it)."""
+        assert hostpower.docker_kwargs(["gpu"]) == {"devices": ["/dev/dri:/dev/dri:rwm"]}
 
     def test_tun_also_adds_the_capability_the_device_is_useless_without(self):
         """Opening /dev/net/tun without NET_ADMIN succeeds and then fails to

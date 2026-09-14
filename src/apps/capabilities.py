@@ -48,6 +48,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "host:device-fuse":   {"risk": "high", "desc": "pass /dev/fuse + SYS_ADMIN into the app's container — FUSE mounts"},
     "host:device-binder": {"risk": "high", "desc": "pass the Android binder devices into the app's container — a redroid/Android guest"},
     "host:privileged":    {"risk": "high", "desc": "run the app's container --privileged — every device and capability, no isolation"},
+    "host:device-gpu":    {"risk": "high", "desc": "pass /dev/dri into the app's container — GPU render node for hardware-accelerated rendering/decode"},
 }
 
 # parameterised capabilities: prefix -> risk. The argument after the prefix is

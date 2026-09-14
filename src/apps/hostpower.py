@@ -79,6 +79,21 @@ GRANTS: dict[str, dict[str, Any]] = {
         "caps": (),
         "desc": "Android binder IPC — a redroid/Android guest",
     },
+    "gpu": {
+        "capability": "host:device-gpu",
+        # A DIRECTORY, not a device node: this process's own container does
+        # not see the host's /dev at all (verified live, 2026-09-14 — the
+        # sibling app containers are created by the host's podman, over its
+        # socket, not by anything running inside this container's mount
+        # namespace), so there is no node here to enumerate. podman expands
+        # a directory device into every node it contains — verified live
+        # against this workspace's own container engine before this grant
+        # was added (docker-py's parse_devices does no client-side path
+        # validation at all; the expansion happens server-side).
+        "devices": ("/dev/dri",),
+        "caps": (),
+        "desc": "GPU render node passthrough — hardware-accelerated rendering/decode",
+    },
     "privileged": {
         "capability": "host:privileged",
         "devices": (),
@@ -93,7 +108,7 @@ GRANTS: dict[str, dict[str, Any]] = {
 #: and "dissolve the container boundary" are different decisions with
 #: different blast radii, and a convenience keyword must not silently make
 #: the second one for you — ``privileged`` has to be typed.
-GRANULAR: tuple[str, ...] = ("kvm", "tun", "fuse", "binder")
+GRANULAR: tuple[str, ...] = ("kvm", "tun", "fuse", "binder", "gpu")
 
 #: Every capability string this module can require. Kept here so the
 #: capability catalog and this catalog cannot drift (see
@@ -214,6 +229,65 @@ def resolve(
             f"the install."
         )
     return wanted
+
+
+def resolve_optional(
+    app_id: str,
+    requested: Iterable[str] | None,
+    permissions: Iterable[str] | None,
+    env: dict[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Like :func:`resolve`, but the HOST leg degrades instead of failing.
+
+    ``runtime.host_power_optional`` exists for a grant where "this host
+    doesn't offer it" is an expected, silent-by-default condition rather than
+    a broken install — GPU render acceleration is the motivating case: a host
+    with no ``/dev/dri`` must still run the app exactly as it does today, not
+    fail to install. That is the opposite of ``resolve()``'s whole point for
+    kvm/tun/fuse/binder, where starting without the device is the failure
+    mode this module exists to prevent (a VM in software emulation reading as
+    "the app is broken"). GPU render acceleration degrading to CPU rendering
+    is not that — it is the ordinary, expected fallback.
+
+    The CAPABILITY leg still raises: an app requesting a device without
+    holding the matching permission is an authoring bug, not a
+    host-availability question, and softening that leg too would let an
+    unentitled app quietly probe for host devices instead of failing loudly.
+
+    A drop here is not silent degradation despite not raising: it is logged
+    below, and the caller (``src/apps/runtime.py``) records both the granted
+    and the dropped-and-requested sets to the journal so ``doctor`` can
+    surface an unmet optional request — see ``src/apps/routes.py``.
+    """
+    wanted = expand(requested)
+    if not wanted:
+        return ()
+
+    held = set(permissions or ())
+    missing_caps = [
+        cap for cap in required_capabilities(wanted) if cap not in held
+    ]
+    if missing_caps:
+        raise HostPowerError(
+            f"{app_id} declares runtime.host_power_optional but is missing "
+            f"the matching permission(s): {', '.join(sorted(missing_caps))}"
+        )
+
+    available = set(host_grants(env))
+    # Same ceiling as resolve(): a host that granted `privileged` covers any
+    # narrower optional request too.
+    if "privileged" in available:
+        available.update(GRANULAR)
+
+    granted = tuple(name for name in wanted if name in available)
+    for name in wanted:
+        if name not in available:
+            log.warning(
+                "apps: %s requested optional host power %r, which this host "
+                "has not granted — continuing without it (see "
+                "`aw-workspace-cli doctor`)", app_id, name,
+            )
+    return granted
 
 
 def docker_kwargs(grants: Iterable[str]) -> dict[str, Any]:

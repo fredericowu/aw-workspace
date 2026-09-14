@@ -39,7 +39,7 @@ class TestShape:
 
     def test_unknown_grant_is_refused_with_the_known_set(self):
         with pytest.raises(ManifestError, match="unknown host power grant"):
-            _validate_host_power({"host_power": ["gpu"]}, "container", [])
+            _validate_host_power({"host_power": ["webcam"]}, "container", [])
 
 
 class TestCapabilityLeg:
@@ -92,6 +92,38 @@ class TestSidecarsAreRefusedNotIgnored:
             _validate_host_power(
                 {"sidecars": [{"name": "qemu", "image": "x", "host_power": ["kvm"]}]},
                 "container", [])
+
+
+class TestHostPowerOptionalVariant:
+    """``runtime.host_power_optional`` shares every validate-time rule with
+    ``runtime.host_power`` — only the load-time host leg differs (drops
+    instead of raising, see src/apps/hostpower.py's resolve_optional)."""
+
+    def test_shape_rules_apply_the_same_way(self):
+        with pytest.raises(ManifestError, match="must be a list"):
+            _validate_host_power({"host_power_optional": "gpu"}, "container", [])
+
+    def test_unknown_grant_is_refused(self):
+        with pytest.raises(ManifestError, match="unknown host power grant"):
+            _validate_host_power({"host_power_optional": ["webcam"]}, "container", [])
+
+    def test_capability_leg_still_applies(self):
+        with pytest.raises(ManifestError, match="host:device-gpu"):
+            _validate_host_power({"host_power_optional": ["gpu"]}, "container", [])
+        _validate_host_power({"host_power_optional": ["gpu"]}, "container",
+                             ["host:device-gpu"])
+
+    def test_tier1_cannot_declare_it_either(self):
+        with pytest.raises(ManifestError, match="only applies to tier=container"):
+            _validate_host_power({"host_power_optional": ["gpu"]}, "inprocess",
+                                 ["host:device-gpu"])
+
+    def test_whole_manifest_accepts_a_correct_declaration(self):
+        m = validate_manifest(_tier2(host_power_optional=["gpu"]) | {
+            "permissions": ["containers:manage", "host:device-gpu"],
+        })
+        assert m.host_power_optional == ["gpu"]
+        assert m.host_power == []
 
 
 class TestManifestProperty:

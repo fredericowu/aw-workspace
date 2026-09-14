@@ -1241,7 +1241,21 @@ class AppRuntime:
         # raises and the load fails — deliberately louder than starting a
         # container that comes up without the device it needs, which surfaces
         # as "the app is broken" with the real cause nowhere in sight.
+        #
+        # runtime.host_power_optional goes through resolve_optional instead:
+        # same capability-leg check, but a host that hasn't opted in DROPS
+        # the grant rather than failing the load — see
+        # src/apps/hostpower.py's resolve_optional docstring. The two sets
+        # are disjoint (a grant name only appears in one of the two manifest
+        # keys) so the union below never double-grants.
         host_power = hostpower.resolve(slug, manifest.host_power, granted)
+        optional_granted = hostpower.resolve_optional(
+            slug, manifest.host_power_optional, granted)
+        optional_dropped = [
+            name for name in manifest.host_power_optional
+            if name not in optional_granted
+        ]
+        host_power = tuple(host_power) + tuple(optional_granted)
 
         self.containers.register(
             slug, image, port, run_flags=run_flags, resources=resources, env=env,
@@ -1249,7 +1263,8 @@ class AppRuntime:
             publish=rt.get("publish") or [])
         self.journal.record(slug, "container:register", image,
                             {"port": port, "run_flags": run_flags, "resources": resources,
-                             "host_power": list(host_power)})
+                             "host_power": list(host_power),
+                             "host_power_optional_dropped": optional_dropped})
         # Companion containers, before the app's own: aw-app-crispal's MCP
         # dials the WordPress/MySQL pair as soon as it comes up, and starting
         # them after it would make every boot's first tool call fail.
