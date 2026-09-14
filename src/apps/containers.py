@@ -480,9 +480,33 @@ class ContainerSupervisor:
         if not self._socket:
             raise ContainerError(
                 "no container engine socket configured (set AW_CONTAINER_SOCKET)")
-        self._ensure_socket_accessible()
         import docker  # lazy — slim image only imports it for Tier-2 apps
         return docker.DockerClient(base_url="unix://" + self._socket, timeout=timeout)
+
+    def _reheal_socket(self) -> None:
+        """Re-check socket accessibility before every USE of a client, cached or not.
+
+        A cached ``docker.DockerClient`` holds only config (base_url, timeout) —
+        it does not keep a connection open — so whether the socket is currently
+        reachable has nothing to do with whether a client object already exists
+        for it. Calling the heal only from ``_new_client`` (the original cut of
+        this fix) meant it ran once per client slot for the life of the
+        process: whichever accessor built the client first healed it, and
+        every later call through that same cached slot skipped the check
+        entirely — even after the host reset the socket's ownership again,
+        which is routine, not one-shot (see ``_ensure_socket_accessible``'s
+        own docstring). Live-reproduced on host 824decc7e0610089, 2026-09-14:
+        a client cached while the socket was healthy kept raising a bare
+        ``PermissionError`` forever after the socket flipped back to
+        ``root:root``, because nothing on that path ever asked again. Each of
+        the three accessors below calls this before touching its (possibly
+        cached) client.
+
+        Skipped when a client was injected (tests/fixtures): there is no real
+        socket to check in that case, and the fake client isn't going stale.
+        """
+        if self._socket and not self._injected_client:
+            self._ensure_socket_accessible()
 
     def _ensure_socket_accessible(self) -> None:
         """Self-heal a container-engine socket this process can't reach.
@@ -498,8 +522,9 @@ class ContainerSupervisor:
 
         The ownership reset is a live property of the mount (it happens
         again every time ``podman.socket``/the VM restarts on the host
-        side), not a one-shot boot condition — so this runs lazily on every
-        client build rather than once at startup.
+        side), not a one-shot boot condition — so ``_reheal_socket`` calls
+        this on every USE of a client (cached or freshly built), not just
+        when one is first constructed.
         """
         if os.access(self._socket, os.R_OK | os.W_OK):
             return
@@ -534,6 +559,7 @@ class ContainerSupervisor:
         it into a failure the caller can report; keeping it off the event loop
         is still the caller's job.
         """
+        self._reheal_socket()
         if self._client is None:
             self._client = self._new_client(
                 int(os.environ.get("AW_CONTAINER_CLIENT_TIMEOUT", "10")))
@@ -552,6 +578,7 @@ class ContainerSupervisor:
         """
         if self._injected_client:
             return self._client
+        self._reheal_socket()
         if self._pull_client is None:
             self._pull_client = self._new_client(
                 int(os.environ.get("AW_CONTAINER_PULL_TIMEOUT", "900")))
@@ -582,6 +609,7 @@ class ContainerSupervisor:
         """
         if self._injected_client:
             return self._client
+        self._reheal_socket()
         if self._create_client is None:
             self._create_client = self._new_client(
                 int(os.environ.get("AW_CONTAINER_CREATE_TIMEOUT", "120")))
