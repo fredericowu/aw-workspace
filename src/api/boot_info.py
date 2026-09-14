@@ -2,7 +2,7 @@
 
 Minted ONCE by the parent process, before ``uvicorn.run(workers=N)`` forks or
 spawns worker processes (see ``src/start/workspace.py``), and read back from
-``os.environ`` by every worker on every request. ``AW_WORKSPACE_WORKERS=10``
+``os.environ`` by every worker on every request. ``AW_WORKSPACE_WORKERS=5``
 is live on this deployment — if each worker minted its own ``boot_id``, a
 poller watching for a restart would see a different value per request and
 could never converge, so the parent sets these into ``os.environ`` before

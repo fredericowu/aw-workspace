@@ -107,7 +107,7 @@ RUN chown -R ubuntu:ubuntu /opt/aw-workspace \
 # /opt/aw-workspace/.aw-workspace to match the hardcoded PATH entry below and
 # the existing host bind-mount — decoupled from $HOME on purpose.
 ENV AW_PORT=9030 \
-    AW_WORKSPACE_WORKERS=10 \
+    AW_WORKSPACE_WORKERS=5 \
     AW_WORKSPACE_VERSION=${AW_WORKSPACE_VERSION} \
     PYTHONPATH=/opt/aw-workspace \
     AW_WORKSPACE_HOME=/opt/aw-workspace/.aw-workspace \

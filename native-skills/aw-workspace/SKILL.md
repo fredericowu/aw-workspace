@@ -268,7 +268,7 @@ observable verb instead of a hand-rolled one-liner.
 rev-parse HEAD` of the tree the process started from), `started_at` (epoch
 seconds), alongside the existing `status`/`workspace`/`version`. Minted
 **once**, in the parent process, before `uvicorn.run(workers=N)` in
-`src/start/workspace.py` — `AW_WORKSPACE_WORKERS=10` is live on this
+`src/start/workspace.py` — `AW_WORKSPACE_WORKERS=5` is live on this
 deployment, and if each worker minted its own `boot_id` a poller could
 never converge on one value. `git_head` in particular is captured at
 process **start**, never read live per request — reading it live would

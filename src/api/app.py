@@ -502,7 +502,8 @@ def create_app() -> FastAPI:
     # /ws/terminal/<id>. So this is no longer the piece that pins the
     # workspace to one worker — W1 (watchdog), W2 (boot), W3 (app lifecycle),
     # W4 (WS registries) and W5/W7 (here) together cover the boot/runtime
-    # state, and AW_WORKSPACE_WORKERS ships as 10 as of W6.
+    # state, and AW_WORKSPACE_WORKERS ships as 5 (10 as of W6, lowered for
+    # typical BYOD hardware).
     # Caveat worth keeping in view: terminals degrade to a worker-owned PTY
     # wherever Redis is unreachable, which is single-worker behaviour and the
     # golden rule of the whole series — never "no Redis, no terminals". The
