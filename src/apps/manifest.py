@@ -987,7 +987,12 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
         raise ManifestError("permissions must be a list of strings")
     for perm in permissions:
         if not is_valid_capability(perm):
-            raise ManifestError(f"unknown permission {perm!r}")
+            raise ManifestError(
+                f"unknown permission {perm!r} — this permission may be newer "
+                f"than your workspace's core; try updating your workspace "
+                f"first. Still failing after an update? The manifest likely "
+                f"has a typo in the permission name."
+            )
     if tier == "container" and "containers:manage" not in permissions:
         raise ManifestError("container apps require the 'containers:manage' permission")
 

@@ -72,8 +72,10 @@ def test_entrypoint_must_be_module_class():
 
 
 def test_unknown_permission_rejected():
-    with pytest.raises(ManifestError, match="unknown permission"):
+    with pytest.raises(ManifestError, match="unknown permission") as exc:
         validate_manifest(_m(permissions=["routes:register", "do:anything"]))
+    assert "try updating your workspace" in str(exc.value)
+    assert "typo" in str(exc.value)
 
 
 def test_routes_contribution_requires_permission():
