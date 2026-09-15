@@ -944,10 +944,29 @@ class AppRuntime:
         under everyone's feet, and race N ``podman stop`` calls at the one
         container. The provisioning worker does that once; the rest just let
         go of their own handles.
+
+        ``slug`` may have no :class:`LoadedApp` at all — a ``load()`` that
+        raised between registering a side effect (a Tier-2 container above
+        all — ``_load_container``'s sidecar registration runs BEFORE its own
+        cleanup ``try``) and setting ``self._apps[slug]`` leaves exactly that
+        residue with nothing to drain/deactivate. Used to raise
+        ``ValueError`` and skip cleanup here, so the orphaned container
+        registration outlived the process: every retry failed with
+        "container already registered for 'x'" — reconciler.py's failed-load
+        ``except`` already calls ``unload`` expecting it to clean this up
+        (see ``_install_provisioned``). Best-effort residue cleanup instead.
         """
         loaded = self._apps.get(slug)
         if loaded is None:
-            raise ValueError(f"app {slug!r} is not loaded")
+            if provision:
+                await asyncio.to_thread(self.containers.stop_all_for, slug)
+                await asyncio.to_thread(self.services.stop_all_for, slug)
+            else:
+                self.containers.forget_all_for(slug)
+                self.services.forget_all_for(slug)
+            self.commands.forget_system_clis_for(slug)
+            self.journal.clear_app(slug)
+            return
 
         timeout = self.drain_timeout if drain_timeout is None else drain_timeout
 

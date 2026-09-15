@@ -351,6 +351,51 @@ def test_runtime_loads_container_app_and_reverts_on_unload(tmp_path):
     _async(run())
 
 
+def test_a_load_failure_after_container_register_leaves_no_orphan(tmp_path, monkeypatch):
+    """Regression (Kanban 3dc5bf3b-9510-819c-bb97-c20a6ee8d9bd): a load that
+    fails AFTER ``containers.register()`` but BEFORE ``self._apps[slug]`` is
+    set — e.g. ``_register_sidecars`` blowing up, which runs OUTSIDE
+    ``_load_container``'s own cleanup ``try`` — used to leave the app's
+    container registered forever. ``unload()`` refused to clean it up
+    ("app 'browser' is not loaded", since ``self._apps`` had no entry), so
+    the reconciler's failed-load revert (``_install_provisioned``'s except)
+    silently swallowed that ``ValueError`` and every retry failed with
+    "container already registered for 'browser'": the app was not merely
+    down, it was STUCK down until the whole process restarted.
+    """
+    pkg = _write_container_app(tmp_path, runtime_extra={
+        "sidecars": [{"name": "db", "image": "mysql:8.0"}]})
+
+    def boom(*a, **kw):
+        raise RuntimeError("sidecar registration blew up")
+
+    async def run():
+        rt = AppRuntime(FastAPI(), journal=ActionJournal(), guard_identity=False)
+        rt.containers = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
+        real_register_sidecars = rt._register_sidecars
+        monkeypatch.setattr(rt, "_register_sidecars", boom)
+
+        with pytest.raises(RuntimeError, match="blew up"):
+            await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
+
+        # the app's own container registered, but self._apps never got an entry
+        assert not rt.is_loaded("browser")
+        assert rt.containers.registered() != [], (
+            "expected the orphaned pre-failure container registration")
+
+        # unload must clean up the residue even though the app never fully loaded
+        await rt.unload("browser")
+        assert rt.containers.registered() == []
+        assert rt.journal.entries_for("browser") == []
+
+        # a retry must now succeed instead of "container already registered"
+        monkeypatch.setattr(rt, "_register_sidecars", real_register_sidecars)
+        await rt.load(pkg, granted_permissions=["containers:manage"], signed=True)
+        assert rt.is_loaded("browser")
+
+    _async(run())
+
+
 def test_load_container_app_does_not_block_the_event_loop(tmp_path):
     """Regression (reported live 2026-08-05, Frederico): installing/updating
     a Tier-2 (container) app used to call the synchronous docker-py client
