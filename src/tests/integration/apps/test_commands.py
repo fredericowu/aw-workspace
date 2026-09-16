@@ -14,7 +14,10 @@ from __future__ import annotations
 import asyncio
 import os
 import textwrap
+import threading
+import time
 
+import pytest
 from fastapi import FastAPI
 
 from src.apps.containers import ContainerError
@@ -119,7 +122,8 @@ def test_system_cli_install_is_idempotent_across_reloads(tmp_path, monkeypatch):
 # app's own installer guard made the same assumption, so neither layer could
 # catch the other (2026-08-12).
 
-from src.apps.commands import CommandInstaller  # noqa: E402
+from src.apps import commands as commands_mod  # noqa: E402
+from src.apps.commands import CommandError, CommandInstaller, HealInFlightError  # noqa: E402
 
 
 def _installer(tmp_path):
@@ -394,3 +398,218 @@ def test_an_explicit_verify_is_the_sole_authority(tmp_path):
     marker.unlink()
     healthy, reason = inst.check_system_cli("essentials", "nvm")
     assert healthy is False and "verify failed" in reason
+
+
+# ---- system-CLI healer PID leak (crispal RODADA 9) --------------------------
+#
+# What actually happened: watchdog.pause() (a lease flap under load) cancels
+# the asyncio Task awaiting CommandInstaller.heal() via asyncio.to_thread, but
+# cancelling that future does NOT stop the worker thread — it keeps running
+# the installer subprocess to completion, untracked. resume() then starts a
+# new watchdog loop that heals the SAME still-broken CLI again. Repeat that
+# enough times under sustained load and you get 7 concurrent
+# install_copilot.sh processes on the host, which is what exhausted PIDs on
+# the crispal bare-metal box. Per the Architect's risk notes: test the guard
+# with threading.Event, not timing, and mutation-test D1/D2/D3 separately.
+
+
+def test_heal_second_call_for_same_cli_returns_immediately_while_first_is_in_flight(tmp_path):
+    """D1 — the actual fix. A threading.Lock held on the worker thread for
+    the duration of the installer call, not an asyncio.Lock (which would be
+    released the instant the awaiting Task is cancelled while this thread
+    keeps running — see heal()'s docstring)."""
+    inst = _installer(tmp_path)
+    calls = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_run_installer(package_dir, installer):
+        calls.append(1)
+        started.set()
+        assert release.wait(timeout=5), "test setup: release was never signalled"
+        return "ok"
+
+    inst.run_installer = fake_run_installer  # instance-level monkeypatch
+
+    t = threading.Thread(target=inst.heal, args=("demo", "bash"))
+    t.start()
+    assert started.wait(timeout=5), "first heal() never started"
+
+    # Simulates resume() re-triggering the same CLI before the first
+    # (possibly abandoned) heal has finished.
+    with pytest.raises(HealInFlightError):
+        inst.heal("demo", "bash")
+    assert len(calls) == 1, "a second heal() must not start a duplicate installer"
+
+    release.set()
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert len(calls) == 1
+
+
+def test_heal_pass_is_skipped_while_a_previous_pass_thread_is_still_in_flight(tmp_path, monkeypatch):
+    """D1 — the whole-pass guard in AppRuntime._heal_system_clis. Simulates
+    the abandoned-thread state left behind by a cancelled watchdog Task
+    directly (via CommandInstaller's own in-flight set), rather than racing
+    real threads, since what matters is that the runtime reads that state
+    correctly — heal_in_flight() is exercised on its own above."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    rt = AppRuntime(FastAPI(), journal=ActionJournal())
+    rt.commands.record_system_cli("demo", "bash", str(tmp_path), "scripts/i.sh",
+                                   verify="bash -c 'exit 1'")
+    rt.commands._healing.add(("demo", "bash"))  # abandoned heal, still "running"
+
+    calls = []
+    monkeypatch.setattr(rt.commands, "heal", lambda *a: calls.append(a))
+
+    _async(rt._heal_system_clis())
+    assert calls == [], "a new heal pass must not start while a previous thread is still in flight"
+
+
+def test_heal_in_flight_skip_is_not_recorded_as_a_failure(tmp_path, monkeypatch):
+    """HealInFlightError is not a real failure — recording it would let a
+    lease flap accelerate the very backoff/circuit-breaker (D2) that exists
+    to protect against wasted retries."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    rt = AppRuntime(FastAPI(), journal=ActionJournal())
+    rt.commands.record_system_cli("demo", "bash", str(tmp_path), "scripts/i.sh",
+                                   verify="bash -c 'exit 1'")
+
+    def raise_in_flight(*a):
+        raise HealInFlightError("busy")
+
+    monkeypatch.setattr(rt.commands, "heal", raise_in_flight)
+    recorded = []
+    monkeypatch.setattr(rt.commands, "record_heal_result", lambda *a: recorded.append(a))
+
+    _async(rt._heal_system_clis())
+    assert recorded == []
+
+
+# ---- healer backoff + circuit breaker (D2) -----------------------------------
+
+
+def _unhealthy_installer(tmp_path):
+    inst = CommandInstaller()
+    inst.record_system_cli("demo", "bash", str(tmp_path), "scripts/install.sh",
+                           verify="bash -c 'exit 1'")
+    return inst
+
+
+def test_missing_system_clis_skips_a_cli_still_within_its_backoff_window(tmp_path, monkeypatch):
+    inst = _unhealthy_installer(tmp_path)
+    now = [1_000_000.0]
+    monkeypatch.setattr(commands_mod.time, "time", lambda: now[0])
+
+    assert ("demo", "bash") in inst.missing_system_clis()
+    inst.record_heal_result("demo", "bash", "install failed")
+    assert ("demo", "bash") not in inst.missing_system_clis(), \
+        "right after a failure the CLI is inside its own backoff window"
+
+    now[0] += 301  # past the first 300s backoff step
+    assert ("demo", "bash") in inst.missing_system_clis()
+
+
+def test_backoff_grows_exponentially_and_caps_at_one_hour(tmp_path, monkeypatch):
+    inst = _unhealthy_installer(tmp_path)
+    now = [0.0]
+    monkeypatch.setattr(commands_mod.time, "time", lambda: now[0])
+
+    delays = []
+    for _ in range(6):
+        inst.record_heal_result("demo", "bash", "still broken")
+        delays.append(inst._heal_state[("demo", "bash")]["next_attempt_at"] - now[0])
+
+    assert delays[:5] == [300, 600, 1200, 2400, 3600]
+    assert delays[5] == 3600, "capped at 1h — a full npm install is too expensive to retry faster"
+
+
+def test_circuit_breaker_opens_after_max_consecutive_failures_and_resets_on_reinstall(tmp_path, monkeypatch):
+    inst = _unhealthy_installer(tmp_path)
+    now = [0.0]
+    monkeypatch.setattr(commands_mod.time, "time", lambda: now[0])
+
+    for _ in range(CommandInstaller.HEAL_MAX_CONSECUTIVE_FAILURES):
+        inst.record_heal_result("demo", "bash", "still broken")
+        now[0] += 3600  # always past whatever the backoff window is
+
+    row = next(r for r in inst.system_cli_report() if r["cli"] == "bash")
+    assert row["heal_gave_up"] is True
+    assert ("demo", "bash") not in inst.missing_system_clis(), \
+        "a CLI that failed 10 installs in a row is not fixed by the 11th"
+
+    # A reinstall/update/activate (record_system_cli called again) resets
+    # the circuit — it does not stay open forever after the app changes.
+    inst.record_system_cli("demo", "bash", str(tmp_path), "scripts/install.sh",
+                           verify="bash -c 'exit 1'")
+    assert ("demo", "bash") in inst.missing_system_clis()
+    row = next(r for r in inst.system_cli_report() if r["cli"] == "bash")
+    assert row["heal_gave_up"] is False
+
+
+# ---- kill the process TREE on timeout (D3) -----------------------------------
+#
+# subprocess.run's own timeout handling kills only the direct child it forked
+# (`bash`) — everything bash forked (npm, node, ...) is left running,
+# reparented onto pid 1 the instant bash dies. Reuses kill_proc_tree
+# (src/api/terminal_manager.py, referenced in runtime.py) rather than a second
+# implementation.
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _assert_pid_dies(pid: int, deadline_s: float = 5.0) -> None:
+    """Poll to a deadline instead of a fixed sleep — a fixed sleep flakes
+    under CPU contention (e.g. other work running in this same shared
+    container), which is exactly the kind of load that triggers the lease
+    flap this whole fix exists for."""
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline and _pid_alive(pid):
+        time.sleep(0.05)
+    assert not _pid_alive(pid), f"pid {pid} was still alive after {deadline_s}s"
+
+
+def test_run_kills_the_whole_process_tree_on_timeout(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    pidfile = tmp_path / "child.pid"
+    script = pkg / "install.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "sleep 30 &\n"
+        f'echo $! > "{pidfile}"\n'
+        "wait\n"
+    )
+    script.chmod(0o755)
+
+    inst = CommandInstaller(timeout=1.0)
+    with pytest.raises(CommandError, match="timed out"):
+        inst.run_installer(str(pkg), "install.sh")
+
+    assert pidfile.exists(), "installer never got far enough to fork its child"
+    child_pid = int(pidfile.read_text().strip())
+    _assert_pid_dies(child_pid)
+
+
+def test_check_system_cli_kills_the_process_tree_on_a_hanging_verify(tmp_path, monkeypatch):
+    """Same problem, same fix, at the other subprocess.run call site the
+    Architect flagged (check_system_cli)."""
+    inst = CommandInstaller()
+    monkeypatch.setattr(CommandInstaller, "VERIFY_TIMEOUT", 1.0)
+    pidfile = tmp_path / "verify_child.pid"
+    inst.record_system_cli(
+        "demo", "bash", str(tmp_path), "scripts/install.sh",
+        verify=f'sleep 30 & echo $! > "{pidfile}"; wait')
+
+    healthy, reason = inst.check_system_cli("demo", "bash")
+    assert healthy is False and "timed out" in reason
+
+    assert pidfile.exists()
+    child_pid = int(pidfile.read_text().strip())
+    _assert_pid_dies(child_pid)

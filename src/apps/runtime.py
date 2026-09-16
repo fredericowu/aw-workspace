@@ -35,7 +35,7 @@ from src.apps import paths
 from src.apps.fetch import apps_root
 from src.apps.base import AppContext, Plugin
 from src.apps.capabilities import filter_grants
-from src.apps.commands import CommandInstaller
+from src.apps.commands import CommandInstaller, HealInFlightError
 from src.apps.containers import ContainerError, ContainerSupervisor, expand_env
 from src.apps.journal import ActionJournal
 from src.apps.manifest import Manifest, load_manifest
@@ -499,9 +499,30 @@ class AppRuntime:
         )
 
     async def _heal_system_clis(self) -> None:
+        # Whole-pass reentrancy guard: a lease flap can cancel the Task
+        # running THIS coroutine mid-heal (watchdog.pause()) without
+        # stopping the worker thread underneath (see CommandInstaller.heal's
+        # docstring) — resume() then starts a brand new watchdog loop that
+        # calls this again. heal_in_flight() reflects real worker-thread
+        # state, not this coroutine's own (cancellable) control flow, so it
+        # stays accurate across that cancellation. Per-CLI reentrancy is
+        # still enforced independently by heal() itself; this just avoids
+        # starting a whole new scan (and re-checking every other CLI's
+        # health) while a previous pass's installer is still running.
+        if self.commands.heal_in_flight():
+            log.warning("apps: skipping system-CLI heal pass — a previous pass's "
+                        "installer is still running on a worker thread (likely "
+                        "abandoned by a cancelled watchdog task after a lease flap)")
+            return
         for app_id, name in self.commands.missing_system_clis():
             try:
                 await asyncio.to_thread(self.commands.heal, app_id, name)
+            except HealInFlightError:
+                # Not a failure — defense in depth, the whole-pass guard
+                # above should already prevent reaching this. Must not
+                # count against backoff/circuit-breaker state.
+                log.warning("apps: heal for %r (%s) skipped — already in flight", name, app_id)
+                continue
             except Exception as exc:  # noqa: BLE001 — one bad CLI must not stop the rest
                 # Recorded, not just logged. This used to be a log line and
                 # nothing else, repeated every pass — 65 times in one boot for

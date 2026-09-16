@@ -68,8 +68,13 @@ def _system_clis(section: dict) -> int:
         if row.get("path"):
             print(f"      present at {row['path']} but not working")
         if row.get("heal_failures"):
-            print(f"      self-heal has failed {row['heal_failures']}x: "
-                  f"{row.get('last_heal_error') or 'unknown error'}")
+            if row.get("heal_gave_up"):
+                print(f"      self-heal GAVE UP after {row['heal_failures']} failed attempts: "
+                      f"{row.get('last_heal_error') or 'unknown error'} "
+                      f"— restart the owning app to retry")
+            else:
+                print(f"      self-heal has failed {row['heal_failures']}x: "
+                      f"{row.get('last_heal_error') or 'unknown error'}")
     return len(unhealthy)
 
 
