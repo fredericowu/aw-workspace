@@ -12,6 +12,7 @@ without ever touching aw-backend over the network per request:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import threading
 import time
@@ -19,6 +20,8 @@ import time
 import httpx
 import jwt as pyjwt
 from fastapi import Header, HTTPException, Request, WebSocket
+
+log = logging.getLogger(__name__)
 
 COOKIE_NAME = "aw_id_jwt"
 JWT_ALGORITHM = "EdDSA"
@@ -54,6 +57,8 @@ def _fetch_public_key_pem() -> str:
             return resp.text
         except Exception as e:  # noqa: BLE001 — retried below, re-raised after last attempt
             last_exc = e
+            log.warning("identity: public-key fetch attempt %d/%d failed: %s",
+                        attempt + 1, _FETCH_RETRIES, e)
             if attempt < _FETCH_RETRIES - 1:
                 time.sleep(_FETCH_RETRY_DELAY_S * (attempt + 1))
     raise last_exc
@@ -72,12 +77,81 @@ def get_public_key_pem() -> str:
     return _public_key_pem
 
 
+def _invalidate_and_refetch_public_key_pem() -> str | None:
+    """Force a fresh ``GET .../identity/public-key`` and replace the cached
+    value, or ``None`` if this workspace pins its key via ``AW_AUTH_PUBLIC_KEY``
+    (a static override — no fetch could ever change it, so there is nothing
+    to invalidate) or the re-fetch itself fails.
+
+    Exists because ``get_public_key_pem`` caches for "the life of the worker"
+    with no TTL (see its docstring) — fine for a normal-running process, but
+    it means a signing-key rotation on aw-backend leaves every already-running
+    worker rejecting EVERY identity JWT minted after the rotation, forever,
+    with nothing short of a process restart fixing it. Found live 2026-09-17:
+    a rotated key + a restarted caller still 401'd because the *workspace*
+    side, not the caller, held the stale key. Called only from
+    ``decode_identity_jwt`` on a signature failure, never on an expired or
+    malformed token — a fresh key cannot fix either of those, so retrying for
+    them would only cost a network round-trip on every genuinely bad token."""
+    global _public_key_pem
+    if os.environ.get("AW_AUTH_PUBLIC_KEY"):
+        log.debug("identity: signature mismatch but AW_AUTH_PUBLIC_KEY pins the key "
+                  "statically — nothing to re-fetch, treating as a genuinely bad token")
+        return None
+    with _lock:
+        try:
+            fetched = _fetch_public_key_pem()
+        except Exception:
+            log.warning("identity: re-fetch of aw-backend's public key failed after a "
+                        "signature mismatch — cannot tell a rotation from a bad token "
+                        "right now", exc_info=True)
+            return None
+        if fetched == _public_key_pem:
+            log.warning("identity: re-fetched aw-backend's public key after a signature "
+                        "mismatch and got the SAME key back — this token's signature "
+                        "really doesn't verify, not a stale-cache issue")
+        else:
+            log.warning("identity: aw-backend's public key changed since it was cached — "
+                        "refreshed in-process (a key rotation, most likely)")
+        _public_key_pem = fetched
+        return fetched
+
+
 def decode_identity_jwt(token: str) -> dict | None:
     """Verify signature + expiry using the PUBLIC key only. No DB lookup —
-    the caller decides what ``sub``/``memberships`` mean for this workspace."""
+    the caller decides what ``sub``/``memberships`` mean for this workspace.
+
+    A signature-verification failure gets exactly one retry against a
+    force-refetched key before this returns None — see
+    ``_invalidate_and_refetch_public_key_pem`` for why."""
     try:
-        return pyjwt.decode(token, get_public_key_pem(), algorithms=[JWT_ALGORITHM])
+        key = get_public_key_pem()
     except Exception:
+        log.warning("identity: could not obtain aw-backend's public key at all — "
+                    "every identity JWT will 401 until this recovers", exc_info=True)
+        return None
+
+    try:
+        return pyjwt.decode(token, key, algorithms=[JWT_ALGORITHM])
+    except pyjwt.InvalidSignatureError:
+        log.info("identity: signature mismatch against the cached public key — "
+                 "retrying once against a freshly fetched key")
+    except Exception as exc:
+        # Expected traffic, not an incident: an expired session, a malformed
+        # header, a token for a different algorithm. Logged at debug — still
+        # never silent, just not alarm-worthy on its own.
+        log.debug("identity: token rejected (%s: %s)", type(exc).__name__, exc)
+        return None
+
+    fresh_key = _invalidate_and_refetch_public_key_pem()
+    if fresh_key is None or fresh_key == key:
+        return None
+    try:
+        return pyjwt.decode(token, fresh_key, algorithms=[JWT_ALGORITHM])
+    except Exception as exc:
+        log.warning("identity: still rejected after a forced public-key refresh (%s: %s) — "
+                    "this token's signature is genuinely invalid, not just stale-cached",
+                    type(exc).__name__, exc)
         return None
 
 
