@@ -7,29 +7,21 @@ on:
 
 jobs:
   unit:
-    runs-on: [self-hosted, aw-workspace]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # The runner's own system python3 is Xcode's old command-line-tools
-      # Python (pip 21.2.4) — too old to resolve some pinned requirements
-      # (e.g. fastapi==0.135.2). build-image.yml sidesteps this by building
-      # everything inside a container; do the same here instead of trying
-      # to get a modern Python installed on the bare host.
-      - name: Select container engine (Podman on macbook-fred, Docker on bare-metal)
-        run: |
-          MAC_PODMAN=/Users/aw/podman-dist/podman/bin/podman
-          if [ -x "$MAC_PODMAN" ]; then
-            "$MAC_PODMAN" machine start >/dev/null 2>&1 || true
-            echo "PODMAN=$MAC_PODMAN" >> "$GITHUB_ENV"
-          elif command -v podman >/dev/null 2>&1; then
-            echo "PODMAN=podman" >> "$GITHUB_ENV"
-          elif command -v docker >/dev/null 2>&1; then
-            echo "PODMAN=docker" >> "$GITHUB_ENV"
-          else
-            echo "::error::No container engine (podman/docker) found on this runner"
-            exit 1
-          fi
+      # Kept container-based (rather than installing Python 3.12 straight on
+      # the runner) for consistency with build-image.yml and because it was
+      # already working — the ORIGINAL reason (the self-hosted `aw-workspace`
+      # runner's own system python3 being Xcode's old command-line-tools
+      # Python, pip 21.2.4) no longer applies now that this runs on
+      # GitHub-hosted `ubuntu-latest` (2026-09-17), which always has a
+      # current Docker Engine. $PODMAN is kept as the variable name below
+      # (unchanged, always "docker" now) to minimize the diff against every
+      # other step that reads it, rather than renaming it everywhere.
+      - name: Select container engine
+        run: echo "PODMAN=docker" >> "$GITHUB_ENV"
 
       # src/tests' own Postgres-gated suites (test_isolation.py, test_db_tables.py,
       # test_workspace_api_key.py, etc. — 10 files) each hardcode
@@ -37,11 +29,11 @@ jobs:
       # set AW_WORKSPACE_DB_URL to 127.0.0.1:5432/awserv themselves, so there's
       # no env var to inject for THEM — they just need a real Postgres
       # reachable at that fixed address. That address has to resolve inside the
-      # pytest container below, not on the runner host: no GH Actions
-      # `services:` block (needs a Docker daemon with host networking this
-      # runner doesn't uniformly have — Podman machine on macbook-fred), and no
-      # published host port either (this runner's bare-metal host already runs
-      # production Postgres, which can own 127.0.0.1:5432 there). Instead, join
+      # pytest container below, not on the runner host — no published host
+      # port either, since this container-join approach predates the move to
+      # `ubuntu-latest` (2026-09-17) and a GH Actions `services:` block would
+      # be the more idiomatic choice on a GitHub-hosted runner now. Kept as
+      # container-join rather than redesigned, since it already works: join
       # the pytest container to the ephemeral Postgres container's OWN network
       # namespace (--network container:<name>) — the exact idiom
       # docker-compose.yml already uses in production (aw-workspace joins

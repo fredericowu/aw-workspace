@@ -1,21 +1,31 @@
 name: Build + push image
 
-# Manual only (for now — Frederico decision 2026-08-01): image + release
-# publish is workflow_dispatch-only while aw-workspace is under active
-# single-repo development, so every commit/push doesn't cut a release.
-# Flip the `push` trigger back on once this settles down.
+# Runs on every push to master (Frederico decision 2026-09-17, superseding
+# the 2026-08-01 manual-only call — see git history for that comment). Every
+# push that lands now cuts a real release: auto-bumps the MINOR version
+# (patch reset to 0, matching the aw-marketplace app-release.yml convention
+# the apps already use — see aw-app-agents-platform-runners' release.yml)
+# and publishes the image. `cancel-in-progress: true` below means a rapid
+# string of pushes only ever builds the LATEST one, not a queue of redundant
+# 30-min multi-arch builds. Safe to run this often now that the build runs
+# on a GitHub-hosted runner (`ubuntu-latest`) instead of the single
+# self-hosted `aw-workspace` machine — there is no longer a shared-capacity
+# bottleneck to protect by gating this manually. `workflow_dispatch` stays
+# for an explicit version override or a manual re-run.
 
 on:
+  push:
+    branches: [master]
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release (defaults to next vX.Y.Z patch)"
+        description: "Version to release (defaults to next vX.Y.0 minor bump)"
         type: string
         required: false
 
 concurrency:
   group: build-image
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -24,7 +34,7 @@ permissions:
 jobs:
   build:
     name: Build + push multi-arch image
-    runs-on: [self-hosted, aw-workspace]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       # fetch-depth: 0 — full history, not a shallow clone, because this
@@ -35,33 +45,22 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Select container engine (Podman on macbook-fred, Docker on bare-metal)
-        run: |
-          MAC_PODMAN=/Users/aw/podman-dist/podman/bin/podman
-          if [ -x "$MAC_PODMAN" ]; then
-            "$MAC_PODMAN" machine start >/dev/null 2>&1 || true
-            echo "ENGINE=podman" >> "$GITHUB_ENV"
-            echo "PODMAN=$MAC_PODMAN" >> "$GITHUB_ENV"
-            echo "/usr/local/bin" >> "$GITHUB_PATH"
-            echo "/Users/aw/podman-dist/podman/bin" >> "$GITHUB_PATH"
-          elif command -v docker >/dev/null 2>&1; then
-            echo "ENGINE=docker" >> "$GITHUB_ENV"
-          else
-            echo "::error::No container engine (podman/docker) found on this runner"
-            exit 1
-          fi
+      # GitHub-hosted ubuntu-latest is x86_64 only — QEMU is what lets
+      # buildx cross-build the linux/arm64 leg below without a native arm64
+      # runner. Replaces the old Podman-on-macbook-fred/Docker-on-bare-metal
+      # branch (2026-08-01..2026-09-17): that existed because the
+      # self-hosted `aw-workspace` runner label could resolve to either
+      # machine, each with different native architectures; a single
+      # GitHub-hosted runner type makes that whole detection moot.
+      - name: Set up QEMU (arm64 emulation on this x86_64 runner)
+        uses: docker/setup-qemu-action@v3
 
-      - name: Set up Docker buildx (bare-metal only)
-        if: env.ENGINE == 'docker'
+      - name: Set up Docker buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
         run: |
-          if [ "$ENGINE" = "podman" ]; then
-            echo "${{ secrets.GITHUB_TOKEN }}" | "$PODMAN" login ghcr.io -u "${{ github.actor }}" --password-stdin
-          else
-            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          fi
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       # ghcr.io rejects mixed-case namespaces — lowercase the owner login.
       - name: Lowercase repo owner
@@ -88,8 +87,12 @@ jobs:
             else
               raw="${latest#v}"
               IFS=. read -r major minor patch <<< "${raw}"
-              patch=$((patch + 1))
-              version="v${major}.${minor}.${patch}"
+              # Minor bump, patch reset to 0 — every push is its own release
+              # now (see the top-of-file comment), so patch++ would just
+              # count pushes forever. Matches the aw-marketplace
+              # app-release.yml convention the apps already release under.
+              minor=$((minor + 1))
+              version="v${major}.${minor}.0"
             fi
           fi
           if ! echo "${version}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -110,39 +113,16 @@ jobs:
           set -euo pipefail
           IMAGE="ghcr.io/${OWNER_LC}/aw-workspace"
 
-          if [ "$ENGINE" = "podman" ]; then
-            MANIFEST="localhost/aw-workspace:${VERSION}"
-            "$PODMAN" manifest rm "$MANIFEST" >/dev/null 2>&1 || true
-            "$PODMAN" manifest create "$MANIFEST"
-
-            for platform in linux/amd64 linux/arm64; do
-              echo "==> Building $platform"
-              "$PODMAN" build \
-                --pull \
-                --platform "$platform" \
-                --manifest "$MANIFEST" \
-                --build-arg "AW_WORKSPACE_VERSION=${VERSION}" \
-                .
-            done
-
-            echo "==> Pushing ${IMAGE}:${VERSION}"
-            "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:${VERSION}"
-            echo "==> Pushing ${IMAGE}:latest"
-            "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:latest"
-            echo "==> Pushing ${IMAGE}:${{ github.sha }}"
-            "$PODMAN" manifest push --all "$MANIFEST" "docker://${IMAGE}:${{ github.sha }}"
-          else
-            echo "==> Building + pushing linux/amd64,linux/arm64 via buildx"
-            docker buildx build \
-              --pull \
-              --platform linux/amd64,linux/arm64 \
-              --build-arg "AW_WORKSPACE_VERSION=${VERSION}" \
-              -t "${IMAGE}:${VERSION}" \
-              -t "${IMAGE}:latest" \
-              -t "${IMAGE}:${{ github.sha }}" \
-              --push \
-              .
-          fi
+          echo "==> Building + pushing linux/amd64,linux/arm64 via buildx"
+          docker buildx build \
+            --pull \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg "AW_WORKSPACE_VERSION=${VERSION}" \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${{ github.sha }}" \
+            --push \
+            .
 
       - name: Tag release commit
         env:
