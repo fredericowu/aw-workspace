@@ -1,20 +1,34 @@
 name: Build + push image
 
-# Runs on every push to master (Frederico decision 2026-09-17, superseding
-# the 2026-08-01 manual-only call — see git history for that comment). Every
-# push that lands now cuts a real release: auto-bumps the MINOR version
-# (patch reset to 0, matching the aw-marketplace app-release.yml convention
-# the apps already use — see aw-app-agents-platform-runners' release.yml)
-# and publishes the image. `cancel-in-progress: true` below means a rapid
-# string of pushes only ever builds the LATEST one, not a queue of redundant
-# 30-min multi-arch builds. Safe to run this often now that the build runs
-# on a GitHub-hosted runner (`ubuntu-latest`) instead of the single
-# self-hosted `aw-workspace` machine — there is no longer a shared-capacity
-# bottleneck to protect by gating this manually. `workflow_dispatch` stays
-# for an explicit version override or a manual re-run.
+# Runs after the Test workflow completes successfully on master (Frederico
+# decision 2026-09-18, superseding the 2026-09-17 "every push" call — see
+# git history: that call made this fire on the SAME push event as Test,
+# in parallel, with no dependency between them, so a push whose Test run
+# failed still built and published an image carrying the untested code.
+# Confirmed live 2026-09-18: the CAP_CHOWN commit's Test run failed on two
+# assertions the change legitimately needed to update, and Build + push
+# image succeeded anyway a few seconds later — a real gap, not a
+# hypothetical one, is what this closes). Every push that lands a
+# successful Test run now cuts a real release: auto-bumps the MINOR
+# version (patch reset to 0, matching the aw-marketplace app-release.yml
+# convention the apps already use — see aw-app-agents-platform-runners'
+# release.yml) and publishes the image. `cancel-in-progress: true` below
+# means a rapid string of pushes only ever builds the LATEST one, not a
+# queue of redundant 30-min multi-arch builds. `workflow_dispatch` stays
+# for an explicit version override or a manual re-run — those bypass the
+# Test gate on purpose, the same way a human re-running a known-good build
+# always could.
+#
+# `workflow_run` checks out `master`'s tip by default, not the commit that
+# was actually tested — a second push landing between Test finishing and
+# this workflow starting would silently build THAT code instead. The
+# explicit `ref: ${{ github.event.workflow_run.head_sha }}` on the checkout
+# step below is what pins this to the exact commit Test passed for.
 
 on:
-  push:
+  workflow_run:
+    workflows: ["Test"]
+    types: [completed]
     branches: [master]
   workflow_dispatch:
     inputs:
@@ -36,14 +50,26 @@ jobs:
     name: Build + push multi-arch image
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # workflow_dispatch has no workflow_run event, so no conclusion to
+    # gate on — a manual run is its own explicit go-ahead. A workflow_run
+    # trigger only proceeds when the Test run it's reacting to actually
+    # passed; anything else (failure, cancelled, timed_out) stops here.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       # fetch-depth: 0 — full history, not a shallow clone, because this
       # checkout is COPYed into the image (including .git) so the running
       # container is a real, workable git repo (Frederico decision
       # 2026-08-01), not just a source snapshot.
+      #
+      # ref: pins to the exact commit Test just passed for (workflow_run's
+      # default checkout is master's CURRENT tip, which can have moved past
+      # that commit already — see the top-of-file comment). Falls through
+      # to the default ref on a workflow_dispatch run, where there is no
+      # workflow_run event to read a sha from.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
       # GitHub-hosted ubuntu-latest is x86_64 only — QEMU is what lets
       # buildx cross-build the linux/arm64 leg below without a native arm64
@@ -52,6 +78,16 @@ jobs:
       # self-hosted `aw-workspace` runner label could resolve to either
       # machine, each with different native architectures; a single
       # GitHub-hosted runner type makes that whole detection moot.
+      # `github.sha` reflects the EVENT's own sha, which for a workflow_run
+      # trigger is this workflow FILE's ref, not the commit Test just passed
+      # for — resolved from the actually-checked-out tree instead (pinned
+      # above via the explicit `ref:`), so every later step that needs "the
+      # commit being released" reads the same, correct value regardless of
+      # which trigger fired this run.
+      - name: Resolve the commit being released
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Set up QEMU (arm64 emulation on this x86_64 runner)
         uses: docker/setup-qemu-action@v3
 
@@ -120,16 +156,17 @@ jobs:
             --build-arg "AW_WORKSPACE_VERSION=${VERSION}" \
             -t "${IMAGE}:${VERSION}" \
             -t "${IMAGE}:latest" \
-            -t "${IMAGE}:${{ github.sha }}" \
+            -t "${IMAGE}:${{ steps.commit.outputs.sha }}" \
             --push \
             .
 
       - name: Tag release commit
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          COMMIT_SHA: ${{ steps.commit.outputs.sha }}
         run: |
           set -euo pipefail
-          git tag "${VERSION}" "${{ github.sha }}"
+          git tag "${VERSION}" "${COMMIT_SHA}"
           git push origin "${VERSION}"
 
       - name: Notify aw-backend release registry
@@ -137,7 +174,7 @@ jobs:
           RELEASE_TOKEN: ${{ secrets.AW_RELEASE_WEBHOOK_TOKEN }}
           OWNER_LC: ${{ steps.owner.outputs.lc }}
           VERSION: ${{ steps.version.outputs.version }}
-          SHA: ${{ github.sha }}
+          SHA: ${{ steps.commit.outputs.sha }}
           RUN_ID: ${{ github.run_id }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
