@@ -18,6 +18,8 @@ import subprocess
 import threading
 from collections import deque
 
+from src.apps.service_lease import ServiceLease, is_lease_held_anywhere
+
 log = logging.getLogger(__name__)
 
 # Bounded backlog kept per service so a log-window snapshot has something to
@@ -50,6 +52,10 @@ class _Service:
         # reported as "off" alongside WHY, not just silently off exactly like
         # a service nobody ever asked to start.
         self.last_exit_code: int | None = None
+        # This worker's cross-worker ownership claim for the CURRENTLY
+        # running local process, or None when nothing is running locally.
+        # See src/apps/service_lease.py.
+        self.lease: ServiceLease | None = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -78,6 +84,22 @@ class ServiceSupervisor:
         svc = self._require(app_id, service_id)
         if svc.proc is not None and svc.proc.poll() is None:
             return self.status(app_id, service_id)  # already running
+
+        # Cross-worker ownership gate (see src/apps/service_lease.py): at
+        # AW_WORKSPACE_WORKERS>1, a request to start/restart this service can
+        # land on a worker that isn't running it while another worker's
+        # instance already is — without this check that spawns a REAL second
+        # subprocess that collides on the service's port with the one
+        # already running elsewhere.
+        lease = ServiceLease(app_id, service_id)
+        if not lease.acquire():
+            log.warning(
+                "apps: service %s/%s is already owned by another worker — refusing to "
+                "spawn a duplicate subprocess that would collide on its port",
+                app_id, service_id)
+            return self.status(app_id, service_id)
+
+        svc.lease = lease
         svc.log_lines.clear()
         svc.last_exit_code = None
         svc.proc = subprocess.Popen(
@@ -101,11 +123,18 @@ class ServiceSupervisor:
                 if svc.last_exit_code not in (None, 0):
                     log.warning("apps: service %s/%s exited with code %s",
                                 app_id, service_id, svc.last_exit_code)
+                # Process exited on its own (crash, or was killed outside of
+                # stop()) — release the claim so another worker's start()
+                # isn't blocked by an ownership record nobody is renewing.
+                if svc.lease is not None:
+                    svc.lease.release()
+                    svc.lease = None
 
         svc._reader_thread = threading.Thread(
             target=_pump, args=(svc.proc, svc.log_lines), daemon=True,
         )
         svc._reader_thread.start()
+        lease.start_heartbeat()
         return self.status(app_id, service_id)
 
     def logs(self, app_id: str, service_id: str) -> list[str]:
@@ -134,19 +163,32 @@ class ServiceSupervisor:
                     proc.kill()
                 proc.wait(timeout=timeout)
             log.info("apps: stopped service %s/%s", app_id, service_id)
+        # Only this worker's own claim, if any — a worker that never spawned
+        # this service locally (svc.proc/svc.lease both None, e.g. it landed
+        # here on a non-owning worker) has nothing of its own to release, and
+        # must not touch another worker's still-live lease.
+        if svc.lease is not None:
+            svc.lease.release()
+            svc.lease = None
         svc.proc = None
         return {"service": service_id, "running": False}
 
     def status(self, app_id: str, service_id: str) -> dict:
         svc = self._require(app_id, service_id)
         running = svc.proc is not None and svc.proc.poll() is None
+        # Cross-worker: this worker isn't running it locally, but another
+        # worker's lease may still be live — report the TRUE fleet-wide
+        # state instead of a false "off" (see src/apps/service_lease.py).
+        remote = False if running else is_lease_held_anywhere(app_id, service_id)
         result = {
             "service": service_id,
-            "running": running,
+            "running": running or remote,
             "pid": svc.proc.pid if running and svc.proc else None,
             "autostart": svc.autostart,
         }
-        if not running and svc.last_exit_code not in (None, 0):
+        if remote and not running:
+            result["remote_worker"] = True
+        if not running and not remote and svc.last_exit_code not in (None, 0):
             result["last_exit_code"] = svc.last_exit_code
             tail = [l for l in svc.log_lines if l.strip()][-3:]
             if tail:
