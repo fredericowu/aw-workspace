@@ -1364,7 +1364,11 @@ def test_workspace_repos_volume_refused_without_the_capability(tmp_path, monkeyp
 
 def test_no_host_power_leaves_the_run_call_unelevated():
     """The path every app installed today takes. It must stay exactly what it
-    was before host_power existed: no privilege, no devices, no added caps."""
+    was before host_power existed: no privilege, no devices, no added caps
+    BEYOND the CAP_CHOWN baseline every Tier-2 container gets regardless of
+    host_power (2026-09-18 — see ContainerSupervisor.start()'s own comment:
+    it isn't a host_power-shaped grant, a container can't reach outside
+    itself with it, so it isn't gated behind that opt-in at all)."""
     fake = _FakeDocker()
     sup = ContainerSupervisor(socket="/dev/null", client=fake)
     sup.register("app", "img", 8080)
@@ -1373,12 +1377,18 @@ def test_no_host_power_leaves_the_run_call_unelevated():
     call = fake.run_calls[-1]
     assert call["privileged"] is False
     assert "devices" not in call
-    assert "cap_add" not in call
+    assert call["cap_add"] == ["CHOWN"]
 
 
 def test_granted_host_power_reaches_the_run_call():
     """A QEMU guest without /dev/kvm falls back to software emulation and is
-    unusably slow — the whole point is that the device actually lands."""
+    unusably slow — the whole point is that the device actually lands.
+    cap_add carries the baseline CHOWN grant (see the test above) MERGED
+    with what host_power itself resolves to, not replaced by it — the merge
+    bug that would silently drop one or the other is exactly what
+    test_container_cap_chown.py's own merge tests exist to catch; this one
+    just confirms the SAME merge happens on the real host_power path, not
+    just a monkeypatched one."""
     fake = _FakeDocker()
     sup = ContainerSupervisor(socket="/dev/null", client=fake)
     sup.register("windows", "dockurr/windows", 8006, host_power=("kvm", "tun"))
@@ -1386,7 +1396,7 @@ def test_granted_host_power_reaches_the_run_call():
 
     call = fake.run_calls[-1]
     assert call["devices"] == ["/dev/kvm:/dev/kvm:rwm", "/dev/net/tun:/dev/net/tun:rwm"]
-    assert call["cap_add"] == ["NET_ADMIN"]
+    assert set(call["cap_add"]) == {"CHOWN", "NET_ADMIN"}
     assert call["privileged"] is False
 
 
