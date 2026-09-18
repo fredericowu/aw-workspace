@@ -760,9 +760,33 @@ class ContainerSupervisor:
             "environment": c.env,
             "volumes": c.volumes,
             # Default stays exactly as it was: no privilege, no devices, no
-            # added capabilities. Only an app that cleared all three
-            # host_power legs overrides this, below.
+            # OTHER added capabilities. Only an app that cleared all three
+            # host_power legs adds anything beyond CAP_CHOWN below.
             "privileged": False,
+            # CAP_CHOWN, unconditionally, for every Tier-2 app — not behind
+            # host_power's opt-in gate, because it isn't an escalation in the
+            # same sense those are: it lets a process change ownership of
+            # files it can already read/write, nothing it couldn't otherwise
+            # touch, and nothing that reaches outside this container's own
+            # mount namespace. Added 2026-09-18 (incident: aw-app-browser
+            # crash-looping — Chromium SIGTRAP'd on every start because its
+            # bind-mounted chrome-profile dir, freshly `os.makedirs`'d by
+            # THIS process, was owned by aw-workspace's own uid, not the
+            # image's `seluser`). The image's own entrypoint already tried to
+            # fix this itself via `sudo chown` — that is the RIGHT instinct
+            # for an app author, and the wrong tool for a container this
+            # deeply nested: measured live, sudo's own startup self-check
+            # refused even though /usr/bin/sudo's on-disk mode/owner were
+            # genuinely correct (-rwsr-xr-x root root) — the kernel declining
+            # to honor a setuid bit across this many layers of user
+            # namespace, not a permissions mistake an app can fix from
+            # inside. CAP_CHOWN sidesteps the whole class: a capability
+            # check, not a setuid-root transition, so it isn't subject to
+            # whatever is blocking sudo here. Every app that bind-mounts a
+            # host-created directory and runs as a non-default container uid
+            # hits this same failure mode, not just this one image — hence
+            # unconditional, not per-app opt-in.
+            "cap_add": ["CHOWN"],
             # Root cause of "it should come back up on its own but doesn't":
             # without a restart policy, podman/docker never restarts this
             # container on its own — only the NEXT aw-workspace process boot
@@ -777,7 +801,17 @@ class ContainerSupervisor:
         }
         kwargs.update(_parse_run_flags(c.run_flags))
         kwargs.update(_resource_kwargs(c.resources))
-        kwargs.update(hostpower.docker_kwargs(c.host_power))
+        # Merge, not overwrite: hostpower.docker_kwargs() returns its own
+        # "cap_add" for an app with host_power grants (e.g. gpu), and a bare
+        # dict.update() would silently drop the baseline CHOWN grant above
+        # for exactly the apps most likely to also need OTHER capabilities.
+        power_kwargs = hostpower.docker_kwargs(c.host_power)
+        power_caps = power_kwargs.pop("cap_add", None)
+        kwargs.update(power_kwargs)
+        if power_caps:
+            existing_caps = kwargs.get("cap_add") or []
+            kwargs["cap_add"] = existing_caps + [
+                cap for cap in power_caps if cap not in existing_caps]
         published = _publish_ports(c.publish)
         if published:
             kwargs["ports"] = published
