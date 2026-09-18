@@ -932,6 +932,129 @@ def test_a_stale_owner_snapshot_does_not_prune_a_live_session(managers,
 
 
 # ---------------------------------------------------------------------------
+# 4b. Re-assert: an owner's lapsed heartbeat key is repaired, not left to
+#     split the fleet
+# ---------------------------------------------------------------------------
+#
+# Before this section's fix, a session's owner was EXEMPT from the owner MAP
+# in `list_sessions()` — its own shell was treated as sufficient authority,
+# permanently. That is correct with no Redis at all, but wrong the instant
+# Redis IS reachable and the owner key has lapsed: every OTHER worker prunes
+# the shared meta on its own next read while the owner goes on listing the
+# session from its local cache forever. Two workers, two different terminal
+# lists, and neither self-corrects — the split-brain this card exists to fix.
+#
+# Three tests, each isolating one of the three independent pieces so a
+# mutation of any single one shows up as exactly one red test:
+#   - the end-to-end convergence (Decision A: the re-assert itself)
+#   - A2 alone (the heartbeat CAS can resurrect an EXPIRED key)
+#   - A3 alone (a heartbeat thread that idled out can be replaced)
+
+
+def test_a_worker_whose_owner_key_lapsed_re_asserts_and_the_fleet_converges(managers):
+    """The core split-brain, pinned end to end.
+
+    Worker A's owner key lapses (a stall, not a crash — the shell is still
+    alive and A still holds the fd). Worker B runs first, sees a conclusive
+    owner map with no entry for this id, and prunes it: the split-brain
+    trigger. Worker A's own next `list_sessions()` must notice its session is
+    missing from a conclusive owner map and re-assert instead of silently
+    continuing to serve a session nobody else can see — after which the next
+    read on every other worker agrees again.
+    """
+    _require_streams()
+    session_id = _sid()
+    worker_a, worker_b = managers(2)
+    worker_a.create(name="split-brain", session_id=session_id, command="sleep 60")
+    assert session_id in {s["id"] for s in worker_b.list_sessions()}
+
+    _get_redis().delete(_term_key(tm._OWNER_SUFFIX, session_id))
+
+    # Worker B prunes first — this is the bug's trigger, unchanged by the fix.
+    assert session_id not in {s["id"] for s in worker_b.list_sessions()}, \
+        "worker B did not prune a session with no live owner"
+
+    # Worker A's own read must repair the condition rather than being exempt
+    # from it.
+    ids_a = {s["id"] for s in worker_a.list_sessions()}
+    assert session_id in ids_a, "the owner did not re-assert its own session"
+    assert _owner_alive(session_id), "re-assert did not republish the owner key"
+
+    # And the fleet has converged: worker B's NEXT read agrees with A instead
+    # of staying pruned forever.
+    ids_b = {s["id"] for s in worker_b.list_sessions()}
+    assert ids_a == ids_b, \
+        "worker A and worker B still disagree after the owner re-asserted"
+
+
+def test_refresh_owner_recreates_an_expired_key(managers):
+    """A2, isolated from Decision A: the heartbeat CAS itself must be able to
+    resurrect an EXPIRED key, not just extend a live one.
+
+    Before the fix, `_refresh_owner`'s CAS only ever compared against an
+    EXISTING value — once the key was gone the CAS returned 0 and wrote
+    nothing, so a single heartbeat tick landing after the TTL lapsed orphaned
+    the session's heartbeat permanently (M1). This calls `_refresh_owner`
+    directly and never touches `list_sessions()`, so it is blind to Decision
+    A's re-assert — a mutation of A2 alone fails only this test.
+    """
+    _require_streams()
+    session_id = _sid()
+    mgr = managers()
+    session = mgr.create(name="lapsed-heartbeat", session_id=session_id,
+                         command="sleep 60")
+    token = session.owner_token
+    assert _owner_alive(session_id)
+
+    _get_redis().delete(_term_key(tm._OWNER_SUFFIX, session_id))
+    assert not _owner_alive(session_id)
+
+    tm._refresh_owner(session_id, token)
+
+    assert _owner_alive(session_id), \
+        "_refresh_owner could not recreate an expired owner key (M1)"
+    assert _get_redis().get(_term_key(tm._OWNER_SUFFIX, session_id)) == token
+
+
+def test_ensure_heartbeat_restarts_after_the_loop_idles_out(managers, monkeypatch):
+    """A3, isolated from Decision A: `_ensure_heartbeat()` must be able to
+    start a NEW thread once the previous one has idled out and exited.
+
+    Before the fix, `_heartbeat_loop` returned without clearing
+    `self._heartbeat`, so a `create()` landing in the window between the loop
+    deciding to exit and actually exiting saw `is_alive() == True`, skipped
+    starting a replacement, and the session it just made owned had no
+    heartbeat thread at all until some LATER create/restart happened to
+    trigger one (M2). This drives the idle-exit path directly and never calls
+    `list_sessions()`, so a mutation of A3 alone fails only this test.
+    """
+    _require_streams()
+    mgr = managers()
+    monkeypatch.setattr(tm, "_OWNER_HEARTBEAT", 0.05)
+
+    mgr._ensure_heartbeat()
+    thread = mgr._heartbeat
+    assert thread is not None and thread.is_alive()
+
+    # No owned sessions -> 3 idle ticks -> the loop exits on its own.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and thread.is_alive():
+        time.sleep(0.05)
+    assert not thread.is_alive(), "heartbeat thread never idled out"
+
+    assert mgr._heartbeat is None, (
+        "the exited thread was not cleared — _ensure_heartbeat would see "
+        "is_alive()==True on the dead thread object and skip starting a "
+        "replacement (M2)"
+    )
+
+    mgr._ensure_heartbeat()
+    assert mgr._heartbeat is not None and mgr._heartbeat.is_alive() \
+        and mgr._heartbeat is not thread, \
+        "_ensure_heartbeat did not start a fresh thread after the old one exited"
+
+
+# ---------------------------------------------------------------------------
 # Stream work must not run on the event-loop thread
 # ---------------------------------------------------------------------------
 

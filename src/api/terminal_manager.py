@@ -334,7 +334,7 @@ class SessionMetaStore:
     and one worker never needs this store.
     """
 
-    _BOOL_FIELDS = {"insecure", "hidden"}
+    _BOOL_FIELDS = {"insecure"}
 
     def get(self, session_id: str) -> dict:
         client = _get_redis()
@@ -450,9 +450,21 @@ def _release_creation(session_id: str) -> None:
 # The token carries a per-incarnation uuid and not just the pid, so a restart
 # that re-owns the same session on the SAME worker still cannot have its
 # predecessor's teardown delete the new owner key out from under it.
+#
+# Three branches, not two: a key that is ABSENT (not just held by someone
+# else) is re-published as ours. Without this branch a single heartbeat tick
+# that lands after the key has already expired can never recover — the CAS
+# only ever compares against an existing value, so an expired key stays
+# expired forever and the worker that still holds the shell becomes a
+# permanent minority reporter in `list_sessions()`. The straggler-heartbeat
+# hazard the CAS exists for is unaffected: a key held by another incarnation
+# still falls into the final `else` and is left alone.
 _OWNER_RENEW_LUA = """
-if redis.call('get', KEYS[1]) == ARGV[1] then
+local cur = redis.call('get', KEYS[1])
+if cur == ARGV[1] then
     return redis.call('expire', KEYS[1], ARGV[2])
+elseif cur == false then
+    return redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2])
 else
     return 0
 end
@@ -1502,6 +1514,16 @@ class TerminalManager:
             if not owned:
                 idle_ticks += 1
                 if idle_ticks >= 3:
+                    # Clear under the same guard `_ensure_heartbeat` checks,
+                    # BEFORE returning: without this, a `create()` that lands
+                    # between this thread deciding to exit and it actually
+                    # exiting sees `is_alive() == True`, skips starting a
+                    # replacement, and the session it just made owned then has
+                    # no heartbeat thread at all until some LATER create/
+                    # restart happens to trigger one — an owner key that
+                    # lapses with nothing left to renew it (M2).
+                    with self._heartbeat_guard:
+                        self._heartbeat = None
                     return
                 continue
             idle_ticks = 0
@@ -1858,6 +1880,13 @@ class TerminalManager:
             _delete_streams(session_id,
                             (old.gen if old else meta.get("gen")) or "")
             _release_creation(session_id)
+            # Explicit, not just relying on `create()` below to call it too:
+            # a heartbeat thread that exited between its own idle-exit check
+            # and actually returning (the M2 TOCTOU `_heartbeat_loop` now
+            # guards against) has no other trigger to replace it until
+            # something else happens to create/restart a session on this
+            # worker. Idempotent — a no-op if a thread is already running.
+            self._ensure_heartbeat()
             old_type = old.type if old else (meta.get("type") or "terminal")
             old_name = name or (old.name if old else (meta.get("name") or session_id))
             old_command = command if command is not None else (
@@ -1940,7 +1969,7 @@ class TerminalManager:
             if session or shell_pid:
                 logger.info("Terminal removed: %s", session_id)
 
-    def list_sessions(self, include_hidden: bool = False) -> list[dict]:
+    def list_sessions(self) -> list[dict]:
         """Every live session in the FLEET, not just this worker's.
 
         Local handles plus anything in Redis whose owner heartbeat is still
@@ -1979,9 +2008,8 @@ class TerminalManager:
         # OWNER: a remove() that landed on another worker kills the shell
         # directly in the shared PID namespace, and this worker's EOF only
         # fires if its PTY reader happens to be running. A session this worker
-        # owns is deliberately never pruned by the owner MAP — its own shell
-        # is the authority, and with no Redis at all that map is legitimately
-        # empty.
+        # owns is never pruned by the owner MAP — its own shell is the
+        # authority, and with no Redis at all that map is legitimately empty.
         dead = [
             sid for sid, s in self.sessions.items()
             if not s.alive
@@ -1992,6 +2020,32 @@ class TerminalManager:
             session = self.sessions.pop(sid, None)
             if session is not None:
                 session.close_streams()
+
+        # RE-ASSERT, not exempt: a locally-owned, still-alive session missing
+        # from a CONCLUSIVE owner map means its heartbeat lapsed (M1/M2), not
+        # that the session ended — this worker's shell is still there and
+        # still the authority. Left alone, every OTHER worker prunes the
+        # Redis meta on its own next pass while this worker keeps listing the
+        # session from its local cache forever: a permanent split brain that
+        # never self-corrects (the bug this card exists to fix). Re-publish
+        # the owner key and the meta hash instead, so the next read on every
+        # other worker agrees again. Conditional on the orphan case only —
+        # this runs on every broadcast fleet-wide, so making it unconditional
+        # would add a write per owned session on every single pass.
+        if conclusive:
+            for s in self.sessions.values():
+                if s.is_owner and s.id not in owners:
+                    logger.warning(
+                        "Terminal list: %s is locally owned but missing from "
+                        "the owner map — re-asserting ownership (a heartbeat "
+                        "tick likely lapsed past the TTL)", s.id)
+                    _set_owner(s.id, s.owner_token)
+                    self._meta.update(
+                        s.id, name=s.name, type=s.type,
+                        command=s.command or "", shell_pid=s.shell_pid or 0,
+                        gen=s.gen, insecure=s.insecure,
+                        agent_session_id=s.agent_session_id or "",
+                    )
 
         listed: dict[str, dict] = {
             s.id: {

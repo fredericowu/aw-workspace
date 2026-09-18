@@ -187,9 +187,8 @@ class TerminalRoutes:
 
     # ---- REST -----------------------------------------------------------
 
-    async def list_terminals(self, include_hidden: bool = False,
-                             identity: dict = Depends(require_identity)):
-        return await asyncio.to_thread(self.mgr.list_sessions, include_hidden)
+    async def list_terminals(self, identity: dict = Depends(require_identity)):
+        return await asyncio.to_thread(self.mgr.list_sessions)
 
     async def create_terminal(self, data: dict = Body(default={}),
                               identity: dict = Depends(require_identity)):
@@ -437,6 +436,11 @@ class TerminalRoutes:
         try:
             await websocket.send_text(json.dumps({
                 "type": "init",
+                # Additive version handle only — this socket stays on its
+                # existing legacy envelope (12 message types, ~8 producers/
+                # consumers); see aw-ws/1 standard §9.3. Unknown keys are
+                # ignored by every client (§4.3), so this ships alone.
+                "protocol": 1,
                 "components": await asyncio.to_thread(component_snapshot, self.app),
                 "terminals": await asyncio.to_thread(self.mgr.list_sessions),
             }))
