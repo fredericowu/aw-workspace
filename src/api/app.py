@@ -13,10 +13,14 @@ import os
 import re
 
 from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING
 
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import Headers
+
+if TYPE_CHECKING:
+    from src.apps.boot_reconcile_coord import BootReconcileCoordinator
 
 from src.api import boot_info
 from src.api.db import create_all_tables, get_session, get_workspace_schema
@@ -135,54 +139,61 @@ def _write_setting(key: str, value: dict) -> None:
         session.commit()
 
 
-async def _is_boot_provisioner() -> bool:
-    """W3: does THIS worker run the side-effecting boot reconcile?
+async def _is_boot_provisioner() -> tuple[bool, BootReconcileCoordinator | None]:
+    """W3/W4: does THIS worker run the side-effecting boot reconcile?
 
-    Two rules, in order:
+    1. **At ``AW_WORKSPACE_WORKERS<=1`` — always yes**, without consulting
+       Redis at all. There is no other worker to coordinate with, so any
+       coordination here could only ever subtract behaviour, and the card's
+       golden rule is that a single-worker deployment behaves identically.
+       Getting this wrong is not theoretical: a plain ``cooldown_acquire``
+       gate made a single worker that restarted twice inside the cooldown
+       window skip its own boot reconcile AND its ``agent sync`` — caught
+       by ``test_skills_routes`` before this landed.
 
-    1. **At ``AW_WORKSPACE_WORKERS<=1`` — which is what ships — always yes**,
-       without consulting Redis at all. There is no other worker to
-       coordinate with, so any coordination here could only ever subtract
-       behaviour, and the card's golden rule is that a single-worker
-       deployment behaves identically. Getting this wrong is not theoretical:
-       a plain ``cooldown_acquire`` gate made a single worker that restarted
-       twice inside the cooldown window skip its own boot reconcile AND its
-       ``agent sync`` — caught by ``test_skills_routes`` before this landed.
+    2. **At >1, one worker per FLEET BOOT wins it — and keeps it for the
+       reconcile's actual runtime, not a fixed clock.** Returns
+       ``(True, coordinator)`` for the leader — the caller must heartbeat
+       it for the duration of the real reconcile pass and mark it done
+       afterwards — or ``(False, None)`` for a follower. Keyed on
+       ``boot_info.boot_id()`` (see that module) so a later restart always
+       gets its own claim rather than inheriting one opened by the boot
+       before it — see boot_info's own docstring for the ``os.getppid()``
+       incident that keying used to reproduce.
 
-    2. **At >1, one worker per FLEET BOOT wins the claim.** Keyed on
-       ``boot_info.boot_id()`` — a uuid4 minted once by the parent process
-       in ``mint_boot_identity()`` before ``uvicorn.run(workers=N)``
-       forks/spawns workers, and inherited via ``os.environ`` by every
-       worker of that one boot (see ``src/start/workspace.py::main`` and
-       ``src/api/boot_info.py``) — so a later restart always mints a fresh
-       id and gets its own claim, rather than inheriting a window opened by
-       the boot before it. This used to be keyed on ``os.getppid()`` under
-       the assumption that a restart is always a different master process;
-       that's false when the container restarts in place (no recreation,
-       same PID namespace) — a fresh master reliably gets reassigned the
-       same low pid, so two boots 12s apart both keyed on parent pid 2 and
-       the second one's 10 fresh workers all deferred to the first (already
-       dead) boot's still-live 120s cooldown claim, leaving every worker
-       with ``ctx.provision=False`` and no ``autostart=True`` service ever
-       spawned that boot. The window only has to cover how far apart the
-       workers of ONE boot start; the provisioning mutex covers the
-       reconcile's own runtime.
+       W4 (2026-09-18, incident: workspace ``crispal`` — see
+       ``boot_reconcile_coord``'s module docstring): the ORIGINAL >1 path
+       used ``cooldown_acquire``, a one-shot claim with a fixed 120s TTL —
+       far shorter than a real reconcile pass (450s+ measured live). A
+       worker respawned by uvicorn after that window elapsed re-won the
+       (already-expired) claim and ran a SECOND full pass on top of a still
+       -running first one; over 2+ hours this produced up to 21 concurrent
+       passes on one boot. ``BootReconcileCoordinator`` replaces the fixed
+       TTL with a renewed lease (dies with its holder, not with a clock)
+       plus a terminal "done" marker every later check short-circuits on.
 
-    Redis unreachable — the normal case in every environment today — falls
-    back to yes, i.e. today's behaviour: every worker converges independently,
-    wastefully but correctly.
+    Redis unreachable — falls back to ``(True, None)``, i.e. today's
+    degrade-open behaviour: every worker converges independently,
+    wastefully but correctly. ``None`` rather than a coordinator because
+    there is nothing real to heartbeat against — the caller must check for
+    it before calling any coordinator method.
     """
     if int(os.environ.get("AW_WORKSPACE_WORKERS", "1") or "1") <= 1:
-        return True
-    from src.libs.redis_coord import cooldown_acquire
+        return True, None
+    from src.apps.boot_reconcile_coord import BootReconcileCoordinator
 
+    coordinator = BootReconcileCoordinator(boot_info.boot_id())
     try:
-        return await cooldown_acquire(
-            f"boot-apps-reconcile:{boot_info.boot_id()}", seconds=120.0)
+        leading = await coordinator.coordinate()
     except Exception:
-        log.exception("apps: could not claim the boot reconcile — this worker "
-                      "will run its own, as it did before W3")
-        return True
+        log.exception("apps: could not coordinate the boot reconcile — this "
+                      "worker will run its own, as it did before W3")
+        await coordinator.aclose()
+        return True, None
+    if not leading:
+        await coordinator.aclose()
+        return False, None
+    return True, coordinator
 
 
 async def _boot_reconcile_and_sync(app: FastAPI) -> None:
@@ -201,11 +212,25 @@ async def _boot_reconcile_and_sync(app: FastAPI) -> None:
     and the same podman socket. The rest attach to whatever is already on disk
     (fast, no network, no side effects) and converge again off the
     ``apps:changed`` that pass publishes at its end. See src/apps/lifecycle.py.
+
+    W4: the leader's coordinator (``None`` at <=1 workers or on a Redis
+    fallback — nothing real to hold) is heartbeated for the ENTIRE
+    reconcile call below, and marked done only in the ``finally`` — see
+    ``_is_boot_provisioner`` and ``boot_reconcile_coord`` for the incident
+    this closes.
     """
-    provisioner = await _is_boot_provisioner()
+    provisioner, coordinator = await _is_boot_provisioner()
 
     if provisioner:
-        await reconcile_on_boot(app)
+        if coordinator is not None:
+            await coordinator.start_heartbeat()
+        try:
+            await reconcile_on_boot(app)
+        finally:
+            if coordinator is not None:
+                await coordinator.stop_heartbeat()
+                await coordinator.mark_done()
+                await coordinator.aclose()
     else:
         log.info("apps: another worker is running this boot's app reconcile — "
                  "attaching to what is already installed instead")
