@@ -174,24 +174,22 @@ class ComponentRoutes:
 
     async def start_component(self, key: str, identity: dict = Depends(require_identity)):
         if key.startswith("service:"):
-            return await self._mutate_service(
-                key, "started", lambda rt, aid, sid: asyncio.to_thread(rt.services.start, aid, sid))
+            return await self._mutate_service(key, "started", "start")
         return await self._mutate(
             key, "started", lambda rt, app_id: asyncio.to_thread(rt.containers.start, app_id))
 
     async def stop_component(self, key: str, identity: dict = Depends(require_identity)):
         if key.startswith("service:"):
-            return await self._mutate_service(
-                key, "stopped", lambda rt, aid, sid: asyncio.to_thread(rt.services.stop, aid, sid))
+            return await self._mutate_service(key, "stopped", "stop")
         return await self._mutate(
             key, "stopped", lambda rt, app_id: asyncio.to_thread(rt.containers.stop, app_id))
 
     async def restart_component(self, key: str, identity: dict = Depends(require_identity)):
         if key.startswith("service:"):
-            async def restart_service(rt, aid, sid):
-                await asyncio.to_thread(rt.services.stop, aid, sid)
-                return await asyncio.to_thread(rt.services.start, aid, sid)
-            return await self._mutate_service(key, "restarted", restart_service)
+            # ONE action, not a route-level stop-then-start pair: only a single
+            # action can be forwarded intact to the owning worker (see
+            # ServiceSupervisor.restart).
+            return await self._mutate_service(key, "restarted", "restart")
 
         async def restart(rt, app_id):
             await asyncio.to_thread(rt.containers.stop, app_id)
@@ -218,7 +216,18 @@ class ComponentRoutes:
             hub.broadcast_soon(payload)
         return payload
 
-    async def _mutate_service(self, key: str, action: str, fn):
+    async def _mutate_service(self, key: str, action: str, command: str):
+        """Run ``command`` (``start``/``stop``/``restart``) on whichever worker
+        owns the service, not necessarily this one.
+
+        At ``AW_WORKSPACE_WORKERS>1`` this request lands on a load-balanced
+        worker that most likely holds no ``Popen`` for the service, and acting
+        locally would be a safe no-op that does nothing the user asked for.
+        :class:`~src.apps.service_relay.ServiceCommandRelay` broadcasts the
+        command so the real owner executes it and answers; with no relay (unit
+        tests, Redis down) it degrades to exactly the local call this used to
+        make.
+        """
         _, row = await asyncio.to_thread(_component_for, self.app, key)
         if row is None:
             return JSONResponse({"error": f"Unknown component: {key}"}, status_code=404)
@@ -227,10 +236,13 @@ class ComponentRoutes:
             return JSONResponse({"error": f"Malformed service key: {key}"}, status_code=400)
         _, app_id, service_id = parts
         rt = _runtime(self.app)
+        relay = getattr(self.app.state, "service_relay", None)
         try:
-            result = fn(rt, app_id, service_id)
-            if inspect.isawaitable(result):
-                result = await result
+            if relay is not None:
+                result = await relay.dispatch(app_id, service_id, command)
+            else:
+                result = await asyncio.to_thread(
+                    getattr(rt.services, command), app_id, service_id)
         except Exception as e:  # ServiceError or subprocess failure
             return JSONResponse({"error": str(e)}, status_code=400)
 

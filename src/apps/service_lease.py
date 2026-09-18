@@ -139,6 +139,14 @@ class ServiceLease:
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: Optional[threading.Thread] = None
 
+    @property
+    def owned(self) -> bool:
+        """Whether this worker still holds the claim — ``acquire()`` won it and
+        no heartbeat has since found it stolen or expired. Read by
+        :meth:`~src.apps.services.ServiceSupervisor.owns_locally` to decide
+        whether this process may act on a broadcast service command."""
+        return self._owned
+
     def _client(self) -> "sync_redis.Redis":
         return _get_shared_client(self._redis_url)
 

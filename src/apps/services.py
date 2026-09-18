@@ -110,7 +110,7 @@ class ServiceSupervisor:
         )
         log.info("apps: started service %s/%s pid=%s", app_id, service_id, svc.proc.pid)
 
-        def _pump(proc: subprocess.Popen, buf: deque[str]) -> None:
+        def _pump(proc: subprocess.Popen, buf: deque[str], own_lease: ServiceLease) -> None:
             try:
                 if proc.stdout is None:
                     return
@@ -126,16 +126,57 @@ class ServiceSupervisor:
                 # Process exited on its own (crash, or was killed outside of
                 # stop()) — release the claim so another worker's start()
                 # isn't blocked by an ownership record nobody is renewing.
-                if svc.lease is not None:
-                    svc.lease.release()
+                #
+                # `own_lease` is captured at SPAWN time, not read off `svc` at
+                # exit time, and the field is cleared only on an identity
+                # match. A restart is stop()+start() back-to-back: stop()
+                # returns as soon as proc.wait() does, start() then acquires a
+                # NEW lease, and this pump reaches its finally a moment later.
+                # Reading `svc.lease` here would find — and release — the
+                # lease belonging to the process that just replaced this one,
+                # leaving a RUNNING service with no ownership record: status()
+                # reports it off fleet-wide, and the next worker to click Start
+                # spawns exactly the duplicate the lease exists to prevent.
+                # (Releasing an already-released lease is a no-op: release()
+                # only touches Redis while it still holds `_owned`.)
+                own_lease.release()
+                if svc.lease is own_lease:
                     svc.lease = None
 
         svc._reader_thread = threading.Thread(
-            target=_pump, args=(svc.proc, svc.log_lines), daemon=True,
+            target=_pump, args=(svc.proc, svc.log_lines, lease), daemon=True,
         )
         svc._reader_thread.start()
         lease.start_heartbeat()
         return self.status(app_id, service_id)
+
+    def restart(self, app_id: str, service_id: str) -> dict:
+        """Stop then start as ONE unit, so a forwarded ``restart`` command is
+        a single action executable on the owning worker.
+
+        Previously this only existed as a route-level stop-then-start pair
+        (``src/api/components.py``), which cannot be forwarded as one thing:
+        relaying the halves separately would let another worker win the lease
+        in between and leave the restart half-done on two machines.
+        """
+        self.stop(app_id, service_id)
+        return self.start(app_id, service_id)
+
+    def owns_locally(self, app_id: str, service_id: str) -> bool:
+        """True only if THIS process is running the service *and* still holds
+        its cross-worker claim — the question a broadcast command asks itself
+        before acting on it (``src/apps/service_relay.py``).
+
+        Both halves matter. A worker whose lease was stolen or expired (the
+        heartbeat clears ``owned``, see ``service_lease.py``) still has a live
+        ``Popen`` and would otherwise answer for a service it no longer owns.
+        Unregistered here answers False rather than raising: most workers have
+        never loaded the app whose service a broadcast names.
+        """
+        svc = self._services.get((app_id, service_id))
+        if svc is None or svc.proc is None or svc.proc.poll() is not None:
+            return False
+        return svc.lease is not None and svc.lease.owned
 
     def logs(self, app_id: str, service_id: str) -> list[str]:
         """Return the buffered stdout/stderr backlog for a managed service."""

@@ -43,6 +43,7 @@ from src.apps import hostpower
 from src.apps.catalog import get_catalog, is_marketplace_app, list_tags
 from src.apps.install_jobs import InstallJobs
 from src.apps.lifecycle import AppLifecycle
+from src.apps.service_relay import ServiceCommandRelay
 from src.apps.manifest import ManifestError, load_manifest
 from src.apps.reconciler import AppSpec, Reconciler
 from src.apps.containers import ContainerError, expand_env
@@ -488,6 +489,12 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
     lifecycle = AppLifecycle()
     reconciler = Reconciler(runtime, lifecycle=lifecycle)
     jobs = InstallJobs()
+    # Forwards a manual service start/stop/restart to the worker that actually
+    # owns the process. Constructed here for the same reason as `lifecycle`
+    # above — at AW_WORKSPACE_WORKERS=1 nobody else is subscribed, so it costs
+    # nothing and needs no further change on a scale-up. See
+    # src/apps/service_relay.py; the lifespan starts and stops its relay.
+    app.state.service_relay = ServiceCommandRelay(runtime)
     app.state.app_runtime = runtime
     app.state.app_reconciler = reconciler
     app.state.app_install_jobs = jobs

@@ -389,6 +389,13 @@ def create_app() -> FastAPI:
             await app.state.app_reconciler.converge_in_process()
 
         await app.state.app_lifecycle.start(_on_apps_changed)
+        # Subscribe this worker to service:cmd/service:reply, so a manual
+        # start/restart that lands here for a service another worker actually
+        # owns is forwarded to that worker instead of being a safe no-op.
+        # Same best-effort posture as the relays above: never raises, and with
+        # Redis unreachable every worker simply acts locally — today's
+        # behaviour. See src/apps/service_relay.py.
+        await app.state.service_relay.start()
         # Converge the running app set to the cloud registry, then (only
         # after) mirror contributes.skills — a fresh/recreated workspace
         # auto-reinstalls the user's apps this way (F3). Backgrounded, NOT
@@ -441,6 +448,10 @@ def create_app() -> FastAPI:
             await app.state.app_install_jobs.aclose()
         except Exception:
             log.exception("lifespan: app lifecycle teardown raised during shutdown")
+        try:
+            await app.state.service_relay.stop()
+        except Exception:
+            log.exception("lifespan: service relay teardown raised during shutdown")
         # W4: drop the three WS-registry Redis relays the same best-effort way.
         try:
             await app.state.notification_mgr.aclose()
