@@ -186,6 +186,15 @@ def _mcp(section: dict) -> int:
     tools = section.get("tools", 0)
     upstreams = section.get("local_upstreams") or []
     print(f"      gateway reachable — {tools} tool(s) across {len(upstreams)} upstream(s)")
+    warm_redis = section.get("warm_redis")
+    if warm_redis is None:
+        print("      warm-token Redis: unknown — gateway predates warm_redis reporting (pre-0.27.0)")
+    elif warm_redis.get("ok"):
+        print(f"      warm-token Redis: ok (source={warm_redis.get('source')})")
+    else:
+        print(f"  ✗ warm-token Redis: NOT ok (source={warm_redis.get('source')}, "
+              f"reachable={warm_redis.get('reachable')}) — schedule_wakeup/ask_human/"
+              "mark_flow_done/supervise/callbacks will fail for warm sessions")
     if section.get("degraded"):
         print(f"  ✗ {section.get('note', 'gateway is serving zero tools')}")
         return 1

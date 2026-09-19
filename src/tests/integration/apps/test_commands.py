@@ -381,6 +381,53 @@ def test_mcp_gateway_status_healthy_is_not_degraded(monkeypatch):
     assert status["tools"] == 209
 
 
+# ---- warm_redis: a missing key is unknown, not degraded --------------------
+#
+# aw-mcp-gateway v0.27.0 added a `warm_redis` block to /healthz: {ok, url,
+# source, reachable, tokens_seen_24h, tokens_unresolved_24h}. An unresolvable
+# warm-token Redis silently breaks schedule_wakeup/ask_human/mark_flow_done/
+# supervise/callback dispatch for every warm session (confirmed live
+# 2026-09-19 against crispal's hosted workspace) with otherwise zero doctor
+# signal. But the hosted fleet is not version-locked — plenty of installs
+# will lack this key for a while — so a MISSING key must never read as
+# degraded, only an explicitly-present `warm_redis.ok == False`.
+
+def test_mcp_gateway_status_missing_warm_redis_key_is_unknown_not_degraded(monkeypatch):
+    """A pre-0.27.0 gateway simply doesn't have the key — must not be treated
+    as broken just because this workspace now knows to look for it."""
+    monkeypatch.setattr("httpx.AsyncClient", _fake_async_client(
+        lambda: {"tools": 40, "local_upstreams": ["kb"]}))
+
+    status = _async(routes_mod._mcp_gateway_status(_FakeMcpRuntime(), expect_tools=True))
+
+    assert status["warm_redis"] is None
+    assert status["degraded"] is False
+
+
+def test_mcp_gateway_status_warm_redis_ok_is_not_degraded(monkeypatch):
+    monkeypatch.setattr("httpx.AsyncClient", _fake_async_client(
+        lambda: {"tools": 40, "local_upstreams": ["kb"],
+                 "warm_redis": {"ok": True, "source": "probed", "reachable": True}}))
+
+    status = _async(routes_mod._mcp_gateway_status(_FakeMcpRuntime(), expect_tools=True))
+
+    assert status["warm_redis"] == {"ok": True, "source": "probed", "reachable": True}
+    assert status["degraded"] is False
+
+
+def test_mcp_gateway_status_warm_redis_explicitly_not_ok_is_degraded(monkeypatch):
+    """The actual crispal shape: gateway reachable, tools flowing fine, but
+    the warm-token Redis it resolved doesn't answer — a total outage for
+    every caller-identity-dependent tool that a bare tools>0 check misses."""
+    monkeypatch.setattr("httpx.AsyncClient", _fake_async_client(
+        lambda: {"tools": 40, "local_upstreams": ["kb"],
+                 "warm_redis": {"ok": False, "source": "none", "reachable": False}}))
+
+    status = _async(routes_mod._mcp_gateway_status(_FakeMcpRuntime(), expect_tools=True))
+
+    assert status["degraded"] is True
+    assert "warm-token Redis" in status["note"]
+
 
 def test_an_explicit_verify_is_the_sole_authority(tmp_path):
     """nvm is a shell function sourced from ~/.nvm/nvm.sh — `which` can never

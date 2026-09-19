@@ -391,6 +391,15 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
     incident had exactly two dead upstreams while everything else kept the
     gateway's total tool count well above zero. ``expect_tools`` alone (no
     ``expected``) still catches the coarser total-collapse case.
+
+    Also folds in the gateway's own ``warm_redis`` block (v0.27.0+): an
+    unresolvable/unreachable warm-token Redis breaks ``schedule_wakeup``,
+    ``ask_human``, ``mark_flow_done``, ``supervise`` and callback dispatch for
+    every warm session in the workspace, with otherwise zero doctor signal
+    (confirmed live 2026-09-19 against crispal's hosted workspace). A
+    **missing** ``warm_redis`` key — an older gateway that predates this
+    field, and the hosted fleet is not version-locked — reads as unknown, not
+    degraded; only an explicitly-present ``warm_redis.ok == False`` counts.
     """
     # NOT ``runtime.is_loaded``: that tracks apps with an in-process plugin, and
     # mcp-gateway is ``tier: container`` — it has none, so is_loaded() is False
@@ -423,11 +432,27 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
          if name not in live),
         key=lambda d: (d["app"], d["server"]),
     )
-    degraded = bool(dead) or (expect_tools and tools == 0)
+    zero_tools = expect_tools and tools == 0
+    # ``warm_redis`` only exists from aw-mcp-gateway v0.27.0 onward (the block
+    # on /healthz: {ok, url, source, reachable, tokens_seen_24h,
+    # tokens_unresolved_24h}). The hosted fleet is not version-locked, so a
+    # gateway that predates it is a normal, common case — a MISSING key must
+    # read as unknown, never as degraded. Only an explicitly-present
+    # ``warm_redis.ok == False`` (an unresolvable/unreachable warm-token
+    # Redis, which silently breaks schedule_wakeup/ask_human/mark_flow_done/
+    # supervise/callback dispatch for every warm session) counts.
+    warm_redis = payload.get("warm_redis")
+    warm_redis_bad = isinstance(warm_redis, dict) and warm_redis.get("ok") is False
+    degraded = bool(dead) or zero_tools or warm_redis_bad
     if dead:
         note = ("%d upstream(s) declared but not live in the gateway: %s" %
                 (len(dead), ", ".join(f"{d['server']} ({d['app']})" for d in dead)))
-    elif degraded:
+    elif warm_redis_bad:
+        note = ("warm-token Redis unresolved/unreachable (source=%s) — "
+                 "schedule_wakeup, list_wakeups, ask_human, mark_flow_done, "
+                 "supervise and callback dispatch will fail for warm sessions"
+                 % warm_redis.get("source", "unknown"))
+    elif zero_tools:
         note = ("gateway reachable but serving ZERO tools despite apps "
                  "declaring mcp.json — at least one upstream is dead")
     elif expected:
@@ -440,6 +465,7 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
         "tools": tools,
         "local_upstreams": upstreams,
         "dead_upstreams": dead,
+        "warm_redis": warm_redis,
         "degraded": degraded,
         "note": note,
     }
