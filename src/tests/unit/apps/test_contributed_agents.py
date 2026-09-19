@@ -9,7 +9,8 @@ once precisely so it can honour it.
 """
 import pytest
 
-from src.apps.agents import KINDS, AgentsRegistry, resolve_file_fields
+from src.apps.agents import (KINDS, MAX_QUALIFIED_SLUG_LEN, AgentsRegistry,
+                             qualify_workspace_agents, resolve_file_fields)
 from src.apps.manifest import ManifestError, validate_manifest
 
 
@@ -467,3 +468,144 @@ def test_a_workflow_and_eval_are_seeded_in_order():
     assert created["evals"] == 1
     assert [kind for kind, _ in provider.order] == [
         "targets", "models", "agent_configs", "groups", "agents", "workflows", "evals", "agent_flows"]
+
+
+# --- workspace qualification (narrowed §5.B — identity only) ----------------
+#
+# A tenant can own more than one workspace, but Agent uniqueness in
+# agents-platform-multitenant is (tenant_id, slug) — a "workspace_qualified"
+# manifest entry gets its slug/name/workspace rewritten here so two
+# workspaces of the same tenant don't collide on one shared row. Deliberately
+# narrow (Architect Q1): no runner_cli, no params.runner merge — Agent.workspace
+# plus agents-platform-multitenant's own _apply_workspace_override is the
+# mechanism that actually points a dispatch at the right machine.
+
+
+def test_a_workspace_qualified_entry_gets_slug_name_and_workspace(monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE", "crispal")
+    spec = {"agents": [{"slug": "telegram-sonnet", "name": "Sonnet",
+                        "workspace_qualified": True}]}
+
+    out = qualify_workspace_agents(spec)
+
+    entry = out["agents"][0]
+    assert entry["slug"] == "telegram-sonnet-crispal"
+    assert entry["name"] == "[crispal] Sonnet"
+    assert entry["workspace"] == "crispal"
+    assert "workspace_qualified" not in entry
+
+
+def test_no_runner_cli_or_params_runner_merge_is_introduced(monkeypatch):
+    # Architect Q1: Agent.workspace is the primary runner-binding mechanism
+    # now — a second, redundant f"{workspace}-{cli}" derivation here would be
+    # a THIRD copy of the exact logic that already lives in
+    # agents-platform-multitenant's executor.py and api/runners.py, which is
+    # the drift class that caused the original bug.
+    monkeypatch.setenv("AW_WORKSPACE", "crispal")
+    spec = {"agents": [{"slug": "telegram-sonnet", "name": "Sonnet",
+                        "workspace_qualified": True, "runner_cli": "claude"}]}
+
+    out = qualify_workspace_agents(spec)
+
+    entry = out["agents"][0]
+    assert "runner_cli" in entry  # passed through untouched, never consumed
+    assert "params" not in entry
+
+
+def test_entries_with_no_workspace_qualified_marker_pass_through_untouched(monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE", "crispal")
+    spec = {"agents": [{"slug": "architect", "name": "Architect"}]}
+
+    out = qualify_workspace_agents(spec)
+
+    assert out["agents"][0] == {"slug": "architect", "name": "Architect"}
+
+
+def test_other_kinds_are_left_alone(monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE", "crispal")
+    spec = {**SPEC, "agents": [{"slug": "telegram-sonnet", "name": "Sonnet",
+                                "workspace_qualified": True}]}
+
+    out = qualify_workspace_agents(spec)
+
+    assert out["targets"] == spec["targets"]
+    assert out["models"] == spec["models"]
+
+
+def test_a_slug_over_the_length_ceiling_is_left_unqualified(monkeypatch, caplog):
+    # Architect finding A5: telegram.py:1326 silently truncates callback
+    # data at 64 chars (ap_agent:<slug>) — a qualified slug past this
+    # ceiling must not be produced at all, not just discouraged by comment.
+    monkeypatch.setenv("AW_WORKSPACE", "a-rather-long-workspace-name-indeed")
+    base_slug = "telegram-gpt-5-6-sol"
+    assert len(f"{base_slug}-a-rather-long-workspace-name-indeed") > MAX_QUALIFIED_SLUG_LEN
+    spec = {"agents": [{"slug": base_slug, "name": "Sol",
+                        "workspace_qualified": True}]}
+
+    with caplog.at_level("ERROR"):
+        out = qualify_workspace_agents(spec)
+
+    entry = out["agents"][0]
+    assert entry["slug"] == base_slug  # unqualified — left exactly as declared
+    assert "workspace" not in entry
+    assert any("exceeds" in r.message for r in caplog.records)
+
+
+def test_missing_aw_workspace_env_leaves_entries_unqualified(monkeypatch, caplog):
+    monkeypatch.delenv("AW_WORKSPACE", raising=False)
+    spec = {"agents": [{"slug": "telegram-sonnet", "name": "Sonnet",
+                        "workspace_qualified": True}]}
+
+    with caplog.at_level("ERROR"):
+        out = qualify_workspace_agents(spec)
+
+    assert out["agents"][0]["slug"] == "telegram-sonnet"
+    assert any("AW_WORKSPACE is unset" in r.message for r in caplog.records)
+
+
+def test_qualification_never_mutates_the_input_dict(monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE", "crispal")
+    spec = {"agents": [{"slug": "telegram-sonnet", "name": "Sonnet",
+                        "workspace_qualified": True}]}
+
+    qualify_workspace_agents(spec)
+
+    assert spec["agents"][0]["slug"] == "telegram-sonnet"
+    assert spec["agents"][0]["workspace_qualified"] is True
+
+
+def test_a_workspace_qualified_agent_reaches_the_provider_already_qualified(monkeypatch):
+    # End-to-end through AgentsRegistry: the same derived slug must be what
+    # the provider actually creates — proving the normalization happens
+    # before dispatch, not as something the provider is trusted to redo.
+    monkeypatch.setenv("AW_WORKSPACE", "crispal")
+    spec = {"agents": [{"slug": "telegram-sonnet", "name": "Sonnet",
+                        "workspace_qualified": True, "model_slug": "sonnet"}]}
+    provider = FakeProvider()
+    rt = FakeRuntime({"runners": FakeLoaded({}, provider)})
+
+    created = AgentsRegistry().register(rt, "sec", spec)
+
+    assert created["agents"] == 1
+    assert "telegram-sonnet-crispal" in provider.store["agents"]
+    assert provider.store["agents"]["telegram-sonnet-crispal"]["workspace"] == "crispal"
+
+
+def test_reconcile_reads_the_same_qualified_slug_the_seed_pass_created(monkeypatch):
+    # Closes W2: seed() and _reconcile() must agree on the identity of a
+    # workspace-qualified agent, or reconcile permanently loses track of it
+    # (it would look for the raw, un-derived slug forever).
+    from src.apps import seeded_state
+
+    monkeypatch.setenv("AW_WORKSPACE", "crispal")
+    spec = {"agents": [{"slug": "telegram-sonnet", "name": "Sonnet",
+                        "workspace_qualified": True, "model_slug": "sonnet"}]}
+    provider = FakeStateProvider()
+    rt = FakeRuntime({"runners": FakeLoaded({}, provider)})
+
+    try:
+        AgentsRegistry().register(rt, "sec", spec)
+        assert "agents:telegram-sonnet-crispal" in provider.state
+        assert "agents:telegram-sonnet" not in provider.state
+    finally:
+        seeded_state.set_provider(None)

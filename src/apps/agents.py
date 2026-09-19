@@ -144,6 +144,13 @@ FILE_FIELDS = {
 #: is "compare the parsed value", not "trim one byte of the raw text".
 JSON_FILE_FIELDS = frozenset({("evals", "dataset")})
 
+#: Telegram's agent-picker callback data is ``ap_agent:<slug>`` and gets
+#: silently cut at 64 chars (telegram.py:1326) — a slug past this ceiling
+#: truncates onto a callback that names no real agent, and two long
+#: qualified slugs can even truncate onto the SAME one. Enforced, not just
+#: documented (Architect finding A5).
+MAX_QUALIFIED_SLUG_LEN = 55
+
 
 @runtime_checkable
 class AgentProvider(Protocol):
@@ -247,6 +254,7 @@ class AgentsRegistry:
         # provider swap, must take effect on the very next activation.
         seeded_state.set_provider(provider)
         resolved = resolve_file_fields(spec, package_dir)
+        resolved = qualify_workspace_agents(resolved)
         try:
             created = provider.register_contributed_agents(app_id, resolved) or {}
         except Exception:  # noqa: BLE001 — a bad seed must not fail activation
@@ -377,6 +385,73 @@ def resolve_file_fields(spec: dict[str, Any], package_dir: str) -> dict[str, Any
                 # would be classified as hand-edits and silently never
                 # applied, for every app using system_prompt_file.
                 entry[field] = raw.rstrip()
+    return out
+
+
+def qualify_workspace_agents(resolved: dict[str, Any]) -> dict[str, Any]:
+    """Give every ``workspace_qualified: true`` agent entry an identity that
+    is unique to THIS workspace, before the spec splits into the seed pass
+    and the reconcile pass (both consume this same, already-transformed
+    dict — see ``_dispatch``/``_reconcile``).
+
+    A tenant can own more than one workspace, but Agent uniqueness in
+    agents-platform-multitenant is ``(tenant_id, slug)`` — so two workspaces
+    of the same tenant both declaring e.g. ``telegram-sonnet`` collide on one
+    shared row. Rewriting the slug/name here, once, at normalization time
+    (rather than inside the provider's own seed()) means the SAME derived
+    slug reaches both the create call and the reconcile lookup — deriving it
+    later, inside seed(), would leave reconcile matching against the raw,
+    un-derived slug from the manifest forever.
+
+    Deliberately narrow (Architect Q1, superseding the original wider
+    §5.B draft): only identity (slug, display name, the ``workspace``
+    field) is touched here. Which Runner a dispatch actually lands on is
+    ``Agent.workspace`` + agents-platform-multitenant's own
+    ``_apply_workspace_override`` — computing (and merging into params) a
+    SECOND, redundant ``f"{workspace}-{cli}"`` here would be a third copy of
+    that derivation (core/executor.py, api/runners.py already have it),
+    which is the exact class of drift that caused the bug this mechanism
+    exists to fix in the first place.
+    """
+    agents = resolved.get("agents") or []
+    if not any(isinstance(e, dict) and e.get("workspace_qualified") for e in agents):
+        return resolved
+    workspace = os.environ.get("AW_WORKSPACE", "")
+    if not workspace:
+        log.error(
+            "apps: AW_WORKSPACE is unset — cannot qualify %d workspace-scoped "
+            "agent(s); leaving them as declared (unqualified) rather than "
+            "guessing a workspace",
+            sum(1 for e in agents if e.get("workspace_qualified")),
+        )
+        return resolved
+    qualified: list[dict[str, Any]] = []
+    for entry in agents:
+        if not (isinstance(entry, dict) and entry.get("workspace_qualified")):
+            qualified.append(entry)
+            continue
+        entry = dict(entry)
+        entry.pop("workspace_qualified", None)
+        base_slug = str(entry.get("slug") or "")
+        base_name = str(entry.get("name") or base_slug)
+        candidate_slug = f"{base_slug}-{workspace}"
+        if len(candidate_slug) > MAX_QUALIFIED_SLUG_LEN:
+            log.error(
+                "apps: qualified slug %r (%d chars) exceeds the %d-char "
+                "ceiling Telegram's callback-data truncation silently cuts "
+                "at (ap_agent:<slug>, telegram.py:1326) — leaving %r "
+                "unqualified for workspace %r; shorten the base slug",
+                candidate_slug, len(candidate_slug), MAX_QUALIFIED_SLUG_LEN,
+                base_slug, workspace,
+            )
+            qualified.append(entry)
+            continue
+        entry["slug"] = candidate_slug
+        entry["name"] = f"[{workspace}] {base_name}"
+        entry["workspace"] = workspace
+        qualified.append(entry)
+    out = dict(resolved)
+    out["agents"] = qualified
     return out
 
 
