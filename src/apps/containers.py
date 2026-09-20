@@ -415,6 +415,21 @@ class _Container:
         return self._name or f"aw-app-{self.app_id}"
 
 
+#: Env var carrying the workspace's own network identity into a network-joined
+#: app container — see ``start()`` and ``refresh_workspace_host``.
+WORKSPACE_HOST_ENV = "AW_WORKSPACE_HOST"
+
+
+def workspace_host() -> str:
+    """How a sibling container on the shared network reaches THIS process.
+
+    One function so the value a container is created with and the value it is
+    later audited against can never drift apart — the whole bug
+    ``refresh_workspace_host`` exists for is those two answers disagreeing.
+    """
+    return socket.gethostname()
+
+
 def _discard(container, name: str) -> None:
     """Remove ``container`` so its name is free, even when podman still
     believes it is running something that is already dead.
@@ -835,7 +850,7 @@ class ContainerSupervisor:
             # — see the rootless-podman-tier2 ADR), and podman sets a
             # container's hostname to its name by default, so gethostname()
             # gives that same resolvable name from inside the workspace.
-            kwargs["environment"]["AW_WORKSPACE_HOST"] = socket.gethostname()
+            kwargs["environment"][WORKSPACE_HOST_ENV] = workspace_host()
             # The reverse direction: an app that needs to publish its OWN
             # address for something else to dial back in (e.g. aw-mcp-gateway
             # writing its own entry into the host's .mcp.json, ADR "container
@@ -866,6 +881,104 @@ class ContainerSupervisor:
             pass
         c.container_id = None
         return {"container": c.name, "running": False}
+
+    # ---- workspace-identity drift ----------------------------------------
+
+    @staticmethod
+    def _baked_workspace_host(obj) -> str | None:
+        """The ``AW_WORKSPACE_HOST`` a live container was actually created with.
+
+        Read off the container itself rather than from anything this process
+        persisted: the container is the only place the answer can't be stale,
+        and it stays right for containers this process never started (an
+        ``auto_start: false`` app the engine's restart policy brought back, a
+        previous boot's leftovers).
+        """
+        env = ((getattr(obj, "attrs", None) or {}).get("Config") or {}).get("Env") or []
+        for entry in env:
+            name, sep, value = str(entry).partition("=")
+            if sep and name == WORKSPACE_HOST_ENV:
+                return value
+        return None
+
+    def workspace_host_drift(self) -> list[dict]:
+        """Running containers still addressing a PREVIOUS workspace container.
+
+        ``start()`` bakes ``AW_WORKSPACE_HOST`` in at creation time, and a
+        container's environment is fixed for its whole life — so every
+        network-joined app that survives this workspace's own container being
+        recreated (redeploy, host migration) keeps dialling a hostname that
+        stopped resolving the moment the old container went away. Nothing else
+        notices: the app is up, healthy and reachable; only its calls BACK
+        into the workspace fail. Measured live 2026-09-20 — aw-app-browser's
+        Chromium was still launched with ``--proxy-server=a9ec92ec4328:9124``
+        12h after that container ceased to exist, so every page it opened
+        failed with ERR_PROXY_CONNECTION_FAILED.
+
+        Only containers that are actually RUNNING and actually carry the var
+        are reported: a stopped app is the user's choice (``auto_start:
+        false``) and starting it here would override that, and a container
+        created without the var never had an address to go stale.
+        """
+        if not self.available:
+            return []
+        from docker.errors import NotFound
+        client = self._docker()
+        current = workspace_host()
+        drifted: list[dict] = []
+        for key, c in self.registered():
+            if not c.network:
+                continue
+            try:
+                obj = client.containers.get(c.name)
+                reload_fn = getattr(obj, "reload", None)
+                if callable(reload_fn):
+                    reload_fn()
+            except NotFound:
+                continue
+            except Exception:  # noqa: BLE001 — one unreadable container must not hide the rest
+                log.exception("apps: could not read %s while auditing %s",
+                              c.name, WORKSPACE_HOST_ENV)
+                continue
+            if getattr(obj, "status", None) != "running":
+                continue
+            baked = self._baked_workspace_host(obj)
+            if baked and baked != current:
+                drifted.append({"app": key, "container": c.name,
+                                "was": baked, "now": current})
+        return drifted
+
+    def refresh_workspace_host(self) -> dict:
+        """Recreate every container found drifted by ``workspace_host_drift``.
+
+        A recreate, not a restart: the engine's own ``unless-stopped`` policy
+        restarts the SAME container object, which is exactly how the stale
+        value survives indefinitely — only going back through ``start()``
+        re-reads ``workspace_host()``.
+
+        Sidecars before the app that dials them, matching
+        ``AppRuntime._load_container``'s ordering: an app container recreated
+        first would come up against a database that is about to be replaced
+        underneath it.
+        """
+        drifted = self.workspace_host_drift()
+        refreshed: list[str] = []
+        errors: list[dict] = []
+        for row in sorted(drifted,
+                          key=lambda r: (r["app"].split(":", 1)[0], ":" not in r["app"])):
+            log.warning("apps: %s still points at workspace %r, which no longer "
+                        "exists (this workspace is %r now) — recreating it",
+                        row["container"], row["was"], row["now"])
+            try:
+                self.start(row["app"])
+            except Exception as exc:  # noqa: BLE001 — one bad app must not block the rest
+                log.exception("apps: could not refresh %s after a workspace "
+                              "identity change", row["container"])
+                errors.append({"app": row["app"], "error": str(exc)})
+                continue
+            refreshed.append(row["app"])
+        return {"host": workspace_host(), "drifted": [r["app"] for r in drifted],
+                "refreshed": refreshed, "errors": errors}
 
     def status(self, app_id: str) -> dict:
         c = self._require(app_id)

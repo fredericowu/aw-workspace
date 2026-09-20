@@ -36,7 +36,8 @@ from src.apps.fetch import apps_root
 from src.apps.base import AppContext, Plugin
 from src.apps.capabilities import filter_grants
 from src.apps.commands import CommandInstaller, HealInFlightError
-from src.apps.containers import ContainerError, ContainerSupervisor, expand_env
+from src.apps.containers import (WORKSPACE_HOST_ENV, ContainerError, ContainerSupervisor,
+                                 expand_env)
 from src.apps.journal import ActionJournal
 from src.apps.manifest import Manifest, load_manifest
 from src.apps.proxy import ContainerReverseProxy
@@ -101,6 +102,14 @@ _MCP_RESCAN_TASK_ID = "mcp-gateway-rescan"
 # clear of a live subprocess.run() reaping its own child (milliseconds).
 DEFAULT_ZOMBIE_REAP_INTERVAL_S = float(os.environ.get("AW_APPS_ZOMBIE_REAP_INTERVAL_S", "60"))
 _ZOMBIE_REAP_TASK_ID = "pid1-zombie-reap"
+
+# Cadence of the AW_WORKSPACE_HOST audit (ContainerSupervisor.workspace_host_
+# drift). A tick is one cheap `containers.get()` + attrs read per registered
+# Tier-2 container and recreates nothing when the identity hasn't moved, so
+# 300s matches the CLI healer rather than the 60s reaction-time loops.
+DEFAULT_WORKSPACE_HOST_HEAL_INTERVAL_S = float(
+    os.environ.get("AW_APPS_WORKSPACE_HOST_HEAL_INTERVAL_S", "300"))
+_WORKSPACE_HOST_TASK_ID = "workspace-host-drift"
 
 # Cookie the central-identity JWT lands in (mirrors src.api.identity.COOKIE_NAME).
 _ID_COOKIE = "aw_id_jwt"
@@ -598,6 +607,53 @@ class AppRuntime:
         is apps/runtime — keep the dependency one-directional."""
         from src.api.terminal_manager import reap_pid1_orphans
         await asyncio.to_thread(reap_pid1_orphans)
+
+    # ---- workspace-identity drift healing ---------------------------------
+
+    def start_workspace_host_healer(
+            self, interval_s: float = DEFAULT_WORKSPACE_HOST_HEAL_INTERVAL_S) -> None:
+        """Start the runtime-owned audit that recreates any Tier-2 container
+        still dialling a PREVIOUS workspace container (see
+        ``ContainerSupervisor.workspace_host_drift``). Same shape and
+        rationale as ``start_system_cli_healer``: core runtime code, so no
+        ``watchdog:tasks`` grant is involved. Call once, from an async
+        context (``reconcile_on_boot``); idempotent.
+
+        ``run_immediately=True``, unlike the other two runtime tasks — boot is
+        precisely when this drift exists, because the workspace's own
+        container was just recreated while its apps' containers were not (the
+        engine's ``unless-stopped`` policy restarts them in place, env and
+        all). The boot reconcile only re-creates containers for apps it
+        actually (re)starts, so an ``auto_start: false`` app, or any app in a
+        pass that timed out, is left pointing at a hostname that no longer
+        resolves. Waiting a full interval to fix that is a whole interval of
+        an app whose calls back into the workspace fail.
+        """
+        if interval_s <= 0:
+            log.info("apps: workspace-host drift healer disabled (interval=%s)", interval_s)
+            return
+        if _WORKSPACE_HOST_TASK_ID in self.watchdog.task_ids_for(_SYSTEM_APP_ID):
+            return
+        self.watchdog.register(
+            _SYSTEM_APP_ID, _WORKSPACE_HOST_TASK_ID, self._heal_workspace_host_drift,
+            interval_s, run_immediately=True,
+        )
+
+    async def _heal_workspace_host_drift(self) -> None:
+        """One tick. Off the event loop — every call inside talks to the
+        container engine socket. Raises when a recreate failed so the
+        supervisor's backoff and ``last_error`` mean something (same reason
+        as ``_rescan_mcp_gateway``); a clean pass that found no drift is the
+        normal case and logs nothing."""
+        if not self.containers.available:
+            return
+        result = await asyncio.to_thread(self.containers.refresh_workspace_host)
+        if result["refreshed"]:
+            log.warning("apps: recreated %s after this workspace's container identity "
+                        "changed to %r", result["refreshed"], result["host"])
+        if result["errors"]:
+            raise ContainerError(
+                f"could not refresh {WORKSPACE_HOST_ENV} for {result['errors']}")
 
     # ---- introspection --------------------------------------------------
 

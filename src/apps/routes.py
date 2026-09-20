@@ -1362,6 +1362,22 @@ async def reconcile_on_boot(app: FastAPI) -> None:
     # lifecycle) gets caught while the process keeps running, not just on the
     # next full workspace recreation.
     app.state.app_runtime.start_system_cli_healer()
+    # Same class of drift, one layer out: this workspace's OWN container may
+    # have been recreated while its apps' containers were only restarted in
+    # place, leaving every network-joined app dialling a hostname that no
+    # longer resolves (see ContainerSupervisor.workspace_host_drift). The
+    # reconcile above doesn't cover it — it recreates a container only for an
+    # app it actually installs/starts. This healer's first tick runs now,
+    # then every interval, since a boot that timed out above still has to
+    # converge. Registered in attach_on_boot as well, for the same W1 reason
+    # the other three are: at AW_WORKSPACE_WORKERS>1 the boot provisioner is
+    # NOT necessarily the RedisLease("core") holder, and registering only
+    # here left the task recorded on a paused worker — "registered watchdog
+    # __system__/workspace-host-drift (paused — not the lease leader)",
+    # measured live 2026-09-20 — i.e. never ticking at all. Every worker
+    # registers; only the leader's supervisor spins it, so it is still one
+    # writer against the container engine.
+    app.state.app_runtime.start_workspace_host_healer()
     # At boot an already-running mcp-gateway will have scanned BEFORE the
     # inprocess apps above activated and (re)wrote their own mcp.json, and
     # nothing in that path is ordered — so reload once, now that they have.
@@ -1419,7 +1435,7 @@ async def attach_on_boot(app: FastAPI) -> None:
       for the whole workspace; the provisioning worker fires it once.
     * ``sync_on_boot`` — its caller skips that (see src/api/app.py).
 
-    The three watchdog starters DO run here, in every worker, because that is
+    The four watchdog starters DO run here, in every worker, because that is
     exactly how W1 designed them: each worker registers the tasks and only the
     ``RedisLease("core")`` holder's supervisor actually spins them — so a
     worker that later wins the lease on failover already has them registered.
@@ -1438,5 +1454,6 @@ async def attach_on_boot(app: FastAPI) -> None:
     app.state.app_runtime.start_system_cli_healer()
     app.state.app_runtime.start_mcp_gateway_rescan()
     app.state.app_runtime.start_zombie_reaper()
+    app.state.app_runtime.start_workspace_host_healer()
     from src.api.otel import ensure_export_state
     ensure_export_state(app.state.app_runtime)
