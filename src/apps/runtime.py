@@ -45,6 +45,7 @@ from src.apps.secret_store import SecretStore
 from src.apps.services import ServiceSupervisor
 from src.apps import skill_sources
 from src.apps import agents as agents_mod
+from src.apps import gateway_profiles
 from src.apps import mcp_template
 from src.apps import repos as repos_mod
 from src.apps import tasks as tasks_mod
@@ -784,6 +785,26 @@ class AppRuntime:
             return False
         return rendered is not None
 
+    def _render_gateway_profiles(self, loaded: LoadedApp) -> bool:
+        """Regenerate ``gateway-profiles.json`` from ``contributes.mcp.profiles``.
+
+        Runs on every activation next to ``_render_mcp_template``, and for the
+        same reason: an update replaces the package dir, so the generated file
+        has to be put back from the manifest that came with it — including
+        being *removed* when the new version declares no profiles (see
+        ``src/apps/gateway_profiles.py``).
+
+        Never fatal, same posture as the mcp.json render: an app whose profile
+        fails to land is an app whose scoped agents see fewer tools, not a
+        reason to take its window and routes down.
+        """
+        try:
+            return gateway_profiles.render(loaded.package_dir, loaded.manifest)
+        except Exception:
+            log.exception("apps: failed to render gateway-profiles.json for %s",
+                          loaded.manifest.id)
+            return False
+
     def _register_skills(self, loaded: LoadedApp) -> None:
         """Copy each ``contributes.skills`` entry into the shared skills index.
 
@@ -984,6 +1005,7 @@ class AppRuntime:
             if "db:own-tables" in granted:
                 self._apply_migrations(manifest, package_dir)
             self._render_mcp_template(loaded)
+            self._render_gateway_profiles(loaded)
             self._register_skills(loaded)
             # ...and the pull half: skills that only exist after install, which a
             # copy-at-activate push cannot see (src/apps/skill_sources.py). Runs
@@ -1404,6 +1426,7 @@ class AppRuntime:
         # skills/ tree, shared Postgres. See load().
         if provision:
             self._render_mcp_template(loaded)
+            self._render_gateway_profiles(loaded)
             self._register_skills(loaded)
             self._register_tasks(loaded)
             self._register_agents(loaded)

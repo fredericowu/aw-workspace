@@ -93,6 +93,36 @@ def _autostart_disabled(runtime) -> list[dict]:
     return out
 
 
+def _referenced_gateway_profiles(runtime) -> dict[str, str]:
+    """Scoped gateway profiles installed apps expect — name -> owning app slug.
+
+    Read from ``contributes.agents[*].mcp_servers[*].profile``, the only place
+    a profile reference exists (``manifest._validate_mcp_references``). An
+    agent-config pointing at ``/mcp/<name>`` for a profile the gateway does
+    not serve gets ``404 {"error":"No such config: <name>"}`` on every request
+    and the agent runs with ZERO tools — with nothing in any log on this side,
+    because from here it is a perfectly valid URL. Naming the profile is the
+    whole value: a total tool count cannot see it, since every other agent on
+    the same gateway keeps working.
+    """
+    out: dict[str, str] = {}
+    for slug in runtime.loaded_slugs():
+        loaded = runtime.get(slug)
+        if loaded is None:
+            continue
+        for entries in (loaded.manifest.agents or {}).values():
+            for entry in entries or []:
+                if not isinstance(entry, dict):
+                    continue
+                for ref in entry.get("mcp_servers") or []:
+                    if not isinstance(ref, dict):
+                        continue
+                    name = str(ref.get("profile") or "").strip()
+                    if name:
+                        out.setdefault(name, slug)
+    return out
+
+
 def _unmet_optional_host_power(runtime, host_offers) -> list[dict]:
     """``runtime.host_power_optional`` requests this host did not grant.
 
@@ -369,7 +399,8 @@ async def _reload_mcp_gateway(runtime: AppRuntime, *,
 
 
 async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
-                              expected: dict[str, str] | None = None) -> dict:
+                              expected: dict[str, str] | None = None,
+                              expected_profiles: dict[str, str] | None = None) -> dict:
     """What the gateway itself reports serving, for doctor's ``mcp`` section.
 
     Before this, ``mcp.apps_contributing_tools`` only listed apps that ship an
@@ -391,6 +422,18 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
     incident had exactly two dead upstreams while everything else kept the
     gateway's total tool count well above zero. ``expect_tools`` alone (no
     ``expected``) still catches the coarser total-collapse case.
+
+    ``expected_profiles`` is the same idea one level up, for scoped profiles
+    (``/mcp/<name>``) instead of upstreams: profile name -> the app slug whose
+    ``contributes.agents[*].mcp_servers[*].profile`` names it (see
+    ``_referenced_gateway_profiles``), compared against ``configs`` on the
+    same ``/healthz``. A referenced profile the gateway does not serve is a
+    404 per request and an agent with zero tools, and nothing else in this
+    workspace reports it — aw-app-marketing's ``marketing`` profile has been
+    in exactly that state since it shipped (measured live 2026-09-21).
+    Like ``warm_redis``, a **missing** ``configs`` key reads as unknown rather
+    than as "every profile is dead": it is only absent on a gateway old enough
+    not to publish it, and the fleet is not version-locked.
 
     Also folds in the gateway's own ``warm_redis`` block (v0.27.0+): an
     unresolvable/unreachable warm-token Redis breaks ``schedule_wakeup``,
@@ -432,6 +475,16 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
          if name not in live),
         key=lambda d: (d["app"], d["server"]),
     )
+    # ``configs`` absent == a gateway that predates publishing it; absent is
+    # unknown, never "all dead". An empty LIST is a real answer (no profile is
+    # served) and does flag every reference.
+    live_configs = payload.get("configs")
+    dead_profiles = sorted(
+        ({"profile": name, "app": app}
+         for name, app in (expected_profiles or {}).items()
+         if name not in set(live_configs)),
+        key=lambda d: (d["app"], d["profile"]),
+    ) if isinstance(live_configs, list) else []
     zero_tools = expect_tools and tools == 0
     # ``warm_redis`` only exists from aw-mcp-gateway v0.27.0 onward (the block
     # on /healthz: {ok, url, source, reachable, tokens_seen_24h,
@@ -443,10 +496,16 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
     # supervise/callback dispatch for every warm session) counts.
     warm_redis = payload.get("warm_redis")
     warm_redis_bad = isinstance(warm_redis, dict) and warm_redis.get("ok") is False
-    degraded = bool(dead) or zero_tools or warm_redis_bad
+    degraded = bool(dead) or bool(dead_profiles) or zero_tools or warm_redis_bad
     if dead:
         note = ("%d upstream(s) declared but not live in the gateway: %s" %
                 (len(dead), ", ".join(f"{d['server']} ({d['app']})" for d in dead)))
+    elif dead_profiles:
+        note = ("%d scoped profile(s) referenced by an installed app but NOT "
+                "served by the gateway: %s — every agent scoped to one gets "
+                "404 per request and starts with zero tools" %
+                (len(dead_profiles),
+                 ", ".join(f"{d['profile']} ({d['app']})" for d in dead_profiles)))
     elif warm_redis_bad:
         note = ("warm-token Redis unresolved/unreachable (source=%s) — "
                  "schedule_wakeup, list_wakeups, ask_human, mark_flow_done, "
@@ -465,6 +524,8 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
         "tools": tools,
         "local_upstreams": upstreams,
         "dead_upstreams": dead,
+        "configs": live_configs if isinstance(live_configs, list) else None,
+        "dead_profiles": dead_profiles,
         "warm_redis": warm_redis,
         "degraded": degraded,
         "note": note,
@@ -1145,7 +1206,8 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 mcp_expected[name] = slug
 
         mcp_status = await _mcp_gateway_status(
-            runtime, expect_tools=bool(mcp_apps), expected=mcp_expected)
+            runtime, expect_tools=bool(mcp_apps), expected=mcp_expected,
+            expected_profiles=_referenced_gateway_profiles(runtime))
         redis_status = await _redis_coord_status()
 
         host_offers = hostpower.host_grants()

@@ -328,6 +328,23 @@ class Manifest:
         return bool(self.contributes.get("mcp", {}).get("reload_on_save", False))
 
     @property
+    def gateway_profiles(self) -> dict[str, Any]:
+        """``contributes.mcp.profiles`` — scoped ``/mcp/<name>`` profiles this
+        app declares, or ``{}``.
+
+        Rendered to ``apps/<id>/gateway-profiles.json`` on every activation
+        (``src/apps/gateway_profiles.py``) for the gateway to scan. Validated
+        at install by ``_validate_gateway_profiles``; this property does no
+        filtering of its own, so what a reviewer reads in the manifest is what
+        reaches the gateway.
+        """
+        declared = self.contributes.get("mcp")
+        if not isinstance(declared, dict):
+            return {}
+        profiles = declared.get("profiles")
+        return dict(profiles) if isinstance(profiles, dict) else {}
+
+    @property
     def contributes_mcp(self) -> bool:
         """Does this app put anything into the MCP Gateway's app-scan?
 
@@ -693,6 +710,95 @@ def _validate_mcp_references(kind: str, slug: str, refs: Any) -> None:
             )
         if not all(isinstance(v, str) and v.strip() for v in ref.values()):
             raise ManifestError(bad)
+
+
+#: The keys a ``contributes.mcp.profiles`` spec may carry, mirrored EXACTLY
+#: from the gateway's own whitelist (``CONFIG_LIST_KEYS`` +
+#: ``CONFIG_SCALAR_KEYS``, apps/mcp-gateway/back/gateway/config.py:200-207).
+#: Drifting from that list is the whole failure mode below: a key this side
+#: accepts and the gateway drops is a policy that reads as enforced and is not.
+GATEWAY_PROFILE_LIST_KEYS = frozenset({
+    "upstreams", "tools_allow",
+    "run_agents_allow", "run_workflows_allow",
+    "run_agents_approval", "run_workflows_approval",
+    "run_agents_always_allow", "run_workflows_always_allow",
+})
+GATEWAY_PROFILE_SCALAR_KEYS = frozenset({"kb_index", "presentation_namespace"})
+GATEWAY_PROFILE_KEYS = GATEWAY_PROFILE_LIST_KEYS | GATEWAY_PROFILE_SCALAR_KEYS
+
+#: A profile name doubles as a URL path segment (``/mcp/<name>``), so it is
+#: held to the same alphabet the gateway's ``valid_config_name`` accepts
+#: (config.py:210). A name this side allows and that side rejects would
+#: produce a profile that is written, scanned, dropped, and 404s forever.
+GATEWAY_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_gateway_profiles(contributes: dict[str, Any]) -> None:
+    """Validate ``contributes.mcp.profiles`` — ``{name: spec}``.
+
+    The other half of ``_validate_mcp_references`` above: a manifest has
+    always been able to *reference* a scoped gateway profile
+    (``{"name","server","profile"}``) and had no way to *define* one, so a
+    reference to a profile nobody created answered HTTP 404 per request and
+    the agent started with zero tools, silently. Whoever references, declares.
+
+    **An unknown key inside a spec is a hard error, and that is the point.**
+    The gateway's ``normalize_config_spec`` is a normalizer by design: it
+    keeps the keys it knows and drops the rest without a word. So
+    ``tools_allowed`` (a typo for ``tools_allow``) simply vanishes, and an
+    absent ``tools_allow`` is what "unrestricted" means downstream
+    (``_tool_allowed`` returns True for everything when the list is empty) —
+    the profile silently serves EVERY tool of every upstream it lists. The
+    gateway cannot catch that. Install time is the only place it can be
+    caught, so it is caught here, loudly.
+
+    No permission gates this: a profile is strictly a *narrowing* of what the
+    gateway's root ``/mcp`` already serves to anyone holding the token, so
+    there is no escalation to authorize.
+    """
+    declared = contributes.get("mcp")
+    if not isinstance(declared, dict):
+        return
+    profiles = declared.get("profiles")
+    if profiles is None:
+        return
+    if not isinstance(profiles, dict):
+        raise ManifestError(
+            "contributes.mcp.profiles must be an object of "
+            "{profile name: spec}")
+    for name, spec in profiles.items():
+        name = str(name)
+        if not GATEWAY_PROFILE_NAME_RE.match(name):
+            raise ManifestError(
+                f"contributes.mcp.profiles name {name!r} must be letters, "
+                "digits, '-' and '_' only — it is served at /mcp/<name>")
+        if not isinstance(spec, dict):
+            raise ManifestError(
+                f"contributes.mcp.profiles[{name!r}] must be an object")
+        unknown = sorted(set(spec) - GATEWAY_PROFILE_KEYS)
+        if unknown:
+            raise ManifestError(
+                f"contributes.mcp.profiles[{name!r}] carries unknown key(s) "
+                f"{unknown!r} — the gateway drops what it does not recognise "
+                "WITHOUT an error, and a dropped 'tools_allow' means the "
+                "profile serves every tool of every upstream it lists. "
+                f"Allowed: {sorted(GATEWAY_PROFILE_KEYS)!r}")
+        for key in sorted(set(spec) & GATEWAY_PROFILE_LIST_KEYS):
+            value = spec[key]
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, list) or not all(
+                isinstance(v, str) and v.strip() for v in value
+            ):
+                raise ManifestError(
+                    f"contributes.mcp.profiles[{name!r}].{key} must be a list "
+                    "of non-empty strings")
+        for key in sorted(set(spec) & GATEWAY_PROFILE_SCALAR_KEYS):
+            value = spec[key]
+            if not isinstance(value, str) or not value.strip():
+                raise ManifestError(
+                    f"contributes.mcp.profiles[{name!r}].{key} must be a "
+                    "non-empty string")
 
 
 def _validate_contributed_repos(
@@ -1077,6 +1183,7 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
             raise ManifestError("contributes.tasks[].schedules must be a list")
 
     _validate_contributed_agents(contributes, permissions)
+    _validate_gateway_profiles(contributes)
     _validate_contributed_repos(contributes, permissions)
     _validate_sidecars(runtime, permissions)
     _validate_publish(runtime, tier, permissions)
