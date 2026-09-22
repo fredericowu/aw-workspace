@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from src.apps import config_store
 from src.apps import fetch as fetch_mod
+from src.apps import gateway_profiles
 from src.apps import mcp_template
 from src.apps.manifest import load_manifest
 from src.apps.registry_client import CloudRegistry
@@ -197,13 +198,23 @@ class Reconciler:
         relying on the rendered ``mcp.json`` sitting next to it, because on a
         FIRST install the reconciler asks this before the app has activated —
         so the rendered file does not exist yet and the gateway would never be
-        told to rescan (src/apps/mcp_template.py)."""
+        told to rescan (src/apps/mcp_template.py).
+
+        ``contributes.mcp.profiles`` is asked for by NAME rather than left to
+        ``contributes_mcp``'s truthiness, which covers it only by coincidence
+        today (a profiles block makes ``contributes.mcp`` a non-empty dict).
+        An app that declares profiles and nothing else ships no ``mcp.json``
+        and no template, so if that coincidence ever narrows, its file would
+        sit in the package dir and never be applied — the exact silent
+        degradation the profile mechanism exists to remove."""
         if manifest is not None and (manifest.contributes_mcp
+                                     or manifest.gateway_profiles
                                      or manifest.reload_mcp_gateway_on_save):
             return True
         if package_dir and (
             os.path.isfile(os.path.join(package_dir, "mcp.json"))
             or os.path.isfile(os.path.join(package_dir, mcp_template.TEMPLATE_NAME))
+            or os.path.isfile(os.path.join(package_dir, gateway_profiles.OUTPUT_NAME))
         ):
             return True
         return False

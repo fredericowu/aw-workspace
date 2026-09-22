@@ -381,6 +381,123 @@ def test_mcp_gateway_status_healthy_is_not_degraded(monkeypatch):
     assert status["tools"] == 209
 
 
+# ---- dead_profiles: a referenced /mcp/<name> the gateway does not serve ----
+#
+# A manifest can point an agent at a scoped profile
+# (mcp_servers: [{"name","server","profile"}]) and nothing creates it. The
+# gateway answers 404 {"error":"No such config: <name>"} per request and the
+# agent starts with ZERO tools, silently — aw-app-marketing's `marketing`
+# profile, measured live 2026-09-21 while the gateway served 385 tools and
+# every other agent worked. No total-count check can see that; only comparing
+# the references against /healthz's `configs` can.
+
+def test_mcp_gateway_status_flags_a_referenced_profile_that_is_not_served(monkeypatch):
+    """The live marketing shape: gateway healthy, one profile referenced by an
+    installed app and absent from `configs`."""
+    monkeypatch.setattr("httpx.AsyncClient", _fake_async_client(
+        lambda: {"local_upstreams": ["kb"], "tools": 385,
+                 "configs": ["crispal-full"]}))
+
+    status = _async(routes_mod._mcp_gateway_status(
+        _FakeMcpRuntime(), expect_tools=True,
+        expected_profiles={"crispal-full": "crispal", "marketing": "marketing"}))
+
+    assert status["degraded"] is True
+    assert status["dead_profiles"] == [{"profile": "marketing", "app": "marketing"}]
+    assert "marketing" in status["note"]
+
+
+def test_mcp_gateway_status_ok_when_every_referenced_profile_is_served(monkeypatch):
+    monkeypatch.setattr("httpx.AsyncClient", _fake_async_client(
+        lambda: {"local_upstreams": ["kb"], "tools": 385,
+                 "configs": ["crispal-full"]}))
+
+    status = _async(routes_mod._mcp_gateway_status(
+        _FakeMcpRuntime(), expect_tools=True,
+        expected_profiles={"crispal-full": "crispal"}))
+
+    assert status["dead_profiles"] == []
+    assert status["degraded"] is False
+
+
+def test_mcp_gateway_status_missing_configs_key_is_unknown_not_all_dead(monkeypatch):
+    """Same rule as warm_redis: the fleet is not version-locked, so a gateway
+    that does not publish `configs` must read as unknown — never as "every
+    profile this workspace references is dead"."""
+    monkeypatch.setattr("httpx.AsyncClient", _fake_async_client(
+        lambda: {"local_upstreams": ["kb"], "tools": 385}))
+
+    status = _async(routes_mod._mcp_gateway_status(
+        _FakeMcpRuntime(), expect_tools=True,
+        expected_profiles={"marketing": "marketing"}))
+
+    assert status["configs"] is None
+    assert status["dead_profiles"] == []
+    assert status["degraded"] is False
+
+
+def test_mcp_gateway_status_an_empty_configs_list_is_a_real_answer(monkeypatch):
+    """Distinct from the case above: the gateway answered, and it serves no
+    profile at all — so every reference IS dead. This is the state a fresh
+    workspace is in before anything creates the profiles."""
+    monkeypatch.setattr("httpx.AsyncClient", _fake_async_client(
+        lambda: {"local_upstreams": ["kb"], "tools": 385, "configs": []}))
+
+    status = _async(routes_mod._mcp_gateway_status(
+        _FakeMcpRuntime(), expect_tools=True,
+        expected_profiles={"crispal-full": "crispal"}))
+
+    assert status["degraded"] is True
+    assert status["dead_profiles"] == [{"profile": "crispal-full", "app": "crispal"}]
+
+
+def test_mcp_gateway_status_without_expected_profiles_is_unchanged(monkeypatch):
+    """Every existing caller passes nothing — no new finding may appear."""
+    monkeypatch.setattr("httpx.AsyncClient", _fake_async_client(
+        lambda: {"local_upstreams": ["kb"], "tools": 40, "configs": []}))
+
+    status = _async(routes_mod._mcp_gateway_status(_FakeMcpRuntime(), expect_tools=True))
+
+    assert status["dead_profiles"] == []
+    assert status["degraded"] is False
+
+
+def test_doctor_prints_the_dead_profile_by_name(capsys):
+    """The verdict is worthless if the output does not say WHICH profile —
+    the whole failure is one agent among many silently losing its tools."""
+    from src.cli.commands.doctor import _mcp
+
+    rc = _mcp({
+        "apps_contributing_tools": ["crispal"],
+        "reachable": True, "tools": 385, "local_upstreams": ["kb"],
+        "configs": ["crispal-full"],
+        "dead_profiles": [{"profile": "marketing", "app": "marketing"}],
+        "warm_redis": {"ok": True, "source": "probed"},
+        "degraded": True,
+        "note": "1 scoped profile(s) referenced by an installed app but NOT served",
+    })
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "marketing" in out
+    assert "/mcp/marketing" in out
+
+
+def test_doctor_says_nothing_about_profiles_when_they_are_all_live(capsys):
+    from src.cli.commands.doctor import _mcp
+
+    rc = _mcp({
+        "apps_contributing_tools": ["crispal"],
+        "reachable": True, "tools": 385, "local_upstreams": ["kb"],
+        "configs": ["crispal-full"], "dead_profiles": [],
+        "warm_redis": {"ok": True, "source": "probed"},
+        "degraded": False, "note": "gateway reachable",
+    })
+
+    assert rc == 0
+    assert "profile" not in capsys.readouterr().out
+
+
 # ---- warm_redis: a missing key is unknown, not degraded --------------------
 #
 # aw-mcp-gateway v0.27.0 added a `warm_redis` block to /healthz: {ok, url,

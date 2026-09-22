@@ -186,6 +186,14 @@ def _mcp(section: dict) -> int:
     tools = section.get("tools", 0)
     upstreams = section.get("local_upstreams") or []
     print(f"      gateway reachable — {tools} tool(s) across {len(upstreams)} upstream(s)")
+    # Named before the degraded verdict below, so the profile that is 404ing
+    # is in the output even if another finding wins the summary note. An agent
+    # scoped to a profile the gateway never heard of starts with zero tools and
+    # says nothing about it.
+    for row in section.get("dead_profiles") or []:
+        print(f"  ✗ gateway profile {row['profile']!r} is referenced by "
+              f"{row['app']} but NOT served — /mcp/{row['profile']} answers 404 "
+              "and that agent runs with zero tools")
     warm_redis = section.get("warm_redis")
     if warm_redis is None:
         print("      warm-token Redis: unknown — gateway predates warm_redis reporting (pre-0.27.0)")
