@@ -284,3 +284,50 @@ def test_resume_is_idempotent_for_an_already_running_task():
         wd.cancel_all_for("app")
 
     _async(run())
+
+
+def test_resume_after_pause_reticks_run_immediately_task_but_not_a_deferred_one():
+    """The exact mechanism a 2026-09-23 fix (Kanban
+    3e45bf3b-9510-816d-b0e3-d94995d2168c, aw-app-agents-platform-runners'
+    identity-token-refresh watchdog) leans on: a RedisLease("core")
+    leadership handoff is pause() then resume() on this same
+    WatchdogSupervisor instance (not a fresh one), and _run() re-evaluates
+    ``t.run_immediately`` on every call, not just the first — so a task
+    registered with run_immediately=True fires again the moment a newly
+    promoted leader's resume() restarts its loop, while a
+    run_immediately=False task waits out its full interval again, same as
+    it did on the very first resume(). This is what makes flipping a single
+    watchdog's own registration parameter enough to fix a leadership-handoff
+    staleness bug, with no change needed in this supervisor itself."""
+    async def run():
+        wd = WatchdogSupervisor()
+        counts = {"immediate": 0, "deferred": 0}
+
+        async def fn_immediate():
+            counts["immediate"] += 1
+
+        async def fn_deferred():
+            counts["deferred"] += 1
+
+        wd.register("app", "immediate", fn_immediate, 10.0, run_immediately=True)
+        wd.register("app", "deferred", fn_deferred, 10.0, run_immediately=False)
+        await asyncio.sleep(0.03)
+        assert counts["immediate"] == 1  # ticked right away
+        assert counts["deferred"] == 0  # still sleeping out its 10s interval
+
+        wd.pause()  # simulate: this process just lost RedisLease("core")
+        wd.resume()  # simulate: this process (or a peer) just regained it
+
+        await asyncio.sleep(0.03)
+        assert counts["immediate"] == 2, (
+            "run_immediately=True must retick on every leadership "
+            "re-acquisition, not just the very first resume()"
+        )
+        assert counts["deferred"] == 0, (
+            "run_immediately=False must still wait out a fresh full "
+            "interval after a leadership handoff, not tick immediately"
+        )
+
+        wd.cancel_all_for("app")
+
+    _async(run())
