@@ -6,7 +6,18 @@ Address: co-located with the server, the CLI reaches it over loopback
 agent-runner container (a different network namespace — shares the workspace
 filesystem, not the server's loopback), loopback is dead; the server published
 its external tunnel URL to ``<home>/.env`` as ``AW_WORKSPACE_API_URL`` (see
-``src/api/workspace_url.py``) exactly for this, so we prefer it when present.
+``src/api/workspace_url.py``) exactly for this, so we fall back to it when
+loopback isn't there.
+
+We probe loopback (a bare TCP connect, not a full request) rather than
+preferring the external URL whenever it's *present* — that env var is mirrored
+into every workspace's ``.env`` unconditionally, so a CLI invoked co-located
+with its own server (e.g. from a shell inside the workspace container) used to
+route every call over the public tunnel edge instead of the loopback sitting
+right there. Found 2026-09-26: that edge is measurably flaky (~30% connect
+timeouts observed against api.fredericowu's tunnel host), which turned
+``marketplace update-all`` from "co-located and instant" into "sometimes hangs
+30s and dies" for no reason tied to the command itself.
 
 Auth: the browser SPA authenticates with the central-identity ``aw_id_jwt``
 (see ``src/api/identity.py``), which the CLI has no way to hold. Instead the
@@ -20,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 from typing import Any
 
 import httpx
@@ -50,17 +62,32 @@ def _read_env_value(name: str) -> str | None:
     return None
 
 
+def _tcp_reachable(host: str, port: int, timeout: float = 0.3) -> bool:
+    """Bare TCP connect probe — cheap enough to run on every CLI call, and
+    fast to fail when nothing's listening (the runner-container case)."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def base_url() -> str:
-    """Where to reach the server. Explicit override first, then the
-    server-published external URL (the runner-container path), then the
-    co-located loopback default."""
+    """Where to reach the server. Explicit override first, then loopback if
+    it's actually listening (the common co-located case — fast and immune to
+    the public tunnel edge's own flakiness), then the server-published
+    external URL as a fallback for a genuinely different network namespace
+    (e.g. an agent-runner container)."""
     override = os.environ.get("AW_LOCAL_API_URL")
     if override:
         return override
+    port = int(os.environ.get("AW_PORT", "9030"))
+    if _tcp_reachable("127.0.0.1", port):
+        return f"http://127.0.0.1:{port}"
     external = os.environ.get(API_URL_ENV_VAR) or _read_env_value(API_URL_ENV_VAR)
     if external:
         return external
-    return f"http://127.0.0.1:{os.environ.get('AW_PORT', '9030')}"
+    return f"http://127.0.0.1:{port}"
 
 
 def _workspace_api_key() -> str:
