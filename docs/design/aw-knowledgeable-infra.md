@@ -535,11 +535,10 @@ extension inside aw-console.
     rule: a 403 confirms the id exists).
   - **See existing links** — part of the neighbourhood payload, plus
     `GET /api/documents/{id}/links`.
-- Library: recommend `react-force-graph-2d` (canvas-based, comfortable into
-  the low thousands of nodes) over a hand-rolled d3-force or Cytoscape. That
-  is a craft call, not an architecture one — if Frederico wants the
-  interaction designed before it is built, that is the **UX Coder's** lane
-  (UX-Proto prototype first), not mine.
+- Library: **`cytoscape` (npm), not `react-force-graph-2d`.** This paragraph
+  originally recommended `react-force-graph-2d`; that recommendation is
+  **withdrawn** — see §5a. The UX Coder built and Frederico approved a
+  Cytoscape.js prototype, and Cytoscape is now a locked decision.
 
 ### Why its own frontend
 
@@ -572,6 +571,86 @@ extension inside aw-console.
 - **Neo4j Browser / Bloom as the user-facing graph UI.** It is an operator
   tool with no tenant scoping whatsoever — exposing it would hand every
   tenant the whole database. Keep 7474 unpublished.
+
+---
+
+## 5a. Frontend stack — decision D1 (2026-09-26)
+
+### Decision
+
+**Vite in vanilla (no-framework) mode, bundling the approved prototype's own
+`index.html` / `style.css` / `app.js` essentially verbatim, with `cytoscape`
+as an npm dependency instead of a CDN `<script>`, and the AuthGate behaviour
+re-expressed in plain JS.** The AP-MT *packaging* shape (Dockerfile stage 1,
+`.dockerignore`, `/assets` mount, SPA fallback) is kept byte-for-byte; the
+AP-MT *UI* stack (React/TSX/Tailwind) is not adopted.
+
+So: AP-MT's build and serving shape, the prototype's code. React is the part
+that gets dropped, not the part that gets kept.
+
+### Where it lands (new repo `repos/aw-knowledgeable`)
+
+| Path | Content |
+|---|---|
+| `frontend/index.html` | prototype `index.html`, `<body>` verbatim minus `#demo-controls`; the `cdn.jsdelivr.net/cytoscape` `<script>` and the bare `<link href="style.css">` replaced by one `<script type="module" src="/src/app.js">`. **`#app` starts hidden** — see risk 3. |
+| `frontend/src/style.css` | prototype `style.css` **verbatim**, plus a `.logged-out-*` block for the gate screen |
+| `frontend/src/app.js` | prototype `app.js` verbatim except: `import cytoscape from "cytoscape"`, `import "./style.css"`, `API_BASE = "/api/"` (was `"api/"` — the prototype is served under `/_frame/`), `api()` moved to `lib/api.js`, and the prototype-only `wireDemoControls()` / `state.demoFirstUploadFailed` / `sleep()`-faked upload progress deleted |
+| `frontend/src/lib/api.js` | the prototype's `api()` helper + the 401 redirect. Behaviour ported from `agents-platform-multitenant/frontend/src/lib/api.ts:505-523` — **the `path !== "/api/me"` exemption is what prevents the redirect loop; keep it**, and keep the never-resolving promise so callers don't run error paths during navigation |
+| `frontend/src/lib/auth.js` | the gate. Behaviour ported from `agents-platform-multitenant/frontend/src/components/AuthGate.tsx:10-27`: `fetch("/api/me")` directly (not through `api()`), 401 → render a logged-out screen with an explicit **Log in** anchor to `${CONSOLE_BASE_URL}/login?return=<encoded href>`; `Sign up` alongside it. Explicit click, no bounce |
+| `frontend/package.json` | deps: `cytoscape` only. devDeps: `vite`. `"build": "vite build"` — **no `tsc -b`**, there is no TypeScript |
+| `frontend/vite.config.js` | `build: { outDir: "dist", emptyOutDir: true }`, dev `server.proxy["/api"]` → the local backend, mirroring `agents-platform-multitenant/frontend/vite.config.ts` |
+| `frontend/.gitignore` | `dist`, `node_modules` |
+| `.dockerignore` | `frontend/dist`, **with the comment from `agents-platform-multitenant/.dockerignore:11-14` copied across**, because the comment is the load-bearing part |
+| `Dockerfile` | stage 1 copied from `agents-platform-multitenant/Dockerfile:28-33` (`node:22-slim`, `npm ci`, `npm run build`) + `COPY --from=frontend-build /fe/dist/ frontend/dist/` (:71). Read that file's stage-1 comment (:5-26) before touching it |
+| `backend/app/main.py` | mirror `agents-platform-multitenant/backend/app/main.py:466-484` — `/assets` mount + SPA fallback. Works unchanged: Vite's vanilla build emits `dist/index.html` + `dist/assets/<name>-<hash>.{js,css}`, and the `f.is_file()` branch (:481) covers anything dropped at `dist/` root |
+
+The gate screen's markup is written in the prototype's **own** CSS vocabulary
+(`.state-panel`, `.btn.btn-primary`, the `--bg`/`--accent` custom properties
+in `style.css:6-33`) — **not** Tailwind. AuthGate.tsx's classes
+(`AuthGate.tsx:33-52`) are not ported. This is the one place the design
+authorises new UI rather than reuse, and the reason is that pulling Tailwind
+in for a single screen is the same disproportionate dependency the UX Coder
+rejected React for, just spelled differently.
+
+### Why not React
+
+`react-force-graph-2d` and the React port were both rejected, for different
+reasons, and neither is re-open:
+
+- **Port the two screens to React, keeping `cytoscape` direct** (the
+  alternative that aligns with AP-MT). Rejected: it is a rewrite of a UI
+  Frederico approved and asked to *reuse*. `app.js` is ~600 lines of
+  imperative DOM wiring — `renderLibraryGrid`, `renderInspector`,
+  `renderSearchResults`, the four-step upload machine
+  (`showOnlyUploadStep`), the add-link modal's `linkState` — and every one of
+  those becomes new code under React. The reuse would be the CSS and the
+  markup only, i.e. the cheap half. Cytoscape also has to live behind a ref +
+  `useEffect` regardless, so React buys nothing for the one screen that
+  matters. **Revisit if** the graph view has to be embedded inside aw-console
+  (§5's "revisit" clause) — that is the only scenario where React earns its
+  cost, and it is a rewrite either way.
+- **`react-force-graph-2d`** — already rejected by the UX Coder, with reason
+  recorded: it brings React in disproportionately to the UX-Proto stack.
+  (Also rejected there: vanilla force-graph — manual hit-testing; sigma.js —
+  WebGL overkill; vis-network — weaker edge styling.)
+- **No build step at all** (serve the three files statically, keep the CDN
+  `<script>`). The most verbatim option, and genuinely tempting: zero changes
+  to the prototype files, no node in the image, and the 2026-08-13 stale-dist
+  trap cannot happen because nothing is built. Rejected on three counts, and
+  the first is the disqualifying one: a live third-party script
+  (`cdn.jsdelivr.net`) inside a page that renders tenant graph data means a
+  CDN compromise reads the graph, and any tenant with restricted egress sees
+  a blank canvas. Second, no lockfile and no SRI — `cytoscape@3.30.2` is
+  pinned by tag only. Third, unhashed `app.js`/`style.css` filenames mean
+  browser and edge caches serve stale JS after a deploy, which is the same
+  "deployed and nothing changed" failure class as the bug in (c), arrived at
+  from the other direction. Vendoring `cytoscape.min.js` into the repo fixes
+  the first two and not the third, at the cost of a 1MB blob nobody updates.
+
+### What this costs
+
+See §7.5, §7.6 and §7.7 — this decision makes the "second SPA" debt concrete,
+adds a duplicated auth gate, and drops build-time type checking.
 
 ---
 
@@ -640,11 +719,32 @@ Stated explicitly rather than assumed, per the card's instruction.
    aw-knowledgeable needs the same column removal AP-MT does. Keeping
    `resolve_tenant_id` as the single swap point is what keeps that a
    one-function change.
-5. **A second SPA to keep coherent.** Own frontend means a third visual
-   language beside aw-console and aw-workspace-ui, with no shared design
-   system to anchor it. That divergence is permanent unless someone extracts
-   one; naming it now is cheaper than discovering it at the third screen.
-6. **The over-fetch vector search caps how large a single tenant can get**
+5. **A second SPA to keep coherent — and after §5a, a third *stack*, not just
+   a third visual language.** aw-console is Next.js App Router, AP-MT and
+   aw-workspace-ui are React/Vite/Tailwind, aw-knowledgeable is
+   vanilla-JS/Vite with hand-written CSS custom properties. No component,
+   design token or hook can be shared with either of the others in any
+   direction. I am accepting this deliberately: the alternative was rewriting
+   an approved UI, and a shared design system does not exist today to be
+   diverged from. But the door it closes is real — if one is ever extracted,
+   this is the codebase that cannot adopt it without a rewrite, and the same
+   rewrite is the price of §5's "embed the graph view in aw-console" revisit
+   clause.
+6. **The auth gate now exists twice, in two languages.** `frontend/src/lib/
+   auth.js` + `lib/api.js` are a hand translation of AP-MT's `AuthGate.tsx` +
+   `api.ts:505-523`. A fix to one will not propagate to the other, and the
+   subtle half — the `/api/me` exemption that prevents the redirect loop — is
+   exactly the kind of thing that gets fixed in one place. Mitigation is
+   cheap and must not be skipped: keep both files tiny and have each name its
+   counterpart's path in a header comment, so the next person editing one
+   knows a sibling exists.
+7. **No TypeScript means the API contract is unchecked until runtime.**
+   AP-MT's `npm run build` runs `tsc -b`, so a renamed backend field fails the
+   build; here it fails in the browser, on the screen where it matters. A
+   cheap floor — `// @ts-check` plus a `jsconfig.json` with `checkJs` — is
+   worth adding, and is not a substitute for a Playwright smoke test over the
+   library → graph → inspector path.
+8. **The over-fetch vector search caps how large a single tenant can get**
    before recall for small tenants degrades measurably. If pre-filtering is
    unavailable on the pinned version, that ceiling is real and undocumented
    unless the seam logs when the floor is not met.
@@ -690,6 +790,41 @@ Stated explicitly rather than assumed, per the card's instruction.
    by nothing. Don't port it as-is; either use it or leave it out. Shipping a
    third unused knob is how the next person concludes the redirect is
    backend-side when it is not.
+10. **The prototype's API paths are not the paths §5 specified.** `app.js`
+    calls `GET api/documents`, `GET api/graph?focus&depth`, `POST api/links`,
+    plus `GET api/nodes/{id}`, `GET api/nodes/{id}/links` and
+    `GET api/search?q=[&exclude=]`. §5 listed `documents/{id}/links`, not
+    `nodes/…`, and listed no search endpoint at all. "Verbatim reuse" is only
+    true if the real backend serves the **prototype's** paths — reconcile this
+    against M6's transcribed `backend.py` before writing either side, and if
+    they differ, the backend moves, not the frontend. Note also that
+    `POST api/documents` in the prototype is **JSON**, while §5 specifies
+    multipart; that one is a real change to `doUpload()` and the only place
+    the frontend diff is more than cosmetic. And `GET /api/search` is a new
+    tenant-scoped fanout read — it needs classifying in K1's
+    `GET_ROUTE_PLAN`, and it must stay bounded by `q` so it never becomes the
+    whole-graph endpoint §5 deliberately designed out.
+11. **The gate must hide the shell, not just skip rendering it.** In React,
+    `AuthGate` returning `null` means the children were never mounted. Here
+    the entire app chrome is already in `index.html` before any JS runs, so a
+    logged-out user sees the topbar, the search box and the empty-state flash
+    before `/api/me` answers. Ship `#app` hidden and let the gate reveal it;
+    do not leave this to the boot listener. Same trap in reverse: the
+    prototype boots from `DOMContentLoaded` — that call has to move *behind*
+    the gate, or the app fetches `documents` as an anonymous user and the
+    first thing the gate screen sits behind is a 401 toast.
+12. **Nobody has ever rendered this prototype.** The UX Coder's visual
+    verification was blocked by an aw-ux-proto platform bug (card
+    `3e75bf3b-9510-8164-983e-f380fd415d12`); Frederico approved the design as
+    he saw it, not this code as executed. Budget for first-render defects and
+    treat the first real load as discovery, not regression. One specific
+    suspect: `mergeGraphData()` re-runs `cose` with `fit: false`
+    (`app.js`'s layout call), so nodes added by an expand can land outside the
+    viewport with no visible feedback — plausible, unverified.
+13. **Two things not to "fix".** Do not delete the frontend build stage
+    because "it's just static files" — that puts the CDN `<script>` back, see
+    §5a. Do not add Tailwind for the gate screen — it is the dependency this
+    decision exists to avoid.
 
 ---
 
