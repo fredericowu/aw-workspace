@@ -851,3 +851,409 @@ Two things to route elsewhere rather than absorb:
   piece of work that this card's scope does not grant, and it gates step 4.
 - **To the UX Coder:** if the graph interaction should be designed before it
   is built, that is a UX-Proto prototype, not an architecture decision.
+
+---
+
+## 10. Decision D2 (2026-09-26) — the ingestion MCP connector's shape
+
+Scope is the PO's and is not re-litigated here: the 6 tools (`upload_document`,
+`create_node`, `create_link`, `get_graph`, `list_documents`, `search_nodes`)
+are a 1:1 mapping over M6's endpoints, and the connector is an **HTTP client**
+— no Cypher, no Neo4j driver, no knowledge of `core/graph.py`. Sequence is
+M3 → M6 → this. Nothing below re-opens M3 or M6.
+
+### Decision, in three parts
+
+1. **Form: a Tier-1 (in-process) aw-workspace app**, new repo
+   `repos/aw-app-knowledgeable`, installed to `apps/knowledgeable/`. It
+   borrows `aw-app-whiteboard`'s Tier-1 discovery wiring and
+   `aw-app-whiteboard`'s *standalone* MCP server's tool-body style — two
+   different files in the same repo, and the split is the whole point (below).
+2. **Reachability: inbound closes. Verified, not assumed.** The stdio-bridge
+   inversion the PO flagged **does not trigger**; direct HTTP from the
+   workspace/gateway to aw-knowledgeable works today by container name.
+3. **Identity: the tenant comes from the connector's own credential, never
+   from the calling agent.** `resolve_tenant_id` gains exactly one branch — a
+   service-caller branch that already exists in AP-MT and is ported, not
+   invented. **This is a BLOCKING prerequisite of M6**, and it is cheap.
+
+---
+
+### Q2 first, because it gates Q1 — reachability, measured
+
+The PO was right to demand this before the form, and right that the socat
+precedent looked threatening. It does not transfer, and the reason is a
+topology fact that was not written down anywhere:
+
+**`aw-host` — the Docker container the workspace runs inside — is itself on
+aw-stack's Docker network.** Measured 2026-09-26:
+
+- `remote_host_exec_run` on host `11e8bd4157845a24` ("aw-host", the default
+  host for workspace `aw`) reports `hostname` = `74eea54e9090`, the presence
+  of `/.dockerenv`, and `nameserver 127.0.0.11` — Docker's embedded DNS. Its
+  own `/etc/hosts` self-entry is `172.22.0.9`.
+- The aw-workspace container (`aw-remote-host-workspace`, 10.89.0.33:9030)
+  and all ~70 app containers are **podman containers nested inside that
+  Docker container**, on network `aw-remote-host` (10.89.0.0/24, gateway
+  10.89.0.1 = aardvark-dns).
+- aardvark-dns forwards unknown names upstream to aw-host's resolver, which
+  is Docker's 127.0.0.11, which resolves aw-stack's containers. `nslookup
+  aw-backend 10.89.0.1` returns a **non-authoritative** answer of
+  172.22.0.8 — that forwarding hop, visible.
+
+So the path is not "workspace host → another host's network". It is "child
+netns → parent's own network". Two direct measurements, from the container
+that actually matters:
+
+```
+# from INSIDE aw-app-mcp-gateway (10.89.0.12) — the container that would
+# hold the upstream entry:
+aw-backend               -> 172.22.0.8      HTTP GET :9025/api/health -> 200
+aw-stack-aw-postgres-1   -> 172.22.0.3      TCP :5432 OPEN
+```
+
+**Why socat was needed for the monolith and is not needed here.** Memory
+`aw-stack-postgres-cutover-done` records the constraint precisely: "The socat
+target must be an **IP**. The aw-sandbox netns has resolv.conf forced to
+1.1.1.1, killing Docker's 127.0.0.11 resolver — names don't resolve in
+there." That is a property of **`aw-sandbox`** (the monolith's container),
+not of the aw-workspace tree. The aw-workspace tree's resolv.conf points at
+aardvark-dns, which forwards to 127.0.0.11 — the exact resolver aw-sandbox
+had broken. The precedent is real and it is about a different container.
+
+**The non-obvious part, and the actual deliverable for the Coders.** Name
+resolution is **per-name, not per-network**. Probed from aw-host:
+
+| resolves | does not resolve |
+|---|---|
+| `aw-backend` → 172.22.0.8 | `redis` |
+| `aw-console` → 172.22.0.2 | `postgres` |
+| `aw-caddy` → 172.22.0.5 | `aw-stack-redis-1` |
+| `aw-redis` → 172.22.0.7 | `aw-stack-aw-console-1` |
+| `aw-stack-aw-postgres-1` → 172.22.0.3 | `aw-stack-aw-caddy-1` |
+| `aw-postgres` → 172.22.0.3 (alias) | `neo4j` |
+
+Compose's default `{project}-{service}-{n}` names mostly do **not** resolve;
+the `aw-*` names do, because aw-stack gives those services an explicit
+`container_name`/alias. `aw-knowledgeable` resolves to nothing today, which
+is correct — it does not exist yet.
+
+**Therefore:** the aw-stack service MUST declare an explicit
+`container_name: aw-knowledgeable` (or an equivalent network alias) on the
+network aw-host is attached to. That is a one-line requirement, and it is the
+difference between this design working and a Coder discovering
+`getaddrinfo failed` after M6 is green. Do not configure the connector with
+an IP — `aw-postgres` proves aliases work, and an IP would re-create the
+brittleness the socat workaround had to accept.
+
+Base URL for the connector: **`http://aw-knowledgeable:<port>`**. Config knob,
+defaulted to that, for the same reason §3 deviation 1 defaults to
+`http://aw-backend:9025` and not a loopback address.
+
+**What would change this decision:** if aw-knowledgeable is ever placed on a
+network aw-host is *not* attached to, or moved to a different physical host,
+Q2 flips and the stdio-bridge becomes the only option. The verification above
+is reproducible in one command — re-run it, don't assume it.
+
+---
+
+### Q1 — the form, and what actually survives of the kb/whiteboard pattern
+
+The PO's warning is correct and sharper than it first looks. Both existing
+`self_register.py` files are about **discovery**, not about calling a manager.
+The "no HTTP hop" rationale lives in a different file —
+`repos/aw-app-whiteboard/whiteboard_app/mcp/http_handler.py:14-18`:
+
+> "this handler calls `WhiteboardManager`/`WhiteboardBrowser` **DIRECTLY** —
+> no HTTP hop needed, it's the same Python process."
+
+So the two concerns are already separated in the tree, and only the second one
+fails to apply here. Splitting the pattern along that line:
+
+**What survives, essentially verbatim:**
+
+- `self_register.py` — `repos/aw-app-whiteboard/whiteboard_app/mcp/self_register.py:44-52`.
+  Tier-1 shape: `socket.gethostname()` (not `127.0.0.1`, not kb's
+  `AW_APP_SELF_HOST` — that env var is the Tier-2 variant, see
+  `apps/kb/kb_app/self_register.py:36-37`), plus `X-Api-Key` in the entry's
+  `headers` because Tier-1 routes sit behind IdentityGuard. Atomic
+  `os.replace` write of `mcp.json`. This is 100% reusable and must not be
+  re-derived — memory `app-mcp-needs-self-register-not-manifest` records that
+  `contributes.mcp.provides` registers **nothing**; an app declaring only that
+  installs clean, passes `doctor`, and serves zero tools silently.
+- The Streamable-HTTP `/mcp` JSON-RPC 2.0 handler + `TOOLS_SCHEMA` + the
+  `_tool_result` envelope — `http_handler.py`, `apps/kb/kb_app/mcp_http.py`.
+  The wire protocol is what `HttpUpstream` speaks; none of it is manager-specific.
+
+**What does not survive — and what replaces it:** the tool bodies. And the
+replacement is also already in this tree, which is the find that settles the
+form. `repos/aw-app-whiteboard/mcp_server/server.py:1-35` is *exactly* this
+problem already solved once:
+
+> "Talks to a running aw-workspace's OWN routes … over plain HTTP,
+> authenticating with the workspace-wide `X-Api-Key` header … This is a
+> STANDALONE process … it can run anywhere that can reach the workspace's API
+> host."
+
+Note its credential discipline, which the connector should copy: the key is
+"**Read fresh on EVERY call (not cached at import time) so a regenerated key
+takes effect without restarting this process**". The connector's own service
+secret must be read the same way.
+
+So the connector is: whiteboard's `self_register.py` + whiteboard's
+`http_handler.py` skeleton + whiteboard's `mcp_server/server.py` **tool-body
+style** (httpx against a remote base URL with a shared-secret header). Three
+files that exist, recombined. There is no novel mechanism here.
+
+**Tier-1 over Tier-2.** Reasons, in order of weight:
+
+1. **Tier-2's isolation buys nothing here.** kb is Tier-2 because it owns
+   pgvector/Postgres deps and heavy indexing. This connector's entire
+   dependency surface is `httpx`, already in core. No DB table, no background
+   loop, no managed service, no image to pin.
+2. **Tier-1 ships on core's deploy path, not the marketplace.** That skips an
+   entire documented failure class: `app-release-and-update-gotchas`,
+   `marketplace-app-onboarding-gaps`,
+   `marketplace-catalog-refresh-is-sequential-blocking`, and
+   `aw-app-uc-phd-marketplace-update-reverts-to-stale-catalog` (a `--update`
+   that silently reverts to a stale catalog). Frederico wants to use this the
+   day it lands; a CDN-lag debugging session is a bad first experience.
+3. **The service secret lives in the workspace secret store**, which a Tier-1
+   app reads in-process.
+4. `inprocess` is the house default — 24 of ~30 installed apps under `apps/`.
+   §"prefer the shape the codebase already uses" applies.
+
+**The cost I am accepting, explicitly.** Tier-1 code is not live until the
+owning process restarts — memories
+`tier1-inprocess-apps-have-no-restart-path`,
+`aw-app-uc-phd-tier1-code-reload-needs-a-core-restart`,
+`tier1-managed-service-code-is-not-live-until-the-owning-worker-restarts-it`
+("service restart lies; check process etime"), and
+`restarting-the-workspace-container-recreates-it-from-latest`. So
+per-iteration turnaround is worse than Tier-2's `docker restart`. I accept it
+because the tool surface is **locked at 6 tools with a fixed 1:1 contract** —
+churn belongs on the aw-knowledgeable side, not here. **Runner-up: Tier-2.**
+Switch if the connector turns out to need per-call iteration (e.g. M6's
+contract proves unstable in practice), or if it ever grows a background
+worker — at which point the WORKERS=10 hazards above become the deciding
+factor rather than a cost.
+
+**Rejected: the generic stdio-bridge** (`repos/aw-mcp-gateway/connector/`).
+Not because it is unfinished — and here the code lies about itself, which the
+Coders must know. `connector/link_client.py:5-8` still says *"STATUS:
+skeleton matching the gateway side's current stub … a placeholder
+bearer-token check, not the final `awlk_<id16>_<secret32>` scheme."* That
+docstring is **stale**: the gateway side is done —
+`back/gateway/remote_upstream.py:12-23` says it "Closes the
+reverse-registration TODOs from the original skeleton", with a real `awlk_`
+token verified against a `TokenStore`, scope globs, and collision handling,
+and `remote_upstream.py:117` reads the same `?token=` query param
+`link_client.py:29` sends. The bridge would very likely work. It is rejected
+on cost and fit:
+
+- Its reason to exist — "reached over HTTP without opening any inbound port"
+  (`connector/__init__.py`) — is answered by Q2. Nothing needs to be opened.
+- It would add a **new long-lived deployable** next to aw-knowledgeable on
+  bare metal, plus link-token lifecycle, for zero capability gain.
+- It spawns a **local stdio MCP child** (`main.py:16-17`, `local_mcp.LocalMcp`),
+  so a stdio MCP server still has to be written *and* wrapped — strictly more
+  code than the Tier-1 handler, not less.
+- It namespaces tools `{workspace_name}__{app_name}__{tool}`
+  (`remote_upstream.py:5-7`), diverging from the `aw__<app>__<tool>` form
+  every agent and skill in this workspace already knows.
+
+**Revisit if** Q2 ever flips, or if aw-knowledgeable is deployed somewhere
+this workspace cannot dial — that is precisely the bridge's case, and it is
+ready for it.
+
+---
+
+### Q3 — agent-originated identity: the load
+
+**The honest starting point: there is no agent identity to authenticate.**
+`repos/aw-mcp-gateway/back/gateway/caller_context.py:1-11` states it plainly:
+
+> "An agent talks to this gateway, and the gateway talks to an app. The app
+> therefore sees the *gateway* as its caller and has no way to tell which
+> agent is on the other end."
+
+What does arrive is a three-header allowlist —
+`caller_context.py:78`: `("x-aw-caller-session-id", "x-aw-caller-run-id",
+"x-aw-caller-agent")` — and the same file, at :76-77, says exactly what they
+are worth: *"Keep this short and boring — **every addition is something a
+caller can now assert about itself**."* They are **self-asserted
+attribution**, not authenticated claims. AP-MT already wrote the trust rule
+for the run-id, at `api/telegram.py:3090-3092`:
+
+> "`run_id` is caller-supplied and **unauthenticated**: this grants **no read
+> access**, it only selects a delivery **destination**."
+
+Four of the six locked tools are reads (`get_graph`, `list_documents`,
+`search_nodes`, and the read half of the others). **Binding a tenant from
+`X-Aw-Caller-Run-Id` would therefore be precisely the bypass the PO
+forbade** — worse than aw-backend's legacy authmiddleware, which at least
+required *a* signed JWT. Ruled out.
+
+#### The decision
+
+**The tenant is a property of the connector's credential, not of the caller.**
+
+This is not a new idea and that is its main virtue — AP-MT shipped it, and the
+pieces are ported rather than designed:
+
+- `agents-platform-multitenant/backend/app/core/identity.py:344-353` —
+  `ServiceIdentity`, `SERVICE_USER_ID = -1`, deliberately **carrying no
+  memberships** ("a service is not a member of anything, and a route that
+  needs to scope by workspace must not silently read an empty list as *all*").
+- `identity.py:356-369` — `verify_service_secret`: `X-Internal-Secret`,
+  compared with `hmac.compare_digest` "so a wrong guess cannot be narrowed
+  down by timing", returning **False rather than raising** when absent, so a
+  caller falls through to identity auth.
+- `identity.py:372` — `require_identity_or_service`, the composite dependency
+  for "a person clicking in the SPA **or** a background producer with no
+  session behind it".
+- `identity.py:251-257` — the `resolve_tenant_id` service branch: service
+  callers resolve to a **declared** ops tenant, "rather than the bootstrap
+  tenant hard-bound".
+
+So, in aw-knowledgeable:
+
+- `backend/app/core/identity.py` gains `ServiceIdentity`,
+  `verify_service_secret` (reading `KNOWLEDGEABLE_SERVICE_SECRET`) and
+  `require_tenant_or_service`.
+- `resolve_tenant_id` gains **one branch**, at the single swap point §2:226-228
+  already designated: `if identity.user_id == SERVICE_USER_ID: return
+  settings.service_tenant_id`. When T2 mints the real claim, this file is
+  still the only one that changes.
+- `backend/app/api/__init__.py`'s **one shared gate list** (§3) becomes
+  `[Depends(require_tenant_or_service)]`. One list, both branches — not a
+  per-route decision, for the reason §3 already cites: per-route gating is how
+  card #5 shipped 48 GET routes handing one tenant's rows to another.
+
+**Why this satisfies all three of the PO's constraints:**
+
+- **(a) No second tenant concept.** It resolves to a row in the *same* local
+  `tenants` projection §2:206-228 defines, keyed the same way. Identity still
+  originates in aw-backend.
+- **(b) `strict` is not weakened.** `strict` raises `UnscopedTenantAccess`
+  when **nothing** is bound. Here a real tenant *is* bound, from an
+  authenticated credential. The ladder is untouched; no new `off`-like escape.
+- **(c) Not a "any workspace JWT" bypass.** The legacy aw-backend gate
+  accepted any JWT as any identity. This accepts **one pre-shared secret**,
+  constant-time-compared, and maps it to **one declared tenant**. There is no
+  impersonation surface: a caller cannot name a tenant, so there is nothing to
+  forge. The agent-supplied headers are recorded as **provenance only** (audit
+  log / node `created_by_run` property) — never read to choose a tenant.
+
+**Two guard-rails that are load-bearing, not polish:**
+
+1. **`service_tenant_id` must have no silent default.** If
+   `KNOWLEDGEABLE_SERVICE_SECRET` is set and `KNOWLEDGEABLE_SERVICE_TENANT_ID`
+   is not, **refuse at boot**. AP-MT's own §1 structural finding is that a
+   silent ops default is what let the bootstrap-tenant leak "survive three
+   prior fixes" (`telegram.py:3093-3097`), and `resolve_tenant_id`'s docstring
+   (`identity.py:237-244`) is a 7-line account of how a convenient fallback
+   made isolation unfalsifiable: "every unknown caller landed in the owner's
+   data."
+2. **One credential, one tenant — enforced by shape.** Today this workspace is
+   one account / one tenant (memory `ap-mt-one-account-one-tenant`), so a
+   single secret is correct. But the mapping must be written as
+   *credential → tenant*, so a second workspace gets a second secret rather
+   than inheriting the first tenant. Getting this wrong reproduces exactly the
+   bug AP-MT fixed in `1de307f`.
+
+**Test, in the K-series' style — K6:** as a service caller with a valid
+secret, writes land in `service_tenant_id`; with a **wrong or absent** secret,
+every gated route 401s and **no** route falls back to an unscoped or default
+tenant; and a call carrying a forged `X-Aw-Caller-Run-Id` naming another
+tenant's run still resolves to `service_tenant_id`. That last assertion is the
+one that would catch a future "helpful" refactor re-introducing header-derived
+tenancy. Also extend §2's
+`test_public_entrypoints_under_strict.py` port: the service path must work
+under `strict`.
+
+#### Blocking or separate card — the answer the PO asked for
+
+**The seam is a BLOCKING prerequisite of M6. The connector that uses it is a
+separate card.** Annotate M6.
+
+The split:
+
+- **Into M6 (blocking):** `ServiceIdentity` + `verify_service_secret` +
+  `require_tenant_or_service` + the one `resolve_tenant_id` branch + the
+  config knobs + K6. Roughly one file touched, one dependency, two config
+  values, one test file.
+- **Separate card (after M6):** the Tier-1 app itself — repo, manifest,
+  `self_register.py`, `/mcp` handler, 6 tool bodies, secret provisioning.
+
+**Why blocking rather than "add it when we build the connector":** M6 ships
+the **one shared gate list**. Retrofitting a second auth branch into an
+already-shipped gate list is done per-router by whoever needs it, and §3
+already documents where that ends — 48 routes. Adding the branch while the
+list has one entry is a one-line change; adding it later is an audit.
+
+**On the PO's escape hatch — it does not trigger.** This is nowhere near the
+cost of M3+M6. It is a port of four small, already-written, already-reviewed
+functions from a sibling repo into a file M6 is creating anyway, plus one
+test. My estimate is a small fraction of M6, not a multiple of it. **No scope
+finding to return**; the granted scope is right.
+
+---
+
+### What D2 makes harder later (extending §7)
+
+9. **The graph cannot attribute a node to an agent in a trustworthy way.**
+   Provenance comes from self-asserted headers, so `created_by_run` is a hint,
+   not evidence. If an audit trail ever needs to be authoritative — "which
+   agent inserted this claim?" — that requires per-agent credentials, which
+   the gateway has no concept of (`caller_context.py:1-11`). Do not let the
+   provenance property quietly become load-bearing for a reasoning feature.
+10. **One service credential means agent writes are indistinguishable from
+    each other at the tenant boundary.** Revoking one misbehaving agent's
+    access means rotating the single secret, i.e. cutting off every agent.
+    Acceptable at one tenant and one workspace; it is the first thing to hurt
+    if aw-knowledgeable is ever offered to a second tenant whose agents call
+    through their own gateway.
+11. **Tier-1 couples the connector's release to core's.** A connector fix
+    ships on the workspace-core deploy path and needs the owning process
+    restarted — so a trivial tool-description typo is a core deploy. This is
+    the concrete form of the Tier-2 runner-up's advantage; it is the
+    trigger to revisit, not a reason to pre-emptively split.
+12. **The reachability finding is a measurement with a shelf life.** It rests
+    on aw-host being a container on aw-stack's own network — an arrangement
+    nothing enforces and no test covers. If aw-stack's networking is ever
+    reorganised, this connector breaks with a DNS error and the design note
+    above is the only record of why it used to work.
+
+### Risks for the Coders
+
+1. **`contributes.mcp.provides` registers nothing.** The gateway only finds an
+   upstream by scanning for the file `self_register.py` writes. Declaring the
+   6 tools in `aw-app.json` and stopping there yields an app that installs
+   clean, passes `aw-workspace-cli doctor`, and serves **zero tools with no
+   error anywhere**. Memory `app-mcp-needs-self-register-not-manifest`.
+2. **A new gateway tool is invisible to the session that created it.** Memory
+   `verify-new-gateway-tools-in-same-session` — verify from a *fresh* session,
+   and expect the reload/zombie-cache behaviour in
+   `mcp-gateway-http-upstream-zombie-caching`.
+3. **`upload_document` is multipart through two hops.** The gateway's
+   `HttpUpstream` speaks JSON-RPC; bytes have to be carried as a
+   base64 argument and re-encoded as multipart by the tool body. Do not
+   assume a file path is shareable — the agent container, the workspace
+   container and aw-knowledgeable have three different filesystems. Memory
+   `remote-host-download-file-mcp-misses-the-shared-tree` is the same trap.
+   Also: the tunnel edge cuts requests at 30s (`tunnel-edge-cuts-requests-at-30s`)
+   — a large ingest must not be a synchronous call that returns the finished
+   parse.
+4. **`StdioUpstream` injects `_gateway_caller_run_id` into tool arguments.**
+   Memory `gateway-injects-caller-run-id-into-notion-calls`: a strict schema
+   rejects the unexpected field with a 400. M6's request models must tolerate
+   (and ignore) an unknown underscore-prefixed key, or the connector must
+   strip it before forwarding.
+5. **Read the service secret fresh on every call**, per
+   `mcp_server/server.py`'s rationale — a rotated secret must not require a
+   core restart to take effect, because on Tier-1 that restart is expensive.
+6. **Do not test reachability from an agent container and call it done.** An
+   agent runner and `aw-app-mcp-gateway` are different containers; the
+   upstream entry is used by the gateway. Verify from inside
+   `aw-app-mcp-gateway`, as §10's Q2 did.
