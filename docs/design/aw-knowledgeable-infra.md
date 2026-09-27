@@ -295,7 +295,7 @@ the first time strict went on.
 
 ### Decision
 
-Port AP-MT's Phase A almost verbatim, with two deliberate deviations.
+Port AP-MT's Phase A almost verbatim, with three deliberate deviations.
 
 ### Where it lands
 
@@ -313,6 +313,29 @@ Port AP-MT's Phase A almost verbatim, with two deliberate deviations.
     from when AP-MT shared aw-sandbox's network namespace; a new service on
     `aw-stack-net` should name the service. `aw-backend` has
     `container_name: aw-backend` and is on that network, so it resolves.
+  - **Deviation 3 (implemented, M4):** the local `sub` -> tenant projection
+    (§2 "Where the tenant comes from") is its own **SQLite file**
+    (`IDENTITY_TENANT_DB_PATH`, default `/data/identity/tenants.db`), not a
+    `tenants` table in a shared Postgres the way AP-MT's `resolve_tenant_id`
+    reads/writes one. This repo has no shared SQL database — only Neo4j —
+    so there is no existing database to add a table to; introducing one
+    (Postgres, SQLite-as-a-service, anything requiring its own connection
+    pool/migration story) purely to hold a single `(account_ref, tenant_id)`
+    mapping would be infrastructure disproportionate to the data. SQLite
+    keeps the same race-safe shape (`INSERT OR IGNORE` + re-`SELECT`,
+    mirroring AP-MT's `ON CONFLICT DO NOTHING` + re-`SELECT`) as a single
+    file on a **dedicated volume** (`identity-data:/data/identity` in
+    `docker-compose.yml`, separate from `documents-data`) — required reading
+    for whoever touches this next: the app container is recreated on every
+    push (§1), so if this volume is ever dropped, every existing account is
+    silently re-minted a *new, empty* tenant on next login and their prior
+    uploads become invisible (still isolated correctly — just to the wrong
+    tenant from that user's point of view). Implemented in
+    `backend/app/core/identity.py`'s `_get_or_mint_tenant` /
+    `_tenant_db_path`. Revisit if this repo ever gains a real shared SQL
+    database for other reasons — at that point this table has an obvious
+    new home and the migration is one function's body, per `resolve_tenant_id`'s
+    own single-swap-point design.
 - `backend/app/api/__init__.py` — **one shared gate list**,
   `_identity_gate = [Depends(require_tenant)]`, applied to every router.
   Do **not** gate per-route. The comment at AP-MT's `api/__init__.py:32-50`
