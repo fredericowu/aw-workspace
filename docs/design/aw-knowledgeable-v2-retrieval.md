@@ -1034,3 +1034,132 @@ something it structurally could not have observed.
    asserts the M6 shapes; update it deliberately rather than letting it
    drift, and keep `test_route_sweep.py`'s K1 table exhaustive — an
    unclassified route is a failure, never a skip.
+
+---
+
+## 10. Per-bucket embedding models, and cross-bucket correlation across them
+
+Written 2026-09-27, answering Frederico verbatim: *"da pra desenhar que cada
+bucket tem um modelo e ainda sim ser possível correlacionar buckets?"*, plus
+his wish to A/B models before committing a corpus, and his framing that
+*"eles na verdade poderão ser selecionados"*.
+
+### Decision
+
+**One embedding model per deployment, not per bucket. Model choice is settled
+by an offline bake-off on real documents, not by a production feature.** Two
+cards follow from that and neither is `(:Bucket)`-shaped:
+
+1. **Promote the bake-off harness into the repo** (`.tmp/kn-bgem3/pt_longform.py`
+   is scratch and will be swept). Corpus + query set + N model names →
+   recall@1/@5 table. No Neo4j, no index, numpy cosine in-process. This is what
+   "rodar testes com modelos" actually needs, and it is strictly better than an
+   in-product comparison because the query set is controlled.
+2. **Build the re-embed pathway**, which does not exist. `grep` over
+   `backend/app` finds no reindex/re-embed path at all; `ensure_schema`
+   (`graph.py:209-217`) raises `RuntimeError` at boot when the model's dimension
+   disagrees with the index and tells a human to "drop the index and re-embed
+   every (:Chunk)" by hand. That is the operation that makes a model decision
+   reversible, and it is the real scaffolding — not a registry field.
+
+**`(:Bucket)` gains no `default_embedding_model` field in V2.** The door it
+would hold open is already open, and the field would be a policy record with
+nothing enforcing it: set it to `bge-m3` on a bucket whose chunks are all
+MiniLM and nothing reconciles the two. The **fact** is already recorded where it
+cannot lie — `embedding_model` / `embedding_dim` stamped per chunk at
+`ingest/worker.py:100-101`.
+
+### Why the chunk stamp is a sufficient *record* but not a sufficient *mechanism*
+
+Going multi-model needs five things the stamp does not provide. They are listed
+because "we already stamp the model, so we're ready" is the exact wrong
+conclusion to draw from §1:
+
+1. **One vector index cannot hold two models.** Not primarily a dimension
+   problem — two 1024-dim models are equally incomparable, and mixing them in
+   one ANN index returns confidently-ranked noise. Separating them means a
+   second index, and a second index on the same `(:Chunk)`/`embedding` schema
+   descriptor is (to my knowledge, **unverified here** — no Neo4j credential is
+   reachable from an Architect container, same limitation §2 records) rejected
+   by Neo4j as an equivalent index. So it needs a **property per model**
+   (`c.embedding_bge_m3`), never a label per model — labels are schema, already
+   rejected twice in these documents (buckets.md §1, §1 above).
+2. **Query-side: one embed per distinct model in the scoped set.** The binding
+   cost is resident memory, not latency: bge-m3 alone is 2.27 GB of weights in a
+   single-worker container (`Dockerfile` CMD, no `--workers`).
+3. **Merging is rank fusion, not score merging.** Cosine scores are not
+   calibrated across models — model A's best hit at 0.81 and model B's at 0.54
+   may be equally good. Merging by score silently favours whichever model runs
+   hotter. The sound merge is **RRF over ranks**. This is the trap: merging by
+   score looks like it works.
+4. **The escalation path is the easy half.** `vector_search_exact`
+   (`graph.py:396-408`) pre-filters in the `MATCH`, so `c.embedding_model = $m`
+   costs nothing there. `vector_search_ann` (`graph.py:363-376`) post-filters,
+   so a model predicate becomes a **third** dilution filter on top of tenant and
+   bucket — the compounding §2 already fights.
+5. **V4's cross-bucket tree descent breaks the same way.** V3 centroids are
+   per-bucket means of chunk embeddings and stay intra-bucket, which is fine;
+   but beam-searching across buckets on two models needs the same fusion.
+
+### The "canonical search model" shortcut does not exist
+
+The tempting cheap answer — one canonical model for retrieval, per-bucket models
+as a storage/quality choice — **is a category error in the retrieval
+direction.** The stored vectors *are* what search compares against; a canonical
+query vector cannot be compared to a bucket's foreign-model vectors at all. The
+only version that works is dual-embedding every chunk (canonical + bucket-local),
+which doubles embed cost and storage and buys retrieval **nothing**, because
+retrieval would only ever touch the canonical vector. The bucket-local vector
+would feed intra-bucket clustering (V3) only — an unmeasured quality delta at 2×
+the ingest cost. Rejected.
+
+### Why deferring costs nothing, stated falsifiably
+
+**Every step of going multi-model later is bounded by a re-embed pass we would
+have to run anyway.** Renaming `embedding` → `embedding_<model>` is one batched
+Cypher `SET`/`REMOVE` over the same chunks the re-embed already rewrites; the
+index is dropped and recreated in both cases; V3 centroids are rebuilt in both
+cases. And crucially the source bytes are never lost — `storage_path` stays on
+the volume and `extract_text(storage_path)` is re-runnable
+(`ingest/worker.py:53-60`), so no re-embed ever needs a re-upload. That is the
+fact that makes all of this reversible.
+
+**What would prove this wrong:** any multi-model step whose cost is *not*
+bounded by a re-embed pass. If one is found, this section is wrong and
+per-bucket models should be scaffolded early.
+
+The cost that *does* grow is §3's, unchanged and now urgent for a different
+reason: re-embedding is free today because no production corpus has embeddings.
+The bake-off on real documents wants to happen **before** the first big ingest,
+and it needs Frederico's actual documents plus a query set with known answers.
+
+### Rejected
+
+- **`default_embedding_model` on `(:Bucket)` now, "to keep the door open".**
+  Rejected above: a registry property is a `SET` on a handful of nodes — the
+  cheapest migration in this system — and an unenforced one can lie.
+- **Per-bucket model selection exposed in the UI.** It would promise something
+  retrieval cannot honour: the moment two buckets differ, `scope=all`
+  (buckets.md §3) silently becomes N searches needing fusion that does not
+  exist. Model selection belongs at deploy/tenant config —
+  `EMBEDDING_MODEL` already exists (`embeddings.py:model_name()`) — paired with
+  the reindex operation above. Whether it is later surfaced per tenant is a
+  Product Owner call; the design absorbs either, because reindex is the same
+  operation.
+- **Building RRF now.** We will probably want it — for hybrid dense+sparse
+  (bge-m3's sparse head is off this path per Amendment 5, but BM25 is not) —
+  and that is the reason to build it, not multi-model.
+
+### What this makes harder later
+
+1. **A genuinely per-bucket model becomes a schema change plus a re-embed**, not
+   a config flip. Accepted on the argument above; revisit it the moment a
+   *measured* per-bucket quality gap exists on a bucket that is mostly searched
+   alone.
+2. **One index means one dimension for the whole graph, forever-ish.** Every
+   bucket inherits the model chosen before the first corpus lands, so the
+   bake-off in card 1 is load-bearing in a way a reversible choice would not be.
+3. **`scope=all` stays cheap only while the graph is single-model.** Anyone
+   adding a second model must fix `scope=all` in the same change, or it returns
+   half the corpus and says nothing — the unlabelled-thin-result failure §5 and
+   buckets.md:445-449 both exist to prevent.
