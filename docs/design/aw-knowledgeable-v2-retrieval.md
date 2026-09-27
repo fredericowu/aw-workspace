@@ -712,6 +712,15 @@ shared with the other two SPAs).
    Fixing it afterwards means his first look at a populated graph is the
    broken one.
 
+**The topic tree in item 2 is not the folder tree**, and a later request asked
+for the folder one. `aw-knowledgeable-buckets.md` §8 (addendum, 2026-09-27)
+decides that they are separate mechanisms answering separate questions — the
+topic tree is *derived* (discovery: "what is in here?"), a `folder_path`
+property on `(:Document)` is *authored* (filing: "where did I put it?") — and it
+rejects both nesting buckets and reusing this tree for filing. **Nothing in §5,
+§6 or their cards changes;** §8 adds a sidebar to the `library` view and a
+property, in a card of its own. Read it before "unifying" the two trees.
+
 ---
 
 ## 7. Bucket scope, and the denial decision that is still open

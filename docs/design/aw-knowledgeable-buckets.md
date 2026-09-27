@@ -492,3 +492,208 @@ Two things to route rather than absorb:
   is a question about the RAGA-style construction loop, which is out of scope
   for v1 by the PO's own card, and answering it now would be designing against
   a loop nobody has specified.
+
+---
+
+## 8. Addendum (2026-09-27): folders are not buckets
+
+Status: **amendment to §1's rejection list, and a scoping answer.** Written by
+the Architect agent against card `3e85bf3b-9510-81d9-85c4-da4412eca7b6`.
+**Nothing already shipped is reopened** — V2 (the flat registry, `bucket_ctx`,
+the scope envelope) is Done and deployed and stays exactly as built.
+
+Frederico's ask, verbatim, with a screenshot of the **`kb` app's** file-tree
+sidebar (`mapped_folders/docs/{architecture,design,runbooks,standards}`) as his
+visual reference:
+
+> *"eu queria ter um estrutura assim de buckets, com sub buckets (sub pastas) e
+> quando eu clicasse, eu visse os documentos e como eles se interligam […]
+> Dentro da estrutura de arquivos, vamos ter o documento original, na visao do
+> grafo, veriamos a interligacao dos documentos; queria experimentar isso"*
+
+### Decision
+
+**Add a `folder_path` string property to `(:Document)` and render it as a
+navigable tree. Do not nest buckets, and do not repurpose V3's topic tree for
+this.**
+
+The reframe that makes this a decision rather than a compromise: a filesystem
+uses **one** mechanism — a directory — for **two** unrelated jobs, and the ask
+inherits that conflation. In this system those jobs are already separate, and
+one of them is expensive:
+
+| | what it answers | who authors it | cost to change |
+|---|---|---|---|
+| **bucket** | who may see this at all | a tenant admin, via a token scope | a permission boundary (§7bis) |
+| **folder** | how *I* arrange what I can already see | the uploader | a property |
+| **topic** (V3) | what the machine found in here | the clustering pass | rebuilt on demand |
+
+Three trees, three jobs, and they are orthogonal on purpose:
+
+- the **folder tree** is *mine* — human-authored, stable, exact, and it is the
+  one in the screenshot;
+- the **topic tree** (V3, `aw-knowledgeable-v2-retrieval.md:594-628`) is *the
+  machine's* — derived from chunk-embedding clusters, with labels from an LLM
+  or, degraded, from c-TF-IDF keywords; it drifts on every rebuild and a
+  document surfaces wherever its *chunks* cluster, which can be several places
+  at once;
+- the **graph** is *the links* — `LINKS_TO` (human) and `RELATED_TO` (derived).
+
+So the answer to "does V3 already cover this?" is **no, and yes to a different
+half of the sentence.** V3+V4+V5b already deliver "click into a tree, see the
+documents, see how they interconnect" as a **discovery** affordance — V5b's own
+card says so, and that remains true. What they cannot deliver is *Frederico's
+folders, with Frederico's names, in Frederico's order, stable across rebuilds*.
+He pointed at `docs/design`, not at `Cluster 3: retrieval, embeddings, neo4j`.
+A semantic clustering pass is structurally the wrong mechanism for reproducing a
+filing decision a human already made, and the tell is that nobody would accept a
+file manager that re-arranged their folders when the corpus grew.
+
+### Where it lands
+
+```
+(:Document {tenant, bucket, external_id, label, …, folder_path})
+```
+
+One property. No new node, no new relationship, no hop, no change to the
+constraint, nothing on the hot path, no authorization semantics.
+
+- **`backend/app/core/graph.py`** — the template catalogue (`:267-463`):
+  `list_documents` (`:327-333`) gains an optional folder predicate; a new
+  `list_folders` returns the distinct `folder_path` values in the bucket with a
+  document count each, on the shape `list_buckets` (`:311-325`) already uses for
+  counting; `set_document_folder` and `move_folder_prefix` for the write side.
+- **`backend/app/api/documents.py:43`** — `upload_document` gains an optional
+  `folder_path` form field. **This is the part the ask does not come with:**
+  today upload is a single multipart file and the only thing it knows is
+  `file.filename` (`:44`, `:64`) — there is **no source folder path to
+  preserve**, because unlike the `kb` app (`apps/kb/kb_app/kb_ops.py:1093`,
+  `:1208`, which mirrors a real directory into
+  `mapped_folders/<name>/<rel_path>`) this app has no filesystem to mirror. It
+  has an upload form. The path has to be *supplied*, and there are exactly three
+  supply lines: a browser **directory** upload (`<input webkitdirectory>` hands
+  the frontend `File.webkitRelativePath` = `docs/design/foo.md`), an explicit
+  field on the single-file upload defaulting to the currently-selected tree
+  node, and the D2 service caller (`core/identity.py`'s `X-Internal-Secret`
+  branch) passing one from an ingestion connector.
+- **`backend/app/api/documents.py`** — a move route, so a mis-filed document is
+  not stuck until it is re-uploaded.
+- **a new `GET /api/folders`** — flat list of paths + counts, nested by the
+  frontend. Bucket-scoped through the existing `require_bucket_read`
+  (`core/identity.py:392-405`); it invents no gate of its own.
+- **`frontend/src/app.js`** — the tree is a **sidebar in the `library` view**,
+  not a fourth `state.view` (`:19`, `switchView` `:63-67`). That is what the
+  screenshot shows, and it composes with V5a's bucket switcher instead of
+  competing with it: pick bucket → tree filters `renderLibraryGrid` (`:101`) →
+  click a document → `openGraph` (`:164`) → M7's existing focus/depth expansion
+  (`focusNode` `:239`).
+- **"the graph of this folder"** seeds the Cytoscape view from the folder's
+  documents and merges through the existing `mergeGraphData` (`:179`), capped,
+  with the cap stated in the UI ("showing 30 of 84 — narrow the folder").
+
+### Rejected
+
+- **Nested buckets — a `parent` on `(:Bucket)`, or `IN_BUCKET` with
+  `PARENT_OF`.** This is the option §1 itself left a door open for: *"Revisit if
+  buckets need to nest (a 'Medicine' bucket containing 'Cardiology'), which is
+  the one requirement a flat property genuinely cannot serve"* (`:127-129`). The
+  trigger fired, and the answer is still no — because **a fact arrived between
+  that sentence and this one that §1 did not have: the bucket became a
+  permission boundary** (`aw-knowledgeable-v2-retrieval.md` §7bis, shipped;
+  `core/identity.py:368-390`). Nesting a permission boundary is not a schema
+  question, it is a scope-inheritance question, and both answers are bad:
+  - **inherited** — a grant of `view-one: medicine` silently widens the moment
+    anyone creates a child bucket under it. Privilege escalation by creation,
+    performed by a user who was only filing documents.
+  - **not inherited** — the tree has holes. `GET /api/buckets` filters rows to
+    `scopes.visible_buckets()` (`backend/app/api/buckets.py:54-61`), so a token
+    holding a child but not its parent either renders an orphan, or renders the
+    parent's **name** — which is precisely the leak §7bis Decision 2 deleted the
+    `in_scope` field to close (`v2-retrieval.md:794-801`).
+
+  Two further costs, either of which would be enough on its own: a document
+  lives in exactly one bucket (`:111-112`, and `graph.py:171-180` on why the
+  constraint stays two columns), so a parent bucket renders **empty** while its
+  children are full unless every read expands a descendant set — the hot-path
+  hop §1 rejected, arrived at from the other direction. And V3's tree is
+  per-bucket with per-bucket centroids, so a parent bucket either has no topic
+  tree or gets a second clustering pass over its descendants' chunks.
+
+  **What would change this:** a stated requirement to *grant* on a subtree
+  ("read everything under Medicine"), or per-sub-area retrieval config. Both are
+  bucket-shaped and neither is what was asked for. Filing is not granting.
+- **V3's topic tree as the answer, card closed as a clarifying note.** Rejected
+  above. Keeping it would ship a tree whose nodes are named by a language model
+  and whose membership moves when the corpus grows, in answer to a request for
+  `docs/design`. V3/V4/V5a/V5b stay in the backlog **exactly as scoped** — this
+  adds a card, it does not edit theirs.
+- **A `(:Folder)` registry node with `PARENT_OF`,** by symmetry with Amendment
+  1's `(:Bucket)`. Amendment 1's argument was that a bucket *must* be able to
+  exist while empty, because it is a boundary you grant before there is data to
+  put behind it. A folder is the inverse: it is created by putting something in
+  it, and an empty folder has no scope to hold and nothing to authorize. Adopt
+  this shape the day folders need to exist empty, carry attributes, or hold one
+  document in two places — it is the same argument one level down, and it is
+  cheap *then*.
+- **Deriving the folder from content** (topic → path). That is a second derived
+  tree, i.e. a worse V3, and it destroys the one property the folder tree exists
+  to have: that a human put it there.
+- **`GET /api/graph?folder=<path>` as a seeded multi-node endpoint.** The
+  genuine runner-up, and one request instead of N. Rejected for now because
+  `api/graph.py:1-8` and `aw-knowledgeable-infra.md:526-529` guard "no endpoint
+  that can return the whole graph" deliberately, and a `folder=` seed is that
+  door with a parameter on it. Take it if the N-request version measures badly —
+  but then it keeps the node cap **and** reports the cap in the envelope, on
+  §2's declared-scope rule.
+
+### What this makes harder later
+
+1. **Two organising axes over one document, and they will disagree.** Moving a
+   document between folders does not move it between topics; the topic tree
+   keeps showing it wherever its chunks cluster. That is correct and it will
+   read as a bug, so each tree has to say on screen what produced it.
+2. **A folder rename is O(documents under the prefix), forever.** Batched and
+   bounded, but it is a miniature data migration every time — the exact cost a
+   `(:Folder)` registry would reduce to a single `SET`. Booked knowingly.
+3. **One folder per document is baked in** by the same logic as one bucket per
+   document — a path string holds one value. Unlike the bucket case there is no
+   §3 edge as an escape hatch; the escape is the `(:Folder)` node above.
+4. **Granting on a subtree stays unexpressible.** A token names buckets one at a
+   time; "read everything under Medicine" is not a thing this can say, and after
+   this card it is still not a thing this can say.
+
+### Risks for the Coders
+
+1. **Folders must acquire no authorization logic whatsoever.** Anything
+   folder-shaped appearing near `_bucket_denied` (`core/identity.py:368-390`) is
+   the mistake this whole section exists to prevent. And it will not be caught by
+   testing through the API: `resolve_bucket_scopes`'s T2-less body
+   (`identity.py:333-366`) grants `write` on **every** bucket in the tenant, so
+   nothing in the running system denies anything yet. A broken boundary looks
+   identical to a working one from outside.
+2. **Do not add `list_folders` to `_BUCKET_UNSCOPED_NODE_TEMPLATES`**
+   (`graph.py:1250`). That exemption exists for exactly one reason — enumerating
+   the registry itself has no single bucket to filter by (`:305-311`). A folder
+   listing is bucket-scoped by definition, so it carries `{tenant, bucket}` like
+   every other node pattern and K5 must keep asserting it. Pattern-matching the
+   exemption is the trap.
+3. **Every document that already exists has no `folder_path` at all.** Neo4j
+   deletes a null property rather than storing it — `documents.py:67-71` already
+   documents this behaviour for `processing_error`. So root is `""` on write, and
+   every read must treat **absent** as root too, via `coalesce(d.folder_path,
+   '')` **inside the template**, not in Python. That is what makes this a
+   backfill-free migration.
+4. **The prefix-boundary bug on rename.** `STARTS WITH 'docs/de'` matches
+   `docs/design`. Match `folder_path = $from OR folder_path STARTS WITH $from +
+   '/'`, and have a test whose fixture contains both `docs/de` and `docs/design`.
+5. **`folder_path` goes on `(:Document)` only, never on `(:Chunk)`.** Chunks
+   reach it through `PART_OF`. Denormalising it makes a rename rewrite every
+   chunk, and §10's re-embed pass already owns that table.
+6. **Do not widen the unique constraint.** `(tenant, external_id)`, two columns
+   (`graph.py:171-180`). Third time this is written down in these documents.
+
+**Not verified here:** no Neo4j credential is reachable from an Architect
+container (the same limitation `aw-knowledgeable-v2-retrieval.md` §2 and §10
+both record), so the `coalesce`-on-absent-property and `STARTS WITH` semantics
+above are from the Cypher contract, not from a live query. Both are cheap to
+check in the first five minutes of the card.
