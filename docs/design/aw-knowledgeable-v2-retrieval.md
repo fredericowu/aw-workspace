@@ -400,6 +400,140 @@ the next person needs, so that re-opening it is cheap rather than archaeology:
 
 Qwen3-0.6B-Q remains the runner-up on the terms above, unchanged.
 
+### Amendment 5 (2026-09-27) — `BAAI/bge-m3` supersedes mpnet; and Amendment 2a blamed the wrong cause
+
+Frederico asked for `BAAI/bge-m3` to be evaluated against the mpnet decision,
+with the same bar the 128-token defect was found at. Everything below was
+**measured in an Architect container this session**, not read off a catalogue or
+a model card. Harness kept at `.tmp/kn-bgem3/pt_longform.py`.
+
+**Decision: `BAAI/bge-m3`.** The decision above (mpnet) is superseded before it
+was ever applied — `embeddings.py:76` still reads
+`paraphrase-multilingual-MiniLM-L12-v2`, so **no code depends on mpnet** and this
+costs a one-line default change plus a new backend, not a migration.
+
+#### The correction that matters most: external-data ONNX is NOT broken here
+
+Amendment 2a records that `multilingual-e5-large` and `embeddinggemma-300m`
+"fail to load under this onnxruntime" with *"External data path escapes model
+directory"*, and Amendment 3 extrapolated from that to predict jina-v3 would
+fail the same way. **That diagnosis is wrong, and it is wrong in a way that was
+about to cost a model choice.**
+
+Measured on `onnxruntime 1.30.0`, loading bge-m3's `onnx/model.onnx` +
+`model.onnx_data` (2266.8 MB external data):
+
+- through a **HuggingFace cache tree** → `FAIL: External data path escapes model
+  directory`, resolving to `…/cache/blobs/8b3c6cec…`;
+- the **same files copied out as real files in one directory** → `LOADED OK in
+  1.3s`.
+
+The failure is ORT 1.30's external-data path validation refusing HF's
+`snapshot/…/onnx/model.onnx_data → ../../../blobs/<sha>` **symlink**, which by
+construction escapes the model directory. It is a *packaging* failure, not a
+model or runtime incompatibility. Consequences: external-data models are all
+reachable here if materialised as real files, so e5-large and jina-v3 were
+**never disqualified on runtime grounds** (jina-v3's `cc-by-nc-4.0` rejection
+stands on licence alone, which is the rejection that needed no benchmark);
+and **the Dockerfile bake step must materialise real files** — a bake that
+leaves an HF symlink tree produces an image that loads fine in the build's own
+probe and dies on first embed in production.
+
+#### Measured facts
+
+| | MiniLM-L12 (live) | mpnet (superseded) | **bge-m3 (chosen)** |
+|---|---|---|---|
+| licence | apache-2.0 | apache-2.0 | **mit** (HF `cardData`, live) |
+| in fastembed 0.8.1 | yes | yes | **no — any family** |
+| real output dim | 384 | 768 | **1024** (forward pass) |
+| real window | **128** (hard trunc.) | 512 | **no truncation config**; 4803 tok OK measured, `max_position_embeddings` 8194 |
+| weights | 0.22 GB | 1.0 GB | **2.27 GB** |
+| throughput @512 tok | n/a (truncates) | 843 tok/s | **562 tok/s** |
+
+`bge-m3` is absent from **every** fastembed 0.8.1 family — `TextEmbedding`
+(37 models; only `bge-*-en` and `bge-small-zh`), `SparseTextEmbedding`,
+`LateInteractionTextEmbedding`. So it cannot arrive the way MiniLM and mpnet do.
+
+#### The retrieval test §3 said could not be run
+
+§3 admitted the mpnet gain was *"a reasoned inference"* and named the missing
+test: a Portuguese set whose answers sit **beyond 128 tokens**. It was built and
+run. All 12 passages share a near-identical 228-token Portuguese preamble, so the
+discriminating fact lives **only** in the tail and a 128-token window must score
+at chance. Two independently-reworded 12-query sets, recall@1:
+
+| | set A | set B | combined |
+|---|---|---|---|
+| MiniLM (128 tok) | 1/12 | 1/12 | **2/24** — chance is 1/12 |
+| mpnet (512 tok) | 9/12 | 7/12 | 16/24 |
+| **bge-m3** | 12/12 | 9/12 | **21/24** |
+
+Read this honestly, because the two findings in it are not equally strong:
+
+1. **The 128-token defect is confirmed emphatically and reproducibly.** MiniLM
+   lands exactly on chance in both sets. The 10/12 tie that chose it could not
+   see this, because every passage in that set fit its window.
+2. **bge-m3 > mpnet is a genuine Portuguese *quality* win, not a window
+   artifact.** Every passage is ~270 tokens — well inside mpnet's 512 — so mpnet
+   saw everything and still missed. Its misses are synonym failures
+   (`descanso anual`→férias, `dormida`→alojamento, `estagiar`→estagiários),
+   exactly the PT lexical variation this corpus is for.
+3. **But the margin is modest and the corpus is synthetic.** +5/24 across 24
+   queries, consistent in direction across both sets, on an adversarial corpus
+   built to isolate the window. It is not a prediction of the delta on
+   Frederico's real documents.
+
+The large, unambiguous win is **getting off 128 tokens at all** — mpnet delivers
+that too. bge-m3 is chosen for the increment on top, bought now while it is free.
+
+#### Why now, and what it costs
+
+Now, because §8.1's cost is the argument: no production corpus has embeddings, so
+this is a default change. Later it is a full re-embed **plus** dropping and
+recreating the vector index **plus** rebuilding every V3 centroid.
+
+Costs accepted, all of them real:
+
+- **A hand-rolled ONNX backend**, ~40 lines, where fastembed was free. It needs
+  `tokenizers` + `onnxruntime` only — **no torch, no sentence-transformers**,
+  both already present as fastembed's own transitive deps (verified: neither
+  `torch` nor `transformers` is installed, and neither is needed). This is the
+  premise in the question that resolved *favourably*: there is no PyTorch import
+  in the answer. It is nonetheless idiomatically foreign — `aw-app-kb` and
+  `research-search` both run the fastembed path — so `core/embeddings.py` keeps
+  **both** backends, selected by model name, which is also the cheap revert.
+- **+1.27 GB image** over mpnet. Host was at 90% / 42 GB free this session —
+  **check before deploying** (memory `host-disk-near-full-breaks-apps-silently`).
+- **1024 dims = 2.67× the page-cache pressure** the §2 scan cap was sized for.
+  `core/graph.py:770`'s arithmetic still says "384 dims × 4 bytes ≈ 1.5 KB" and
+  must be rewritten to ~4 KB/vector; raising
+  `NEO4J_server_memory_pagecache_size` is already booked in §2.
+- **~1.5× slower embedding** than mpnet per token. Ingest is async, so this is
+  throughput, not a request-latency regression.
+
+#### What bge-m3 does NOT give us
+
+Its headline "multi-functionality" (dense + sparse + ColBERT multi-vector) **is
+not available on this path** — measured: the ONNX graph exposes only
+`token_embeddings` and `sentence_embedding`. The sparse and ColBERT heads ship as
+torch checkpoints (`sparse_linear.pt`, `colbert_linear.pt`), so reaching them
+means `FlagEmbedding` + PyTorch, which is the architectural cost this decision
+avoids. **We are adopting bge-m3 as a dense multilingual encoder only.** Nothing
+in §2–§5 assumes otherwise, and no hybrid-retrieval plan should be built on that
+capability without re-opening this.
+
+Its 8192-token window is architecturally real but **not practically usable on
+this CPU-only host**: attention is quadratic and measured cost runs 0.91 s @512,
+1.96 s @1024, 6.87 s @2048, 26.7 s @4803 tokens — a single 8k embed exceeded a
+120 s budget. Chunking stays bounded by §4's window, sized well below the model
+cap. The window's value here is **headroom that removes silent truncation as a
+failure mode**, not an invitation to embed whole documents.
+
+**Runner-up: mpnet, unchanged and reachable by configuration.** What would send
+us back: the bespoke backend proving fragile, or disk. Qwen3-0.6B-Q stays the
+runner-up for the *deferred bake-off*, which this does not close — the harness
+now exists, and the corpus to replace is still Frederico's real documents.
+
 ---
 
 ## 4. Chunking and ingestion: structure-aware, async, claimed atomically
