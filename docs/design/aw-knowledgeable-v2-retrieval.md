@@ -685,6 +685,46 @@ created. Same reason the two render differently in §6.
   is explicitly schedulable/triggerable per bucket, and a new document is
   searchable by flat vector search the moment it is `ready`, tree or no tree.
 
+### Amendment 1 (V3, 2026-09-27) — "shares a leaf topic" is not a usable edge rule
+
+Written from the implementation of this section (`backend/app/topics/`), against
+a real 1 232-chunk corpus of 9 workspace documents. Two things in the BUILD half
+above are wrong as specified, and both were found by running it rather than by
+reading it.
+
+**1. `RELATED_TO {via: "topic"}` needs a weighted score and a threshold.** The
+rule as written — related if they *share a leaf topic* — produced a **complete
+graph**: all 36 possible pairs of 9 documents, every one of them "related",
+because a long document has chunks under most leaves. That is the dust cloud
+this whole section exists to replace, with edges drawn on it.
+
+The implemented rule keeps the shape and weights it: the score is the cosine
+between the two documents' per-leaf **chunk-count distributions**, thresholded
+(`TOPIC_RELATED_MIN_TOPIC_SCORE`, default 0.5). 36 edges → 4, and the four are
+the pairs a reader names unprompted. Two set-based scores were measured first and
+are recorded in `topics/related.py` as worse, with the reason each fails:
+`shared / min(topics)` lets a one-topic README score 1.0 against everything, and
+Jaccard over topic sets still ranks `buckets ↔ pipeline-testing` above
+`cicd ↔ pipeline-testing` because membership is binary.
+
+`via: "embedding"` needed no amendment and is the precise arm of the two.
+
+**2. c-TF-IDF alone does not produce a usable label.** §5 says labels fall back
+to "c-TF-IDF keywords over the cluster's chunks", and that alone labelled the
+top-level topics `one, api, app` and `bucket, one, every` — the idf penalty is
+outweighed by a high in-cluster frequency for a term that is everywhere. The
+implementation adds a ceiling on how many sibling topics a term may appear in
+(`MAX_CLUSTER_SHARE`, 0.6) before it is disqualified from a label; the same
+topics then read `aw-remote-host, socket, github`. A label's only job is to tell
+a topic apart from its siblings, so a term in most of them is disqualified
+however it scores.
+
+**Not amended, and confirmed by the same run:** the centroid as cluster mean,
+`k` from `round(sqrt(n/2))` with a ceiling, the 3-level cap, per-bucket scope,
+and the LINKS_TO guarantee in §9.5 — which the implementation makes structural
+(one delete template per relationship type, no `DETACH DELETE`, plain `DELETE`
+on `(:Topic)` so an unowned edge fails the rebuild instead of being detached).
+
 ---
 
 ## 6. Where the frontend lands
