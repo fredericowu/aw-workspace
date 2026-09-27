@@ -148,6 +148,18 @@ bucket at a time.** Multi-bucket membership is an edge (§3), not a second node.
 
 ## 2. Denial semantics: declared scope, not silent absence — and 403, not 404
 
+> **SUPERSEDED 2026-09-27 — see `aw-knowledgeable-v2-retrieval.md` §7bis.**
+> This section rests on the premise stated in §0 and §5.4 that a tenant is
+> effectively one person, so "the caller owns the id". Frederico answered the
+> product question this section itself flagged under *"What would change this
+> decision"*: **a tenant is multi-person, with per-bucket scopes carried on the
+> token.** That makes the bucket a permission boundary, so the denial shaping
+> below inverts to 404 and `GET /api/buckets` stops listing out-of-scope names.
+> Mechanisms 1 and 2 (server-injected unforgeable scope; machine-readable scope
+> envelope) survive unchanged, and §5.4's refusal to put a `user` property on a
+> node is *vindicated*, not reversed. Read §7bis before implementing anything in
+> this section.
+
 ### Decision
 
 **Out-of-scope buckets are *visible as names*, their *contents* are not, and

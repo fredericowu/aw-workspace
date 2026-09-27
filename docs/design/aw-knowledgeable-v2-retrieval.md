@@ -289,6 +289,91 @@ is ~470 MB against nomic's ~520 MB, on a host that was at 95% disk
 - **`multilingual-e5-large` / `bge-m3`.** Better multilingual quality, ~2 GB
   of image. Not on this host.
 
+### Amendment 3 (2026-09-27) — `jina-embeddings-v3` is rejected; the 128-token window is the real defect
+
+Frederico asked why not `jinaai/jina-embeddings-v3`. Two answers, and the second
+matters more than the question.
+
+**jina-v3 is rejected, on licence, before quality is even weighed.** Verified
+against Hugging Face's own metadata this session: `jinaai/jina-embeddings-v3` is
+**`cc-by-nc-4.0` — non-commercial**. aw-knowledgeable is a multi-tenant product
+with tenants, plans and billing behind aw-console; a non-commercial model in the
+retrieval hot path is a licence violation baked into every stored vector, and
+§8.1 already says the vectors are a full rebuild to change. It is the one
+rejection here that needs no benchmark. On the merits it was otherwise the
+strongest candidate on paper — 8192-token sequence length, ~100 languages,
+1024 dims.
+
+Secondary, and independently disqualifying: fastembed ships it as
+`onnx/model.onnx` **plus `onnx/model.onnx_data`** — external-data layout. That is
+the same layout as `intfloat/multilingual-e5-large`, which the V1 coder measured
+as failing to load in this runtime with *"External data path escapes model
+directory"* (`backend/app/core/embeddings.py`, Amendment 2a). jina-v3 would
+very likely fail identically. So it is not merely licence-blocked; it probably
+does not run here.
+
+**The real finding is in the model V1 actually shipped with.** §3's
+`intfloat/multilingual-e5-small` **is not in fastembed's catalogue at all**, so
+the V1 coder correctly escalated per this section's own instruction ("pick the
+nearest multilingual one that is and say which") and chose
+`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`. That model's real
+input window is **128 tokens** — verified independently this session by loading
+it and reading the tokenizer, and worth stating loudly because **fastembed's own
+catalogue metadata advertises 512 for it and is wrong.** A design that trusted
+`list_supported_models()` would never have seen this.
+
+128 tokens is ~90–110 words of Portuguese. It forced the chunker off §4's
+~1000-char target — `backend/app/core/chunking.py:8-12` records the concession —
+and it is a defect the coder's own 12-query head-to-head **could not detect**,
+because every passage in that set was short enough to fit. The visible symptom is
+already in V1's live E2E: retrieved `chunk#1` of the test PDF opens mid-sentence
+on *"frequencia e a forca da contraccao"*.
+
+Three compounding costs, none of which the tie score shows:
+
+1. Chunks ~3× smaller than designed means ~3× as many, each carrying less
+   context — the standard recipe for retrieving a fragment that scores well and
+   answers nothing.
+2. **V3's topic tree clusters chunk embeddings and averages them into
+   centroids** (`§5`). Thinner chunks make noisier centroids, and the centroid is
+   the field V4 beam-searches. The defect propagates into the tree.
+3. Per §8.1 this is a full rebuild to change later, and it is near-free now.
+
+**Decision: `sentence-transformers/paraphrase-multilingual-mpnet-base-v2`.**
+512-token window (verified by loading it, not read from the catalogue), 768 dims,
+apache-2.0, already downloaded and already measured by the V1 coder at the same
+10/12 as MiniLM on short passages. It is the same family, it is the one the coder
+proved loads in this runtime, and it is a one-line change to `DEFAULT_MODEL`
+because `embeddings.py` reads the dimension and the window *from the model* and
+`chunking.py` derives its budget from `max_tokens()`. Amendment 2b (no
+`query:`/`passage:` prefixes) stands — mpnet is symmetric too.
+
+Be honest about what is and is not measured: the **window is a verified fact**,
+the **retrieval gain from it is a reasoned inference.** The test that would
+confirm or refute it is a PT query set whose answers span more than 128 tokens of
+context — which is precisely the set the existing benchmark lacks.
+
+Costs accepted: the image grows ~780 MB beyond §9.4's estimate (0.22 → 1.0 GB;
+48 GB free at 89% — check before deploying), and 768 dims doubles the
+page-cache pressure §2's cap is bounded by. §2 already books raising
+`NEO4J_server_memory_pagecache_size` as part of this wave, so that is the same
+change, not a new one.
+
+**Runner-up, and the one thing that would change this: `Qwen/Qwen3-Embedding-0.6B-Q`.**
+apache-2.0, 1024 dims, int8, 1.12 GB, **32k-token window**, 2025, and it needs
+`onnxruntime>=1.23` — this host has **1.30.0**, so it is reachable. It is the
+only candidate that would plausibly beat mpnet on Portuguese quality rather than
+just on window. It is not the decision because it is unverified here (untested
+load, and it needs an `Instruct:` query prefix, which un-does Amendment 2b), and
+because mpnet removes the actual defect at zero new risk.
+
+**Given that this choice is a full rebuild to reverse, one measured bake-off
+across MiniLM-L12 / mpnet / Qwen3-0.6B-Q on real long-form Portuguese documents
+is worth one card — and it is worth it before the first real corpus is ingested,
+not after.** That is a scoping call for the Product Owner. Until it runs, mpnet
+is the decision and the re-embed cost is ~zero, because no production corpus has
+embeddings yet.
+
 ---
 
 ## 4. Chunking and ingestion: structure-aware, async, claimed atomically
@@ -501,6 +586,182 @@ constraint that makes the answer cheap is structural: **every route raises
 through one `_bucket_denied()` helper in one module.** Flipping to 404 is one
 function body plus one column of K1's table. No route learns the convention
 individually.
+
+---
+
+## 7bis. The answer arrived: a tenant is multi-person. Scopes live on the token
+
+Frederico answered on 2026-09-27, verbatim:
+
+> "1 tenant tem vários usuários com diferentes roles, igual no ap-mt,
+> entretanto, os buckets são por tenant, nao por usuario, existe isolamento por
+> bucket (poder ver tudo, ver somente um, ler/escrever) esses serão escopos do
+> token de API -> um api key pode ter esse tipo de organizacao, um usuário tb
+> pode ter esse tipo de organizacao, o aw-console/aw-backend é quem faz a gestao
+> da identidade."
+
+That is the "yes" branch §7 above and `aw-knowledgeable-buckets.md:213-220`
+both named. **The bucket is now a permission boundary.** The paragraph above is
+superseded; the sentence that saves it is the structural one — the flip really
+is one helper body plus one column, and this section is that flip.
+
+### Decision 1 — three outcomes, not a blanket flip to 404
+
+| Token's scope for bucket B | Request | Answer |
+|---|---|---|
+| none | read or write | **404** — existence hidden |
+| `read` (`view-all` or `view-one` covering B) | read | **200** |
+| `read` only | write | **403** — existence already legitimately known |
+| `write` | read or write | **200** |
+
+**Flipping everything to 404 would be the over-correction**, and it is the
+mistake I expect to be made here because "bucket is a security boundary now"
+reads as "apply K1's rule". It is wrong for the read-only case: a caller who
+legitimately holds `read` on B already knows B exists, so a 404 on their write
+protects nothing and destroys the one next action they have — ask a tenant admin
+for `write`. 404 is for *"this token has no business knowing B exists"*; 403 is
+for *"you know it exists, you may not do that to it"*.
+
+So K1's route plan gains **two** classes, replacing the single
+`"403-cross-bucket"` that `aw-knowledgeable-buckets.md:204-210` specified:
+
+- `"404-no-bucket-scope"`
+- `"403-bucket-read-only"`
+
+An unclassified route stays a failure, never a skip
+(`aw-knowledgeable-infra.md:243-246`).
+
+### Decision 2 — `GET /api/buckets` returns only what the token can see
+
+`aw-knowledgeable-buckets.md:179-182`'s `in_scope: bool` field **is deleted.**
+It was safe only under the premise that the caller owns the whole tenant; with
+per-token scopes those rows leak the names of buckets the token has no business
+knowing. `view-all` returns every bucket in the tenant; `view-one` returns
+exactly one. The `document_count`/`node_count` counts stay — but only on rows
+the token can already see.
+
+What survives from buckets.md §2 untouched: **mechanism 1** (scope is
+server-injected and absent from the tool's public schema — that is what makes it
+a boundary rather than a convention) and **mechanism 2** (the scope goes in a
+machine-readable envelope field, not a human string). Those were never about who
+owns the tenant.
+
+And **buckets.md §5.4 is vindicated, not reversed.** It refused a `user`
+property on a node, on the grounds that if per-user visibility ever arrived the
+scope must be "resolved per request from the caller's context and mapped to a
+bucket set". That is exactly what arrived. Do not grow a node-level ACL.
+
+### Decision 3 — where the scope comes from: identity is central, authorization is local
+
+**aw-backend/aw-console own identity. aw-knowledgeable owns bucket
+authorization. These are different questions and they must not be merged into
+one claim.**
+
+- **Central (aw-backend):** who the subject is, which **tenant** they belong to,
+  and their **tenant-level role**. This is an *extension of what M4 already
+  shipped*, and it is already the plan of record over there — not a new idea.
+  `aw-backend/src/api/db_models.py:1097-1111` defines `TenantMember` as "**many
+  per tenant**, which is the whole point of the table existing", with a
+  tenant-level `role`; and `db_models.py:1084-1085` states plainly: *"Nothing
+  reads this table yet: T1 is schema + backfill only. Minting the `tenant` JWT
+  claim from it is T2."* Today `create_identity_jwt`
+  (`aw-backend/src/api/identity_auth.py:138-143`) mints exactly
+  `sub`/`memberships`/`iat`/`exp` — no tenant, no scopes. **T2 is the blocking
+  prerequisite, and it is M4-shaped: same JWKS, same EdDSA, no new shared
+  secret.**
+- **Local (aw-knowledgeable):** which buckets, and read vs write.
+
+**Why bucket scopes must NOT go in the central JWT**, even though that looks
+like the tidy answer: a bucket is aw-knowledgeable's own resource and aw-backend
+does not know its slugs exist. Putting per-bucket grants in the central token
+would make aw-backend carry a per-app resource ACL, and creating a bucket would
+become a change to the identity service. That is the wrong coupling, and it is
+what "não invente um sistema de permissão paralelo aqui" actually protects
+against read correctly: **do not reinvent identity; authorization over your own
+resources is yours.** The same split is already how this estate works — the MCP
+gateway injects `kb_index` scope per profile without aw-backend knowing any KB
+path exists (buckets.md §2 mechanism 1).
+
+### Where it lands
+
+`backend/app/core/identity.py:250` — `resolve_tenant_id()`, already documented
+in that file as "the single swap point" — gains a sibling in the same module:
+
+- `resolve_bucket_scopes(identity) -> BucketScopeSet`, and
+- `_bucket_denied(bucket, scopes, *, write: bool)` raising 404 or 403 per
+  Decision 1's table.
+
+Both in one module, one helper, one table. That is the entire enforcement
+surface, which is the property §7 above bought and this section spends.
+
+### The live bug this exposes — `one account, one tenant` is already baked in
+
+**This is the part that is not a future problem.**
+`backend/app/core/identity.py:217-247` (`_get_or_mint_tenant`) keys its SQLite
+projection on `account_ref TEXT PRIMARY KEY`, with `account_ref =
+str(identity.user_id)` (`identity.py:268`). So **two users of the same company
+get two different minted tenant ids, and therefore two disjoint graphs.** A
+multi-person tenant is not representable today — not as a missing feature, as a
+primary key.
+
+That is not an accident: `identity.py:16-21` says it deliberately copied AP-MT's
+shape, and the T1 card that created `tenant_members` says of exactly that shape
+*"um tenant com vários users não é representável lá… é o índice único, não
+convenção, e o T2 remove aquilo"*. **aw-knowledgeable copied the defect T2
+exists to remove.** Memory `ap-mt-one-account-one-tenant` records the same
+property one repo over.
+
+Consequence for sequencing, and it is the good news: the fix is the swap the
+file was designed for. When T2 mints the claim, `resolve_tenant_id` reads it
+instead of minting locally — one function body, in the one file, as
+`identity.py:18-21` promised.
+
+### Does this block V2? No — but it changes three things in its card
+
+**V2 (`feature:aw-knowledgeable-v2-buckets-api`) is not blocked, provided it is
+built against a scope-set seam instead of against the "caller owns the tenant"
+premise.** Until T2 lands, `resolve_bucket_scopes()` returns *"every bucket in
+this tenant, read+write"* for a human caller and the service tenant's buckets
+for the D2 service caller. Same routes, same helper, same tests; when T2 lands,
+the resolver's body changes and no route does.
+
+What would genuinely block V2 is shipping it with buckets.md §2 as written —
+`in_scope: false` rows, 403-with-name as the default, and no scope-set
+indirection. Then every route learns the wrong premise and the multi-user work
+becomes a rewrite of all of them, which is buckets.md §1's own K5 argument
+arriving from the other direction.
+
+So, three edits to the V2 card, all cheap and all now:
+
+1. `GET /api/buckets` filters by the token's scope set; **no `in_scope` field.**
+2. Denial goes through `_bucket_denied()` with Decision 1's table — default
+   **404**, `403` reserved for read-only-on-write.
+3. K1's plan gains `"404-no-bucket-scope"` and `"403-bucket-read-only"` instead
+   of `"403-cross-bucket"`.
+
+### What this makes harder later
+
+1. **Who grants a scope is now an unanswered product question**, and it is on
+   the critical path for the multi-user card in a way it was not before: a
+   tenant admin needs a surface to say "user 2 gets `view-one` on
+   `cardiologia`". That surface does not exist in aw-console (it manages
+   workspaces, not tenants) and does not exist here. Naming it is the PO's.
+2. **An API key with bucket scopes is a second credential shape**, and
+   `require_identity_or_service` (`identity.py:195-208`) has only two branches
+   today — human JWT, or the D2 `X-Internal-Secret` service caller with *no*
+   memberships by design. A scoped API key is a third, and the service branch
+   must not become the place it is smuggled in: `ServiceIdentity`
+   (`identity.py:142-152`) deliberately carries no memberships precisely so an
+   empty list can never be read as "all". A scoped key that resolves to an empty
+   scope set must mean **nothing**, never everything.
+3. **404-by-default makes a misconfigured scope indistinguishable from an empty
+   graph** — §8.3's warning, now worse. The `(:Bucket)` registry-existence check
+   from §1 is what separates "your token cannot see it" from "you typed it
+   wrong", and it stops being a nicety.
+4. **The 403/404 split is a two-line rule that will be flattened.** buckets.md
+   §5.3 predicted someone would "fix" 403 into 404; the same reflex now argues
+   for making *everything* 404. The two K1 classes are the mitigation and they
+   are not optional.
 
 ---
 
