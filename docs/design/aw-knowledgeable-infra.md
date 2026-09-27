@@ -465,17 +465,82 @@ not the pre-flight.
 
 ### TLS
 
-The five existing `custom_domains` all declare `"tls": "route53"` (DNS-01).
-**Memory `caddy-route53-credential-is-dead` says that credential may no
-longer work.** Verify a DNS-01 challenge can still be answered *before*
-assuming the new host will get a cert; otherwise use the on-demand-TLS path
-the per-workspace blocks now use (`on_demand_tls { ask … }`,
-`aw-backend/src/libs/caddy_template.py:758-759`). A new site whose cert never
-issues looks like a routing bug and is not one.
+The existing `custom_domains` entries all declare `"tls": "route53"` (DNS-01).
+Memory `caddy-route53-credential-is-dead` documented that credential failing
+with `InvalidClientTokenId` on 2026-09-05 — but that memory's own RESOLVED
+addendum (verified 2026-09-26) already found the credential working again.
+**Confirmed a second time live on 2026-09-27, end to end, for a brand-new
+hostname**, not just re-checked cert expiries on existing ones: adding
+`knowledgeable.aw.tekflox.com` with `"tls": "route53"` and reloading produced
+a real Let's Encrypt certificate (`issuer=Let's Encrypt CN=YE2`,
+`notBefore=Sep 27 2026`, `notAfter=Dec 26 2026`), matching the pattern of the
+7 pre-existing entries. **Route53 DNS-01 is the healthy, working path — do
+not reach for on-demand TLS as a fallback.** The inversion to remember: it is
+on-demand TLS that is unstable today (`docker logs aw-caddy` shows a retry
+storm of `tls.on_demand … context canceled` on per-workspace
+`*.workspace.aw.tekflox.com` names), not DNS-01. Use `"tls": "route53"` for
+any new `custom_domains` entry unless a specific reason rules it out.
+
+One transient artifact worth knowing about, not a fresh problem: CertMagic's
+first DNS-01 attempt against the *production* ACME endpoint can fail with
+"No TXT record found" if the TXT hasn't finished propagating (which is why
+existing entries set `wait_for_route53_sync true`), and CertMagic reacts by
+issuing a throwaway cert from the **staging** CA to keep the site TLS-live
+while it retries — a log line mentioning `acme-staging-v02` during a renewal
+is this self-healing behavior, not a sign DNS-01 is broken, as long as the
+cert actually being served (check with `openssl s_client … | openssl x509
+-noout -issuer`) is production Let's Encrypt shortly after.
 
 Upstream: `proxy_host: aw-knowledgeable`, its own port. aw-caddy is on
 `aw-stack-net`, `agentic-workspace_default` and `aw-workspaces-net` — the new
-container on `aw-stack-net` is reachable by name, no fourth network needed.
+container on `aw-stack-net` is reachable by name, no fourth network needed
+(confirmed live: `docker exec aw-caddy wget -qO- http://aw-knowledgeable:8090/api/health`
+→ `{"status":"ok"}`).
+
+### Verified live 2026-09-27 — M5 delivery
+
+Ground truth at the moment `knowledgeable.aw.tekflox.com` went live, measured
+on the bare-metal host, superseding the "hazard" framing above where it
+disagrees:
+
+- **The 2026-09-05 data divergence is fully converged, re-confirmed with a
+  fresh byte-for-byte diff** (not inherited from the 2026-09-26 note): the
+  `workspace` row's `custom_domains` (7 entries) rendered byte-identical
+  (md5 `f57ef75ec344a902f9ae4d5feac5dffe`, 34083 bytes both sides) to the live
+  on-disk Caddyfile, immediately before this change. The mandatory pre-flight
+  is not a formality here — it is what made it safe to proceed.
+- **The dry-run-then-real-write pattern worked as designed.** Rendering the
+  proposed config in-memory (monkeypatching `get_config()` inside a throwaway
+  `docker exec` Python process, no DB write) showed the diff was exactly the
+  new `knowledgeable.aw.tekflox.com` block — 32 added lines, zero removed —
+  before anything was persisted. Only after that dry-run confirmed a
+  purely-additive diff was `save_config()` called for real.
+- **The reload path is `save_config()` (writes the Postgres `workspace` row,
+  drops the in-process cache) then `regenerate_and_reload()` from
+  `aw-backend/src/libs/caddy_template.py`**, called directly inside the
+  `aw-backend` container rather than through the HTTP routes — `PUT
+  /api/settings/aw` and `POST /api/aw-config/reload` are the same two calls
+  wrapped in FastAPI handlers behind `AuthMiddleware`, so calling the
+  underlying functions in-process has an identical effect without needing to
+  extract a production API key into an agent session. **This milestone's
+  reload is manual** — nothing schedules or triggers it automatically; the
+  `docker exec` above ran once, deliberately, by a human-supervised agent.
+  Automating that trigger is out of scope here (target
+  `caddy-ownership-consolidation`).
+- **Result:** `custom_domains` now holds 8 entries. `curl -sf -o /dev/null -w
+  '%{http_code}' https://knowledgeable.aw.tekflox.com/api/health` → `200`,
+  backed by a real (non-staging) Let's Encrypt cert. All 7 pre-existing
+  hostnames re-checked immediately after (`api.aw` via `/api/health` since
+  the bare API root correctly 404s, `console.aw`, `agents-platform.aw`,
+  `headscale.aw`, `derp.aw`, `api.tekflox.com`, `www.tekflox.com`) still
+  served 200 with no interruption.
+- **DNS is a non-issue for this hostname, confirmed as a wildcard, not an
+  explicit record**: `dig +short` against `knowledgeable.aw.tekflox.com`,
+  the bare apex, and an arbitrary nonexistent subdomain
+  (`zzz-nonexistent-check-*.aw.tekflox.com`) all resolved to the same
+  `65.109.66.88` — a `*.aw.tekflox.com` (likely with-apex) wildcard already
+  covers any hostname under the zone, which is why this milestone never
+  needed a DNS step.
 
 ### Rejected
 
