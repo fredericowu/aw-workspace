@@ -178,12 +178,21 @@ this section, and **do not invent a third mechanism.**
   in-tree precedent is `_SCOPED_OVERFETCH = 80` in
   `aw-app-kb/kb_app/mcp_http.py`, which exists for the same reason.
 - The scan cap is a **page-cache** constraint, not a CPU one.
-  `NEO4J_server_memory_pagecache_size` is `256m`
-  (`repos/aw-stack/docker-compose.yml:123`), set before the graph held
-  anything. At 384 dims × 4 bytes ≈ 1.5 KB per embedding, ~50 k chunks of
-  embeddings already exceed that cache. Over the cap: return what was scanned,
-  log that the result is partial — never silently truncate, and never OOM the
-  shared store.
+  `NEO4J_server_memory_pagecache_size` is `1g`
+  (`repos/aw-stack/docker-compose.yml:151`, raised from the `256m` this doc
+  previously cited — commit `e1b9c6a`, "raise page cache 256m -> 1g for
+  aw-knowledgeable's vector wave"). Neo4j stores float array components as
+  **doubles (8 bytes each)**, not 4-byte floats: a V-wave coder measured this
+  directly against the live store — 20,000 chunks written through the app's
+  own seam (384-dim embedding + ~380 chars of text + heading_path) grew
+  `/data/databases/neo4j` by 77.5 MB, i.e. **3.9 KB per chunk, measured, not
+  derived**. At that rate embeddings alone exceed the current 1 GiB cache
+  past roughly **~269 k chunks** — not the ~50 k this bullet previously
+  claimed, which was false under either figure (50 k × 1.5 KB = 75 MB, or
+  50 k × 3.9 KB = 195 MB — neither exceeds even the old 268 MB/256m cache,
+  let alone the current 1 GiB one). Over the cap: return what was scanned,
+  log that the result is partial — never silently truncate, and never OOM
+  the shared store.
 - **Raising the page cache is part of this wave**, not a later optimisation:
   this is the change that makes Neo4j's memory config matter for the first
   time. It is an `aw-stack` edit and therefore an `aw-stack` deploy (infra doc
