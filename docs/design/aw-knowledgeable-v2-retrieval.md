@@ -719,6 +719,30 @@ topics then read `aw-remote-host, socket, github`. A label's only job is to tell
 a topic apart from its siblings, so a term in most of them is disqualified
 however it scores.
 
+### Amendment 2 (V3, 2026-09-27) — a threshold cannot bound edge density; fan-out can
+
+Found after Amendment 1 had already landed, by running the pass on the **live**
+`architecture-pilot` bucket: 32 generated architecture docs that share a
+template, so every pair genuinely is similar. The thresholds calibrated on the
+varied corpus above produced **707 edges against 496 possible pairs per `via`** —
+436 `embedding` (88% of every pair in the bucket) and 271 `topic` (55%). The same
+defaults on `docs-pilot`, 10 hand-written documents, produced **7**.
+
+The thresholds are not wrong, and re-tuning them is not the fix: one global
+similarity floor cannot serve both a hand-written corpus and a generated one, and
+the generated near-duplicate corpus is the kind this estate keeps producing.
+
+So the derived graph gains the bound that holds whatever the corpus looks like:
+**each document keeps at most `TOPIC_RELATED_MAX_PER_DOC` (8) derived neighbours
+per `via`**, applied as a mutual top-N in descending score order — a pair
+survives only while *both* endpoints still have room, so what is kept is always
+the strongest ties rather than whichever pair was enumerated first. The invariant
+that buys is the one the graph view needs and a threshold can never promise: no
+document ever renders more than N derived neighbours of one kind.
+
+Drops are counted in the build response and the split between the two bounds is
+logged, per §5's own standing rule against a silent downgrade.
+
 **Not amended, and confirmed by the same run:** the centroid as cluster mean,
 `k` from `round(sqrt(n/2))` with a ceiling, the 3-level cap, per-bucket scope,
 and the LINKS_TO guarantee in §9.5 — which the implementation makes structural
