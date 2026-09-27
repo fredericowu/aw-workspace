@@ -367,12 +367,38 @@ just on window. It is not the decision because it is unverified here (untested
 load, and it needs an `Instruct:` query prefix, which un-does Amendment 2b), and
 because mpnet removes the actual defect at zero new risk.
 
-**Given that this choice is a full rebuild to reverse, one measured bake-off
-across MiniLM-L12 / mpnet / Qwen3-0.6B-Q on real long-form Portuguese documents
-is worth one card — and it is worth it before the first real corpus is ingested,
-not after.** That is a scoping call for the Product Owner. Until it runs, mpnet
-is the decision and the re-embed cost is ~zero, because no production corpus has
-embeddings yet.
+### The three-model bake-off: deliberately deferred, no card (2026-09-27)
+
+This section previously argued that a measured bake-off across MiniLM-L12 /
+mpnet / Qwen3-0.6B-Q on real long-form Portuguese documents was worth one card
+**before** the first real corpus is ingested, because §8.1 makes the choice a
+full rebuild to reverse. That was put to Frederico as a scoping call. **His
+answer: no card now — proceed on mpnet.**
+
+The reasoning is his and it is recorded here rather than argued with: mpnet is
+*verified* (512-token window read off the tokenizer, apache-2.0, loads on this
+host), and the point of the wave is to get something running rather than to
+optimise an input to a pipeline that does not exist yet.
+
+**This is registered as a fast-follow, not as closed.** The trigger is explicit:
+*if Portuguese retrieval quality proves insufficient in real use.* Two things
+the next person needs, so that re-opening it is cheap rather than archaeology:
+
+- **The test that would settle it** is the one the V1 coder's benchmark
+  structurally could not run: a Portuguese query set whose answers sit **beyond
+  128 tokens into a passage**. Every passage in the 12-query tie (10/12 both
+  models) fit inside MiniLM's real window, which is exactly why the tie could
+  not see the defect. Reuse that harness; replace the corpus.
+- **The cost of deferring is not zero and it grows.** Re-embedding today is ~free
+  because no production corpus has embeddings. Once a tenant's real documents are
+  ingested, the same change is a full re-embed of every chunk **plus** dropping
+  and recreating the vector index (its dimension is fixed at creation —
+  `core/graph.py:206-213` hard-raises on mismatch rather than mixing
+  incomparable vectors) **plus** a rebuild of every `(:Topic)` centroid, since
+  V3's centroids are means of chunk embeddings and are not comparable across
+  models. That third cost did not exist when the question was first asked.
+
+Qwen3-0.6B-Q remains the runner-up on the terms above, unchanged.
 
 ---
 
@@ -738,6 +764,52 @@ So, three edits to the V2 card, all cheap and all now:
    **404**, `403` reserved for read-only-on-write.
 3. K1's plan gains `"404-no-bucket-scope"` and `"403-bucket-read-only"` instead
    of `"403-cross-bucket"`.
+
+### Sequencing V2 against a T2 that is not ready (2026-09-27)
+
+T2 is now a card (`3e85bf3b-9510-81f5-bcef-cc3805cab785`, target
+`aw-backend-t2-tenant-claim`) and in flight, but V2 must not wait on it and must
+not be scoped down to dodge it. The split is **not** "build the API, skip the
+permissions" — that is the version that teaches every route the wrong premise.
+It is a split along *where the scope set comes from*:
+
+**V2 builds, without T2 — everything except the source of the scope set:**
+
+- the `(:Bucket)` registry, `bucket_ctx`, `GET`/`POST /api/buckets`, the scope
+  envelope, and real bucket filtering on every template;
+- `BucketScopeSet` as a real type, and `_bucket_denied()` implementing
+  **Decision 1's table in full** — all three outcomes, 404 and 403 both;
+- `resolve_bucket_scopes(identity) -> BucketScopeSet` with its T2-less body:
+  every bucket in the tenant, read+write, for a human caller; the service
+  tenant's buckets for the D2 service caller.
+
+**V2 does not build, and this is the only piece that waits for T2:** the body of
+`resolve_bucket_scopes` that *reads scopes off the token*. That is one function
+body — which is the whole point of §7's helper-shaped design.
+
+**The trap this creates, and the thing that defuses it.** With a permissive
+T2-less resolver, the 404/403 table is dead code in production: nothing ever
+denies, so nothing ever proves the table is right, and the two K1 classes have
+no route that can exercise them. Shipping it that way means the enforcement is
+first exercised on the day T2 lands, which is the worst possible day to discover
+it is wrong.
+
+**So `_bucket_denied()` must be proven against an injected `BucketScopeSet`, not
+against a token.** V2's tests construct the scope set directly — a set with
+`read` on `a` only, one with `write`, one empty — and assert all three outcomes
+of Decision 1 plus both K1 classes. When T2 lands, the *only* new thing under
+test is the token→scope-set mapping; the table is already covered. Concretely:
+`resolve_bucket_scopes` takes the identity and returns the set, and the routes
+depend on the set, so a test overrides the dependency rather than minting a JWT.
+If the enforcement can only be tested through a real token, the seam is in the
+wrong place and V2 should be pushed back, not the tests weakened.
+
+**What V2 may not claim.** Its live verification (two buckets, a document in
+each) proves *filtering*, not *authorization* — a caller that holds everything
+cannot demonstrate a denial. V2's report must say that in those words. The
+end-to-end "token with `view-one` gets 404 on the other bucket" proof belongs to
+the T2 follow-up card and nowhere else; a V2 that reports it as done is reporting
+something it structurally could not have observed.
 
 ### What this makes harder later
 
