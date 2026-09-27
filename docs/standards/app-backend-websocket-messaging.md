@@ -1,7 +1,11 @@
 # Standard — app↔backend WebSocket messaging
 
-**Status:** design, written 2026-09-09. Sections 1–3 **document what already
-exists**; sections 4–8 **design what does not**. No code changes in this card.
+**Status:** design, written 2026-09-09; **amended 2026-09-27** (§2.6, §5 tunnel
+rows, §7.3/§7.7/§7.1, §9.1 status, §10.4b, §12) to cover the tunnel-bridged
+transport and the reconnect behaviour, from
+`bug:presentations-ws-fast-reconnect-loop`
+(`3e85bf3b-9510-8176-a689-c0cd08496924`). Sections 1–3 **document what already
+exists**; sections 4–8 **design what does not**.
 **Card:** `Architecture: app↔backend WebSocket messaging framework` —
 `3d65bf3b-9510-819b-af72-c38538fadce0`, target
 `aw-app-backend-ws-messaging-framework`.
@@ -257,6 +261,77 @@ binary), sets `max_size=None`, and closes `1011` if the upstream dial fails. A
 Tier-2 app therefore speaks the same protocol as a Tier-1 app; the proxy adds
 nothing and constrains nothing.
 
+### 2.6 Tunnel-bridged transport — BYOD / `remote-host` placement
+
+*Added 2026-09-27, from `bug:presentations-ws-fast-reconnect-loop`
+(`3e85bf3b-9510-8176-a689-c0cd08496924`). §2.1–§2.5 describe the socket when
+aw-backend is not in the data path. For a `remote-host`-placed workspace it
+always is, and that hop has its own contract — which until now was written
+nowhere, and was wrong.*
+
+For `docker` placement, Caddy proxies the workspace container directly. For
+`remote-host` placement there is no network route to the user's machine, so
+**every** browser WebSocket to `api.<slug>.workspace.<domain>` is relayed:
+
+```
+browser → Caddy → aw-backend → /link WS → aw-remote-host (Go) → 127.0.0.1:<port>
+```
+
+Two aw-backend implementations of that relay exist, and a change to one is
+almost never correct without the same change to the other:
+
+| Path | Where | When it runs |
+|---|---|---|
+| in-process | `WorkspaceTunnelProxyMiddleware._bridge_ws`, `repos/aw-backend/src/api/routes/workspace_tunnel_proxy.py:669` | the request landed on the worker that owns this host's `/link` |
+| cross-worker relay | `HostLinkRelay._owner_ws` / `relay_ws`, `repos/aw-backend/src/api/routes/host_link_relay.py:1218`, `:1503` | every other worker — **the majority path at the deployed `AW_BACKEND_WORKERS=10`** |
+
+#### 2.6.1 Rule — do not accept the browser before the far end is dialled
+
+`host_link.ws_open_tunnel()` (`host_link.py:812`) only *sends* the `ws_open`
+frame; it returns before the remote host has dialled anything. Accepting the
+browser's upgrade on the strength of that send is a lie: the browser is told
+`101 Switching Protocols` for a socket that does not exist yet.
+
+**The bridge must not send `websocket.accept` until the host has confirmed its
+local dial succeeded** — a real `ws_open_ok` frame, mirroring the `tcp_open_ok`
+the TCP channel has had since it was built (`host_link.py:4613`). This is the
+one place the tunnel differs from §2.3's accept-then-close rule: there the
+accept is deliberate, because the peer is known to exist and only the identity
+failed. Here the peer's existence is the open question.
+
+#### 2.6.2 Rule — an old host agent must keep working
+
+`aw-remote-host` is a binary **on the user's own machine**, updated on the
+user's schedule, not ours. aw-backend deploys centrally and instantly. A
+control plane that waits for a frame an older agent never sends converts a
+degraded socket into **no sockets at all** for every BYOD workspace that has
+not upgraded — strictly worse than the bug being fixed.
+
+So the confirmation is **capability-gated, not assumed**: the host advertises
+what it speaks in its `register` frame (`repos/aw-remote-host/internal/link/link.go:272`,
+which already carries `cli_version`), and a host that advertises nothing gets
+the legacy fire-and-forget path unchanged. The version-gating precedent to
+follow is `_exit_gate_scope_refusal` / `_parse_agent_version`
+(`host_link.py:333-382`). Prefer an explicit capability list over a version
+comparison — `aw-remote-host`'s own update path has a documented history of
+reporting a version that is not the code that is running.
+
+**Any future `/link` frame added in this direction inherits this rule.** The
+control plane may never make a new host→control-plane frame load-bearing
+without a negotiated fallback.
+
+#### 2.6.3 Rule — the bridge forwards the close, it does not invent one
+
+Both receivers used to hardcode the browser-facing close to `1000`
+(`workspace_tunnel_proxy.py::host_to_client`, `host_link_relay.py::owner_to_client`),
+so a failed dial on the far end of the tunnel reached the browser as *normal
+closure*. That is the mechanism behind the ~3s reconnect loop in the card
+above: nothing was logged, nothing was shown, and every client correctly
+treated a clean close as "reconnect, quietly, forever".
+
+A bridge close must carry a §5 code and the host's real reason. See §5's tunnel
+rows. **`1000` is reserved for a close the application actually meant.**
+
 **Verdict on the card's question 1:** a shared transport framework exists and
 is sound. What follows is the layer it stops at.
 
@@ -388,8 +463,15 @@ of the codebase does; it makes the rest derivable instead of memorized.
 | `4404` | target does not exist | `apps/remote-screen/…/routes.py:40` |
 | `4415` | unsupported protocol for this target | `apps/remote-screen/…/routes.py:41` |
 | `4426` | protocol version not supported (§4.3) | — |
-| `4502` | upstream/backing service unreachable | `remote-screen:42`, `remote-host-terminal:60` |
-| `4503` | this app is not configured | `remote-host-terminal:47` |
+| `4502` | upstream/backing service unreachable | `remote-screen:42`, `remote-host-terminal:60`; **the tunnel bridge on a failed local dial or a dropped `/link`** (§2.6.3) |
+| `4503` | this app is not configured; **the tunnel bridge when the host is offline** (`HTTPProxyUnavailable`) | `remote-host-terminal:47` |
+
+The two tunnel rows are deliberate reuse, not new codes. The **HTTP** half of
+the very same bridge already answers `502` when the host's local dial fails
+(the `aw-remote-host-tunnel-502-retry` target documents it) and `503` when the
+host is gone. A WebSocket on that bridge failing the same way for the same
+reason must not report a different class — `4000 + the HTTP status that would
+have applied` is exactly what §5 is.
 
 `1011` stays as-is for an internal proxy failure (`src/apps/proxy.py:206`) —
 it is the correct RFC 6455 code and no client branches on it.
@@ -427,11 +509,52 @@ standard.
    hot-loops forever on all three.
 2. Reconnect with **exponential backoff and jitter**, capped — not the fixed
    2s/5s `setTimeout` currently copy-pasted across five call sites.
-3. Ignore unknown `type`s (this is what makes §4.3 work).
-4. Handle the literal `type: "error"` centrally.
-5. Build the URL with `host.app.wsUrl('/ws/<name>')` (§2.4).
+3. **Reset the backoff on a *healthy* connection, never on `onopen`.**
+   *(Added 2026-09-27 — see §7.1, this is the rule the reconnect loop was
+   actually missing.)*
+4. Ignore unknown `type`s (this is what makes §4.3 work).
+5. Handle the literal `type: "error"` centrally.
+6. Build the URL with `host.app.wsUrl('/ws/<name>')` (§2.4).
+7. **Surface a repeating failure.** After a small number of consecutive
+   unhealthy connects (3 is enough), stop being silent: a connection-state
+   indicator, a console warning naming the close code, or both. A socket that
+   has failed thirty times in a row is not a transient blip and must not look
+   like one. The `bug:presentations-ws-fast-reconnect-loop` card was opened by
+   a human reading a DevTools Network panel, which is the only place the
+   failure was visible at all.
 
-The right home for 1–4 is a **real** shared hook next to the existing one:
+### 7.1 Why `onopen` is the wrong place to reset the backoff
+
+Exponential backoff is normally written as "reset the attempt counter when the
+connection opens". Under §2.6's premature-accept failure that degenerates into
+a **fixed-interval hot loop that no amount of backoff tuning fixes**:
+
+```
+connect → onopen fires (the 101 was real) → attempt = 0
+        → server closes 150ms later
+        → retry at base delay → repeat forever
+```
+
+The observed 11,518 requests over 7.5h came from a client whose reconnect logic
+was, by the letter of rule 2, correct. `apps/tasks/ui/src/ws.js:125` — the best
+WS client in the estate and the reference for §9.1 — has this exact bug:
+`socket.onopen = () => { attempt = 0; }`.
+
+**A connection counts as healthy when it has done something a broken one
+cannot**, whichever comes first:
+
+- it received its first inbound frame — §4.3 already makes `<domain>_init`
+  mandatory and the server's first frame, so for any conforming socket this is
+  the handshake landing; or
+- it stayed open for `MIN_HEALTHY_MS` (10s is a reasonable default) — the
+  fallback for a socket the server legitimately holds silent.
+
+Only then does the attempt counter reset. A socket that opens and dies in
+150ms never qualifies, so the retries space out to the cap as they should. This
+costs four lines and is the difference between a self-limiting client and one
+that generates 11k requests against a broken tunnel.
+
+The right home for 1–5 is a **real** shared hook next to the existing one:
 `repos/aw-workspace-ui/src/hooks/` — taking a path and returning parsed
 envelopes and a connection state, with `useWebSocket.js` renamed to
 `useLogStream.js` to stop advertising a generality it has never had (§2.4).
@@ -462,9 +585,29 @@ Ordered by value, not by repo. Each is a separate card.
 1. **Shared client hook + close-code handling** (`aw-workspace-ui`). Fixes the
    §0.4 reconnect loop for every existing client. **Do this first** — it is the
    only item with a user-visible bug behind it, and it is independent of every
-   server change. **In flight** as Kanban
+   server change. Was **in flight** as Kanban
    `bug:ws-clients-ignore-4401-infinite-reconnect`
    (`3d65bf3b-9510-8186-b22d-f1c583cdd0f1`).
+
+   **Status as read on 2026-09-27: half done, and the half that shipped is the
+   half that does not stop a loop.** What landed is close-code *gating* —
+   `isAuthWsClose`/`notifyWsAuthFailed` (`repos/aw-workspace-ui/src/auth.js:188-192`)
+   inlined at seven call sites (`App.jsx:511`, `TopNotifications.jsx:53`,
+   `AppsMarketplace.jsx:193`, `GitHubSection.jsx:172`, `WorkspaceNav.jsx:248`,
+   `TerminalWindow.jsx:378`, `AndroidViewerWindow.jsx:62`, plus three app
+   plugins). What did **not** land is the hook: `repos/aw-workspace-ui/src/hooks/`
+   still holds only `useWebSocket.js` (the mislabelled log stream) and
+   `useComponentStatus.js`. Backoff exists in exactly two places in the whole
+   estate — `apps/tasks/ui/src/ws.js` and `App.jsx:548-616`'s DAP socket. Every
+   other client is still a fixed `setTimeout(connect, 2000|3000|5000)`.
+
+   So a 4401 now stops, and **everything else still hot-loops** — which is
+   precisely the shape of `bug:presentations-ws-fast-reconnect-loop`. Finish
+   this item: promote `createSharedSocket` out of `apps/tasks/ui/src/ws.js`
+   (whose own header says it is a stand-in waiting for exactly this), add §7.3's
+   healthy-dwell reset and §7.7's surfacing, and migrate the call sites.
+   `isAuthWsClose` stays — it is the same rule, already correct, and the hook
+   should import it rather than re-declare the set.
 2. **Template** (`aw-app-template`). Make `/ws/echo` speak `aw-ws/1` and carry
    this document's §8 in its docstring. Every new app is born from it.
    **In flight** under `feat:tasks-window-push-update-own-ws`
@@ -523,6 +666,26 @@ correctness hazard, and a standard that blesses it has to also write down "…
 unless you're forwarding someone else's object", which is a rule nobody
 remembers at the moment it matters.
 
+### 10.4b Closing the tunnel bridge with `1011` instead of `4502`
+
+*(Added 2026-09-27.)* The runner-up for §2.6.3, and what the first
+implementation attempt chose. `1011` is a correct RFC 6455 code for "the server
+hit an unexpected condition", it needs no table entry, and §5 already blesses
+it for `src/apps/proxy.py`'s equivalent failure.
+
+Rejected on **client actionability**, which is the whole point of §7. `1011`
+is what an app's own handler emits when it crashes; a client that sees it
+cannot tell "this app is broken" from "the tunnel to your laptop is down", and
+those want different behaviour — the first is worth surfacing as an app error,
+the second is worth a slow retry and a "workspace disconnected" state. `4502`
+also keeps the bridge's two halves consistent: the HTTP path on the very same
+hop already answers `502`.
+
+The narrower argument against `1011` is that it re-creates the original bug in
+a quieter form. The defect was never "the code was 1000" — it was "the bridge
+substituted a code of its own for the far end's real failure". A hardcoded
+`1011` is still a substitution; it is just a less flattering one.
+
 ### 10.5 A shared `AwWebSocket` server base class / decorator
 
 Rejected as premature. The envelope is four keys; a base class that enforces it
@@ -579,6 +742,29 @@ Named honestly, because each one is a door this closes.
   panel, not by CI. If §9.1 ships the shared hook, it should ship with tests
   for the close-code branches specifically — those are the paths that only
   execute when a session expires, which no one does on purpose.
+- **The two tunnel bridges must change together, and only one of them runs in
+  your test.** `_bridge_ws` and `_owner_ws`/`relay_ws` (§2.6) are independent
+  implementations of the same relay. At `AW_BACKEND_WORKERS=10` the relay is
+  the ~90% path, but a single-worker local run exercises only the in-process
+  one — so a fix applied to one and not the other passes locally and fails in
+  production nine times out of ten. Existing coverage to extend:
+  `src/tests/unit/api/test_workspace_tunnel_proxy.py`,
+  `src/tests/integration/api/test_f6_tunnel_relay_multiworker.py`.
+- **The `ws_open_ok` gate has a 30-second failure mode if §2.6.2 is skipped.**
+  Both bridges time the ack out against `HTTP_TIMEOUT_S = 30.0`
+  (`workspace_tunnel_proxy.py:195`, `host_link_relay.py:324`). Against a host
+  agent that never sends the frame, every WebSocket on that workspace hangs 30s
+  and then closes — repeatedly. That is not a milder bug than the reconnect
+  loop, it is a worse one, and it lands on users who did nothing.
+- **Three independent clients open `/api/apps/presentations/ws`.**
+  `repos/aw-workspace-ui/src/App.jsx:498` (for a single `test_finished`
+  message its own comment describes as a still-dead backend integration),
+  `repos/aw-workspace-ui/src/components/MobileApp.jsx:415`, and the app's own
+  plugin `apps/presentations/ui/src/plugin.jsx:83`. That is the "opens twice
+  per page load" the debugger observed — it is not a duplicate-connection bug
+  in one client, it is three clients that do not know about each other. Over
+  the tunnel each one is a separate relayed session, so it multiplies whatever
+  §2.6 is doing wrong. Worth its own card; do not fold it into a tunnel fix.
 - **WS-over-tunnel has its own failure history, independent of anything here.**
   The BYOD PTY socket opened at the edge and closed `1000` without ever
   reaching the workspace (Kanban `bug:tunnel-websocket-not-bridged-to-byod`,
