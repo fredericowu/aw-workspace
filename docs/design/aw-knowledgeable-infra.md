@@ -565,6 +565,77 @@ disagrees:
   covers any hostname under the zone, which is why this milestone never
   needed a DNS step.
 
+### Amendment 2026-09-28 — the second host, `api.knowledgeable.aw.tekflox.com`
+
+Frederico asked for a dedicated API hostname beside the UI one, verbatim:
+*"cria o dominio proprio, pode ser UI: https://knowledgeable.aw.tekflox.com/ e
+backend https://api.knowledgeable.aw.tekflox.com/"*. Delivered as a **ninth**
+`custom_domains` entry pointing at the **same** container and port
+(`aw-knowledgeable:8090`) as the UI host — one upstream, two edge names.
+
+**The UI keeps calling `/api` on its own origin and must not be repointed
+here.** Verified rather than assumed: `frontend/src/lib/api.js:10` is
+`API_BASE = "/api/"`, and the live bundle
+(`/assets/index-C2NbFyFm.js`) contains exactly one absolute tekflox URL —
+`https://console.aw.tekflox.com`, the AuthGate login link. Nothing in the
+browser path is cross-origin, so **no CORS configuration exists anywhere in
+this service, and none is needed**. The `api.*` host exists for programmatic
+callers (Bearer / MCP), which send no cookies and therefore need no
+`Allow-Credentials`. Pointing the frontend at it would turn every
+credentialed request cross-origin and buy a CORS story for nothing.
+
+**The pre-flight of §4 is not a formality and it ran again, in full.** What it
+found, before anything was written:
+
+- the `workspace` row's 8 `custom_domains` rendered **byte-identical** to the
+  live on-disk Caddyfile — md5 `6e7b66e6e653ff4032faf566bcdee9c2` on both
+  sides. The 2026-09-05 data divergence remains converged, re-measured, not
+  inherited from the 09-27 note;
+- the dry-run render with the new entry appended was **purely additive**:
+  **23 lines added, 0 removed**, host set 11 → 12, the single added address
+  being `api.knowledgeable.aw.tekflox.com`. Only after that gate passed was
+  anything persisted, and the file that landed carried exactly the dry-run's
+  predicted md5 (`7266a43e2791d24b0344f082d485ba05`).
+
+**One correction to the M5 write path above, and it matters.** M5 records the
+reload as `save_config()` then `regenerate_and_reload()`. **`save_config()` is
+the wrong call for this.** `get_config()` returns the config with every
+`{{env.X}}` placeholder already **expanded** (`src/config/__init__.py`'s module
+docstring and `get_config`'s tail: *"placeholders are stored verbatim in the DB
+and expanded on every read"*), so the read-modify-`save_config` round trip
+persists the *resolved* values over the placeholders — quietly baking
+host-specific values, and any secret that ever lands in one, into the durable
+row. It was harmless on 09-27 only by luck: the row happens to hold **zero**
+`{{env.` placeholders today (checked, not assumed). Use
+`_load_raw_from_db()` → mutate → `_persist_raw()` → `invalidate_cache()`
+instead; that is what this change did. If a placeholder is ever reintroduced,
+the `save_config()` path destroys it on the next unrelated domain edit.
+
+**Rollback artifacts left on the host**, both pre-change:
+`/opt/agentic-workspace/data/tmp/aw-workspace-row-backup-20260928.json` (the
+full raw `workspace` row) and
+`/opt/agentic-workspace/data/tmp/caddy-conf/Caddyfile.bak-20260928-preapi`.
+
+**DNS held at two levels, which the 09-27 note did not establish.** A
+`*.aw.tekflox.com` wildcard matches exactly one label, so
+`api.knowledgeable.aw.tekflox.com` was not covered by the reasoning above.
+Measured: it resolves to `65.109.66.88`, and so does a two-level nonexistent
+control (`zzz.zzz-nonexistent-9x.aw.tekflox.com`) — the zone answers at
+arbitrary depth. No DNS step was needed here either, but the *reason* is
+broader than a single-label wildcard.
+
+**Result:** `custom_domains` holds 9 entries.
+`https://api.knowledgeable.aw.tekflox.com/api/health` → `200 {"status":"ok"}`,
+`https://knowledgeable.aw.tekflox.com/` → `200` with the app HTML. Certs are
+production Let's Encrypt, **not staging** (`CN = YE1`, `notBefore=Sep 28
+2026`, `notAfter=Dec 27 2026`; the log shows `acme-v02` and
+`certificate obtained successfully`). All 9 pre-existing hostnames re-checked
+after the reload and unchanged: `console.aw`, `agents-platform.aw`,
+`headscale.aw`, `derp.aw`, `api.tekflox.com`, `www.tekflox.com`, `www.aw`,
+`aw.tekflox.com` → 200; `api.aw` → 404 at the bare root (correct) and 200 on
+`/api/health`. As with M5 **this reload was manual** — nothing triggers it
+automatically; automation is still target `caddy-ownership-consolidation`.
+
 ### Rejected
 
 - **`knowledgeable.app.aw.tekflox.com` under the wildcard.** Free cert, but
