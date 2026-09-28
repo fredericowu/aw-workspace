@@ -1355,7 +1355,8 @@ convention:**
    predicate (or the `ASSERTS.bucket` equivalent) **in the Cypher** — a
    node's existence is what leaks when the name is the secret
    ("Projeto Fênix"). Post-filtering in Python or the frontend is the leak
-   happening.
+   happening. *(Amended: a third evidence arm — in-bucket manual
+   declaration — exists; see Amendment 1 at the end of §11.)*
 2. **A new static-guard class enforces rule 1**, exactly as K5 enforces
    tenant scoping: `(:Entity)` joins a named bucket-exemption set (precedent:
    `_BUCKET_UNSCOPED_NODE_TEMPLATES`, `graph.py:1867`), and the guard asserts
@@ -1546,6 +1547,8 @@ written down:
    Cross-bucket connection is served structurally — through the shared
    `(:Entity)` node, visible to each reader exactly as far as their own
    mentions reach (§11.1's rules do this with no extra machinery).
+   *(Amendment 2 at the end of §11 extends this rule from the artifact to
+   its inputs — what Onda 1.4 may and may not read off a shared identity.)*
 
 ### 11.6 Sequencing — the T2 golden window: couple them, and gate the backfill, not the code
 
@@ -1660,3 +1663,135 @@ rows.
    and their upload.
 8. **Cost is a first-class output** — tokens per document logged, and a
    per-drain budget cap setting so a runaway corpus cannot silently spend.
+
+### Amendment 1 (Onda 1.2, 2026-09-28) — the visibility predicate has a third arm: `declared_in`
+
+**Ratified.** Written against production (`ed63e60`, CI green, QA 258/258
+live) — the code shipped ahead of this text under the shared-tree cadence,
+flagged on the Onda 1.2 card as an amendment request rather than taken
+silently. This is the contract catching up, not a rubber stamp: the shape was
+re-derived here from §11.1's own constraints before ratifying.
+
+**The defect in §11.1 as written.** Rule 1 names exactly two evidence types —
+a visible mention, a visible assertion — while the same section requires that
+manual creation (`POST /api/nodes`, name + kind) keep working. A hand-created
+entity has neither: no chunk mentions it, no extractor asserted anything
+about it. Under rule 1 as written, `POST /api/nodes` writes a node that is
+invisible to every read, unlinkable and unsearchable the instant it is born.
+The two halves of §11.1 contradict each other, and it took implementing to
+notice — the same lesson as §5's amendments.
+
+**The ratified shape.** `(:Entity)` gains `declared_in` — a list of bucket
+slugs, appended dedup-style on create (`backend/app/core/graph.py:926-934` at
+`ed63e60`), unioned on alias merge so a manual declaration survives fusion
+(`merge_entity_identity`, `graph.py:1153-1166`) — and
+`entity_visible_predicate` (`graph.py:350-386`) gains the third arm:
+`$bucket_id IN coalesce(e.declared_in, [])`. Rule 1 now reads: **an entity
+may reach a reader only with at least one visible mention, visible assertion,
+or in-bucket declaration.** K6 asserts against the expanded predicate text,
+so the third arm is guard-covered like the first two.
+
+**Why this does not reopen "an entity has no `bucket`".** Three properties,
+each load-bearing:
+
+1. **It is not membership.** The identity stays tenant-wide and shared — the
+   same name declared by hand in two buckets is ONE node visible in both,
+   which is the whole §11.1 point. `declared_in` records where a declaration
+   happened, the exact analogue of what a mention's chunk endpoint records
+   for extracted evidence.
+2. **It carries no content.** The channel §11.1 closed was a stored
+   description accreting restricted text. A slug list accretes nothing a
+   reader wrote.
+3. **It is never serialized to a caller — and this is now a rule of §11.1,
+   not an implementation habit.** Bucket slugs can themselves be the secret;
+   an entity visible to me via a mention in my bucket must not carry the
+   names of the other buckets it was declared in. Test-enforced at
+   `backend/tests/test_entities.py:248`
+   (`test_declared_in_is_never_echoed_to_a_caller`). Any future endpoint
+   that echoes `declared_in` is a §7bis scope leak, full stop.
+
+**Rejected** (the first two recorded in the predicate's docstring, the third
+added at ratification):
+
+- **An edge to the `(:Bucket)` registry node.** §1 Amendment 1 keeps that
+  node edge-free and off every hot path; this would put it on the hottest
+  one — the visibility predicate runs inside every entity read.
+- **Leaving manual entities invisible until first mention.** Breaks a live
+  screen and §11.1's own requirement; "create, then see nothing" is
+  indistinguishable from data loss to the user.
+- **A synthetic zero-content "declaration chunk"**, so arm 1 could carry
+  manual creation too. Keeps the predicate two-armed at the price of minting
+  fake `(:Chunk)` rows into every chunk-facing surface — counts, topic
+  clustering input, flat search. Uniformity of the predicate is not worth
+  polluting the content model.
+
+**What it makes harder later (extends §11.8):** bucket rename or deletion
+must now sweep `declared_in` lists across the tenant's entities — a property
+scan, not an edge walk. No bucket rename/delete op exists today, so the debt
+is recorded before its creditor. And arm 3 legitimizes degree-0 entities
+(visible with no edges at all), so every graph-facing surface must tolerate
+an entity with no neighbourhood.
+
+### Amendment 2 (Onda 1.2, 2026-09-28) — shared identity is not shared evidence: the rule Onda 1.4 builds against
+
+**Ratified as a consequence, not a bug — with the inference rule below made
+normative**, because a documented tension without a rule is how 1.4's coder
+reaches for the convenient global count.
+
+**The tension, precisely.** Identity is `(tenant, name_norm)` unique
+(constraint at `graph.py:251-252`, `ed63e60`), so the union merge crosses
+buckets *by construction*: mentioning `RedisLease` in bucket A and bucket B
+produces one node. Authorization is per bucket (§7bis). The per-bucket-copy
+alternative was rejected in §11.7 for real costs and is not reopened. What is
+new here is naming what the shared node is allowed to *mean* to a reader who
+does not see all of it.
+
+**The rule: a shared identity is a join point, never shared evidence.** Any
+artifact derived within bucket B — the `RELATED_TO {via: "entity"}` scores
+1.4 will compute, and every future derived `via` — may take as input only
+evidence visible in B: `MENTIONS` edges from B's chunks, `ASSERTS` edges
+stamped B. Forbidden as inputs, explicitly: the entity's tenant-wide mention
+or assertion counts, its degree, its `declared_in` list, its `aliases`, its
+`created_at`, and its existence-in-other-buckets in any form. The falsifiable
+form, which is also the test 1.4 must ship: **a score computed in bucket B is
+byte-identical whether or not the same entity carries evidence in any other
+bucket** — build the same corpus twice, once with and once without
+cross-bucket evidence on the shared entities, and assert equal scores. A
+score that shifts with out-of-scope evidence is a one-bit oracle ("this name
+is also active somewhere you cannot see"); §11.5 rule 2 already bans derived
+aggregates from *crossing* buckets, and this extends the same rule from the
+artifact to its inputs.
+
+The concrete trap this closes for 1.4: §11.5's "per-bucket IDF" means
+document frequency counted over in-bucket mentions only. The entity node's
+tenant-wide mention count is one property read away and is exactly the number
+1.4 must not use.
+
+**What stays legitimately cross-bucket, so it is not "fixed" later:**
+
+- **The structural join itself.** §11.5 already serves cross-bucket
+  connection through the shared node, each reader reaching exactly as far as
+  their own evidence — §11.1's predicate does the fencing.
+- **Alias merge (§11.3).** A merge is tenant-wide by design: fusing "o helper
+  de lease" into `RedisLease` relinks every bucket's documents at once —
+  that instant relink is the payoff the layer was bought for. Named
+  consequence, accepted: a merge justified by evidence the admin saw in
+  bucket A changes what a reader confined to bucket B sees (their links move
+  to the survivor). Acceptable because merge is a deliberate admin operation
+  with a human in the loop — ingestion never merges identities beyond exact
+  `name_norm` collision (§11.3) — and what B's reader sees afterwards is
+  still only B-visible evidence, re-hung on the surviving name.
+
+**Rejected:**
+
+- **Forbidding identity union across buckets** (per-bucket identity plus a
+  cross-bucket `SAME_AS` hub) — §11.7's first rejection re-proposed through
+  the authorization lens; same residual leak, more machinery.
+- **Documenting the tension without a rule.** "Not a bug" is true and
+  insufficient: the next reader of an unruled tension re-litigates it, which
+  is this document's own §11.7 argument for writing rejections down.
+
+**What it makes harder later:** every future derived `via` inherits the
+byte-identical-score obligation as a standing test, and §11.8.2's
+bucket-to-tenant split migration gains one more thing to carve — `declared_in`
+lists and cross-bucket alias unions must be split by provenance too.
