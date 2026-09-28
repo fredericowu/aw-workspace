@@ -18,6 +18,22 @@ against, or (b) the in-tree precedents those milestones are copying.
 
 ## 0. The reframe the rest of this document rests on
 
+> **AMENDED 2026-09-28** — the second bullet below, "**Bucket** is a
+> *relevance* boundary… **There is no adversary**", was the operative model
+> through 2026-09-26 and is no longer true. On 2026-09-27 Frederico stated
+> that a tenant has multiple users with different roles and that bucket
+> isolation is scoped by the API token; `aw-knowledgeable-v2-retrieval.md`
+> §7bis recorded the flip in one sentence: **"The bucket is now a permission
+> boundary."** There is an adversary now — a co-tenant caller whose token does
+> not grant a given bucket. Everything below that reasons from "there is no
+> adversary" needs the note this amendment points to at its own site, not a
+> rewrite here: see the dated amendments in §3, §4 and §5, and §2's own
+> SUPERSEDED note above the fold there. The first bullet (tenant is a security
+> boundary) is untouched by any of this. The text below is left standing on
+> purpose — it is the record of why §1–§4 were decided the way they were,
+> under the premise then in effect, and deleting it would turn load-bearing
+> decisions into arbitrary ones for whoever reads this next.
+
 **A tenant boundary and a bucket boundary are not the same kind of thing, and
 must not be built out of the same machinery.**
 
@@ -309,6 +325,35 @@ fanout read needing classification in K1's `GET_ROUTE_PLAN`; it now also needs
 the §2 `"403-cross-bucket"` treatment for `scope=current` and an explicit entry
 justifying `scope=all`.
 
+### Amendment (2026-09-28): the two-extremes rule survives the premise flip, and matters more under it
+
+> Written against card `3e95bf3b-9510-8187-9f23-ca98c7412aca`, following §0's
+> amendment and `aw-knowledgeable-v2-retrieval.md` §7bis.
+
+The both-endpoints-visible rule derived above does not depend on §0's
+now-superseded "no adversary" premise — it depends only on bucket membership
+being mutable and edges not carrying `bucket`, both still true. If anything
+the rule is **more load-bearing** under a permission boundary than it was
+under a relevance one: a relevance boundary that leaked an edge produced a
+wrong answer for a caller who owned both sides anyway; a permission boundary
+that leaks one discloses that a restricted document exists and how it
+connects to something the caller can already see. **The filter that enforces
+this has to live in the Cypher template, never in a post-fetch step or the
+frontend** — a node that never enters the result set cannot leak; a node
+fetched and then hidden client-side already has.
+
+The "N links hidden by scope" count this section proposes above (*"3 links
+hidden by scope"*) was designed under the relevance premise, where the count
+is informative and harmless — it tells an honest caller why their own view
+looks smaller than the graph. Under a permission boundary the count is itself
+a signal: "this document has 47 hidden links" tells a caller without bucket
+access that restricted content exists and roughly how connected it is, even
+though they can name none of it. **The count must be configurable per
+bucket, and off by default for a bucket marked sensitive.** No mechanism for
+marking a bucket sensitive exists yet in this design — that is a requirement
+to carry into whichever card builds the scope-aware traversal, not something
+resolved here.
+
 ### Rejected
 
 - **A `(:Bucket)-[:RELATES_TO]->(:Bucket)` edge as a first-class "bucket
@@ -389,6 +434,27 @@ cardiology corpus merely because they share a tenant. It also means a
 placement move carries a schema-reconciliation question with it. Not this
 card's problem; it is the next one's, and it should not be discovered then.
 
+### Amendment (2026-09-28): per-bucket scope is now a security requirement, not only a cost optimization
+
+> Written against card `3e95bf3b-9510-8187-9f23-ca98c7412aca`, following §0's
+> amendment and `aw-knowledgeable-v2-retrieval.md` §7bis.
+
+The decision above — retro passes run per bucket, fenced by tenant — was
+reached on cost grounds: the LightRAG-shaped incremental cost curve, and one
+area's churn not invalidating another's. That reasoning still holds
+unchanged. A stronger reason now sits beside it: any *derived aggregate*
+computed over more than one bucket — a topic centroid, a community summary, a
+`RELATED_TO` weight — bakes content from every bucket it drew on into a
+single artifact, and nothing in the graph remembers afterward which buckets
+contributed. Under a permission boundary, showing that artifact to a reader
+who cannot see all of its inputs **is** a leak, not a UX rough edge. So a
+cross-bucket rebalance, or a cross-bucket topic tree, is no longer merely
+expensive — it is a mechanism this design cannot allow to exist. Corollary:
+**there is no such thing as a cross-bucket topic tree.** A genuinely global
+view would have to be built per permission set, which is combinatorial;
+cross-bucket connections stay structural links (§3), never a shared derived
+tree.
+
 ### Rejected
 
 - **Tenant-wide rebalance only.** Simpler, and it is the only pass that can
@@ -434,6 +500,14 @@ card's problem; it is the next one's, and it should not be discovered then.
    the caller's context (the `kb_index` shape) and mapped to a bucket set — a
    `user` property on a node is the shape to refuse, because it makes every
    node's ACL a data-migration problem.
+
+   **Amendment (2026-09-28), against card `3e95bf3b-9510-8187-9f23-ca98c7412aca`:**
+   this is exactly what happened. `aw-knowledgeable-v2-retrieval.md` §7bis
+   confirms the trigger fired — per-user bucket scopes now exist, carried on
+   the API token — and resolves it exactly as predicted here: scope is
+   resolved per request via `resolve_bucket_scopes()`, mapped to a bucket set,
+   with no `user` property added to any node. §7bis's own words: this refusal
+   is **"vindicated, not reversed."**
 5. **One bucket per document is baked in by §1's constraint choice.** Correct
    for the mutable-placement model, and it forecloses "this paper is genuinely
    in both areas" as a *membership* answer. The escape hatch is §3's edge, and
