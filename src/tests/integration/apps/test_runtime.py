@@ -103,6 +103,71 @@ def test_unload_waits_for_in_flight_request_to_drain(tmp_path):
     _async(run())
 
 
+def test_two_concurrent_tier1_loads_do_not_cross_wire_each_others_routes(tmp_path):
+    """The trap the 2026-09-28 reconcile pool had to be built around.
+
+    ``_mount`` (reached from ``ctx.routes.register`` inside ``activate()``)
+    attaches to ``self._loading`` — a SINGLETON. Two Tier-1 apps activating at
+    once, both awaiting inside ``activate()`` before registering, each find
+    whichever ``loaded`` was written last (or ``None``, once the faster one
+    finished and cleared it). ``AppRuntime._activate_lock`` serializes exactly
+    that window.
+
+    Measured with the lock removed: ``_mount``'s own id check fires and the
+    second app's load dies with "routes.register() may only be called during
+    activate()" — so the damage is a FAILED load rather than a silently
+    misrouted one, which is the better of the two but still an app that is
+    simply not there after a boot, for no reason visible in its own logs.
+
+    Each plugin below awaits BEFORE registering its route, which is what gives
+    the interleave a chance to happen — without the await this passes even with
+    the lock removed.
+    """
+    plugin_src = """
+        import asyncio
+        from fastapi import FastAPI
+
+        class AppPlugin:
+            async def activate(self, ctx):
+                api = FastAPI()
+
+                @api.get("/who")
+                async def who():
+                    return {"app": ctx.app_id}
+
+                # The interleave point: yield the loop between being made
+                # `_loading` and actually mounting.
+                await asyncio.sleep(0.05)
+                ctx.routes.register(api)
+            async def deactivate(self):
+                return None
+    """
+    pkg_a = _write_app(tmp_path, "twin-a", plugin_src)
+    pkg_b = _write_app(tmp_path, "twin-b", plugin_src)
+
+    async def run():
+        host = FastAPI()
+        rt = AppRuntime(host, guard_identity=False)
+        await asyncio.gather(rt.load(pkg_a), rt.load(pkg_b))
+
+        assert rt.is_loaded("twin-a") and rt.is_loaded("twin-b")
+        # Each app owns exactly one mount, and it is its own.
+        for slug in ("twin-a", "twin-b"):
+            loaded = rt.get(slug)
+            assert loaded.mount is not None, f"{slug} never got its mount"
+            assert loaded.mount.path == f"/api/apps/{slug}"
+
+        transport = httpx.ASGITransport(app=host)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            for slug in ("twin-a", "twin-b"):
+                r = await c.get(f"/api/apps/{slug}/who")
+                assert r.status_code == 200, f"{slug}'s route is not mounted"
+                # The cross-wiring signature: 200 from the OTHER app's plugin.
+                assert r.json() == {"app": slug}
+
+    _async(run())
+
+
 def test_load_rejects_ungranted_routes_permission(tmp_path):
     plugin_src = """
         from fastapi import FastAPI

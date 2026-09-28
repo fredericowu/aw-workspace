@@ -454,6 +454,21 @@ class AppRuntime:
         self._apps: dict[str, LoadedApp] = {}
         self._lock = asyncio.Lock()
         self._loading: LoadedApp | None = None  # set during activate() for _mount
+        # `_loading` is a SINGLETON: ctx.routes.register, called from inside
+        # plugin.activate(), mounts onto "the app currently loading". Since
+        # 2026-09-28 a boot reconcile installs several apps concurrently
+        # (src/apps/reconciler.py's pool), and two Tier-1 activate() calls that
+        # both await would otherwise interleave and cross-wire one app's routes
+        # onto the other. This serializes the `_loading` → activate() →
+        # mount/cleanup window, and ONLY that window: _load_container passes
+        # `loaded` to _attach_mount explicitly and deliberately does NOT take
+        # this lock, which is what lets the slow podman starts overlap.
+        self._activate_lock = asyncio.Lock()
+        # contributes.repos clones into the ONE shared repos/ tree, so two
+        # concurrently-installing apps declaring the same repo could race the
+        # clone. Clones are rare and fast after the first, so one global lock
+        # costs nothing worth measuring.
+        self._repos_lock = asyncio.Lock()
         # F4 effect backends the capability facades route through.
         self.commands = CommandInstaller()
         self.services = ServiceSupervisor()
@@ -858,7 +873,10 @@ class AppRuntime:
         if not specs:
             return
         try:
-            created = await asyncio.to_thread(self.repos.register, manifest.id, specs)
+            # Serialized across concurrently-installing apps: the clone target
+            # is the shared repos/ tree (see _repos_lock in __init__).
+            async with self._repos_lock:
+                created = await asyncio.to_thread(self.repos.register, manifest.id, specs)
         except Exception:  # noqa: BLE001 — cloning must never fail an install
             log.exception("apps: repo cloning failed for %s", manifest.id)
             return
@@ -975,23 +993,26 @@ class AppRuntime:
         )
 
         # _mount (called from within activate via ctx.routes.register) attaches
-        # to the app currently loading.
-        self._loading = loaded
-        try:
-            await plugin.activate(ctx)
-        except Exception:
+        # to the app currently loading — a singleton, hence the lock. See
+        # _activate_lock's comment in __init__: a concurrent reconcile pass can
+        # have two Tier-1 apps in here at once.
+        async with self._activate_lock:
+            self._loading = loaded
+            try:
+                await plugin.activate(ctx)
+            except Exception:
+                self._loading = None
+                # residue-free failed load: drop any Mount recorded before the
+                # failure, forget journal entries (incl. capability:denied), unimport
+                if loaded.mount is not None and loaded.mount in self.host.router.routes:
+                    self.host.router.routes.remove(loaded.mount)
+                    self._invalidate_openapi()
+                if loaded.host_mount is not None and loaded.host_mount in self.host.router.routes:
+                    self.host.router.routes.remove(loaded.host_mount)
+                self.journal.clear_app(slug)
+                self._unimport(module_prefix)
+                raise
             self._loading = None
-            # residue-free failed load: drop any Mount recorded before the
-            # failure, forget journal entries (incl. capability:denied), unimport
-            if loaded.mount is not None and loaded.mount in self.host.router.routes:
-                self.host.router.routes.remove(loaded.mount)
-                self._invalidate_openapi()
-            if loaded.host_mount is not None and loaded.host_mount in self.host.router.routes:
-                self.host.router.routes.remove(loaded.host_mount)
-            self.journal.clear_app(slug)
-            self._unimport(module_prefix)
-            raise
-        self._loading = None
 
         self._apps[slug] = loaded
         # PROVISION: everything from here to _invalidate_openapi writes to

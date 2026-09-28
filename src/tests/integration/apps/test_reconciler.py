@@ -19,6 +19,8 @@ import asyncio
 import shutil
 import sys
 import textwrap
+import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -153,11 +155,12 @@ async def _get(host, path):
         return await c.get(path)
 
 
-def _reconciler(tmp_path, monkeypatch, cloud):
+def _reconciler(tmp_path, monkeypatch, cloud, fetch=None):
     monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path / "apps"))
     host = FastAPI()
     rt = AppRuntime(host, guard_identity=False)
-    rc = Reconciler(rt, cloud=cloud, local=FakeMirror(), fetch=_fake_fetch)
+    rc = Reconciler(rt, cloud=cloud, local=FakeMirror(),
+                    fetch=fetch or _fake_fetch)
     return host, rt, rc
 
 
@@ -1110,7 +1113,17 @@ def _desired_row(slug, repo):
 
 def test_reconcile_installs_the_boot_priority_app_first_then_alphabetically(
         tmp_path, monkeypatch):
-    """mcp-gateway goes first; everything else falls in behind it by app_id."""
+    """mcp-gateway goes first; everything else falls in behind it by app_id.
+
+    Pinned to ``AW_APPS_RECONCILE_CONCURRENCY=1`` since the 2026-09-28 pool
+    landed: at N=1 the pass is byte-for-byte the old serial one, which is
+    exactly the rollback-switch claim worth a test. The tail's COMPLETION order
+    is deliberately no longer fixed at N>1 (a pooled install of 47 apps
+    finishes in whatever order podman and GitHub answer) — what still holds
+    there is BOOT_PRIORITY-before-everything, covered by
+    ``test_boot_priority_app_finishes_before_any_pooled_install_starts``.
+    """
+    monkeypatch.setenv("AW_APPS_RECONCILE_CONCURRENCY", "1")
     _patch_reload(monkeypatch, [])
     slugs = ["zeta", "mcp-gateway", "alpha", "middle"]
     repos = {s: _make_app_repo(tmp_path, s) for s in slugs}
@@ -1136,7 +1149,12 @@ def test_reconcile_install_order_is_identical_across_shuffled_desired_lists(
     """The bug was NONDETERMINISM, not just a missing priority: the same
     workspace with the same apps could put mcp-gateway at position 3 one boot
     and position 40 the next. Two different permutations of one desired set
-    must now converge to the same install order."""
+    must now converge to the same install order.
+
+    Also pinned to N=1 (see the test above): the property under test is that the
+    INPUT permutation stops mattering, which lives in the shared sort — and a
+    pool that finishes apps out of order would mask it rather than test it."""
+    monkeypatch.setenv("AW_APPS_RECONCILE_CONCURRENCY", "1")
     _patch_reload(monkeypatch, [])
     slugs = ["delta", "mcp-gateway", "bravo", "echo", "charlie"]
     repos = {s: _make_app_repo(tmp_path, s) for s in slugs}
@@ -1153,6 +1171,202 @@ def test_reconcile_install_order_is_identical_across_shuffled_desired_lists(
         a = await install_order(tmp_path / "ws_a", first)
         b = await install_order(tmp_path / "ws_b", second)
         assert a == b == ["mcp-gateway", "bravo", "charlie", "delta", "echo"]
+
+    _async(run())
+
+
+# ---- bounded intra-pass parallelism (2026-09-28) --------------------------
+#
+# Frederico, via Telegram: after a restart/update it takes "like 5 minutes"
+# before every app is running. The pass installs apps one at a time, and the
+# 09-10 card measured 450s+ / "0 of 22 apps, 11 minutes in". The missing-install
+# phase now runs through a bounded pool (AW_APPS_RECONCILE_CONCURRENCY, default
+# 3); mcp-gateway still goes up alone and first, and upgrades/removals stay
+# sequential.
+#
+# The 2026-09-17 incident is the reason the bound exists at all: ~21 duplicated
+# FULL passes (each: 47 fetches + pip installs + podman starts) took the
+# container to 99% memory and 88% of its PID ceiling. That was N WORKERS
+# duplicating one pass — src/apps/boot_reconcile_coord.py fixed that and is
+# untouched here — but it is also why nothing below is an unbounded gather.
+
+
+class _SlowFetch:
+    """A fetch that burns real wall-clock time in a worker thread (exactly like
+    the real tarball download, which ``_install_provisioned`` runs through
+    ``asyncio.to_thread``) and records how many installs were inside it at once.
+
+    Threads, not ``asyncio.sleep``, on purpose: overlapping to_thread calls is
+    the mechanism the whole change rests on, so a fake that only yields to the
+    event loop would prove less than it looks like it does.
+    """
+
+    def __init__(self, delay=0.4):
+        self.delay = delay
+        self._lock = threading.Lock()
+        self._in_flight = 0
+        self.max_in_flight = 0
+        self.started: list[str] = []
+        # loaded_slugs() as seen the moment each fetch began — how "mcp-gateway
+        # finished before anything else started" is checked below.
+        self.loaded_at_start: list[tuple[str, tuple[str, ...]]] = []
+        self.observe = lambda: ()
+
+    def __call__(self, repo, ref="HEAD", *, slug, token=None, dest=None):
+        with self._lock:
+            self._in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self._in_flight)
+            self.started.append(slug)
+            self.loaded_at_start.append((slug, tuple(self.observe())))
+        try:
+            time.sleep(self.delay)
+            return _fake_fetch(repo, ref, slug=slug, token=token, dest=dest)
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+
+def test_reconcile_overlaps_missing_installs_up_to_the_concurrency_cap(
+        tmp_path, monkeypatch):
+    """The point of the change: six apps must not cost six serial installs.
+
+    Both halves are asserted, because either one alone would pass the wrong
+    implementation — overlap without a cap is the 09-17 resource profile, and a
+    cap without overlap is today's serial pass with extra machinery.
+    """
+    monkeypatch.setenv("AW_APPS_RECONCILE_CONCURRENCY", "3")
+    _patch_reload(monkeypatch, [])
+    slugs = [f"app{i}" for i in range(6)]
+    repos = {s: _make_app_repo(tmp_path, s) for s in slugs}
+    fetch = _SlowFetch()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, FakeCloud(), fetch=fetch)
+
+    async def run():
+        result = await rc.reconcile([_desired_row(s, repos[s]) for s in slugs])
+        assert result["errors"] == []
+        assert sorted(result["installed"]) == slugs
+        assert fetch.max_in_flight == 3, "no overlap, or the cap was exceeded"
+        # Self-calibrating rather than a hardcoded seconds budget: the summary
+        # now carries both numbers, so the claim is "the pass was much shorter
+        # than the sum of its apps", which is exactly what parallelism means.
+        serial_sum = sum(result["app_durations_s"].values())
+        assert result["duration_s"] < serial_sum * 0.7, (
+            f"pass took {result['duration_s']}s vs {serial_sum}s of per-app work")
+        assert result["concurrency"] == 3
+
+    _async(run())
+
+
+def test_concurrency_one_installs_strictly_serially(tmp_path, monkeypatch):
+    """The rollback switch. ``AW_APPS_RECONCILE_CONCURRENCY=1`` must be the old
+    pass, not a pool of size one — no overlap at all, and (asserted in the two
+    BOOT_PRIORITY ordering tests above) the same completion order."""
+    monkeypatch.setenv("AW_APPS_RECONCILE_CONCURRENCY", "1")
+    _patch_reload(monkeypatch, [])
+    slugs = ["one", "three", "two"]
+    repos = {s: _make_app_repo(tmp_path, s) for s in slugs}
+    fetch = _SlowFetch(delay=0.05)
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, FakeCloud(), fetch=fetch)
+
+    async def run():
+        result = await rc.reconcile([_desired_row(s, repos[s]) for s in slugs])
+        assert result["errors"] == []
+        assert result["installed"] == ["one", "three", "two"]
+        assert fetch.max_in_flight == 1
+        assert result["concurrency"] == 1
+
+    _async(run())
+
+
+def test_boot_priority_app_finishes_before_any_pooled_install_starts(
+        tmp_path, monkeypatch):
+    """mcp-gateway is the whole workspace's MCP surface: every agent session is
+    blind until it answers, and on 2026-09-10 a human had to start it by hand 11
+    minutes into a boot. The pool must not merely put it in the first batch —
+    it must be up and loaded before any other app's install begins."""
+    monkeypatch.setenv("AW_APPS_RECONCILE_CONCURRENCY", "3")
+    _patch_reload(monkeypatch, [])
+    slugs = ["mcp-gateway", "aaa", "bbb", "ccc", "ddd"]
+    repos = {s: _make_app_repo(tmp_path, s) for s in slugs}
+    fetch = _SlowFetch(delay=0.2)
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, FakeCloud(), fetch=fetch)
+    fetch.observe = rt.loaded_slugs
+
+    async def run():
+        # Gateway deliberately last in the desired list — with no ORDER BY
+        # upstream that is as legitimate an input as any other.
+        result = await rc.reconcile(
+            [_desired_row(s, repos[s]) for s in ["ddd", "bbb", "ccc", "aaa", "mcp-gateway"]])
+        assert result["errors"] == []
+        assert sorted(result["installed"]) == sorted(slugs)
+
+        assert fetch.started[0] == "mcp-gateway"
+        gateway_call = fetch.loaded_at_start[0]
+        assert gateway_call == ("mcp-gateway", ()), (
+            f"something was already loaded when the gateway started: {gateway_call}")
+        for slug, loaded_then in fetch.loaded_at_start[1:]:
+            assert "mcp-gateway" in loaded_then, (
+                f"{slug} started installing before the gateway had finished")
+        # ...and it really was alone: the pool only opened afterwards.
+        assert fetch.max_in_flight == 3
+
+    _async(run())
+
+
+def test_two_pooled_apps_sharing_a_dependency_install_it_exactly_once(
+        tmp_path, monkeypatch):
+    """The hazard the per-app_id locks exist for. Concurrently, two apps that
+    both require the same app both see ``is_loaded(dep) is False`` before either
+    has registered it at runtime — so both install it, and the loser dies on
+    runtime.load's "already loaded" ValueError, taking a perfectly good app
+    down with it."""
+    monkeypatch.setenv("AW_APPS_RECONCILE_CONCURRENCY", "3")
+    _patch_reload(monkeypatch, [])
+    dep_repo = _make_app_repo(tmp_path, "shared-dep")
+    repos = {
+        s: _make_app_repo(tmp_path, s,
+                          dependencies=[{"id": "shared-dep", "repo": dep_repo}])
+        for s in ("left", "right")
+    }
+    fetch = _SlowFetch(delay=0.2)
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, FakeCloud(), fetch=fetch)
+
+    async def run():
+        result = await rc.reconcile(
+            [_desired_row(s, repos[s]) for s in ("left", "right")])
+        assert result["errors"] == []
+        assert sorted(result["installed"]) == ["left", "right"]
+        assert rt.is_loaded("shared-dep")
+        assert fetch.started.count("shared-dep") == 1, (
+            f"the shared dependency was fetched {fetch.started.count('shared-dep')} "
+            "times — the keyed lock is not deduping")
+
+    _async(run())
+
+
+def test_one_failing_app_does_not_sink_the_rest_of_the_pool(tmp_path, monkeypatch):
+    """Same guarantee the serial loop gave (``test_reconcile_one_bad_app_does
+    _not_block_others``), now that the installs share a gather: one app's
+    exception must be recorded per-app and not cancel its siblings."""
+    monkeypatch.setenv("AW_APPS_RECONCILE_CONCURRENCY", "3")
+    _patch_reload(monkeypatch, [])
+    good = [f"ok{i}" for i in range(4)]
+    repos = {s: _make_app_repo(tmp_path, s) for s in good}
+    desired = [_desired_row(s, repos[s]) for s in good]
+    desired += [_desired_row(s, "file:///no/such/repo") for s in ("bad1", "bad2")]
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, FakeCloud(),
+                              fetch=_SlowFetch(delay=0.1))
+
+    async def run():
+        result = await rc.reconcile(desired)
+        assert sorted(result["installed"]) == good
+        for slug in good:
+            assert rt.is_loaded(slug)
+        assert sorted(e["app_id"] for e in result["errors"]) == ["bad1", "bad2"]
+        assert {e["action"] for e in result["errors"]} == {"install"}
+        # Even the failures are timed — a boot that is slow because of retries
+        # against a dead repo is a thing worth seeing in the summary.
+        assert set(result["app_durations_s"]) >= {*good, "bad1", "bad2"}
 
     _async(run())
 

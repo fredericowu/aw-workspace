@@ -21,6 +21,19 @@ Everything effectful (fetch/remove, cloud I/O, local-mirror persistence) is
 injected so the reconciler is unit-testable without a network or a live cloud —
 the defaults wire the real git fetch, the ``CloudRegistry`` HTTP client, and the
 workspace's ``AppInstall`` PG mirror.
+
+**The install path is async-CONCURRENT since 2026-09-28.** A boot reconcile
+runs up to ``AW_APPS_RECONCILE_CONCURRENCY`` (default 3) app installs at once
+inside ONE pass — see :meth:`Reconciler._install_missing`. So anything added
+below this line that touches process-global state (env vars, cwd, ``os.chdir``,
+signal handlers, a shared on-disk staging path) has to be concurrency-aware, or
+take one of the locks that already exist for exactly that: the per-``app_id``
+locks in this module, ``AppRuntime._activate_lock`` (the Tier-1
+``self._loading`` singleton) and ``AppRuntime._repos_lock`` (the shared
+``repos/`` clone tree). ``_install_pip_requires`` is deliberately left as a
+SYNC call on the event-loop thread — that is what serializes pip against the
+one venv the whole workspace shares; do not "improve" it to ``to_thread``
+without adding an explicit pip lock.
 """
 from __future__ import annotations
 
@@ -30,6 +43,7 @@ import json
 import logging
 import os
 import shutil
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -53,6 +67,46 @@ log = logging.getLogger(__name__)
 # comment there for the full reasoning, including why this is deliberately NOT
 # the place to express an ordinary app-to-app dependency.
 BOOT_PRIORITY: tuple[str, ...] = ("mcp-gateway",)
+
+# How many MISSING apps a single reconcile pass installs at once, once
+# BOOT_PRIORITY has gone up serially. Read per pass (not at import) so an
+# operator — or a test — can change it without a reimport.
+#
+# ``1`` is the rollback switch and reproduces the old fully-serial pass exactly:
+# same submission order, same completion order, no pool at all. The default of
+# 3 is deliberately small. The 2026-09-17 incident (see
+# ``src/apps/boot_reconcile_coord.py``) took the container to 99% memory and 88%
+# of its PID ceiling with ~21 concurrent FULL passes — 47 fetches + pip installs
+# + podman starts each. Three concurrent app installs inside ONE pass is an
+# order of magnitude below even a single duplicated pass, and the per-slot cost
+# that matters is one heavy container create (kali/blender/signoz class).
+_RECONCILE_CONCURRENCY_ENV = "AW_APPS_RECONCILE_CONCURRENCY"
+_DEFAULT_RECONCILE_CONCURRENCY = 3
+# A pooled install waiting on another app's keyed lock. Generous — a real
+# install can legitimately take minutes (image pull) — but finite, because a
+# manifest dependency cycle reached from two concurrent roots would otherwise
+# hang the whole pass silently instead of raising the way the single-task stack
+# check (:meth:`_install_dependencies`) does.
+_APP_LOCK_TIMEOUT = 300.0
+
+
+def _boot_order_key(item: tuple[str, Any]) -> tuple[int, str]:
+    """BOOT_PRIORITY first in its declared order, everything else by app_id."""
+    app_id = item[0]
+    return (BOOT_PRIORITY.index(app_id) if app_id in BOOT_PRIORITY else len(BOOT_PRIORITY),
+            app_id)
+
+
+def _reconcile_concurrency() -> int:
+    raw = os.environ.get(_RECONCILE_CONCURRENCY_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_RECONCILE_CONCURRENCY
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        log.warning("apps: %s=%r is not an integer — using %d",
+                    _RECONCILE_CONCURRENCY_ENV, raw, _DEFAULT_RECONCILE_CONCURRENCY)
+        return _DEFAULT_RECONCILE_CONCURRENCY
 
 
 @dataclass
@@ -185,6 +239,15 @@ class Reconciler:
         # asyncio.Lock is not re-entrant and a nested acquire would deadlock
         # the whole worker on its own install.
         self._provision_depth = 0
+        # One lock per app_id, guarding _install_provisioned. Needed because a
+        # pass now installs several apps CONCURRENTLY and two of them can share
+        # a required dependency: both would see is_loaded(dep)==False before
+        # either registered it at runtime, both would install it, and the loser
+        # would die on runtime.load's "already loaded" ValueError. Keyed rather
+        # than global so the point of the pool — overlapping podman starts —
+        # survives. Created lazily; safe because there is no await between the
+        # lookup and the insert.
+        self._app_locks: dict[str, asyncio.Lock] = {}
 
     # ---- MCP gateway rescan triggers ---------------------------------------
 
@@ -741,8 +804,53 @@ class Reconciler:
         await self._trigger_broadcast("install", summary.get("app_id"))
         return summary
 
+    def _app_lock(self, app_id: str) -> asyncio.Lock:
+        lock = self._app_locks.get(app_id)
+        if lock is None:
+            lock = self._app_locks[app_id] = asyncio.Lock()
+        return lock
+
     async def _install_provisioned(self, spec: AppSpec, *, write_cloud: bool = True,
                                    _dependency_stack: tuple[str, ...] = ()) -> dict[str, Any]:
+        """Serialize per app_id, then do the install (:meth:`_install_locked`).
+
+        A spec with no ``app_id`` yet (the id only becomes known from the
+        manifest) cannot be keyed and goes straight through — that is the
+        explicit sideload path, never the concurrent reconcile one, which
+        always has the id from its desired row.
+        """
+        if not spec.app_id:
+            return await self._install_locked(
+                spec, write_cloud=write_cloud, _dependency_stack=_dependency_stack)
+        lock = self._app_lock(spec.app_id)
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=_APP_LOCK_TIMEOUT)
+        except (asyncio.TimeoutError, TimeoutError) as e:
+            raise TimeoutError(
+                f"waited {_APP_LOCK_TIMEOUT:.0f}s for another concurrent install of "
+                f"{spec.app_id!r} to finish — most likely a dependency cycle "
+                "reached from two apps at once") from e
+        try:
+            # Whoever held the lock may have been installing this very app as
+            # ITS dependency. Re-check rather than duplicating the work. Only on
+            # the reconcile/dependency path: the user-facing explicit install
+            # (write_cloud=True) must keep raising "already loaded", which is a
+            # real answer to a real request rather than a race.
+            if not write_cloud and self.runtime.is_loaded(spec.app_id):
+                loaded = self.runtime.get(spec.app_id)
+                return {"app_id": spec.app_id,
+                        "version": loaded.manifest.version if loaded else spec.version,
+                        "granted_permissions": loaded.granted_permissions if loaded else [],
+                        "package_dir": loaded.package_dir if loaded else None,
+                        "dependencies_installed": [],
+                        "skipped": "already-loaded"}
+            return await self._install_locked(
+                spec, write_cloud=write_cloud, _dependency_stack=_dependency_stack)
+        finally:
+            lock.release()
+
+    async def _install_locked(self, spec: AppSpec, *, write_cloud: bool = True,
+                              _dependency_stack: tuple[str, ...] = ()) -> dict[str, Any]:
         # _resolve_package_dir does a synchronous tarball download + extract
         # (fetch.fetch_app_repo, httpx.stream + tarfile) when spec.repo is set
         # — offloaded to a thread so a reconcile pass fetching/upgrading an
@@ -992,7 +1100,8 @@ class Reconciler:
         #   ``reconcile_on_boot``'s own timeout comment in routes.py), and on
         #   2026-09-10 the gateway landed late enough in it that a human had to
         #   run ``aw-workspace-cli start mcp-gateway`` by hand 11 minutes after
-        #   boot. Being first is worth more here than any amount of parallelism.
+        #   boot. Being first — alone, to completion, ahead of the install pool
+        #   below — is worth more than sharing a slot with two other apps.
         # * The order was not merely unprioritised, it was NONDETERMINISTIC:
         #   ``LocalMirror.list`` is a plain select() with no ORDER BY and the
         #   cloud path returns whatever aw-backend's query yields, so the same
@@ -1007,9 +1116,16 @@ class Reconciler:
         # which already installs dependencies first and, crucially, says so in
         # the manifest where the next reader will find it. BOOT_PRIORITY is a
         # core-owned answer to a different question: what the framework itself
-        # cannot boot without. Known cost of the alphabetical key: it freezes an
-        # order that is random today, so someone will eventually come to depend
-        # on app A activating before app B without ever declaring it.
+        # cannot boot without.
+        #
+        # What this sort does and does not buy, since 2026-09-28: it fixes the
+        # SUBMISSION order, which is what makes a boot reproducible and keeps
+        # mcp-gateway at the head. It no longer fixes the order apps finish
+        # ACTIVATING in — ``_install_missing`` runs the tail concurrently, so
+        # completion order is whatever podman and GitHub answer. Any app that
+        # turns out to need another one up first must declare it in
+        # ``dependencies.apps``; a boot that "only works sometimes" is that
+        # missing declaration surfacing, not the pool misbehaving.
         #
         # This sort also reorders the UPGRADE branch below, which is
         # uninstall-then-install — so a gateway version bump now takes the
@@ -1017,19 +1133,18 @@ class Reconciler:
         # coalesced reload landing on a gateway that may still be re-pulling its
         # image. Not worse than today (today it happens at an arbitrary position
         # instead), but it is now deterministic, so it is worth saying out loud.
-        desired_active = dict(sorted(
-            desired_active.items(),
-            key=lambda kv: (
-                BOOT_PRIORITY.index(kv[0]) if kv[0] in BOOT_PRIORITY else len(BOOT_PRIORITY),
-                kv[0],
-            ),
-        ))
+        desired_active = dict(sorted(desired_active.items(), key=_boot_order_key))
         actual_before = set(self.runtime.loaded_slugs())
 
+        pass_started = time.monotonic()
         installed: list[str] = []
         removed: list[str] = []
         upgraded: list[str] = []
         errors: list[dict[str, str]] = []
+        # Wall-clock per app, so "the boot is slow" is a number in the summary
+        # and in the log line rather than an impression. Covers installs,
+        # upgrades and removals — whatever this pass actually did to each app.
+        durations: dict[str, float] = {}
 
         # Coalesce every gateway reload this pass would trigger into one at
         # the end (see _pending_gateway_reload). Set even on the error paths
@@ -1040,21 +1155,34 @@ class Reconciler:
         # one per app (see _trigger_broadcast).
         self._pending_broadcast = False
 
-        # install missing (desired but not loaded) — don't re-write the desired
-        # row we're converging TO. For apps present on both sides, a version
-        # bump OR a trust/grant change in the registry is an upgrade =
-        # uninstall + install with the new spec (config/permissions survive —
-        # they come from the desired row, which is left untouched).
+        # Partition the desired set ONCE, up front, instead of asking
+        # is_loaded() per app as the loop reaches it: the missing half is what
+        # the pool below runs concurrently, and the present half stays strictly
+        # sequential (its upgrade branch reads self.local.list mid-loop, which
+        # would race the pooled installs' own local.upsert writes).
+        missing: dict[str, AppSpec] = {}
+        present: dict[str, AppSpec] = {}
         for app_id, spec in desired_active.items():
-            if not self.runtime.is_loaded(app_id):
-                try:
-                    await self.install(spec, write_cloud=False)
-                    installed.append(app_id)
-                except Exception as e:  # noqa: BLE001 — one bad app must not block the rest
-                    log.exception("apps: reconcile failed to install %s", app_id)
-                    errors.append({"app_id": app_id, "action": "install", "error": str(e)})
-                continue
+            (present if self.runtime.is_loaded(app_id) else missing)[app_id] = spec
 
+        # Phases 1+2: BOOT_PRIORITY serially to completion, then the rest
+        # through the bounded pool.
+        already_loaded = await self._install_missing(missing, installed, errors, durations)
+        # An app a pooled peer pulled in as ITS dependency is now loaded but was
+        # partitioned as missing. Hand it to the present-side checks below —
+        # that is where the old serial loop put it when it got there and found
+        # it already up.
+        for app_id in already_loaded:
+            present[app_id] = missing[app_id]
+        present = dict(sorted(present.items(), key=_boot_order_key))
+
+        # Phase 3, unchanged and still sequential: for apps present on both
+        # sides, a version bump OR a trust/grant change in the registry is an
+        # upgrade = uninstall + install with the new spec (config/permissions
+        # survive — they come from the desired row, which is left untouched).
+        # Don't re-write the desired row we're converging TO.
+        for app_id, spec in present.items():
+            app_started = time.monotonic()
             loaded = self.runtime.get(app_id)
             running_version = loaded.manifest.version if loaded else ""
             version_changed = bool(spec.version) and spec.version != running_version
@@ -1143,17 +1271,20 @@ class Reconciler:
                         except Exception:
                             log.exception("apps: %s could not be rolled back and is "
                                           "now DOWN", app_id)
+                durations[app_id] = round(time.monotonic() - app_started, 1)
 
         # uninstall extra (loaded but not desired) — converge actual to desired;
         # leave the (absent) desired row alone.
         protected = self._loaded_dependency_closure(set(desired_active))
         for app_id in (actual_before | set(self.runtime.loaded_slugs())) - protected:
+            app_started = time.monotonic()
             try:
                 await self.uninstall(app_id, write_cloud=False)
                 removed.append(app_id)
             except Exception as e:  # noqa: BLE001
                 log.exception("apps: reconcile failed to uninstall %s", app_id)
                 errors.append({"app_id": app_id, "action": "uninstall", "error": str(e)})
+            durations[app_id] = round(time.monotonic() - app_started, 1)
 
         # Fire the single coalesced reload. Clearing the flag FIRST makes
         # _trigger_gateway_reload take its immediate path, and leaves the
@@ -1170,11 +1301,86 @@ class Reconciler:
         if wanted_broadcast:
             await self._trigger_broadcast("reconcile")
 
+        duration_s = round(time.monotonic() - pass_started, 1)
+        concurrency = _reconcile_concurrency()
         result = {"source": source, "desired": sorted(desired_active),
                   "installed": installed, "upgraded": upgraded, "removed": removed,
                   "errors": errors, "mcp_gateway_reloaded": wanted_reload,
-                  "apps_changed_published": wanted_broadcast}
-        log.info("apps: reconciled (%s) — installed=%s upgraded=%s removed=%s errors=%d "
-                 "mcp_reload=%s",
-                 source, installed, upgraded, removed, len(errors), wanted_reload)
+                  "apps_changed_published": wanted_broadcast,
+                  "duration_s": duration_s, "concurrency": concurrency,
+                  "app_durations_s": durations}
+        # The slowest few by name, because that is the actionable half of a slow
+        # boot — the full per-app map is in the summary for anyone who wants it.
+        slowest = sorted(durations.items(), key=lambda kv: -kv[1])[:5]
+        log.info("apps: reconciled (%s) in %.1fs at concurrency=%d — installed=%s "
+                 "upgraded=%s removed=%s errors=%d mcp_reload=%s slowest=%s",
+                 source, duration_s, concurrency, installed, upgraded, removed,
+                 len(errors), wanted_reload,
+                 ", ".join(f"{a}={s:.1f}s" for a, s in slowest))
         return result
+
+    async def _install_missing(self, missing: dict[str, AppSpec],
+                               installed: list[str], errors: list[dict[str, str]],
+                               durations: dict[str, float]) -> list[str]:
+        """Install every MISSING app of one pass: BOOT_PRIORITY serially and to
+        completion first, then the rest through a bounded pool.
+
+        Returns the app_ids that turned out to be already loaded by the time
+        their own task ran — a concurrent peer pulled them in as ITS dependency
+        (see :meth:`_install_provisioned`'s re-check).
+
+        Why BOOT_PRIORITY stays alone and first: mcp-gateway is the whole
+        workspace's MCP surface, every agent session is blind until it is up,
+        and on 2026-09-10 it landed late enough in a 450s+ serial pass that a
+        human started it by hand 11 minutes into the boot. Being first is worth
+        more than sharing its slot with two other apps.
+
+        One app's failure is recorded and does not sink the pool: each task owns
+        its own try/except, so ``errors`` stays per-app exactly as the serial
+        loop's did.
+        """
+        already_loaded: list[str] = []
+
+        async def install_one(app_id: str, spec: AppSpec) -> None:
+            started = time.monotonic()
+            try:
+                summary = await self.install(spec, write_cloud=False)
+                if summary.get("skipped") == "already-loaded":
+                    already_loaded.append(app_id)
+                else:
+                    installed.append(app_id)
+            except Exception as e:  # noqa: BLE001 — one bad app must not block the rest
+                log.exception("apps: reconcile failed to install %s", app_id)
+                errors.append({"app_id": app_id, "action": "install", "error": str(e)})
+            finally:
+                durations[app_id] = round(time.monotonic() - started, 1)
+
+        # `missing` is already sorted BOOT_PRIORITY-first, so this just splits
+        # that order in two without re-deriving it.
+        priority = [a for a in missing if a in BOOT_PRIORITY]
+        rest = [a for a in missing if a not in BOOT_PRIORITY]
+
+        for app_id in priority:
+            await install_one(app_id, missing[app_id])
+
+        concurrency = _reconcile_concurrency()
+        if concurrency <= 1 or len(rest) <= 1:
+            # The rollback switch: byte-for-byte the old serial pass — same
+            # submission order, same completion order, no tasks, no semaphore.
+            for app_id in rest:
+                await install_one(app_id, missing[app_id])
+            return already_loaded
+
+        sem = asyncio.Semaphore(concurrency)
+
+        async def guarded(app_id: str) -> None:
+            async with sem:
+                await install_one(app_id, missing[app_id])
+
+        log.info("apps: installing %d app(s) at concurrency=%d (after %d priority app(s))",
+                 len(rest), concurrency, len(priority))
+        # gather, not as_completed: install_one swallows its own exceptions, so
+        # there is nothing here to propagate and nothing to cancel — this is
+        # purely "wait for the pool to drain".
+        await asyncio.gather(*(guarded(app_id) for app_id in rest))
+        return already_loaded
