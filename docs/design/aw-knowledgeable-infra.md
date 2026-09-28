@@ -740,6 +740,35 @@ reasons, and neither is re-open:
 See §7.5, §7.6 and §7.7 — this decision makes the "second SPA" debt concrete,
 adds a duplicated auth gate, and drops build-time type checking.
 
+### Amendment (2026-09-28) — D1 reversed by the product owner; the invoice it wrote came due
+
+Frederico, via Telegram, verbatim: *"a UI tem que está totalmente desacoplada,
+vai levar o JWT token e usar APIs pra falar com o back, react com python, se
+inspira no design do agents-platform-multitenant"*. The frontend moves to
+React 19 + TypeScript + Tailwind on the AP-MT pattern. Full design:
+**`aw-knowledgeable-ui-decoupled.md`** (same directory).
+
+This is a deliberate reversal, not a correction — and it does not contradict
+D1's reasoning; it collects the debt D1 itself priced in writing. §7.5 said of
+a future shared design system: *"this is the codebase that cannot adopt it
+without a rewrite"* — the product owner has now named AP-MT as the reference
+to converge on. §7.6 documented the auth gate existing *"twice, in two
+languages"*, with the warning that a fix to one would not propagate. D1
+accepted both debts for two stated reasons: rewriting an approved UI was
+expensive, and no design system existed to converge on. Both have lapsed —
+the entity layer (v2-retrieval §5 amendments, Onda 1) changes the UI
+substantially regardless, so the "approved UI" is being reopened anyway, and
+the convergence target now exists by declaration.
+
+What survives D1 unchanged: the packaging shape (two-stage Dockerfile,
+`.dockerignore` comment, `/assets` mount + SPA fallback), the rejection of the
+CDN `<script>` (its security reasoning is stack-independent), and risk 10's
+warning about the prototype's API paths. What dissolves: risk 11 (React's
+gate-returns-`null` hides the shell structurally), risk 13's second half ("do
+not add Tailwind"), and the *"vanilla JS, no framework (D1)"* framing of
+v2-retrieval §6 — that section's five UI behaviours stand as the parity spec.
+The V5a/V5b card clauses reading *"do not introduce React here"* are void.
+
 ---
 
 ## 6. What I could not verify from the code
