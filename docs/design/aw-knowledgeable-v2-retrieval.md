@@ -666,7 +666,9 @@ created. Same reason the two render differently in §6.
   form and a deterministic clustering pass; there is no garbage-injection
   problem to gate yet, and gates built against a writer that does not exist
   will be wrong. **Revisit the moment anything autonomous drives
-  `POST /api/nodes`.**
+  `POST /api/nodes`.** *(Revisited: §11. The ingest-worker LLM extractor is
+  that moment — the gates and evidence anchoring arrive there. Auto-discovery
+  stays out.)*
 - **Think-on-Graph 3.0's 5-agent reflective loop (`deep=true`).** The brief
   measures it at +8–11% on multi-hop for 2–3× latency and tokens, worth it
   only for "accuracy-critical" queries, with TURA finding ~95% of real queries
@@ -1245,3 +1247,416 @@ and it needs Frederico's actual documents plus a query set with known answers.
    adding a second model must fix `scope=all` in the same change, or it returns
    half the corpus and says nothing — the unlabelled-thin-result failure §5 and
    buckets.md:445-449 both exist to prevent.
+
+---
+
+## 11. The entity layer — LLM extraction at ingest, LightRAG-style union, per-bucket assertions, versioned edges (Onda 1.1, 2026-09-28)
+
+Written by the Architect agent against card
+`3e95bf3b-9510-818b-80b0-e961a1868571`, from Frederico's 2026-09-28
+conversation (context: `.tmp/aw-knowledgeable/entendendo-extracao-e-relink.md`,
+`incremental-e-tempo.md`, `buckets-ajudam-ou-atrapalham.md`,
+`plano-de-entrega.md`).
+
+**This is an amendment to §5, not a rewrite of it.** §5's rejection of
+"LLM-extracted topic taxonomy instead of clustering" stands on its original
+reasoning: the topic tree is clustering-derived, tested, live, and V4
+beam-searches its centroids. Nothing here replaces it. What this section adds
+is the layer §5 never claimed to provide: **documents never link to
+documents — they link *through entities*** (GraphRAG, arXiv 2404.16130), and
+aw-knowledgeable skipped that layer entirely, which is why every document sits
+at `link_count: 0` and `get_graph` returns empty edges.
+
+Decisions of record, made by Frederico on 2026-09-28 and **not re-litigable
+here**: incremental, LightRAG-style union — never a batch rebuild
+(*"Definitivamente eu quero fazer incremental"*); RAGA's ReAct construction
+loop stays out while the writer is an upload form rather than an agent;
+RAGA's quality gates and evidence anchoring come **in** (this is §5's own
+"revisit" trigger firing — an LLM extractor in the worker *is* "anything
+autonomous driving `POST /api/nodes`"); no Leiden, no community reports; the
+topic tree stays where it is; buckets are a permission boundary (§7bis).
+
+### 11.0 Measured state (live Neo4j, 2026-09-28, cypher-shell on aw-stack-aw-neo4j-1)
+
+The card required the corpus measured before scoping. Measured, not estimated:
+
+| | value |
+|---|---|
+| Documents / chunks, whole store | **179 / 2,086** |
+| Frederico's corpus (`docs-ingestion-test-66`) | **66 docs → 753 chunks** (~11.4/doc) |
+| Embedding model on every chunk | `BAAI/bge-m3` @ 1024 — no mixed models |
+| `(:Entity)` nodes | **4** — all manual QA artifacts (`Test Node Alpha/Beta`, `QA Node Gamma/Delta`) in `aw-workspace-default/default` |
+| `LINKS_TO` / `RELATED_TO` edges | 3 / 703 |
+
+So the cost baseline is: **first backfill = 2,086 LLM calls** (753 for
+Frederico's corpus alone); steady state = one call per chunk at ingest,
+forever. LightRAG's union removes the *rebuild*, not the *extraction* — that
+bill does not shrink, it just stops repeating. Tuning knob (TURA's lesson,
+already in the phase-1 brief): a cheap model for extraction, the strong model
+only for labels/summaries. At ~800 tokens per call this backfill is
+single-digit dollars on a cheap model; it is the per-upload forever-cost that
+must stay visible, so the extractor logs tokens per document.
+
+### 11.1 The write path: entity identity is tenant-wide; ALL content is bucket-scoped
+
+This is the answer to the card's item 4 — the union leak — and it **adopts**
+the proposed shape (shared identity, per-bucket content, description as a
+reader projection), with two hardenings below. The leak, restated: under
+union, an entity's stored description is built by merging mentions from every
+document; if those documents sit in buckets with different permissions, a
+shared description contains restricted content without anyone traversing an
+edge. So the description cannot be a stored field on a shared node. Ever.
+
+**The model:**
+
+```
+(:Entity {tenant, external_id, name, name_norm, kind})      -- identity ONLY.
+      No description, no summary, no content field, ever. No `bucket`.
+
+(:Chunk)-[:MENTIONS {tenant, description, entity_type,
+                     confidence, schema_version}]->(:Entity)
+      -- one edge per (chunk, entity); the mention's bucket is DERIVED from
+         its chunk endpoint (buckets.md §3 two-endpoint rule) — no stamp.
+
+(:Entity)-[:ASSERTS {tenant, bucket, predicate, description, weight,
+                     confidence, valid_from, valid_to, schema_version,
+                     evidence}]->(:Entity)
+      -- subject-predicate-object between two shared identities. `evidence`
+         is the list of supporting chunk external_ids; `weight` is DERIVED
+         from `size(evidence)` (see idempotency, §11.2). `bucket` is the
+         bucket of the asserting evidence — a named deviation, justified
+         below.
+```
+
+**Union semantics (LightRAG):** `MERGE (e:Entity {tenant, name_norm})`; a new
+mention adds a `MENTIONS` edge; a repeated relation `MERGE`s on
+`(subject, ASSERTS {tenant, bucket, predicate}, object)` and set-unions the
+new chunk id into `evidence`. Nothing is ever deleted by ingestion.
+
+**Why `ASSERTS` carries `bucket` when buckets.md §3 says edges must not.**
+§3's two reasons do not transfer: (1) *"a cross-bucket edge has no single
+correct bucket value"* — an assertion **does**: the bucket of the evidence
+that asserted it; both endpoints are bucket-less identities, so the edge is
+the *only* place its scope can live. (2) *"bucket membership is mutable and
+the edge goes stale on rebalance"* — true, and accepted as a named cost in
+§11.8.3: a placement move must re-stamp the moved document's assertions,
+which is bounded and enumerable through `evidence`. The alternative — a
+reified `(:Assertion)` node whose bucket derives from its evidence edges —
+avoids the stamp but puts two hops on every entity-neighbourhood traversal
+and every graph render; rejected for the hot path (same argument as §1's
+registry-node reasoning, in reverse).
+
+**Visibility rules — the two hardenings, and they are structural, not
+convention:**
+
+1. **An entity may reach a reader only with at least one visible mention or
+   assertion.** Every read template that matches `(:Entity)` must carry an
+   `EXISTS { (c:Chunk {tenant, bucket IN $scope})-[:MENTIONS]->(e) }`-shaped
+   predicate (or the `ASSERTS.bucket` equivalent) **in the Cypher** — a
+   node's existence is what leaks when the name is the secret
+   ("Projeto Fênix"). Post-filtering in Python or the frontend is the leak
+   happening.
+2. **A new static-guard class enforces rule 1**, exactly as K5 enforces
+   tenant scoping: `(:Entity)` joins a named bucket-exemption set (precedent:
+   `_BUCKET_UNSCOPED_NODE_TEMPLATES`, `graph.py:1867`), and the guard asserts
+   that every catalogue template touching `(:Entity)` without a bucket
+   predicate either contains the visible-evidence predicate or sits in an
+   explicit write-path allow-list. A template added without either fails the
+   build. Without this guard, the rule survives exactly until the first
+   convenient query.
+
+**Description as projection:** `GET /api/entities/{id}` computes the
+description at read time — aggregate the visible `MENTIONS.description`
+strings (confidence-weighted, recency-ordered, capped), never store the
+result on the node. The accepted cost: an entity render is an aggregate
+query, not a property read (§11.8.1).
+
+**Reuse or diverge from `create_entity` (`graph.py:296-301`)?** Diverge,
+deliberately. That template's `MERGE (n:Entity {tenant, bucket, external_id})`
+is precisely the per-bucket-copy shape this amendment exists to remove — each
+bucket holding its own `RedisLease` is what makes cross-bucket linking
+impossible. The `(:Entity)` **label** is kept (two entity-ish labels would
+need a UI that explains which is which); its identity contract changes to
+`(tenant, name_norm)` unique, and `create_entity`/`POST /api/nodes` is
+rewritten against it. Manual node creation keeps working (name + kind); the
+manual `description` field is **dropped in v1** — it has 4 test rows of
+usage in the entire estate (measured, §11.0), and a stored description on a
+shared node is exactly the leak channel. If a real annotation need appears,
+it comes back as a per-(entity, bucket) note feature, designed then — a PO
+call, flagged, not absorbed. The 4 existing artifacts are migrated
+mechanically (label → name/name_norm) or deleted with Frederico's
+confirmation, per the delete-card precedent.
+
+### 11.2 Extraction: one LLM call per chunk, fixed schema v1, inside the worker
+
+**Where it lands:** `ingest/worker.py`'s `process_one` keeps its current
+pipeline and its current terminal state — the document goes `ready` and
+becomes flat-searchable the moment chunks+embeddings are written
+(`worker.py:113-117`), **then** entity extraction runs as a second,
+lower-priority queue phase, not as a new stage blocking `ready`. A
+753-call backfill must not delay anyone's upload.
+
+- `(:Document)` gains `extraction_status: pending → extracting → done |
+  failed | <null>` alongside `processing_status`.
+- A `claim_next_extraction_document` template joins `_UNSCOPED_TEMPLATES`
+  (`graph.py:730`) under the same two-way guard and the same
+  routing-fields-only contract as `claim_next_pending_document` — Neo4j is
+  the queue; that machinery is reused, not duplicated.
+- `drain_once` claims **upload work first, extraction work only when the
+  upload queue is empty**. Uploads are user-facing; extraction is the
+  background citizen.
+
+**First pass and re-extraction are one mechanism.** Every chunk gets
+`schema_version` stamped at extraction. A document is due for extraction iff
+any of its chunks has `schema_version < CURRENT_SCHEMA_VERSION`. Existing
+chunks are backfilled to `schema_version: 0` at boot — **never claim on
+`IS NULL`**: Neo4j range indexes do not index nulls, and
+`backfill_missing_processing_status` (`graph.py:737-755`) exists because of
+exactly this trap; copy its batched-backfill shape. With that, the Onda 1
+backfill, a future schema bump, and a routine upload all drain through the
+same claim — re-extraction stops being an event and becomes a meterable
+drip, which is the card's item 6 delivered as a property of the design
+rather than a feature.
+
+**Schema v1 is small, fixed, versioned — no auto-discovery.** A constant
+`SCHEMA_VERSION = 1` co-located with two short lists: entity kinds (on the
+order of: `identifier`, `person`, `organization`, `system`, `concept`) and
+predicates, each flagged `functional: true/false` (§11.4). The exact
+vocabulary is the implementing Coder's to finalize against the real corpus;
+the *shape* — small, fixed, versioned, functional-flagged — is decided.
+Schema auto-discovery is the re-extraction debt generator (each silent
+expansion is an implicit request to re-read the whole corpus) and stays out;
+expanding the schema is a deliberate act that bumps the constant and accepts
+the queue cost. Wave 2's event/temporal fields arrive as `SCHEMA_VERSION = 2`
+through this exact path — that is why the stamp must exist now.
+
+**No gleanings in v1 — decided, with the measurement path.** Microsoft's
+gleaning rounds ("did you miss entities?") multiply the per-chunk cost for
+unmeasured recall. Before paying: hand-label entities/relations on a ~20-chunk
+golden set from the real corpus, measure single-pass recall with the same
+promoted-harness pattern §10 card 1 uses for embeddings (`pt_longform.py`),
+and buy gleaning rounds only if recall on identifier-kind entities falls
+below ~0.8. Identifier recall is the one that matters here — a technical
+corpus's linking entities are `claim_next_pending_document`-shaped, and a
+fixed extraction pass is unusually good at those.
+
+**LLM plumbing:** generalize `topics/label.py`'s pattern (Anthropic Messages
+over httpx, `llm_enabled()`, semaphore concurrency — `label.py:186-257`) into
+a shared `core/llm.py`; `label.py` keeps its own fallback semantics.
+Extraction configures its own model (`EXTRACTION_LLM_MODEL`, default a cheap
+model — the TURA knob) and does **not** silently fall back: with no key
+configured the worker does not claim extraction work at all, documents stay
+`extraction_status: "pending"`, and the pending count is exposed on the
+status surface so the degradation is visible (this estate's failure mode is
+silent degradation; a keyword-fallback "extractor" would be worse than none —
+garbage identities are negative work).
+
+**The gates (RAGA's, now due) live in the write seam, not the prompt.** The
+extractor calls `core/graph.py` write functions that structurally require:
+source chunk id + confidence on every entity and relation (**evidence
+anchoring — retroactively impossible to add, so it ships in the first
+commit**); name length/charset caps (a name is never a sentence — this is
+also what bounds the §11.1 name-existence leak); per-chunk caps
+(~30 entities / ~20 relations — over-cap marks the document
+`extraction_status: "failed"` with the counts recorded, because a chunk that
+"contains" 400 entities is a garbled extraction, not a dense chunk);
+predicate ∈ schema; no self-loops; and the `MENTIONS` MERGE MATCHes its
+chunk within `{tenant, bucket}`, so a hallucinated chunk reference is a
+0-row failure, loud, not a silent skip. Prompted behaviour the model can
+ignore; the tool it cannot.
+
+**Idempotency is load-bearing:** a claim-crash-reclaim or a re-extraction
+must not double-count. Hence `MENTIONS` MERGEd per (chunk, entity) and
+`ASSERTS.weight` **derived from `size(evidence)`** after set-union — never a
+blind `+= 1`. The test that proves it: extract the same chunk twice, assert
+the graph is byte-identical.
+
+### 11.3 Normalization: hard for identifiers, soft for prose
+
+Microsoft's soft, summarize-away dedup is right for prose and wrong for a
+technical corpus — `claim_next_pending_document`, `aw-stack-aw-neo4j-1`,
+file paths are exact strings, and soft-matching them is how 400
+same-thing entities are minted. The extractor therefore classifies each
+entity's `kind`, and `kind` drives `name_norm`:
+
+- **identifier** (code symbols, hostnames, paths, container names): verbatim
+  minus surrounding backticks/quotes; case preserved. Exact match only.
+- **prose** (people, orgs, concepts): NFKC, casefold, trim, collapse
+  whitespace. No accent-stripping (this is a Portuguese corpus; merging
+  distinct accented words is a real risk for a marginal gain), no stemming.
+
+A prose mention and an identifier that denote the same thing ("o helper de
+lease" vs `RedisLease`) stay **two entities until an explicit alias merge** —
+which is the card's retro case (a), and the strongest argument for the layer:
+the merge op moves `MENTIONS`/`ASSERTS` edges to the survivor, appends the
+losing `name_norm` to an `aliases` list, deletes the loser — and every old
+document is linked at the instant of fusion, zero re-reads. v1 ships the
+merge **operation** (admin endpoint); candidate *discovery* stays manual.
+Aliases never re-extract; schema changes never merge: **apelido funde, fato
+versiona, esquema reprocessa.**
+
+### 11.4 Versioned assertions: union has no notion of supersession
+
+Pure union asserts everything it ever read: "Caddy runs on aw-backend" (true
+in July) and "Caddy runs on aw-stack" (true since September) both stand, and
+the graph returns both with equal confidence — undecided, which is worse than
+wrong. So `valid_from`/`valid_to` go on `ASSERTS` **from the first commit**
+(adding them later means not knowing the validity of anything already
+written), with the closing rule:
+
+- Only predicates flagged `functional` close (one current object per
+  subject: `runs_on`, `located_in`, …). Non-functional predicates
+  (`depends_on`, `part_of`, `authored_by`) union forever. Versioning
+  everything is expensive; versioning nothing is the undecided graph.
+- On a new assertion (S, P, O₂) with functional P **in the same bucket** as
+  an open (S, P, O₁), O₁ ≠ O₂: set the old edge's `valid_to`, record
+  `superseded_by`. **Closing never crosses a bucket** — an assertion a
+  reader cannot see must not alter what they can see (permission boundary,
+  §7bis). Cross-bucket contradiction is *surfaced* to a reader who holds
+  both buckets (both assertions, dated), never resolved silently.
+- Default reads return open assertions (`valid_to IS NULL`); closed history
+  is opt-in.
+- v1's `valid_from` is **transaction time** (when we learned it), stated
+  explicitly so Wave 2's event-time model (`occurred_from`/`occurred_to`)
+  lands beside it without collision. Wave 2 has its own design; nothing more
+  is decided here.
+
+### 11.5 `RELATED_TO {via: "entity"}` — and the aggregate rule made security-grade
+
+Document-to-document `RELATED_TO` gains the third `via`. Score = sum of
+per-bucket IDF over shared entities — rarity-weighted so a ubiquitous entity
+("aw-workspace", mentioned everywhere) draws no edges. This is §5 Amendment 1's
+complete-graph lesson applied *before* shipping instead of after; Amendment 2's
+mutual top-N bound (`TOPIC_RELATED_MAX_PER_DOC`) applies to this `via`
+unchanged, drops counted.
+
+Two scope rules, and the second is the general one the card asked to be
+written down:
+
+1. **`via: "entity"` derivation runs per bucket**, incrementally (on a
+   document's extraction completing, recompute that document's entity-derived
+   neighbours within its bucket — bounded by the document's own entity set,
+   never a bucket-wide rebuild).
+2. **A structural link may cross a bucket; a derived aggregate never may.**
+   A cross-bucket `RELATED_TO` score, like a topic centroid or a community
+   summary, bakes content from every input into an artifact nothing will
+   remember is sensitive. buckets.md §4 already made the topic pass
+   per-bucket *for cost*; under §7bis the same decision is a **security
+   requirement**, which is a stronger claim and is now recorded as one.
+   Cross-bucket connection is served structurally — through the shared
+   `(:Entity)` node, visible to each reader exactly as far as their own
+   mentions reach (§11.1's rules do this with no extra machinery).
+
+### 11.6 Sequencing — the T2 golden window: couple them, and gate the backfill, not the code
+
+The aw-backend T2 card (Ready to Deploy: `b0da528` + `5aae5e1`, CI green, QA
+approved) records that after the swap the knowledgeable `tenant_id` for the
+same user resolves differently and the existing graph goes **orphaned and
+indistinguishable from empty**. Its Architect wrote: *"If the graph is empty
+or near-empty this is the cheapest moment T2 will ever have."*
+
+**Recommendation: yes — sequence the tenant swap with Onda 1, in this order,
+and the coupling costs zero calendar time because only the last step waits:**
+
+1. Fire the T2 deploy (it is a manual workflow away).
+2. Land the claim-consumption card already in backlog (`Identity.claims`,
+   `resolve_tenant_id` reading the claim behind `require_tenant_claim`,
+   default false — the one-function-body swap `identity.py:18-21` promised).
+3. Run the one-shot tenant remap of the existing graph. The two backlog
+   cards (`reconcile minted tenant_ids`, `tenant_id derivado de
+   account_ref`) collapse into this step — they *are* this remap, executed
+   in the window. Today it is a bounded Cypher `SET` over 66 documents +
+   753 chunks + edges for the affected tenant (measured, §11.0).
+4. **Only then** run the first extraction backfill (a flag flip on the
+   already-shipped worker).
+
+Why this order rather than "re-extraction makes remap free": extraction does
+**not** rewrite `Document`/`Chunk` tenant properties — union writes new
+`Entity`/`MENTIONS`/`ASSERTS` alongside them — so the swap is never literally
+free. What the window controls is the *size of the remap surface*: run the
+backfill first and every extracted entity, mention and assertion carries the
+doomed tenant id too, roughly doubling the surface and adding a
+half-remapped-graph failure mode (two tenant spellings, each half invisible)
+on top of the one the T2 card already warns about. Waiting costs a flag
+flip; not waiting converts a 753-chunk remap into a remap of everything the
+extractor writes. Ondas 1.2–1.5 **code** proceeds in parallel with steps
+1–3 — nothing in the implementation depends on which tenant string is in the
+rows.
+
+### 11.7 Rejected
+
+- **Per-bucket entity copies + a tenant-level `SAME_AS` hub node.** Keeps
+  every content node bucket-stamped and K5 pristine; rejected because every
+  cross-bucket traversal and every graph render pays two hops through the
+  hub, the per-bucket copies still need the visible-evidence rule (the hub
+  leaks existence the same way), and alias fusion must now operate on N
+  copies + hub instead of one node. Same residual leak, more machinery.
+- **No shared node at all — cross-bucket linking as a query-time join on
+  `name_norm`.** The maximally-safe shape; rejected because the join
+  re-derives identity on every read, alias fusion has nowhere to live (the
+  instant-relink payoff of case (a) disappears), and the graph view cannot
+  render an identity that only exists inside a query.
+- **A per-reader ACL on the entity node.** buckets.md §5.4 already refused
+  node-level ACLs and §7bis vindicated it: scope is resolved per request
+  from the caller's context. Not reopened.
+- **Reified `(:Assertion)` nodes** instead of `ASSERTS` edges — see §11.1;
+  two hops on the hot path.
+- **A separate label for extracted entities** (`(:Concept)` etc.) — two
+  entity-ish labels need a UI that explains which is which, and manual and
+  extracted mentions of the same name must land on the same identity anyway.
+- **Gleanings in v1** — unmeasured recall for a multiplied bill; §11.2 has
+  the measurement that would buy them.
+- **Keyword/regex fallback extraction when no LLM key is configured** —
+  garbage identities are negative work; visible pending is honest.
+- **Schema auto-discovery** — the re-extraction debt generator; §11.2.
+- **Blocking `ready` on extraction** — a user's upload must not wait on a
+  backfill's LLM queue.
+
+### 11.8 What this makes harder later
+
+1. **Entity descriptions are no longer cheap reads.** Every entity render
+   aggregates visible mentions at query time. When this gets slow, the fix
+   is a per-(entity, scope) cache with invalidation on write — real work,
+   deferred knowingly.
+2. **Tenant-wide identity bakes in "a bucket never becomes a tenant".**
+   Spinning a bucket out into its own tenant now requires splitting shared
+   entities by mention provenance. Evidence anchoring makes it *possible*;
+   it is still a migration.
+3. **The placement pass loses its "moves touch no edges" property**
+   (buckets.md §4's table): moving a document re-stamps the `bucket` on
+   assertions its chunks evidence. Bounded and enumerable via `evidence`,
+   but no longer a pure property update.
+4. **Every schema bump costs a corpus re-extraction** — parcelled by the
+   queue, but 2,086 chunks of LLM calls per bump at today's size. Budget
+   per bump; the version stamp is what makes the bill visible instead of
+   invisible.
+5. **The graph becomes still more irreplaceable** — extraction output is
+   LLM-priced state on top of §8.4's embeddings and tree, and
+   `feature:aw-knowledgeable-m2-neo4j-backup` is *still* in Backlog. Flagged
+   to the Product Owner a second time: M2 should land inside this wave.
+
+### 11.9 Risks for the Coders
+
+1. **Onda 0.1 is editing `core/graph.py` and `ingest/worker.py` right now**
+   (link-count/summary card, in flight this session). Every Onda 1 card
+   sequences after it lands; none may start against today's tree.
+2. **The `IS NULL` claim trap** — backfill `schema_version: 0`, never claim
+   on null (`graph.py:737-755` is the precedent and the reason).
+3. **Idempotency by construction** — weight from `size(evidence)`, never
+   `+= 1`; same-chunk-twice test is mandatory (§11.2).
+4. **The static guards fail closed** — new `(:Entity)` templates must carry
+   the visible-evidence predicate or sit in the named write-path allow-list;
+   K5's tenant rule and the `_UNSCOPED_TEMPLATES` two-way assertion apply to
+   the new claim template unchanged.
+5. **LLM output is untrusted input.** Malformed JSON, hallucinated chunk
+   refs (0-row MATCH must fail the item loudly, not skip it silently), and
+   prompt-injection *from document content* are all expected; the gates are
+   the defence and they live in code.
+6. **`pyproject.toml`'s explicit `packages` list** (§9.2) — a new
+   `backend.app.extraction` package that is not added there imports fine in
+   tests and `ImportError`s in the container.
+7. **Do not starve uploads** — extraction claims only when the upload queue
+   is empty; a backfill of 2,086 chunks will otherwise sit between a user
+   and their upload.
+8. **Cost is a first-class output** — tokens per document logged, and a
+   per-drain budget cap setting so a runaway corpus cannot silently spend.
