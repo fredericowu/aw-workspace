@@ -37,6 +37,7 @@ from src.apps import config_store
 from src.apps import fetch as fetch_mod
 from src.apps import gateway_profiles
 from src.apps import mcp_template
+from src.apps.capabilities import filter_grants
 from src.apps.manifest import load_manifest
 from src.apps.registry_client import CloudRegistry
 from src.apps.runtime import AppRuntime
@@ -1064,9 +1065,31 @@ class Reconciler:
             # routes/app_installs.py's upsert_install). Neither used to be
             # detected here, so a currently-loaded app kept running with a
             # stale grant until something else forced a version bump.
+            #
+            # Compare against the grant a real install would actually
+            # PRODUCE from `spec`, not the raw stored value — `loaded.
+            # granted_permissions` is always that produced/effective set
+            # (runtime.load's own return), but `spec.granted_permissions`
+            # is whatever the cloud desired-row last had written to it, and
+            # every automatic reconcile pass below calls install() with
+            # write_cloud=False, so a correction computed during install
+            # (e.g. runtime._load_container force-adding `containers:manage`
+            # back into the grant for a tier=container app regardless of
+            # `signed`, since F8 signing isn't wired up — see its own
+            # comment) never makes it back to the cloud to compare against
+            # next time. Without normalizing here first, that permanent gap
+            # between "stored desired" and "actually effective" read as a
+            # trust change on EVERY pass, forever — uninstalling and
+            # reinstalling the app (and, for tier=container, its sidecars)
+            # every ~30-40s, recomputing the exact same corrected grant each
+            # time and never converging. Confirmed live on aw-app-crispal,
+            # 2026-09-28.
+            expected_granted, _ = filter_grants(spec.granted_permissions, signed=spec.signed)
+            if loaded and loaded.manifest.tier == "container":
+                expected_granted = list(dict.fromkeys(expected_granted + ["containers:manage"]))
             trust_changed = bool(loaded) and (
                 loaded.signed != spec.signed
-                or set(loaded.granted_permissions) != set(spec.granted_permissions)
+                or set(loaded.granted_permissions) != set(expected_granted)
             )
             if version_changed or trust_changed:
                 # What we would put back. Read BEFORE the uninstall, which

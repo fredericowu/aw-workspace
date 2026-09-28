@@ -927,6 +927,103 @@ def test_trust_filter_still_strips_high_risk_from_an_unsigned_app(tmp_path, monk
     assert "ui:code" not in granted
 
 
+class _FakeManifest:
+    def __init__(self, tier, version="1.0.0"):
+        self.tier = tier
+        self.version = version
+        self.dependencies = {}
+
+
+class _FakeLoaded:
+    """Stands in for a real ``LoadedApp`` without needing a container engine
+    socket — only the attributes ``_reconcile_provisioned``'s trust_changed
+    check actually reads."""
+
+    def __init__(self, granted_permissions, signed, tier="container", version="1.0.0"):
+        self.manifest = _FakeManifest(tier, version)
+        self.granted_permissions = granted_permissions
+        self.signed = signed
+
+
+def test_reconcile_does_not_loop_a_container_apps_forced_containers_manage_grant(
+        tmp_path, monkeypatch):
+    """Regression: aw-app-crispal (+ its db/wordpress sidecars) self-recreated
+    every ~30-40s, forever (bug:arvin-health-probe-false-unhealthy, 2026-09-28).
+
+    ``runtime._load_container`` always force-adds ``containers:manage`` into
+    the EFFECTIVE grant for a tier=container app, independent of ``signed``
+    (the F8 signing gate is disabled) — but every automatic reconcile pass
+    calls ``install(write_cloud=False)``, so that correction never reaches
+    the cloud's stored desired row. Comparing the raw stored grant
+    (``spec.granted_permissions``, missing ``containers:manage`` because an
+    unsigned app's install flow filtered it out as high-risk) against the
+    effective one (``loaded.granted_permissions``, which always has it) read
+    as a permanent trust change and reinstalled the app on every single pass.
+    """
+    cloud = FakeCloud([
+        {"app_id": "crispal", "version": "1.0.0", "repo": "unused", "ref": "main",
+         "granted_permissions": ["net:outbound"], "signed": False,
+         "config": {}, "state": "installed"},
+    ])
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    monkeypatch.setattr(rt, "is_loaded", lambda app_id: True)
+    monkeypatch.setattr(rt, "loaded_slugs", lambda: ["crispal"])
+    monkeypatch.setattr(rt, "get", lambda app_id: _FakeLoaded(
+        granted_permissions=["net:outbound", "containers:manage"], signed=False))
+
+    calls: list[str] = []
+
+    async def spy_uninstall(app_id, **kw):
+        calls.append(app_id)
+
+    async def spy_install(spec, **kw):
+        calls.append(spec.app_id)
+
+    rc.uninstall = spy_uninstall
+    rc.install = spy_install
+
+    result = _async(rc.reconcile())
+    assert result["upgraded"] == []
+    assert result["removed"] == []
+    assert not result["errors"]
+    assert calls == []
+
+
+def test_reconcile_still_upgrades_a_container_app_that_lost_a_low_risk_permission(
+        tmp_path, monkeypatch):
+    """The normalization above must not swallow a REAL grant change — only
+    the containers:manage force-add it exists to neutralize."""
+    cloud = FakeCloud([
+        {"app_id": "crispal", "version": "1.0.0", "repo": "unused", "ref": "main",
+         "granted_permissions": ["net:outbound"], "signed": False,
+         "config": {}, "state": "installed"},
+    ])
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    monkeypatch.setattr(rt, "is_loaded", lambda app_id: True)
+    monkeypatch.setattr(rt, "loaded_slugs", lambda: ["crispal"])
+    monkeypatch.setattr(rt, "get", lambda app_id: _FakeLoaded(
+        # still running with a permission the desired row no longer grants.
+        granted_permissions=["net:outbound", "secrets:own", "containers:manage"],
+        signed=False))
+
+    calls: list[str] = []
+
+    async def spy_uninstall(app_id, **kw):
+        calls.append(("uninstall", app_id))
+
+    async def spy_install(spec, **kw):
+        calls.append(("install", spec.app_id))
+
+    rc.uninstall = spy_uninstall
+    rc.install = spy_install
+
+    result = _async(rc.reconcile())
+    assert result["upgraded"] == ["crispal"]
+    assert calls == [("uninstall", "crispal"), ("install", "crispal")]
+
+
 # ---------------------------------------------------------------------------
 # A failed update must not leave the app down — both halves of that, measured
 # on aw-app-crispal on 2026-08-16.
