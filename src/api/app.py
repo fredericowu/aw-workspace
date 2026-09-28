@@ -530,6 +530,19 @@ def create_app() -> FastAPI:
     async def regenerate_workspace_api_key_route(identity: dict = Depends(require_identity)):
         return {"key": await asyncio.to_thread(regenerate_workspace_api_key)}
 
+    # Recovery endpoint for a sibling process (aw-workspace-cli, an agent
+    # runner container) whose local .env is missing/stale: unauthenticated
+    # and MUST NEVER return or log the key — it just re-runs the server's own
+    # boot-time publish (get_or_create_workspace_api_key(), same call as the
+    # lifespan startup above), which mints-if-absent and rewrites
+    # <AW_WORKSPACE_HOME>/.env. The caller then re-reads .env from disk. This
+    # keeps the trust boundary exactly what it is today — filesystem read
+    # access to the 0600 .env — instead of adding a new secret-over-HTTP path.
+    @app.post("/api/workspace-api-key/sync-env")
+    async def sync_workspace_api_key_env():
+        await asyncio.to_thread(get_or_create_workspace_api_key)
+        return {"ok": True}
+
     # Terminal feature (strangler migration #1): PTY shells on this BYOD host.
     # Safe at AW_WORKSPACE_WORKERS>1 since W5 and, since W7, without the GNU
     # `screen` dependency: the PTY is still forked by exactly one worker (a

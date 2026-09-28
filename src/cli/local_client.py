@@ -90,31 +90,93 @@ def base_url() -> str:
     return f"http://127.0.0.1:{port}"
 
 
+def _probe_health(timeout: float = 3.0) -> dict | None:
+    """``GET /api/health``, or ``None`` if the server isn't reachable. Short
+    timeout — the tunnel edge is known-flaky (see module docstring), and a
+    hung recovery probe is worse than the plain error it's trying to enrich.
+    Uses ``httpx.request`` rather than ``httpx.get`` — ``src/tests/conftest.py``
+    globally monkeypatches ``httpx.get`` to stub marketplace-catalog fetches,
+    which would silently swallow this call in the test suite."""
+    try:
+        resp = httpx.request("GET", base_url() + "/api/health", timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except (httpx.HTTPError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _sync_env(timeout: float = 3.0) -> bool:
+    """``POST /api/workspace-api-key/sync-env`` — unauthenticated, returns no
+    secret. Makes the server re-run its own boot-time publish
+    (``get_or_create_workspace_api_key()``), rewriting ``<home>/.env``. Never
+    logs or returns the key itself."""
+    try:
+        resp = httpx.request("POST", base_url() + "/api/workspace-api-key/sync-env", timeout=timeout)
+        return resp.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
 def _workspace_api_key() -> str:
     """The workspace API key, read from ``<home>/.env`` (the server writes it
-    there at boot). Raises with a clear message — and logs — if it's missing."""
+    there at boot). If missing, self-heals by asking the server to re-publish
+    it (only when the server is actually reachable) before re-reading. Raises
+    a self-diagnosing error — never a bare guess — if it's still missing."""
+    env_file = os.path.join(workspace_home_path(), ".env")
     key = _read_env_value(API_KEY_ENV_VAR)
-    if not key:
-        env_file = os.path.join(workspace_home_path(), ".env")
-        logger.error("%s not found in %s", API_KEY_ENV_VAR, env_file)
+    if key:
+        return key
+
+    health = _probe_health()
+    if health is None:
         raise RuntimeError(
-            f"{API_KEY_ENV_VAR} not found in {env_file} — is the workspace server running?"
+            f"{API_KEY_ENV_VAR} not found in {env_file} and the workspace server is not "
+            f"reachable at {base_url()} — is it running?"
         )
-    return key
+
+    _sync_env()
+    key = _read_env_value(API_KEY_ENV_VAR)
+    if key:
+        logger.warning(
+            "%s was missing from %s — self-healed via sync-env", API_KEY_ENV_VAR, env_file
+        )
+        return key
+
+    raise RuntimeError(
+        f"the workspace server IS running (boot_id={health.get('boot_id')}, "
+        f"git_head={health.get('git_head')}) at {base_url()} but {API_KEY_ENV_VAR} is still "
+        f"absent from {env_file} after re-sync — the CLI and server likely see different "
+        f"filesystems (AW_WORKSPACE_HOME mismatch, or this isn't the machine running the "
+        f"server); check server logs for a failed .env write."
+    )
 
 
 def request(method: str, path: str, json_body: dict | None = None,
             timeout: float = 30.0) -> tuple[int, Any]:
     """Return ``(status_code, parsed_body_or_text)``. Never raises for HTTP
     errors — connection failures are the only thing that propagate."""
-    headers = {HEADER_NAME: _workspace_api_key()}
+    key = _workspace_api_key()
     try:
         resp = httpx.request(
-            method, base_url() + path, json=json_body, headers=headers, timeout=timeout,
+            method, base_url() + path, json=json_body, headers={HEADER_NAME: key}, timeout=timeout,
         )
     except httpx.HTTPError as exc:
         logger.error("%s %s failed to reach the workspace server: %s", method, path, exc)
         raise
+
+    if resp.status_code == 401:
+        _sync_env()
+        refreshed_key = _read_env_value(API_KEY_ENV_VAR)
+        if refreshed_key and refreshed_key != key:
+            try:
+                resp = httpx.request(
+                    method, base_url() + path, json=json_body,
+                    headers={HEADER_NAME: refreshed_key}, timeout=timeout,
+                )
+            except httpx.HTTPError as exc:
+                logger.error("%s %s failed to reach the workspace server: %s", method, path, exc)
+                raise
+
     try:
         body = resp.json()
     except (json.JSONDecodeError, ValueError):
