@@ -1795,3 +1795,195 @@ tenant-wide mention count is one property read away and is exactly the number
 byte-identical-score obligation as a standing test, and §11.8.2's
 bucket-to-tenant split migration gains one more thing to carve — `declared_in`
 lists and cross-bucket alias unions must be split by provenance too.
+
+---
+
+## 12. The Playground — per-request retrieval knobs, and an agent that answers only from the graph (2026-09-29)
+
+Architect design, card `feature:aw-knowledgeable-retrieval-playground`
+(`3ea5bf3b-9510-81bf-a213-d52673f7a96e`). The request, verbatim (Frederico,
+Telegram, 29/09):
+
+> "eu quero ver do lado do Library e Graph um Playground, uma forma de um
+> agente responder somente baseado no conhecimento do grafo de forma que a
+> gente possa brincar com a estrategia e tudo mais, veja como a gente pode
+> parametrizar a busca que ele vai fazer, ou seja, que a tool aceite esses
+> parametros (adicione caso necessario) e na interface a gente consiga fazer
+> o ajuste deles. Podemos criar um agente no ap-mt que tenha acesso somente a
+> tool pra poder usá-la com o conjunto de instrucoes pra isso"
+
+### Decision
+
+A third tab, **Playground**, beside Library/Graph in `frontend-react`.
+Every §5 retrieval knob becomes a **per-request parameter on the existing
+`GET /api/search`** (no `/api/retrieve` split — §8.5 stands), validated per
+the matrix below, and the envelope **echoes the parameters that actually
+ran**. The answer path is **closed-book (fork b2)**: a new
+`POST /api/playground/ask` runs the retrieval in-process under the caller's
+own token with the exact knobs, injects the retrieval envelope into the
+prompt of a tool-less ap-mt agent (`knowledgeable-playground`,
+`model_slug: claude-runner-haiku`, the extractor pattern), and returns
+`{answer, retrieval, params, usage}`. The MCP surface gains a **new tool
+`search_graph`** exposing the same knobs; `search_nodes` stays lexical-only
+because it is the link picker's tool and its default is intentional (§6.4).
+Frederico's "agente que tenha acesso somente a tool" ships too, as a second
+agent (`knowledgeable-explorer`, tool_specs = the new tool only) for
+free-form graph-only chat in ap-mt — explicitly **not** wired into the
+Playground UI, for the identity reason below.
+
+### The fork: who executes the retrieval the UI parametrized
+
+Three candidates were on the table; the decision is **b2, not the hybrid
+the dispatcher recommended**, and the reason is a fact found in the code,
+not a preference:
+
+- **(b1) the agent executes** — UI sends knobs, agent builds the tool call.
+  Rejected: the LLM assembles the call, so the knob you set is not
+  guaranteed to be the knob that ran. A playground whose purpose is
+  comparing strategies cannot tolerate that; §5's own rule ("never a silent
+  downgrade") would be violated by the *caller* instead of the server.
+- **(hybrid) b2 seed + agent refines via the tool within a UI-set ceiling.**
+  Rejected for now on two grounds. (1) **Identity mismatch:** the MCP tool
+  authenticates with `X-Internal-Secret`
+  (`aw-app-knowledgeable/knowledgeable_app/mcp/client.py:56`) — the app's
+  service identity — while §7bis makes the bucket a **per-token** permission
+  boundary enforced by `require_bucket_read` (`core/identity.py:392`). A
+  mid-loop refinement would read the graph as a *different principal* than
+  the seeded retrieval, so "same knobs, same scope, reproducible" cannot
+  hold across the two halves of one answer, and a user scoped `view-one`
+  could receive synthesis grounded in buckets their token cannot see.
+  (2) **No enforcement point for the ceiling:** the refinement call
+  originates in ap-mt and crosses the gateway as the app; the backend has no
+  way to correlate it with the Playground request to clamp its parameters.
+  A prompt-level clamp is not enforcement — it reintroduces b1's defect.
+  The prerequisite that would unlock the hybrid is per-call user-scope
+  propagation through gateway → app → backend; that is a project, not a
+  card, and it is named here so the next person finds the real blocker.
+- **(b2) backend retrieves, agent synthesizes** — chosen. "Responds only
+  from the graph" is guaranteed by construction (the agent has **no tools**
+  and sees only the injected envelope), the knobs that ran are exactly the
+  knobs sent, and the retrieval runs under the caller's own token, so §7bis
+  scoping holds end to end. The hybrid's virtue — iterative refinement — is
+  preserved where it belongs in a playground: the human twists a knob and
+  asks again.
+
+### The knobs
+
+Grounded in §5 and §7; a knob that changes nothing observable does not
+exist here. `bucket` is not in this table — it is already a per-request
+scope selector (`?bucket=`, `core/identity.py:392`) and the Playground
+simply surfaces the existing active-bucket control.
+
+| knob | applies to | default | valid range | observable change |
+|---|---|---|---|---|
+| `mode` | all | `lexical` (endpoint, unchanged — link picker) / `tree` (Playground UI) | `lexical\|semantic\|tree` | which algorithm runs; envelope `mode`/`strategy`; result shape (nodes vs chunks with `topic_path`) |
+| `limit` | all | 20 | 1–100 (validated; today unbounded) | result count; the top-`k` of §5 RETRIEVE 3 |
+| `beam_width` | `tree` only | server config (`TOPIC_SEARCH_BEAM_WIDTH`, 3) | 1–10 | how many branches survive each descent level (`topics/retrieve.py:53-55`) → different `topic_path`s and different leaves re-scored; echoed in envelope |
+| `min_score` | `semantic`, `tree` | none (off) | 0.0–1.0 | results below the cosine cut are dropped **after** top-k, with `dropped_below_min_score: n` declared in the envelope |
+| `related_vias` | `semantic`, `tree` | `[]` (off) | subset of `{topic, embedding, entity}` | envelope gains `related`: per result document, its `RELATED_TO` neighbours restricted to those vias, with `via` + `score` — the §5/§11.5 derived edges become visible in retrieval for the first time |
+
+`beam_width` moves from global config to a per-request override:
+`tree_search(query_vector, k, beam_width=None)` with `None` meaning the
+config value (`topics/retrieve.py:30/44`, `core/graph.py:3035`). The config
+knob stays as the default source, unchanged for every other caller.
+
+### Never a silent downgrade — the validation matrix
+
+§5's standing rule, applied to knob/mode mismatches. Two distinct cases:
+
+- **Request-shape mismatch → 400.** `beam_width` with `mode≠tree`;
+  `min_score` or `related_vias` with `mode=lexical`. The caller asked for
+  something the chosen algorithm cannot honour; refusing is the honest
+  answer.
+- **Runtime inapplicability → declared in the envelope.** `mode=tree` with
+  `beam_width` set, on a bucket with no tree: the flat fallback still runs
+  (as today) and the envelope says `strategy: "flat"` **and**
+  `not_applied: ["beam_width"]`. A 400 would be wrong — the request was
+  well-formed; the world declined it.
+- **Always:** semantic/tree envelopes gain `params`, echoing the effective
+  values `{mode, limit, beam_width, min_score, related_vias}`. In a
+  playground, "what actually ran" is the most important datum on the screen.
+
+### Where it lands
+
+- `repos/aw-knowledgeable/backend/app/api/search.py` — knob params +
+  validation matrix + `params` echo; mode dispatch refactored into a helper
+  `playground.py` can reuse in-process (no HTTP self-call).
+- `repos/aw-knowledgeable/backend/app/topics/retrieve.py:30` —
+  `beam_width` parameter.
+- `repos/aw-knowledgeable/backend/app/core/graph.py` — one new read:
+  `RELATED_TO` neighbours for a set of document ids, filtered by `via`,
+  tenant/bucket-scoped like every other statement.
+- `repos/aw-knowledgeable/backend/app/api/playground.py` (new) —
+  `POST /api/playground/ask` (`{question, retrieve_only, …knobs}`);
+  ap-mt call with `model: "agent/knowledgeable-playground"` and an ApiKey
+  scoped to that slug, read from the workspace vault via `core/secrets.py`
+  exactly like the extraction key (`ingest/extraction.py:104-117`).
+- `repos/aw-knowledgeable/backend/app/core/llm.py` — a second transport
+  function speaking OpenAI `POST /v1/chat/completions`; `complete()` speaks
+  Anthropic `/v1/messages` and is not bent to do both.
+- `repos/aw-knowledgeable/frontend-react/src/` — third NAV entry
+  (`App.tsx:6-7`), `routes/Playground.tsx`: knob panel, question box,
+  answer panel, and the **retrieved panel** (chunks with `score`,
+  `topic_path`, strategy/escalated/`not_applied` badges, `params` echo,
+  `related` neighbours). Without the retrieved panel it is a chatbot, not a
+  playground.
+- `repos/aw-app-knowledgeable/knowledgeable_app/mcp/` — the `search_graph`
+  tool (schema + client passthrough, field-by-field per the module's own
+  rule). Backend 400s surface verbatim to the agent — that is the declared
+  contract doing its job; the tool does not pre-validate semantics.
+- ap-mt (no repo change) — agents `knowledgeable-playground` (synthesizer,
+  `tool_specs: []`) and `knowledgeable-explorer` (`tool_specs`: the new
+  tool only), both `model_slug: claude-runner-haiku`; one ApiKey via
+  `POST /api/api-keys {agent_slugs: ["knowledgeable-playground"]}`, stored
+  in the workspace vault for the backend to read.
+
+### Rejected
+
+- **b1 and the hybrid** — above, with the unlock condition named.
+- **A separate `/api/playground/search` or `/api/retrieve`** — §8.5's
+  rejection stands; the knobs land on the one search endpoint every consumer
+  already uses, so the tool and the UI cannot drift apart.
+- **`overfetch` as a knob** — it changes escalation *latency*, and the
+  escalation is already self-correcting and declared (`strategy`,
+  `escalated`); a knob whose effect is mostly invisible in results fails
+  this section's own admission rule.
+- **Agent-side knobs (model, temperature)** — the ask is about retrieval
+  strategy; one fixed cheap synthesizer keeps answer variance from
+  polluting retrieval comparisons. Revisit only if answer quality becomes
+  the thing being played with.
+- **Conversation state** — v1 is single-turn by design; a stateless call is
+  the reproducible one.
+
+### What this makes harder later
+
+- The `params`/`not_applied` echo becomes API contract; renaming or
+  re-ranging a knob is a breaking change for the tool and the UI at once.
+- The closed-book path couples `POST /api/playground/ask` to ap-mt's
+  availability. Degradation is declared, not silent: retrieval still
+  returns (`retrieve_only`, and the UI renders the retrieved panel even
+  when synthesis 502s) — but "the Playground answers" now depends on a
+  second system.
+- `knowledgeable-explorer` reads as the app's service identity (default
+  bucket today). Fine for free-form play; it must never be presented as a
+  user-scoped surface until scope propagation exists.
+
+### Risks for the Coders
+
+1. `min_score` filters **after** top-k and declares the drop count — do not
+   re-fetch to backfill, that silently changes the experiment.
+2. `topics/retrieve.py` assumes a uniform-level frontier; `beam_width` 1–10
+   does not disturb that, but a `beam_width` larger than the frontier must
+   just take everything, not crash on `beam[0]`.
+3. ap-mt's `anthropic-*` models are all dead (no `ANTHROPIC_API_KEY`);
+   `claude-runner-haiku` only.
+4. New gateway tools appear only in a **new** agent session
+   (`verify-new-gateway-tools-in-same-session`), and the app self-registers
+   — the manifest registers nothing (`app-mcp-needs-self-register-not-manifest`).
+   Never edit the installed copy under `/opt/aw-workspace/apps/knowledgeable`.
+5. The frontend must render both result shapes: lexical returns nodes,
+   semantic/tree return chunks. A Playground that breaks on `mode=lexical`
+   fails its own comparison purpose.
+6. The ApiKey is a credential: vault only, never `.env`, never logged —
+   commit `6f46811` is the precedent and the reasoning is in
+   `core/secrets.py`.
