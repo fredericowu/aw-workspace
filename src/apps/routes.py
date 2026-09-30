@@ -400,7 +400,8 @@ async def _reload_mcp_gateway(runtime: AppRuntime, *,
 
 async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
                               expected: dict[str, str] | None = None,
-                              expected_profiles: dict[str, str] | None = None) -> dict:
+                              expected_profiles: dict[str, str] | None = None,
+                              expected_versions: dict[str, str] | None = None) -> dict:
     """What the gateway itself reports serving, for doctor's ``mcp`` section.
 
     Before this, ``mcp.apps_contributing_tools`` only listed apps that ship an
@@ -434,6 +435,19 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
     Like ``warm_redis``, a **missing** ``configs`` key reads as unknown rather
     than as "every profile is dead": it is only absent on a gateway old enough
     not to publish it, and the fleet is not version-locked.
+
+    ``expected_versions`` maps upstream/server name -> the version in that
+    app's ``aw-app.json`` **on disk right now**, compared against the version
+    the gateway reports having actually DIALED that upstream at
+    (``upstream_app_versions`` on ``/healthz``). A mismatch means the gateway
+    is still serving the tool list it cached before the app was updated, so a
+    tool that shipped, deployed green and passed CI is invisible to every live
+    session at once — and nothing else in this workspace reports it. From
+    inside a session it is indistinguishable from the session-cache lesson
+    (``verify-new-gateway-tools-in-same-session``), which is what sent the
+    2026-09-29 diagnosis the wrong way. Same missing-key tolerance as
+    ``warm_redis``: a gateway that predates the field reads as unknown, never
+    as stale.
 
     Also folds in the gateway's own ``warm_redis`` block (v0.27.0+): an
     unresolvable/unreachable warm-token Redis breaks ``schedule_wakeup``,
@@ -496,7 +510,27 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
     # supervise/callback dispatch for every warm session) counts.
     warm_redis = payload.get("warm_redis")
     warm_redis_bad = isinstance(warm_redis, dict) and warm_redis.get("ok") is False
-    degraded = bool(dead) or bool(dead_profiles) or zero_tools or warm_redis_bad
+    # ``upstream_app_versions`` only exists from aw-mcp-gateway v0.37.0 onward
+    # ({name: {app, version}} on /healthz). A MISSING key reads as unknown —
+    # the fleet is not version-locked and a gateway that predates the field is
+    # a normal case — and so does a null ``version`` on either side (the app's
+    # manifest was unreadable when the gateway scanned it). Only two versions
+    # that are both known and different count, because only that combination
+    # actually proves the gateway is serving a pre-update tool list.
+    dialed_versions = payload.get("upstream_app_versions")
+    stale = sorted(
+        ({"server": name,
+          "app": row.get("app") or (expected or {}).get(name),
+          "dialed": row.get("version"),
+          "installed": (expected_versions or {}).get(name)}
+         for name, row in (dialed_versions or {}).items()
+         if isinstance(row, dict) and row.get("version")
+         and (expected_versions or {}).get(name)
+         and row.get("version") != expected_versions[name]),
+        key=lambda d: d["server"],
+    ) if isinstance(dialed_versions, dict) else []
+    degraded = (bool(dead) or bool(dead_profiles) or zero_tools or warm_redis_bad
+                or bool(stale))
     if dead:
         note = ("%d upstream(s) declared but not live in the gateway: %s" %
                 (len(dead), ", ".join(f"{d['server']} ({d['app']})" for d in dead)))
@@ -511,6 +545,13 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
                  "schedule_wakeup, list_wakeups, ask_human, mark_flow_done, "
                  "supervise and callback dispatch will fail for warm sessions"
                  % warm_redis.get("source", "unknown"))
+    elif stale:
+        note = ("%d upstream(s) still dialled at a superseded app version: %s "
+                "— tools added by those updates are invisible to every live "
+                "session until the gateway re-dials" %
+                (len(stale),
+                 ", ".join("%s at %s but %s is installed"
+                           % (d["server"], d["dialed"], d["installed"]) for d in stale)))
     elif zero_tools:
         note = ("gateway reachable but serving ZERO tools despite apps "
                  "declaring mcp.json — at least one upstream is dead")
@@ -527,6 +568,10 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
         "configs": live_configs if isinstance(live_configs, list) else None,
         "dead_profiles": dead_profiles,
         "warm_redis": warm_redis,
+        # None (not {}) when the gateway predates the field, so the CLI can
+        # print "unknown" instead of implying every version matched.
+        "upstream_app_versions": dialed_versions if isinstance(dialed_versions, dict) else None,
+        "stale_upstreams": stale,
         "degraded": degraded,
         "note": note,
     }
@@ -1193,6 +1238,11 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         # so a specific dead upstream can be named, not just inferred from a
         # zero total.
         mcp_expected: dict[str, str] = {}
+        # Server name -> the owning app's version ON DISK right now, for the
+        # version-skew check: the gateway reports which version it actually
+        # dialled each upstream at, and a difference means it is still serving
+        # that upstream's pre-update tool list.
+        mcp_expected_versions: dict[str, str] = {}
         for slug in mcp_apps:
             loaded = runtime.get(slug)
             try:
@@ -1200,14 +1250,28 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                     doc = json.load(f)
             except (OSError, ValueError):
                 continue
+            # Read from aw-app.json rather than loaded.manifest.version so
+            # both sides of the comparison read the SAME file: the gateway
+            # mounts this exact directory read-only and takes its own dialled
+            # version from it. An in-memory manifest is a second source that
+            # can differ from disk for reasons that have nothing to do with
+            # the gateway being stale.
+            try:
+                with open(os.path.join(loaded.package_dir, "aw-app.json"), encoding="utf-8") as f:
+                    installed_version = str((json.load(f) or {}).get("version") or "").strip()
+            except (OSError, ValueError):
+                installed_version = ""
             for name, spec in (doc.get("mcpServers") or {}).items():
                 if isinstance(spec, dict) and spec.get("enabled") is False:
                     continue
                 mcp_expected[name] = slug
+                if installed_version:
+                    mcp_expected_versions[name] = installed_version
 
         mcp_status = await _mcp_gateway_status(
             runtime, expect_tools=bool(mcp_apps), expected=mcp_expected,
-            expected_profiles=_referenced_gateway_profiles(runtime))
+            expected_profiles=_referenced_gateway_profiles(runtime),
+            expected_versions=mcp_expected_versions)
         redis_status = await _redis_coord_status()
 
         host_offers = hostpower.host_grants()

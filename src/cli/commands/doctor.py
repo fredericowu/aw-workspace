@@ -194,6 +194,19 @@ def _mcp(section: dict) -> int:
         print(f"  ✗ gateway profile {row['profile']!r} is referenced by "
               f"{row['app']} but NOT served — /mcp/{row['profile']} answers 404 "
               "and that agent runs with zero tools")
+    # A tool can ship, deploy green and pass CI while the gateway keeps
+    # serving the tool list it cached before that app was updated — invisible
+    # to every live session at once, and indistinguishable from the
+    # session-cache lesson from inside a session. This is the only place that
+    # skew is reported. See card mcp-gateway:reload-diff-ignores-app-version.
+    if section.get("upstream_app_versions") is None:
+        print("      upstream app versions: unknown — gateway predates "
+              "upstream_app_versions reporting (pre-0.37.0)")
+    for row in section.get("stale_upstreams") or []:
+        print(f"  ✗ gateway dialed {row['server']} at {row['dialed']} but "
+              f"{row['installed']} is installed"
+              + (f" ({row['app']})" if row.get("app") else "")
+              + " — tools invisible until re-dial")
     warm_redis = section.get("warm_redis")
     if warm_redis is None:
         print("      warm-token Redis: unknown — gateway predates warm_redis reporting (pre-0.27.0)")
