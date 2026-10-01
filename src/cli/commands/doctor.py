@@ -44,6 +44,7 @@ def run(args: list[str]) -> int:
     problems += _permissions(report.get("permissions") or [])
     problems += _app_checks(report.get("app_checks") or [])
     _autostart(report.get("autostart") or [])
+    problems += _autostart_not_running(report.get("autostart_not_running") or [])
     _host_power(report.get("host_power") or {})
     problems += _mcp(report.get("mcp") or {})
     problems += _redis(report.get("redis") or {})
@@ -143,6 +144,25 @@ def _autostart(rows: list) -> None:
               f"— someone has to start it by hand, every time")
     print("      turn one back on in Apps › <app> › Settings › Auto-start, or")
     print("      POST /api/apps/<slug>/config {\"config\": {\"auto_start\": true}}")
+
+
+def _autostart_not_running(rows: list) -> int:
+    """The inverse of ``_autostart`` — apps configured ON that are actually
+    OFF right now. Recurred silently (undetected by this command) at least
+    15 times across three apps between 2026-09-06 and 2026-09-29, always
+    discovered instead via ``aw-workspace-cli status``'s COMPONENTS table
+    and fixed by a manual restart. Counted as a real problem."""
+    if not rows:
+        return 0
+    print()
+    print(f"Auto-start — {len(rows)} app(s) configured ON but NOT running")
+    for row in rows:
+        print(f"  ✗ {row['app']:<14} auto_start is on ({row.get('tier', '?')}) "
+              f"but {row['component']} is off right now")
+        if row.get("last_error"):
+            print(f"      exit {row.get('last_exit_code')}: {row['last_error']}")
+    print("      restart it: aw-workspace-cli restart <app>, then find out why it stopped")
+    return len(rows)
 
 
 def _host_power(section: dict) -> None:

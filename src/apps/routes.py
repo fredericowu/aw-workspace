@@ -94,6 +94,53 @@ def _autostart_disabled(runtime) -> list[dict]:
     return out
 
 
+def _autostart_not_running(runtime) -> list[dict]:
+    """Apps configured to auto-start that are NOT actually running right now.
+
+    The counterpart to ``_autostart_disabled``, and unlike it, a real problem:
+    this is the exact gap documented across at least 15 recurrences between
+    2026-09-06 and 2026-09-29 on three different apps (aw-app-proxy 8x,
+    codegraphcontext 11x, whatsapp 6x — finding_key
+    ``aw-workspace-multiworker:proxy-app-auto-start-not-running`` and
+    siblings). ``aw-workspace-cli status``'s COMPONENTS table already shows
+    this (``○ proxy:proxy-server off`` while ``config.auto_start: true``);
+    doctor never cross-checked it, so a stopped auto-start app read as
+    "No silent degradation found" for hours — once, 3.5h, after a manual
+    test left aw-app-proxy's service stopped (2026-10-01).
+    """
+    out: list[dict] = []
+    for slug in runtime.loaded_slugs():
+        loaded = runtime.get(slug)
+        if loaded is None:
+            continue
+        props = (loaded.manifest.effective_config_schema or {}).get("properties") or {}
+        if "auto_start" not in props:
+            continue
+        if not (loaded.config or {}).get("auto_start", True):
+            continue  # already reported by _autostart_disabled
+        for app_id, service_id in runtime.services.registered():
+            if app_id != slug:
+                continue
+            status = runtime.services.status(app_id, service_id)
+            if not status.get("running"):
+                out.append({
+                    "app": slug, "tier": loaded.manifest.tier,
+                    "component": f"{app_id}:{service_id}",
+                    "last_exit_code": status.get("last_exit_code"),
+                    "last_error": status.get("last_error"),
+                })
+        for app_id, _container in runtime.containers.registered():
+            if app_id != slug:
+                continue
+            try:
+                status = runtime.containers.status(app_id)
+            except ContainerError:
+                status = {"running": False}
+            if not status.get("running"):
+                out.append({"app": slug, "tier": loaded.manifest.tier, "component": app_id})
+    return out
+
+
 def _referenced_gateway_profiles(runtime) -> dict[str, str]:
     """Scoped gateway profiles installed apps expect — name -> owning app slug.
 
@@ -1345,6 +1392,10 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         * ``autostart`` — apps the manifest says start on boot vs apps this
           workspace's stored config will actually start (see
           ``_autostart_disabled``).
+        * ``autostart_not_running`` — apps whose config says ``auto_start:
+          true`` but whose service/container is not actually running right
+          now (see ``_autostart_not_running``) — the inverse gap, and the one
+          that was actually silent: this IS counted as a problem.
         * ``host_power`` — what the BYOD host opted into vs what each loaded
           app was actually granted. An app whose grant is empty while its
           manifest asks for one cannot be loaded at all (the load raises), so
@@ -1438,6 +1489,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
 
         app_checks = await _app_doctor_checks(runtime)
         autostart_off = _autostart_disabled(runtime)
+        autostart_not_running = await asyncio.to_thread(_autostart_not_running, runtime)
 
         unhealthy = [c for c in clis if not c["healthy"]]
         failing_app_checks = [c for c in app_checks if not c["ok"]]
@@ -1448,7 +1500,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             # the CLI's own problem count) to see, just not treated as an
             # active production degradation until something depends on it.
             "ok": (not unhealthy and not permissions and not failing_app_checks
-                   and not mcp_status["degraded"]),
+                   and not mcp_status["degraded"] and not autostart_not_running),
             "app_checks": app_checks,
             "system_clis": {
                 "total": len(clis),
@@ -1456,6 +1508,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             },
             "permissions": permissions,
             "autostart": autostart_off,
+            "autostart_not_running": autostart_not_running,
             "host_power": {
                 "host_offers": list(host_offers),
                 "summary": hostpower.describe(host_offers),
