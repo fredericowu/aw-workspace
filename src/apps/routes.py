@@ -34,7 +34,7 @@ import os
 import re
 
 import anyio
-from fastapi import Body, Depends, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Body, Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
 from src.api.identity import authorize_ws, require_identity
@@ -47,6 +47,7 @@ from src.apps.service_relay import ServiceCommandRelay
 from src.apps.manifest import ManifestError, load_manifest
 from src.apps.reconciler import AppSpec, Reconciler
 from src.apps.containers import ContainerError, expand_env
+from src.apps.fetch import package_dir_for
 from src.apps.runtime import AppRuntime
 
 log = logging.getLogger(__name__)
@@ -277,6 +278,51 @@ def _merge_config(previous: dict, incoming: dict) -> dict:
         else:
             merged[key] = value
     return merged
+
+
+def _leaf_gateway_url(mcp_doc: dict) -> str | None:
+    """The URL of an app's OWN leaf MCP gateway, from its ``mcp.json`` — the
+    ``type: "gateway"`` entry (e.g. ``http://aw-app-kali-linux:9200/mcp``),
+    not any ``stdio``/``http`` upstream the same doc might also declare."""
+    for server in (mcp_doc.get("mcpServers") or {}).values():
+        if isinstance(server, dict) and server.get("type") == "gateway" and server.get("url"):
+            return server["url"]
+    return None
+
+
+def _match_leaf_tool(names: list[str], tool: str) -> tuple[str | None, str | None]:
+    """Resolve ``tool`` against a leaf gateway's federated ``tools/list``
+    names by SUFFIX match — never an exact-prefix guess, since the
+    leaf-local federated prefix embeds ``AW_WORKSPACE_SLUG``, which differs
+    per deployment (e.g. ``aw__kali_control__proxy_set`` here, something
+    else on another workspace). An exact match (the bare tool name, with no
+    prefix at all) wins outright. Returns ``(tool_name, None)`` on a unique
+    resolution, or ``(None, "not_found"|"ambiguous")``."""
+    if tool in names:
+        return tool, None
+    matches = [n for n in names if n.endswith(f"__{tool}")]
+    if not matches:
+        return None, "not_found"
+    if len(matches) > 1:
+        return None, "ambiguous"
+    return matches[0], None
+
+
+def _unwrap_leaf_tool_result(rpc_result: dict) -> tuple[bool, object]:
+    """Unwrap an MCP ``tools/call`` JSON-RPC result's ``content[0].text``
+    (parsed as JSON when possible) into ``(ok, result)`` — ``ok`` is the
+    inverse of the MCP ``isError`` flag, not the JSON-RPC envelope's own
+    (unrelated) success, which is already handled by ``raise_for_status``."""
+    is_error = bool(rpc_result.get("isError"))
+    content = rpc_result.get("content") or []
+    text = content[0].get("text") if content and isinstance(content[0], dict) else None
+    result = text
+    if text is not None:
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError:
+            pass
+    return not is_error, result
 
 
 async def _apply_runtime_config(runtime: AppRuntime, loaded, previous: dict) -> None:
@@ -932,6 +978,108 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         await reconciler._trigger_broadcast("config", slug)
 
         return _app_config_payload(loaded)
+
+    @app.api_route("/api/apps/{slug}/leaf-tool/{tool}", methods=["GET", "POST"])
+    async def leaf_tool_call(slug: str, tool: str, request: Request,
+                             identity: dict = Depends(require_identity)):
+        """UI → one of an app's OWN leaf MCP gateway tools, directly — the
+        mechanism a declarative `toggle` widget's `bind`/`action` dial.
+
+        Exists because nothing else reaches a leaf gateway from the SPA: the
+        Tier-2 reverse proxy targets the app's single declared port (the
+        desktop, for Kali — port 3500, not the gateway's 9200), and no
+        declarative widget can shape a JSON-RPC envelope (`button` sends no
+        body). Any app that ships an `mcp.json` `type: "gateway"` entry opts
+        into this surface implicitly — same identity gate as every other
+        `/api/apps/{slug}/...` route, nothing added for this one.
+
+        Offline-aware: a stopped container answers `{"offline": true,
+        "message"}` (200 for GET so a `bind` can render it; 409 for POST) —
+        checked via `containers.status()`, same source `doctor` already
+        reads, before ever dialing the leaf.
+
+        Resolves the tool by SUFFIX match against the leaf's own `tools/list`
+        (one stateless, tokenless JSON-RPC round trip — this leaf's `/mcp` is
+        sessionless): the leaf-local prefix embeds `AW_WORKSPACE_SLUG`, which
+        differs per deployment, so a caller must never hardcode it. An exact
+        match wins outright; otherwise a unique suffix match is required —
+        no match is 404, more than one is 409 (ambiguous).
+        """
+        loaded = runtime.get(slug)
+        if loaded is None:
+            return JSONResponse({"error": f"{slug} not installed"}, status_code=404)
+
+        # Tier-2 only: a Tier-1 inprocess app has no container, so
+        # containers.status() raises ContainerError rather than answering
+        # running/stopped — there is no offline state to report for it, so
+        # this just skips straight to dialing the leaf.
+        try:
+            status = await asyncio.to_thread(runtime.containers.status, slug)
+            if not status["running"]:
+                message = f"{slug} is stopped — start the container to use this setting."
+                if request.method == "GET":
+                    return {"offline": True, "message": message}
+                return JSONResponse({"offline": True, "message": message}, status_code=409)
+        except ContainerError:
+            pass
+
+        mcp_path = os.path.join(package_dir_for(slug), "mcp.json")
+        try:
+            with open(mcp_path) as f:
+                mcp_doc = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return JSONResponse({"error": f"{slug} has no readable mcp.json"}, status_code=404)
+
+        gateway_url = _leaf_gateway_url(mcp_doc)
+        if not gateway_url:
+            return JSONResponse(
+                {"error": f"{slug} has no leaf gateway (mcp.json type:gateway entry)"},
+                status_code=404,
+            )
+
+        arguments: dict = {}
+        if request.method == "POST":
+            raw_body = await request.body()
+            if raw_body:
+                try:
+                    arguments = json.loads(raw_body)
+                except json.JSONDecodeError:
+                    return JSONResponse({"error": "request body must be JSON"}, status_code=400)
+
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                list_resp = await client.post(gateway_url, json={
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {},
+                })
+                list_resp.raise_for_status()
+                tools = ((list_resp.json() or {}).get("result") or {}).get("tools") or []
+                names = [t.get("name") for t in tools if isinstance(t, dict) and t.get("name")]
+
+                tool_name, match_error = _match_leaf_tool(names, tool)
+                if match_error == "not_found":
+                    return JSONResponse(
+                        {"error": f"no tool named/suffixed {tool!r} on {slug}'s leaf gateway"},
+                        status_code=404,
+                    )
+                if match_error == "ambiguous":
+                    return JSONResponse(
+                        {"error": f"ambiguous tool suffix {tool!r} on {slug}'s leaf gateway"},
+                        status_code=409,
+                    )
+
+                call_resp = await client.post(gateway_url, json={
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": tool_name, "arguments": arguments},
+                })
+                call_resp.raise_for_status()
+        except httpx.HTTPError as e:
+            return JSONResponse(
+                {"error": f"could not reach {slug}'s leaf gateway: {e}"}, status_code=502,
+            )
+
+        ok, result = _unwrap_leaf_tool_result((call_resp.json() or {}).get("result") or {})
+        return {"ok": ok, "result": result}
 
     @app.post("/api/apps/{slug}/update")
     async def update_app(slug: str, identity: dict = Depends(require_identity)):

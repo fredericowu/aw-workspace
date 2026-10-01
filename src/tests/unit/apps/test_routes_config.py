@@ -82,3 +82,75 @@ def test_a_full_form_post_behaves_exactly_as_before():
 
 def test_an_empty_save_changes_nothing():
     assert _merge_config({"a": "1"}, {}) == {"a": "1"}
+
+
+# --- the leaf-tool bridge's pure helpers --------------------------------------
+
+from src.apps.routes import (  # noqa: E402
+    _leaf_gateway_url, _match_leaf_tool, _unwrap_leaf_tool_result,
+)
+
+
+def test_leaf_gateway_url_finds_the_type_gateway_entry():
+    mcp_doc = {"mcpServers": {"kali": {"enabled": True, "type": "gateway",
+                                        "url": "http://aw-app-kali-linux:9200/mcp"}}}
+    assert _leaf_gateway_url(mcp_doc) == "http://aw-app-kali-linux:9200/mcp"
+
+
+def test_leaf_gateway_url_ignores_non_gateway_entries():
+    mcp_doc = {"mcpServers": {"other": {"type": "stdio", "command": "python3"}}}
+    assert _leaf_gateway_url(mcp_doc) is None
+
+
+def test_leaf_gateway_url_missing_mcp_servers():
+    assert _leaf_gateway_url({}) is None
+
+
+def test_match_leaf_tool_exact_name_wins():
+    names = ["aw__kali_control__proxy_status", "proxy_status"]
+    assert _match_leaf_tool(names, "proxy_status") == ("proxy_status", None)
+
+
+def test_match_leaf_tool_suffix_match_is_workspace_slug_agnostic():
+    """Never hardcode the `aw__` federated prefix — it embeds
+    AW_WORKSPACE_SLUG, which differs per deployment."""
+    names = ["aw__kali__aw__kali_control__proxy_set"]
+    assert _match_leaf_tool(names, "proxy_set") == ("aw__kali__aw__kali_control__proxy_set", None)
+
+
+def test_match_leaf_tool_not_found():
+    assert _match_leaf_tool(["aw__kali_control__proxy_status"], "proxy_set") == (None, "not_found")
+
+
+def test_match_leaf_tool_ambiguous_suffix():
+    names = ["aw__kali_control__proxy_set", "aw__other__weird__proxy_set"]
+    tool_name, error = _match_leaf_tool(names, "proxy_set")
+    assert tool_name is None
+    assert error == "ambiguous"
+
+
+def test_unwrap_leaf_tool_result_parses_json_text_content():
+    rpc_result = {"content": [{"type": "text", "text": '{"enabled": true}'}], "isError": False}
+    ok, result = _unwrap_leaf_tool_result(rpc_result)
+    assert ok is True
+    assert result == {"enabled": True}
+
+
+def test_unwrap_leaf_tool_result_is_error_flips_ok():
+    rpc_result = {"content": [{"type": "text", "text": "boom"}], "isError": True}
+    ok, result = _unwrap_leaf_tool_result(rpc_result)
+    assert ok is False
+    assert result == "boom"
+
+
+def test_unwrap_leaf_tool_result_non_json_text_stays_a_string():
+    rpc_result = {"content": [{"type": "text", "text": "plain text, not json"}]}
+    ok, result = _unwrap_leaf_tool_result(rpc_result)
+    assert ok is True
+    assert result == "plain text, not json"
+
+
+def test_unwrap_leaf_tool_result_no_content():
+    ok, result = _unwrap_leaf_tool_result({})
+    assert ok is True
+    assert result is None
