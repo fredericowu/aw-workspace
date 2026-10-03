@@ -1,4 +1,4 @@
-"""Cross-process file locks for the PROVISION half of W3.
+"""Cross-process file locks — the provisioning mutex AND leader election.
 
 ``src/apps/lifecycle.py`` explains *why* provisioning has to be serialized;
 this is *how*. The original mechanism was a Redis ``SET NX PX`` key, which
@@ -42,6 +42,27 @@ overridable per-instance (``AppLifecycle(lock_dir=…)``,
 ``CommandInstaller(lock_dir=…)``) and process-wide via ``AW_APPS_LOCK_DIR``.
 The test suite sets that env var to a tmp dir for every test — a test that
 took the LIVE lock could block, or block behind, a real provisioning pass.
+
+**Leadership is a flock too, and only a flock** (2026-10-03, Frederico:
+"for defining the leader, it should be flock only, it's not a fallback, it's
+the only logic"). Everything above describes a mutex *around* work; the same
+primitive also answers *who* does the work at all:
+
+* :class:`FlockLease` — holding ``locks/<name>.lock`` IS being the leader
+  (Lock D: the watchdog's periodic tasks). Replaces ``RedisLease("core")``,
+  now deleted from ``src/libs/redis_coord.py``.
+* ``src/apps/boot_reconcile_coord.py`` — holding ``locks/boot-reconcile.lock``
+  IS leading this boot's app reconcile (Lock C).
+
+Why that is strictly better than the Redis ``SET NX`` it replaces, and not
+merely cheaper: a Redis call can fail *without carrying any fact* about who
+holds the key, so every caller needed a degrade-open branch — and with Redis
+unreachable by default here (``src/libs/redis_coord.py``'s own docstring) that
+branch WAS the behaviour. Confirmed live: 45/45 samples of
+``GET /api/apps/-/watchdog`` reported no leader at all. ``flock`` has no
+reachability failure mode; ``EAGAIN`` *is* the fact that someone else holds
+it, so the state is binary and "nobody is the leader" cannot be represented
+while at least one worker is alive.
 """
 from __future__ import annotations
 
@@ -130,6 +151,20 @@ def _try_acquire(path: str) -> Optional[int]:
         raise
     _stamp(fd)
     return fd
+
+
+def try_acquire(path: str) -> Optional[int]:
+    """Public, non-blocking single attempt — the leader-election primitive.
+
+    Same contract as the internal one the polling helpers use: the returned
+    fd IS the lock (hold it, :func:`release` it), ``None`` means someone else
+    holds it right now. Exposed because leadership is decided by *one* try,
+    not by waiting: a worker that loses simply stands by (``FlockLease``, the
+    boot-reconcile coordinator, the one-shot boot claims in
+    ``src/api/app.py``), where a worker that loses the *provisioning* mutex
+    has to wait its turn and do the work anyway.
+    """
+    return _try_acquire(path)
 
 
 def release(fd: Optional[int]) -> None:
@@ -236,3 +271,150 @@ def held(path: str, *, timeout: float, poll_s: float = POLL_S,
         yield fd is not None
     finally:
         release(fd)
+
+
+#: How often a standby re-contends for leadership. Also the failover bound:
+#: a leader that dies has its flock dropped by the kernel instantly, so the
+#: gap is just the next poll — against the 15s TTL ``RedisLease`` needed.
+LEASE_POLL_S = 5.0
+
+
+class FlockLease:
+    """Single-leader election (Lock D) where holding the flock IS leading.
+
+    Wired into ``src/api/app.py``'s lifespan as the gate on
+    ``WatchdogSupervisor`` (``on_acquire`` → ``resume()``, ``on_release`` →
+    ``pause()``) — the same callback contract ``RedisLease("core")`` had, so
+    ``src/apps/watchdog.py`` did not change when this replaced it.
+
+    How it differs from the lease it replaces, beyond the transport:
+
+    * **No renewal, no TTL, no heartbeat.** The held open-file-description
+      *is* the liveness proof. The kernel drops it on exit, crash and
+      ``kill -9`` — nothing to renew, and no window in which a live leader
+      can lose its own claim to a clock.
+    * **Binary state, no "unknown".** ``RedisLease`` needed a third state
+      because a raised connection error carries no fact about who holds the
+      key, and that third state is precisely what made every worker fall
+      back to "ungated, run everything locally". ``EAGAIN`` from ``flock``
+      IS the fact that another process holds it, so a standby is a standby.
+    * **Failover in one poll** (:data:`LEASE_POLL_S`), not one TTL.
+
+    Only started at ``AW_WORKSPACE_WORKERS>1``: with one worker there is no
+    rival, ``WatchdogSupervisor`` is ungated by default, and
+    ``GET /api/apps/-/watchdog`` reports ``gate:"ungated"`` — which is what
+    the absence of a lease on ``app.state`` already meant.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        lock_dir: Optional[str] = None,
+        poll_interval: float = LEASE_POLL_S,
+        on_acquire=None,
+        on_release=None,
+    ) -> None:
+        self.name = name
+        self.poll_interval = poll_interval
+        self._lock_dir = lock_dir
+        self._on_acquire = on_acquire
+        self._on_release = on_release
+        self._fd: Optional[int] = None
+        self._task: Optional[asyncio.Task] = None
+        # None only before start() — "no attempt made yet", not a steady
+        # state the way RedisLease's "unknown" was. start() resolves it
+        # inline before the lifespan proceeds, so nothing ever observes it.
+        self._state: Optional[str] = None
+
+    @property
+    def path(self) -> str:
+        return lock_path(self.name, self._lock_dir)
+
+    @property
+    def is_leader(self) -> bool:
+        return self._state == "leader"
+
+    async def start(self) -> None:
+        """Contend once inline, then poll.
+
+        The inline attempt matters: the lifespan continues immediately after
+        this, and a standby must already have fired ``on_release`` by then —
+        ``WatchdogSupervisor`` defaults to leader, so a worker that has not
+        yet been told it lost is a worker running the periodic tasks.
+        """
+        if self._task is not None:
+            raise RuntimeError("lease already started")
+        await self._contend()
+        self._task = asyncio.ensure_future(self._run())
+
+    async def stop(self) -> None:
+        """Cancel the poll loop and drop the lock, so the next worker's poll
+        can take over within :data:`LEASE_POLL_S` instead of waiting for this
+        process to actually die.
+
+        Deliberately does NOT fire ``on_release``: this runs in the lifespan's
+        shutdown path, where pausing a supervisor that is about to be
+        destroyed is noise, and a callback reaching into half-torn-down state
+        is a real risk. Never raises — a shutdown must not hang or crash on
+        the teardown of a lock we may never have held.
+        """
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("apps: FlockLease(%s) poll loop raised during stop",
+                              self.name)
+            self._task = None
+        release(self._fd)
+        self._fd = None
+        self._state = "standby"
+
+    async def _contend(self) -> None:
+        """One attempt, with the edge-triggered callbacks.
+
+        Edge-triggered, not per-poll: a standby re-contends every
+        :data:`LEASE_POLL_S` forever, and firing ``on_release`` on each losing
+        attempt would call ``watchdog.pause()`` twelve times a minute on every
+        non-leader worker for the life of the process.
+        """
+        fd = try_acquire(self.path)
+        if fd is not None:
+            self._fd = fd
+            if self._state != "leader":
+                self._state = "leader"
+                log.warning("apps: FlockLease(%s) acquired — this worker (pid=%s) "
+                            "is the leader", self.name, os.getpid())
+                if self._on_acquire is not None:
+                    await self._on_acquire()
+            return
+        if self._state != "standby":
+            self._state = "standby"
+            log.warning("apps: FlockLease(%s) held by %s — this worker (pid=%s) "
+                        "is standby", self.name, holder(self.path), os.getpid())
+            if self._on_release is not None:
+                await self._on_release()
+
+    async def _run(self) -> None:
+        while True:
+            await asyncio.sleep(self.poll_interval)
+            # A live holder cannot lose an flock, so there is nothing to
+            # re-check or renew — only a standby has anything to do.
+            if self._state == "leader":
+                continue
+            try:
+                await self._contend()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A broken lock dir (read-only, full) is the only way this
+                # can fail, and it is not a reason to kill the loop: the
+                # same bug once darkened a paused worker permanently, since
+                # it never polled again to notice things had recovered (see
+                # redis_coord's _run before the W1 fix).
+                log.exception("apps: FlockLease(%s) attempt failed — staying %s, "
+                              "will retry in %.0fs", self.name, self._state,
+                              self.poll_interval)

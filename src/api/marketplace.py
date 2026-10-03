@@ -247,12 +247,13 @@ def reconcile_sources_on_boot() -> None:
 
     Idempotent per-row (each entry is only upserted if ``get_source(sid)
     is None``), which is what lets ``src/api/app.py``'s lifespan gate the
-    call itself on a ``cooldown_acquire`` claim (W2) instead of gating
-    here: at ``AW_WORKSPACE_WORKERS>1`` every worker calling this at once
-    is wasteful (N redundant round-trips) but never corrupting, so the
-    call site chooses "first worker through the door wins, Redis
-    unreachable falls back to every worker running it" rather than this
-    function enforcing single-caller itself.
+    call itself on a one-shot ``flock`` claim (W2) instead of gating here:
+    at ``AW_WORKSPACE_WORKERS>1`` every worker calling this at once is
+    wasteful (N redundant round-trips) but never corrupting, so the call
+    site chooses "first worker through the door wins" rather than this
+    function enforcing single-caller itself. (It was a Redis
+    ``cooldown_acquire`` claim until 2026-10-03, where an unreachable Redis
+    — the normal case — meant every worker ran it anyway.)
     """
     try:
         with open(_mirror_path(), encoding="utf-8") as f:

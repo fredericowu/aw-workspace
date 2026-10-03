@@ -672,8 +672,9 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
 
 async def _redis_coord_status() -> dict:
     """Whether `src/libs/redis_coord.py` can actually reach a Redis right
-    now (W0). That module (F5b: RedisBroadcaster/RedisLease/cooldown/
-    RedisPollQueue) has zero consumers today, so nothing else would ever
+    now (W0). That module (F5b: RedisBroadcaster/RedisPollQueue — the
+    leadership primitives moved to ``flock`` on 2026-10-03, see
+    ``src/apps/fs_lock.py``) has few consumers, so little else would ever
     notice its resolved URL going dead — its hardcoded fallback
     (127.0.0.1:6379) answers nothing outside local dev sharing
     aw-sandbox's netns, and the per-workspace companion that would provide
@@ -1351,18 +1352,30 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
 
         W1: ``leader`` reports whether THIS process currently runs the
         tasks at all — at ``AW_WORKSPACE_WORKERS>1`` only the worker holding
-        ``RedisLease("core")`` is the leader, and every other worker's tasks
-        come back with ``paused: true``. A paused task is a normal
+        the watchdog-leader flock is the leader, and every other worker's
+        tasks come back with ``paused: true``. A paused task is a normal
         non-leader state, not a failure — see ``WatchdogSupervisor.pause()``.
 
-        ``gate`` additionally reports the underlying RedisLease("core")
-        state directly, rather than making a caller infer it from
-        ``leader`` alone (which can't distinguish "no lease system at all"
-        from "contending and currently standby"): ``"ungated"`` — no lease
-        was ever started for this process (``leader`` is the
-        WatchdogSupervisor default, true by design); ``"leader"`` — this
-        process holds RedisLease("core"); ``"standby"`` — this process is
-        contending but lost/hasn't won yet.
+        ``gate`` additionally reports the underlying lease state directly,
+        rather than making a caller infer it from ``leader`` alone (which
+        can't distinguish "no lease system at all" from "contending and
+        currently standby"): ``"ungated"`` — no lease was ever started for
+        this process, which at ``AW_WORKSPACE_WORKERS<=1`` is the normal
+        state (``leader`` is then the WatchdogSupervisor default, true by
+        design); ``"leader"`` — this process holds
+        ``<AW_WORKSPACE_HOME>/locks/watchdog-leader.lock``; ``"standby"`` —
+        another worker holds it.
+
+        Lock D (2026-10-03): the lease behind this is an ``fcntl.flock``
+        (``FlockLease``, ``src/apps/fs_lock.py``), not ``RedisLease("core")``.
+        Same three ``gate`` values, same response shape — but ``"standby"``
+        on every worker at once is no longer representable. That WAS the
+        live state (45/45 samples, the "watchdog is leaderless" incident):
+        a Redis poll that raised carried no fact about who held the key, so
+        no worker could ever confirm it had won. Sampling this endpoint
+        across workers is still the way to verify leadership; cross-check
+        the pid in the lock file against that worker's "watchdog resumed"
+        log line.
         """
         lease = getattr(app.state, "watchdog_lease", None)
         if lease is None:
@@ -1698,7 +1711,7 @@ async def reconcile_on_boot(app: FastAPI) -> None:
     # then every interval, since a boot that timed out above still has to
     # converge. Registered in attach_on_boot as well, for the same W1 reason
     # the other three are: at AW_WORKSPACE_WORKERS>1 the boot provisioner is
-    # NOT necessarily the RedisLease("core") holder, and registering only
+    # NOT necessarily the watchdog-leader flock holder, and registering only
     # here left the task recorded on a paused worker — "registered watchdog
     # __system__/workspace-host-drift (paused — not the lease leader)",
     # measured live 2026-09-20 — i.e. never ticking at all. Every worker
@@ -1764,7 +1777,7 @@ async def attach_on_boot(app: FastAPI) -> None:
 
     The four watchdog starters DO run here, in every worker, because that is
     exactly how W1 designed them: each worker registers the tasks and only the
-    ``RedisLease("core")`` holder's supervisor actually spins them — so a
+    watchdog-leader flock holder's supervisor actually spins them — so a
     worker that later wins the lease on failover already has them registered.
     """
     reconciler: Reconciler = app.state.app_reconciler

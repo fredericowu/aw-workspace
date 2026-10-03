@@ -53,7 +53,7 @@ does with the flag and follow the nearest case.
 ### Serialization
 
 ``provision_lock()`` is a cross-worker mutex, not a leader lease. Leadership
-(W1's ``RedisLease("core")``) answers "who runs the periodic tasks"; this
+(W1's watchdog ``FlockLease``) answers "who runs the periodic tasks"; this
 answers "only one worker is inside the side-effecting half at a time", which
 is what ``pip``/``podman``/``git`` into one shared tree actually needs. Two
 *different* apps installed simultaneously through two different workers is a

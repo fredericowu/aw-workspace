@@ -314,7 +314,7 @@ def test_boot_registers_the_healer_and_its_first_tick_repairs_now(monkeypatch):
 def test_a_worker_that_did_not_run_the_reconcile_registers_it_too():
     """Measured live 2026-09-20, on the first cut of this fix: at
     ``AW_WORKSPACE_WORKERS=5`` the boot provisioner is not necessarily the
-    ``RedisLease("core")`` holder, so registering only in ``reconcile_on_boot``
+    watchdog-leader flock holder, so registering only in ``reconcile_on_boot``
     produced "registered watchdog __system__/workspace-host-drift (paused —
     not the lease leader)" and the task never ticked at all. Every worker
     registers it (W1); only the leader's supervisor spins it.

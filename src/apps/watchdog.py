@@ -18,17 +18,29 @@ with its own ``WatchdogSupervisor`` registering the SAME tasks (core CLI
 healer, mcp-gateway rescan, zombie reaper, any app-contributed
 ``watchdog:tasks``) — without a gate that's N copies of each, and N
 concurrent CLI-healer installers racing the same binary path is corruption,
-not just waste. ``src/api/app.py``'s lifespan wires a ``RedisLease("core")``
-whose ``on_acquire``/``on_release`` call ``resume()``/``pause()`` here — the
-ONE choke point every periodic task funnels through, so app-contributed
-tasks are covered without each starter needing its own gate.
+not just waste. ``src/api/app.py``'s lifespan wires a lease whose
+``on_acquire``/``on_release`` call ``resume()``/``pause()`` here — the ONE
+choke point every periodic task funnels through, so app-contributed tasks
+are covered without each starter needing its own gate.
 ``WatchdogSupervisor`` defaults to leader (``register()`` starts the loop
-immediately, exactly as before W1) so a process that never wires a lease at
-all — or one where Redis is unreachable, since ``RedisLease`` then never
-manages to fire ``on_acquire`` — keeps running its tasks locally instead of
-silently going dark. ``pause()`` only ever runs on a confirmed lease loss,
-which by construction can't happen at ``AW_WORKSPACE_WORKERS=1`` (a single
-process has no rival to lose the lease to).
+immediately, exactly as before W1) so a process that wires no lease at all
+keeps running its tasks locally instead of silently going dark.
+
+That lease is a ``flock`` as of 2026-10-03 (``FlockLease``,
+``src/apps/fs_lock.py``) and no longer ``RedisLease("core")``. Nothing in
+this module changed with it — the ``resume()``/``pause()`` contract is
+identical — but the reliability of the thing driving it is not: the Redis
+lease could not distinguish "someone else holds it" from "I couldn't ask",
+so with Redis unreachable (the default here) ``on_acquire`` never fired on
+ANY worker and this supervisor's leader-by-default was the only thing
+keeping the tasks alive — confirmed live at 45/45 samples of
+``GET /api/apps/-/watchdog`` reporting no leader. A flock always grants to
+exactly one contender, so exactly one worker now gets ``resume()`` and the
+rest get a real ``pause()``.
+
+``pause()`` still only ever runs on a confirmed loss, which by construction
+can't happen at ``AW_WORKSPACE_WORKERS<=1`` — no lease is even started
+there, so a single worker stays ungated exactly as before.
 """
 from __future__ import annotations
 
@@ -91,7 +103,7 @@ class WatchdogSupervisor:
     """Runtime-owned registry + lifecycle for apps' periodic tasks.
 
     See the module docstring's "W1: leader mode" section for the
-    resume()/pause() contract this process's RedisLease("core") drives.
+    resume()/pause() contract this process's leader lease drives.
     """
 
     def __init__(self) -> None:
@@ -102,7 +114,7 @@ class WatchdogSupervisor:
     def is_leader(self) -> bool:
         """Whether this process's tasks currently run their loops.
         True by default (ungated) — only ``pause()`` ever flips it False,
-        which only happens from a confirmed RedisLease("core") loss."""
+        which only happens from a confirmed leader-lease loss."""
         return self._leader
 
     def register(self, app_id: str, task_id: str,
@@ -167,7 +179,7 @@ class WatchdogSupervisor:
                 t.task.cancel()
 
     def pause(self) -> None:
-        """RedisLease("core") on_release: stop every registered task's loop
+        """Leader-lease on_release: stop every registered task's loop
         WITHOUT dropping the registrations, so a subsequent resume() restarts
         them with no re-registration. Idempotent — a task with no running
         loop (already paused, or registered while paused) is left alone."""
@@ -183,7 +195,7 @@ class WatchdogSupervisor:
                     "%d registration(s) kept", stopped, len(self._tasks))
 
     def resume(self) -> None:
-        """RedisLease("core") on_acquire: (re)start every registered task's
+        """Leader-lease on_acquire: (re)start every registered task's
         loop. Idempotent — a task already running is left alone."""
         self._leader = True
         started = 0

@@ -65,8 +65,18 @@ jobs:
       # something a single-process test can stand in for, so
       # test_multiworker_app_lifecycle.py skips without one, and a skipped
       # test is how a card's whole VERIFY step quietly stops running.
-      # (test_redis_coord.py and test_watchdog_lease_multiworker.py, from W0
-      # and W1, were skipping here for the same reason.)
+      # (test_redis_coord.py, from W0, was skipping here for the same
+      # reason.)
+      #
+      # The LEADER-ELECTION suites no longer need this at all: as of
+      # 2026-10-03 leadership is flock-only, so
+      # test_watchdog_flock_lease_multiworker.py and
+      # test_boot_reconcile_flock_multiprocess.py need nothing but a
+      # filesystem and cannot skip. That is a correctness improvement in
+      # itself — their Redis predecessor (test_watchdog_lease_multiworker.py,
+      # now deleted) skipped in every environment that had no Redis, which
+      # is exactly where the leaderless-watchdog bug it was meant to catch
+      # was live.
       #
       # Joined to the Postgres container's netns, not its own, for exactly
       # the reason spelled out above it: the suites hardcode loopback

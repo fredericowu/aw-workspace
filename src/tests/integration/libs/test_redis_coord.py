@@ -2,10 +2,17 @@
 aw-backend's F0 module — see that repo's own
 src/tests/integration/libs/test_redis_coord.py for the un-ported original).
 
+The ``RedisLease`` and ``cooldown_acquire`` halves of this file are gone with
+the primitives themselves (2026-10-03): leadership is decided by ``flock``
+only now, and its cross-process proofs live in
+``src/tests/integration/apps/test_watchdog_flock_lease_multiworker.py`` and
+``test_boot_reconcile_flock_multiprocess.py`` — which, unlike anything here,
+do not skip when Redis is unreachable (i.e. always, in this environment).
+
 These spawn REAL OS processes (multiprocessing, fork) racing against each
-other over a shared Redis instance — the whole point of RedisLease /
-RedisBroadcaster is cross-process coordination, so a single-process /
-single-event-loop test wouldn't actually exercise the guarantee. Requires
+other over a shared Redis instance — the whole point of RedisBroadcaster is
+cross-process coordination, so a single-process / single-event-loop test
+wouldn't actually exercise the guarantee. Requires
 a reachable Redis at AW_TEST_REDIS_URL (defaults to the same
 127.0.0.1:6379 address the F5a companion is deterministically reachable
 at) — skips cleanly if it isn't there.
@@ -70,76 +77,6 @@ def _workspace_env(monkeypatch):
 # Worker process bodies — module-level so they're picklable/forkable.
 # ---------------------------------------------------------------------------
 
-def _lease_failover_worker(role: str, redis_url: str, ttl: float, renew: float, queue, stop_event) -> None:
-    os.environ["AW_WORKSPACE"] = WORKSPACE
-    from src.libs.redis_coord import RedisLease
-
-    async def main():
-        pid = os.getpid()
-
-        async def on_acquire():
-            queue.put(("acquire", pid, lease.token, time.time()))
-
-        async def on_release():
-            queue.put(("release", pid, lease.token, time.time()))
-
-        lease = RedisLease(role=role, redis_url=redis_url, ttl=ttl, renew=renew,
-                            on_acquire=on_acquire, on_release=on_release)
-        await lease.start()
-        while not stop_event.is_set():
-            await asyncio.sleep(0.05)
-        await lease.stop()
-
-    asyncio.run(main())
-
-
-def _lease_churn_worker(role: str, redis_url: str, ttl: float, renew: float,
-                         counter_key: str, rounds: int, stop_event) -> None:
-    os.environ["AW_WORKSPACE"] = WORKSPACE
-    from src.libs.redis_coord import RedisLease
-    import redis.asyncio as aioredis
-
-    async def main():
-        client = aioredis.from_url(redis_url, decode_responses=True)
-        for _ in range(rounds):
-            if stop_event.is_set():
-                break
-
-            # W1 fix: on_release now fires on BOTH a confirmed loss of a
-            # held lease AND a confirmed loss of the initial race (never
-            # held it at all) — see redis_coord.py's _try_acquire(). This
-            # counter is an active-leader gauge, so it must only move on a
-            # genuine leader transition; track locally whether this attempt
-            # actually won so a first-attempt loss (which never
-            # incremented) doesn't decrement it below zero.
-            ever_leader = False
-
-            async def on_acquire():
-                nonlocal ever_leader
-                ever_leader = True
-                await client.incr(counter_key)
-
-            async def on_release():
-                nonlocal ever_leader
-                if ever_leader:
-                    ever_leader = False
-                    await client.decr(counter_key)
-
-            lease = RedisLease(role=role, redis_url=redis_url, ttl=ttl, renew=renew,
-                                on_acquire=on_acquire, on_release=on_release)
-            await lease.start()
-            deadline = time.time() + ttl * 3
-            while not lease.is_leader and time.time() < deadline:
-                await asyncio.sleep(0.05)
-            if lease.is_leader:
-                await asyncio.sleep(random.uniform(0.2, 0.5))
-            await lease.stop()
-            await asyncio.sleep(random.uniform(0.05, 0.15))
-        await client.aclose()
-
-    asyncio.run(main())
-
-
 def _broadcast_subscriber_worker(topic: str, redis_url: str, queue, ready_event, stop_event) -> None:
     os.environ["AW_WORKSPACE"] = WORKSPACE
     from src.libs.redis_coord import RedisBroadcaster
@@ -162,103 +99,6 @@ def _broadcast_subscriber_worker(topic: str, redis_url: str, queue, ready_event,
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-
-class TestRedisLeaseFailover:
-    def test_exactly_one_new_leader_within_ttl_after_kill(self):
-        from src.libs.redis_coord import _leader_prefix
-
-        ctx = multiprocessing.get_context("fork")
-        role = f"f5b-test-failover-{uuid.uuid4().hex[:8]}"
-        ttl, renew = 2.0, 0.5
-
-        queue = ctx.Queue()
-        stop_event = ctx.Event()
-        procs = [
-            ctx.Process(target=_lease_failover_worker, args=(role, REDIS_URL, ttl, renew, queue, stop_event))
-            for _ in range(3)
-        ]
-        for p in procs:
-            p.start()
-
-        try:
-            # Wait for the first leader to emerge.
-            first = _drain_until(queue, kind="acquire", timeout=5.0)
-            assert first is not None, "no process acquired the lease in time"
-            _, leader_pid, leader_token, _ = first
-
-            leader_proc = next(p for p in procs if p.pid == leader_pid)
-            leader_proc.kill()  # SIGKILL — no graceful release, simulates a crash
-            leader_proc.join(timeout=5)
-
-            # A survivor must take over within ttl (+ a scheduling buffer).
-            second = _drain_until(queue, kind="acquire", timeout=ttl + 3.0,
-                                   exclude_pid=leader_pid)
-            assert second is not None, f"no new leader took over within ttl={ttl}s"
-            _, new_leader_pid, new_leader_token, _ = second
-            assert new_leader_pid != leader_pid
-            assert new_leader_token != leader_token
-
-            # Exactly one new leader: draining a bit longer must not reveal
-            # a second, different process also believing it's leader.
-            extra = _drain_until(queue, kind="acquire", timeout=1.5,
-                                  exclude_pid={leader_pid, new_leader_pid})
-            assert extra is None, f"double leadership detected: {extra}"
-        finally:
-            stop_event.set()
-            for p in procs:
-                if p.is_alive():
-                    p.join(timeout=5)
-                if p.is_alive():
-                    p.kill()
-            sync_redis.Redis.from_url(REDIS_URL).delete(f"{_leader_prefix()}{role}")
-
-
-class TestRedisLeaseNoDoubleLeadership:
-    def test_atomic_active_leader_count_never_exceeds_one(self):
-        from src.libs.redis_coord import _leader_prefix
-
-        ctx = multiprocessing.get_context("fork")
-        role = f"f5b-test-counter-{uuid.uuid4().hex[:8]}"
-        counter_key = f"aw:ws:{WORKSPACE}:test:active:{role}"
-        ttl, renew = 1.5, 0.4
-        rounds = 4
-
-        r = sync_redis.Redis.from_url(REDIS_URL, decode_responses=True)
-        r.delete(counter_key)
-        r.delete(f"{_leader_prefix()}{role}")
-
-        stop_event = ctx.Event()
-        procs = [
-            ctx.Process(target=_lease_churn_worker,
-                        args=(role, REDIS_URL, ttl, renew, counter_key, rounds, stop_event))
-            for _ in range(4)
-        ]
-        for p in procs:
-            p.start()
-
-        observed_max = 0
-        observed_any_leader = False
-        deadline = time.time() + rounds * (ttl * 3 + 1.0) + 5.0
-        try:
-            while time.time() < deadline and any(p.is_alive() for p in procs):
-                val = int(r.get(counter_key) or 0)
-                observed_max = max(observed_max, val)
-                observed_any_leader = observed_any_leader or val >= 1
-                time.sleep(0.05)
-        finally:
-            stop_event.set()
-            for p in procs:
-                p.join(timeout=5)
-                if p.is_alive():
-                    p.kill()
-            final = int(r.get(counter_key) or 0)
-            r.delete(counter_key)
-            r.delete(f"{_leader_prefix()}{role}")
-
-        assert observed_any_leader, "no process ever became leader"
-        assert observed_max <= 1, f"active-leader counter exceeded 1 (saw {observed_max}) — double leadership"
-        assert final == 0, f"counter didn't settle back to 0 after all processes stopped (was {final})"
-
 
 class TestRedisBroadcasterCrossProcess:
     def test_publish_in_one_process_reaches_subscriber_in_another(self):
@@ -392,51 +232,3 @@ class TestRedisBroadcasterKeyIsWorkspaceScoped:
 
         asyncio.run(scenario())
         assert received_channels == [f"{_bcast_prefix()}{topic}"]
-
-
-class TestCooldownAcquire:
-    def test_first_caller_wins_second_is_blocked_then_expires(self):
-        from src.libs.redis_coord import cooldown_acquire, _cooldown_prefix
-
-        key = f"f5b-test-cooldown-{uuid.uuid4().hex[:8]}"
-
-        async def scenario():
-            first = await cooldown_acquire(key, seconds=1, redis_url=REDIS_URL)
-            second = await cooldown_acquire(key, seconds=1, redis_url=REDIS_URL)
-            await asyncio.sleep(1.3)
-            third = await cooldown_acquire(key, seconds=1, redis_url=REDIS_URL)
-            return first, second, third
-
-        first, second, third = asyncio.run(scenario())
-        assert first is True
-        assert second is False
-        assert third is True
-
-        sync_redis.Redis.from_url(REDIS_URL).delete(f"{_cooldown_prefix()}{key}")
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _drain_until(queue, kind: str, timeout: float, exclude_pid=None):
-    """Pop events off `queue` until one matches `kind` and isn't from an
-    excluded pid, or `timeout` elapses. Returns the matching event tuple
-    or None."""
-    if exclude_pid is None:
-        exclude_pid = set()
-    elif isinstance(exclude_pid, int):
-        exclude_pid = {exclude_pid}
-
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            break
-        try:
-            event = queue.get(timeout=remaining)
-        except Exception:
-            break
-        if event[0] == kind and event[1] not in exclude_pid:
-            return event
-    return None

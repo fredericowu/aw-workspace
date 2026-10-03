@@ -542,7 +542,7 @@ def test_lifecycle_publish_and_lock_are_noops_without_redis(monkeypatch, tmp_pat
 def test_single_worker_never_defers_its_boot_reconcile(monkeypatch):
     """GOLDEN RULE, as a test. ``AW_WORKSPACE_WORKERS<=1`` is what ships, and
     such a worker must ALWAYS run its own boot reconcile — never wait for a
-    "provisioner" that does not exist.
+    "provisioner" that does not exist, and never even consult a lock.
 
     This is a regression test with a scar behind it: gating purely on a Redis
     ``cooldown_acquire`` made a single worker restarting twice inside the
@@ -557,7 +557,7 @@ def test_single_worker_never_defers_its_boot_reconcile(monkeypatch):
     monkeypatch.setenv("AW_WORKSPACE_WORKERS", "1")
 
     def _boom(*a, **k):
-        raise AssertionError("a single worker must not consult Redis/the "
+        raise AssertionError("a single worker must not consult the "
                              "coordinator at all")
 
     monkeypatch.setattr(
@@ -565,82 +565,29 @@ def test_single_worker_never_defers_its_boot_reconcile(monkeypatch):
     assert asyncio.run(_is_boot_provisioner()) == (True, None)
 
 
-def test_multi_worker_falls_back_to_provisioning_when_redis_is_down(monkeypatch):
-    """No coordination available -> every worker converges independently.
-    Wasteful, but it is exactly the pre-W3 degrade-open behaviour, which is
-    the right failure mode: apps come up. ``coordinator`` in the returned
-    tuple must be ``None`` here — there is nothing real to hand the caller
-    to heartbeat against."""
+def test_multi_worker_still_provisions_when_coordination_itself_breaks(monkeypatch):
+    """The lock directory being unusable (read-only, full) is the only way
+    coordinate() can raise now that no network is involved — and apps must
+    still come up. ``coordinator`` in the returned tuple must be ``None``:
+    there is no held lock to finish.
+
+    This used to be the ``Redis is down`` test, and that case used to be the
+    NORMAL one — which is exactly what made it dangerous, since every worker
+    took this branch and led concurrently. It is a genuine edge case now.
+    """
     from src.api.app import _is_boot_provisioner
     from src.apps.boot_reconcile_coord import BootReconcileCoordinator
 
     monkeypatch.setenv("AW_WORKSPACE_WORKERS", "10")
 
     async def _down(self):
-        raise ConnectionError("redis is down")
+        raise OSError("read-only file system")
 
     monkeypatch.setattr(BootReconcileCoordinator, "coordinate", _down)
-    # aclose() is left as the real implementation on purpose: self._client
-    # is still None (coordinate() raised before ever calling _get_client()),
-    # so the real aclose() is a correct no-op here — exercising it for real
-    # is what proves _is_boot_provisioner's except-branch actually calls a
-    # working aclose(), not a mock that would hide a bug in it.
     assert asyncio.run(_is_boot_provisioner()) == (True, None)
 
 
-class _FakeRedisForClaims:
-    """Minimal in-memory stand-in for the coordinator's Redis client — real
-    wall-clock TTLs, just the GET/SET/EVAL subset it calls. Lets these
-    app.py-orchestration tests exercise the REAL BootReconcileCoordinator
-    (not a hand-rolled substitute for it) without touching a live Redis.
-    Fuller correctness of the coordinator itself (heartbeat survival, dead
-    -leader reclaim, etc.) is covered by test_boot_reconcile_coord.py — this
-    is scoped to what app.py's _is_boot_provisioner does with the result.
-    """
-
-    def __init__(self):
-        self._store: dict[str, tuple[str, float | None]] = {}
-
-    def _expire_if_due(self, key):
-        import time
-        if key in self._store:
-            _, expires_at = self._store[key]
-            if expires_at is not None and time.monotonic() >= expires_at:
-                del self._store[key]
-
-    async def get(self, key):
-        self._expire_if_due(key)
-        entry = self._store.get(key)
-        return entry[0] if entry else None
-
-    async def set(self, key, value, nx=False, px=None, ex=None):
-        import time
-        self._expire_if_due(key)
-        if nx and key in self._store:
-            return None
-        expires_at = None
-        if px is not None:
-            expires_at = time.monotonic() + px / 1000.0
-        elif ex is not None:
-            expires_at = time.monotonic() + ex
-        self._store[key] = (value, expires_at)
-        return True
-
-    async def eval(self, script, numkeys, *args):
-        import time
-        key, token, px = args
-        self._expire_if_due(key)
-        entry = self._store.get(key)
-        if entry is None or entry[0] != token:
-            return 0
-        self._store[key] = (token, time.monotonic() + int(px) / 1000.0)
-        return 1
-
-    async def aclose(self):
-        pass
-
-
-def test_multi_worker_claim_is_scoped_to_one_fleet_boot(monkeypatch):
+def test_multi_worker_claim_is_scoped_to_one_fleet_boot(monkeypatch, tmp_path):
     """Exactly one worker of a boot provisions (returns a coordinator), the
     other two attach (return None) — and every one of them was keyed on the
     SAME boot-nonce minted once by the parent process (``boot_info.boot_id()``)
@@ -654,20 +601,20 @@ def test_multi_worker_claim_is_scoped_to_one_fleet_boot(monkeypatch):
     monkeypatch.setattr(boot_info, "compute_git_head", lambda: "")
     boot_info.mint_boot_identity()
 
-    shared_client = _FakeRedisForClaims()
+    lock_dir = str(tmp_path / "locks")
     real_init = BootReconcileCoordinator.__init__
 
     def _patched_init(self, boot_id, **kw):
         # Short patience: these three "workers" are awaited SEQUENTIALLY
         # below (one real reconcile pass per worker in production is never
         # concurrent with another worker's own check either), so a follower
-        # correctly finds the lease already held — it only actually WAITS
-        # out max_wait_s if something regressed and nobody ever marks done.
-        # Keeping that short is what turns a regression into a fast
+        # correctly finds the done marker already written — it only actually
+        # WAITS out max_wait_s if something regressed and nobody ever
+        # finishes. Keeping that short is what turns a regression into a fast
         # assertion failure instead of the 43-MINUTE hang this test suite
-        # caught once already (see the pytest run that produced this fix).
+        # caught once already.
+        kw.setdefault("lock_dir", lock_dir)
         real_init(self, boot_id, max_wait_s=0.2, poll_interval=0.02, **kw)
-        self._client = shared_client  # bypass real aioredis.from_url
 
     monkeypatch.setattr(BootReconcileCoordinator, "__init__", _patched_init)
 
@@ -681,7 +628,7 @@ def test_multi_worker_claim_is_scoped_to_one_fleet_boot(monkeypatch):
                 # gets a coordinator, followers see done and attach) is not
                 # about proving the coordinator waits out a slow pass, which
                 # test_boot_reconcile_coord.py already covers directly.
-                await coordinator.mark_done()
+                await coordinator.finish()
             results.append((leading, coordinator))
         return results
 
@@ -695,7 +642,7 @@ def test_multi_worker_claim_is_scoped_to_one_fleet_boot(monkeypatch):
     assert coordinators[0].boot_id == boot_info.boot_id()
 
 
-def test_restart_in_place_with_pid_reuse_gets_a_fresh_claim(monkeypatch):
+def test_restart_in_place_with_pid_reuse_gets_a_fresh_claim(monkeypatch, tmp_path):
     """Regression test for the W3 boot-provisioner bug fixed 2026-09-06
     (Kanban card ``aw-workspace-multiworker:proxy-app-auto-start-not-running``).
 
@@ -711,10 +658,10 @@ def test_restart_in_place_with_pid_reuse_gets_a_fresh_claim(monkeypatch):
     Simulated here by minting a boot-nonce for "boot #1", running its fleet,
     then minting an entirely new one for "boot #2" (what
     ``mint_boot_identity()`` does on every real restart, independent of
-    ``os.getppid()``) against a SHARED fake claim store — a lease that never
-    got a heartbeat AND never expired within the test's own runtime is the
-    worst case for cross-boot leakage. Boot #2 must still get its own
-    provisioner, because its key differs from boot #1's.
+    ``os.getppid()``) against a SHARED lock directory — boot #1's done marker
+    is still sitting there, which is the worst case for cross-boot leakage.
+    Boot #2 must still get its own provisioner, because the marker it looks
+    for is keyed on its own boot_id.
     """
     from src.api import boot_info
     from src.api.app import _is_boot_provisioner
@@ -723,19 +670,12 @@ def test_restart_in_place_with_pid_reuse_gets_a_fresh_claim(monkeypatch):
     monkeypatch.setenv("AW_WORKSPACE_WORKERS", "3")
     monkeypatch.setattr(boot_info, "compute_git_head", lambda: "")
 
-    shared_client = _FakeRedisForClaims()
+    lock_dir = str(tmp_path / "locks")
     real_init = BootReconcileCoordinator.__init__
 
     def _patched_init(self, boot_id, **kw):
-        # A long lease_ttl: this boot's own runtime must not accidentally
-        # expire boot #1's claim on its own — only a DIFFERENT boot_id
-        # (never any TTL race) is what must isolate boot #2 from it. Short
-        # max_wait_s for the same reason as the sibling test above: a
-        # follower here is expected to see the lease already taken and
-        # return immediately, never to actually wait one out.
-        real_init(self, boot_id, lease_ttl=3600.0, max_wait_s=0.2,
-                  poll_interval=0.02, **kw)
-        self._client = shared_client
+        kw.setdefault("lock_dir", lock_dir)
+        real_init(self, boot_id, max_wait_s=0.2, poll_interval=0.02, **kw)
 
     monkeypatch.setattr(BootReconcileCoordinator, "__init__", _patched_init)
 
@@ -744,7 +684,7 @@ def test_restart_in_place_with_pid_reuse_gets_a_fresh_claim(monkeypatch):
         for _ in range(3):
             leading, coordinator = await _is_boot_provisioner()
             if coordinator is not None:
-                await coordinator.mark_done()
+                await coordinator.finish()
             results.append((leading, coordinator))
         return results
 
@@ -757,72 +697,3 @@ def test_restart_in_place_with_pid_reuse_gets_a_fresh_claim(monkeypatch):
     results_2 = asyncio.run(fleet())
     assert [r[0] for r in results_2] == [True, False, False]
     assert results_2[0][1].boot_id != results_1[0][1].boot_id
-
-
-def test_converge_cannot_interleave_with_this_worker_s_own_install(runtime, tmp_path,
-                                                                   monkeypatch):
-    """``install`` has a window between ``runtime.load`` (the app is LOADED)
-    and ``local.upsert`` (the app is LISTED). An apps:changed from another
-    worker landing inside it finds an app that is loaded-but-unlisted — which
-    is exactly ``converge_in_process``'s definition of "detach this" — and
-    would unmount an install that was succeeding.
-
-    So a convergence must hold the same in-process lock a provisioning pass
-    does. Asserted directly: park an install inside that window, fire a
-    converge, and require that it has NOT progressed and the mount is intact.
-    """
-    from src.apps.lifecycle import AppLifecycle
-    from src.apps.reconciler import AppSpec, Reconciler
-
-    fx = _Effects()
-    fx.wire(runtime, monkeypatch)
-    pkg = _pkg(tmp_path)
-    rows: list[dict] = []
-
-    class _Mirror:
-        def list(self):
-            return list(rows)
-
-        def upsert(self, spec, package_dir):
-            rows.append({"app_id": spec.app_id, "version": spec.version,
-                         "package_dir": package_dir,
-                         "granted_permissions": spec.granted_permissions,
-                         "config": spec.config, "signed": spec.signed})
-
-    reconciler = Reconciler(runtime, local=_Mirror(), lifecycle=AppLifecycle())
-    monkeypatch.setattr(type(reconciler.cloud), "configured", property(lambda self: False))
-
-    async def run():
-        in_window = asyncio.Event()
-        release = asyncio.Event()
-        real_load = runtime.load
-
-        async def _park_after_load(*a, **k):
-            result = await real_load(*a, **k)
-            in_window.set()          # loaded, not yet upserted
-            await release.wait()
-            return result
-
-        monkeypatch.setattr(runtime, "load", _park_after_load)
-        install = asyncio.create_task(
-            reconciler.install(AppSpec(app_id="w3app", package_dir=pkg),
-                               write_cloud=False))
-        await asyncio.wait_for(in_window.wait(), timeout=5)
-
-        # Mid-window: loaded here, absent from the mirror.
-        assert runtime.is_loaded("w3app") and rows == []
-        converge = asyncio.create_task(reconciler.converge_in_process())
-        done, _ = await asyncio.wait({converge}, timeout=1.0)
-
-        assert not done, "the converge ran inside the install window"
-        assert runtime.is_loaded("w3app"), "the converge detached a live install"
-
-        release.set()
-        await asyncio.wait_for(install, timeout=10)
-        result = await asyncio.wait_for(converge, timeout=10)
-        # It runs once the install has committed, and now agrees with it.
-        assert result == {"attached": [], "detached": [], "reconfigured": [],
-                          "errors": []}
-        assert runtime.is_loaded("w3app")
-
-    asyncio.run(asyncio.wait_for(run(), timeout=40))

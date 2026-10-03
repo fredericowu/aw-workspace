@@ -26,12 +26,32 @@ Unlike aw-backend's `aw:` namespace, every key here is additionally scoped
 under `aw:ws:<AW_WORKSPACE>:` — the companion Redis is already isolated
 per-workspace (F5a), so this isn't required for correctness, but it keeps
 keys legible/greppable if a companion instance is ever inspected directly
-or shared. This module provides the same four primitives as the source:
+or shared. This module provides two of the four primitives in the source:
 
 - `RedisBroadcaster` — pub/sub fan-out across workers/processes.
-- `RedisLease` — single-leader election with automatic failover.
-- `cooldown_acquire` — one-shot "claim this window" helper.
 - `RedisPollQueue` — Redis Streams-backed event log (long-poll delivery).
+
+**Leadership deliberately does NOT live here any more.** `RedisLease`
+(single-leader election) and `cooldown_acquire` (one-shot "claim this
+window") were deleted on 2026-10-03 — every leader decision in this
+codebase is now an `fcntl.flock`, and only an flock: see
+`src/apps/fs_lock.py`'s `FlockLease` (watchdog tasks),
+`src/apps/boot_reconcile_coord.py` (boot reconcile), and the one-shot claim
+in `src/api/app.py`'s lifespan (marketplace sources). The reason is the
+paragraph above about F5a: with this Redis unreachable by default, a
+`SET NX` that raised carried no fact about who held the key, so every
+caller needed a degrade-open branch — and that branch was the live
+behaviour, confirmed by 45/45 samples of `GET /api/apps/-/watchdog`
+reporting no leader at all. What is left here is messaging and fan-out,
+which is genuinely Redis-shaped: a flock cannot deliver a message to
+another process, and a broadcast that silently doesn't arrive degrades to
+"converge on the next restart" rather than to "two processes both think
+they own this".
+
+(`src/apps/service_lease.py` is the one remaining Redis-primary ownership
+decision in core. It is NOT an oversight — its `is_lease_held_anywhere`
+needs a remote READ of "does anyone hold this", which flock only answers
+via a momentary acquire-probe. Tracked as its own follow-up card.)
 
 Plus `get_redis_pool()` — a shared, per-URL-cached async client (bootstrap
 helper) meant to be reused by upcoming sub-cards (F5d proxy, F5g terminal)
@@ -39,8 +59,6 @@ instead of each opening its own connection.
 
 Key layout (all under `aw:ws:<workspace>:`):
     aw:ws:<ws>:bcast:<topic>    — pub/sub channels (RedisBroadcaster)
-    aw:ws:<ws>:leader:<role>    — leader-election keys (RedisLease)
-    aw:ws:<ws>:cooldown:<key>   — cooldown_acquire keys
     aw:ws:<ws>:mdpoll:<session> — long-poll event streams (RedisPollQueue)
     aw:ws:<ws>:mdpoll:epoch     — long-poll shared epoch (RedisPollQueue)
 """
@@ -112,42 +130,12 @@ def _bcast_prefix() -> str:
     return f"{_key_prefix()}bcast:"
 
 
-def _leader_prefix() -> str:
-    return f"{_key_prefix()}leader:"
-
-
-def _cooldown_prefix() -> str:
-    return f"{_key_prefix()}cooldown:"
-
-
 def _poll_stream_prefix() -> str:
     return f"{_key_prefix()}mdpoll:"
 
 
 def _poll_epoch_key() -> str:
     return f"{_poll_stream_prefix()}epoch"
-
-
-# Renew-time CAS: only refresh the TTL if we're still the recorded owner.
-# Prevents a straggler renew (e.g. delayed by GC/scheduling) from
-# resurrecting a lease another process has since legitimately acquired.
-_RENEW_LUA = """
-if redis.call('get', KEYS[1]) == ARGV[1] then
-    return redis.call('pexpire', KEYS[1], ARGV[2])
-else
-    return 0
-end
-"""
-
-# Release-time CAS: only delete the key if we're still the owner, so a
-# graceful stop() can never delete a lease someone else already holds.
-_RELEASE_LUA = """
-if redis.call('get', KEYS[1]) == ARGV[1] then
-    return redis.call('del', KEYS[1])
-else
-    return 0
-end
-"""
 
 
 _pool_cache: dict[str, aioredis.Redis] = {}
@@ -161,8 +149,8 @@ def get_redis_pool(redis_url: Optional[str] = None) -> aioredis.Redis:
     and F5g (terminal) are meant to call directly rather than hand-rolling
     their own `aioredis.from_url(...)`.
 
-    Not used internally by `RedisBroadcaster`/`RedisLease`/`RedisPollQueue`
-    below — those still own (and close) their own client, matching the
+    Not used internally by `RedisBroadcaster`/`RedisPollQueue` below —
+    those still own (and close) their own client, matching the
     ported aw-backend behavior 1:1. A shared, never-closed client here
     would break their `stop()`/`close()` semantics for every other caller.
     """
@@ -249,157 +237,6 @@ class RedisBroadcaster:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
-
-
-class RedisLease:
-    """Single-leader election for one `role` name, backed by
-    `aw:ws:<ws>:leader:<role>`.
-
-    - Acquire: `SET aw:ws:<ws>:leader:<role> <token> NX PX <ttl*1000>` —
-      only one process ever wins this for a given role at a time (Redis
-      key exclusivity), win propagates via `on_acquire`.
-    - Hold: every `renew` seconds, a Lua CAS refreshes the TTL only if the
-      key still holds our own `token` — a process that lost the lease
-      (key expired and someone else grabbed it) detects that on its next
-      renew attempt and fires `on_release`.
-    - Failover: if the leader dies without releasing (crash, kill -9), the
-      key simply expires after `ttl` seconds with no renewal, and the next
-      process's acquire attempt succeeds — bounded failover time of `ttl`.
-    """
-
-    def __init__(
-        self,
-        role: str,
-        redis_url: Optional[str] = None,
-        ttl: float = 15.0,
-        renew: float = 5.0,
-        on_acquire: Optional[Callable[[], Awaitable[None]]] = None,
-        on_release: Optional[Callable[[], Awaitable[None]]] = None,
-    ):
-        self.role = role
-        self.ttl = ttl
-        self.renew_interval = renew
-        self.token = uuid.uuid4().hex
-        self._redis_url = redis_url or get_workspace_redis_url()
-        self._key = f"{_leader_prefix()}{role}"
-        self._on_acquire = on_acquire
-        self._on_release = on_release
-        self._client: Optional[aioredis.Redis] = None
-        self._task: Optional[asyncio.Task] = None
-        # Ternary, not boolean: "unknown" (no confirmed fact about the lease
-        # yet — either we haven't polled, or the last poll raised) is
-        # distinct from "standby" (Redis answered nil — a positive fact that
-        # someone else holds the key). Only a confirmed "standby" transition
-        # fires on_release; "unknown" never does, which is what keeps the
-        # ungated fallback (Redis unreachable -> WatchdogSupervisor stays at
-        # its default leader=True) intact. See _try_acquire()/_run().
-        self._state: str = "unknown"
-
-    @property
-    def is_leader(self) -> bool:
-        return self._state == "leader"
-
-    def _get_client(self) -> aioredis.Redis:
-        if self._client is None:
-            self._client = aioredis.from_url(self._redis_url, decode_responses=True)
-        return self._client
-
-    async def start(self) -> None:
-        if self._task is not None:
-            raise RuntimeError("lease already started")
-        self._task = asyncio.create_task(self._run())
-
-    async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
-        if self._state == "leader":
-            await self._release()
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
-
-    async def _run(self) -> None:
-        try:
-            while True:
-                try:
-                    if self._state != "leader":
-                        await self._try_acquire()
-                    else:
-                        await self._try_renew()
-                except Exception as e:  # noqa: BLE001 — transient Redis blip
-                    # A raised exception carries no fact about who holds the
-                    # lease (unlike a clean nil), so state is deliberately
-                    # left untouched here — see the module's on_release
-                    # contract in _try_acquire(). Without this, any blip
-                    # would previously kill this task forever (an unretrieved
-                    # asyncio task exception), silently darkening whichever
-                    # worker hit it — paused losers included, since they'd
-                    # never poll again to notice Redis came back.
-                    logger.warning(
-                        "redis_coord: role=%s poll failed (Redis unreachable?), "
-                        "state unchanged (%s): %s", self.role, self._state, e,
-                    )
-                await asyncio.sleep(self.renew_interval)
-        except asyncio.CancelledError:
-            raise
-
-    async def _try_acquire(self) -> None:
-        client = self._get_client()
-        won = await client.set(self._key, self.token, nx=True, px=int(self.ttl * 1000))
-        if won:
-            if self._state != "leader":
-                self._state = "leader"
-                logger.info("redis_coord: role=%s acquired by token=%s", self.role, self.token)
-                if self._on_acquire is not None:
-                    await self._on_acquire()
-        else:
-            # Redis answered nil: a positive fact (Redis works AND someone
-            # else holds the key), not the same as "no fact" from a raised
-            # exception. Edge-triggered on the transition INTO standby, not
-            # every poll — _run() polls every renew_interval (5s default),
-            # so a naive "fire on_release every losing poll" would call
-            # watchdog.pause() 12x/min forever on every losing worker.
-            if self._state != "standby":
-                self._state = "standby"
-                logger.warning("redis_coord: role=%s lost race, standby token=%s", self.role, self.token)
-                if self._on_release is not None:
-                    await self._on_release()
-
-    async def _try_renew(self) -> None:
-        client = self._get_client()
-        renewed = await client.eval(_RENEW_LUA, 1, self._key, self.token, int(self.ttl * 1000))
-        if not renewed:
-            self._state = "standby"
-            logger.warning("redis_coord: role=%s lost by token=%s", self.role, self.token)
-            if self._on_release is not None:
-                await self._on_release()
-
-    async def _release(self) -> None:
-        client = self._get_client()
-        await client.eval(_RELEASE_LUA, 1, self._key, self.token)
-        self._state = "standby"
-        if self._on_release is not None:
-            await self._on_release()
-
-
-async def cooldown_acquire(key: str, seconds: float, redis_url: Optional[str] = None) -> bool:
-    """Atomically claim a cooldown window for `key`.
-
-    Returns True if this call won it (the key didn't already exist — it's
-    now set with a `seconds`-long expiry), False if someone already holds
-    the cooldown. One-shot: there's no release, it just expires.
-    """
-    client = aioredis.from_url(redis_url or get_workspace_redis_url(), decode_responses=True)
-    try:
-        won = await client.set(f"{_cooldown_prefix()}{key}", "1", nx=True, ex=max(1, int(seconds)))
-        return bool(won)
-    finally:
-        await client.aclose()
 
 
 _LEGACY_INT_CURSOR_RE = re.compile(r"^-?\d+$")

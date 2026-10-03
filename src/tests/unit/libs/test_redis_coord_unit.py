@@ -1,9 +1,15 @@
 """Unit tests for the F5b redis_coord bootstrap helpers — no live Redis
 needed, these only check env-var resolution, key-prefix scoping, and the
-`get_redis_pool()` per-URL cache. Cross-process behavior of the four
-coordination primitives themselves is covered by
+`get_redis_pool()` per-URL cache. Cross-process behavior of the two
+remaining coordination primitives is covered by
 src/tests/integration/libs/test_redis_coord.py and
 test_redis_poll_queue.py (require a real Redis, skip cleanly otherwise).
+
+The `RedisLease` tests that used to live here went with the class
+(2026-10-03, leadership is flock-only now). Their one non-obvious property
+— a poll that raises must not kill the loop, or a paused worker never polls
+again and goes dark forever — carried over to `FlockLease` and is tested in
+src/tests/unit/apps/test_flock_lease.py.
 """
 from __future__ import annotations
 
@@ -55,8 +61,6 @@ class TestKeyPrefixesAreWorkspaceScoped:
     def test_prefixes_embed_the_workspace_slug(self, _clean_env, monkeypatch):
         monkeypatch.setenv("AW_WORKSPACE", "acme")
         assert _clean_env._bcast_prefix() == "aw:ws:acme:bcast:"
-        assert _clean_env._leader_prefix() == "aw:ws:acme:leader:"
-        assert _clean_env._cooldown_prefix() == "aw:ws:acme:cooldown:"
         assert _clean_env._poll_stream_prefix() == "aw:ws:acme:mdpoll:"
         assert _clean_env._poll_epoch_key() == "aw:ws:acme:mdpoll:epoch"
 
@@ -83,67 +87,3 @@ class TestGetRedisPool:
         monkeypatch.setenv("AW_WORKSPACE_REDIS_URL", "redis://127.0.0.1:6379/3")
         pool = _clean_env.get_redis_pool()
         assert pool is _clean_env.get_redis_pool("redis://127.0.0.1:6379/3")
-
-
-class _FailingRedisClient:
-    """Fake `aioredis.Redis` whose `set()` always raises — no live Redis
-    needed. Stands in for a transient connection blip."""
-
-    async def set(self, *args, **kwargs):
-        raise ConnectionError("simulated Redis blip")
-
-
-class TestRedisLeaseRunSurvivesExceptions:
-    """W1 fix (2) regression guard: `_run()` used to die permanently (an
-    unretrieved asyncio task exception) on ANY Redis exception — no
-    `except Exception`, only `except asyncio.CancelledError: raise`. A
-    losing worker that gets paused and then hits a blip on its next poll
-    would go dark forever, with its registrations intact and nothing to
-    resume them. This must hold with no Redis reachable at all."""
-
-    @pytest.mark.asyncio
-    async def test_exception_leaves_state_unknown_and_task_alive(self, _clean_env):
-        lease = _clean_env.RedisLease(role="w1-unit-test", renew=0.01)
-        lease._client = _FailingRedisClient()
-
-        task = asyncio.ensure_future(lease._run())
-        try:
-            # Several poll cycles' worth of raised exceptions.
-            await asyncio.sleep(0.05)
-            assert not task.done(), "lease._run() task died on a Redis exception"
-            assert lease._state == "unknown", (
-                "an exception carries no fact about the lease — state must "
-                "stay unchanged, not flip to standby/leader"
-            )
-            assert lease.is_leader is False
-        finally:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-    @pytest.mark.asyncio
-    async def test_on_release_not_fired_by_a_raised_exception(self, _clean_env):
-        """Only a clean `nil` from Redis (a confirmed loss) may fire
-        on_release — a raised exception must not, or a transient blip would
-        pause a worker that never actually lost the race."""
-        released = False
-
-        async def on_release():
-            nonlocal released
-            released = True
-
-        lease = _clean_env.RedisLease(role="w1-unit-test", renew=0.01, on_release=on_release)
-        lease._client = _FailingRedisClient()
-
-        task = asyncio.ensure_future(lease._run())
-        try:
-            await asyncio.sleep(0.05)
-            assert released is False
-        finally:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass

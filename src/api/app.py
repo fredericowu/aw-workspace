@@ -41,10 +41,15 @@ from src.api.workspace_api_key import (
     regenerate_workspace_api_key,
 )
 from src.api.workspace_url import publish_workspace_api_url
-from src.apps.routes import (_redis_coord_status, attach_on_boot, reconcile_on_boot,
+from src.apps.routes import (attach_on_boot, reconcile_on_boot,
                              register_apps_routes)
 
 log = logging.getLogger(__name__)
+
+#: Lock D: whoever holds ``<AW_WORKSPACE_HOME>/locks/watchdog-leader.lock``
+#: runs this workspace's periodic watchdog tasks. Named here because the
+#: lifespan is its only wirer — ``cat`` it to see the leader's pid.
+WATCHDOG_LEADER_LOCK = "watchdog-leader"
 
 
 def _spa_origin_regex() -> str:
@@ -143,7 +148,7 @@ async def _is_boot_provisioner() -> tuple[bool, BootReconcileCoordinator | None]
     """W3/W4: does THIS worker run the side-effecting boot reconcile?
 
     1. **At ``AW_WORKSPACE_WORKERS<=1`` — always yes**, without consulting
-       Redis at all. There is no other worker to coordinate with, so any
+       any lock at all. There is no other worker to coordinate with, so any
        coordination here could only ever subtract behaviour, and the card's
        golden rule is that a single-worker deployment behaves identically.
        Getting this wrong is not theoretical: a plain ``cooldown_acquire``
@@ -153,13 +158,14 @@ async def _is_boot_provisioner() -> tuple[bool, BootReconcileCoordinator | None]
 
     2. **At >1, one worker per FLEET BOOT wins it — and keeps it for the
        reconcile's actual runtime, not a fixed clock.** Returns
-       ``(True, coordinator)`` for the leader — the caller must heartbeat
-       it for the duration of the real reconcile pass and mark it done
-       afterwards — or ``(False, None)`` for a follower. Keyed on
-       ``boot_info.boot_id()`` (see that module) so a later restart always
-       gets its own claim rather than inheriting one opened by the boot
-       before it — see boot_info's own docstring for the ``os.getppid()``
-       incident that keying used to reproduce.
+       ``(True, coordinator)`` for the leader — the caller must call
+       ``finish()`` on it once the real pass ends — or ``(False, None)`` for
+       a follower. Leadership is a held ``flock``; "this boot's pass already
+       finished" is a done-marker file keyed on ``boot_info.boot_id()`` (see
+       that module) so a later restart always gets its own claim rather than
+       inheriting one opened by the boot before it — see boot_info's own
+       docstring for the ``os.getppid()`` incident that keying used to
+       reproduce.
 
        W4 (2026-09-18, incident: workspace ``crispal`` — see
        ``boot_reconcile_coord``'s module docstring): the ORIGINAL >1 path
@@ -168,24 +174,22 @@ async def _is_boot_provisioner() -> tuple[bool, BootReconcileCoordinator | None]
        worker respawned by uvicorn after that window elapsed re-won the
        (already-expired) claim and ran a SECOND full pass on top of a still
        -running first one; over 2+ hours this produced up to 21 concurrent
-       passes on one boot. ``BootReconcileCoordinator`` replaces the fixed
-       TTL with a renewed lease (dies with its holder, not with a clock)
-       plus a terminal "done" marker every later check short-circuits on.
+       passes on one boot.
 
-    Redis unreachable — falls back to ``(True, None)``, i.e. degrade-open:
-    every worker converges independently, wastefully but correctly. ``None``
-    rather than a coordinator because there is nothing real to heartbeat
-    against — the caller must check for it before calling any coordinator
-    method.
+    **Flock-only, as of 2026-10-03** (Frederico: "for defining the leader, it
+    should be flock only, it's not a fallback, it's the only logic"). This
+    used to ask a Redis-backed coordinator and, when Redis was unreachable —
+    "the normal case today" by ``src/libs/redis_coord.py``'s own docstring —
+    degrade open to ``(True, None)``: every worker leads, concurrently. That
+    was the live behaviour, not the exception. ``flock`` has no reachability
+    failure mode, so there is no longer a branch in which everybody leads.
 
-    "Wastefully but **correctly**" is only true because of what sits one
-    layer down. Until 2026-10-03 it was not: with Redis unreachable (the
-    normal case) all ten workers took this branch and ran a full provisioning
-    pass each, and the mutex meant to serialize them (``provision_lock``) also
-    degraded to a per-process ``asyncio.Lock`` in exactly that case — so ten
-    ``apt-get`` runs hit one ``/var/cache/apt`` and corrupted installs. The
-    lock is now an ``fcntl.flock`` (``src/apps/fs_lock.py``) that does not
-    depend on Redis, which is what makes the waste here merely waste.
+    The ``except`` below is therefore about a broken lock directory
+    (read-only, full), not about coordination being unavailable — it keeps
+    the "apps must come up" posture for a case that should never happen, and
+    it is safe in a way the old degrade-open never was: the provisioning
+    mutex one layer down (Lock A, ``src/apps/lifecycle.py``) is itself an
+    ``fcntl.flock`` now, so two passes serialize instead of racing ``apt``.
     """
     if int(os.environ.get("AW_WORKSPACE_WORKERS", "1") or "1") <= 1:
         return True, None
@@ -195,12 +199,10 @@ async def _is_boot_provisioner() -> tuple[bool, BootReconcileCoordinator | None]
     try:
         leading = await coordinator.coordinate()
     except Exception:
-        log.exception("apps: could not coordinate the boot reconcile — this "
-                      "worker will run its own, as it did before W3")
-        await coordinator.aclose()
+        log.exception("apps: could not coordinate the boot reconcile (the lock "
+                      "directory is unusable?) — this worker will run its own")
         return True, None
     if not leading:
-        await coordinator.aclose()
         return False, None
     return True, coordinator
 
@@ -222,24 +224,20 @@ async def _boot_reconcile_and_sync(app: FastAPI) -> None:
     (fast, no network, no side effects) and converge again off the
     ``apps:changed`` that pass publishes at its end. See src/apps/lifecycle.py.
 
-    W4: the leader's coordinator (``None`` at <=1 workers or on a Redis
-    fallback — nothing real to hold) is heartbeated for the ENTIRE
-    reconcile call below, and marked done only in the ``finally`` — see
+    W4: the leader's coordinator (``None`` at <=1 workers — nothing to hold)
+    keeps its ``flock`` held for the ENTIRE reconcile call below, and records
+    this boot's done marker only in the ``finally`` — see
     ``_is_boot_provisioner`` and ``boot_reconcile_coord`` for the incident
-    this closes.
+    this closes. No heartbeat: the held fd is the liveness proof.
     """
     provisioner, coordinator = await _is_boot_provisioner()
 
     if provisioner:
-        if coordinator is not None:
-            await coordinator.start_heartbeat()
         try:
             await reconcile_on_boot(app)
         finally:
             if coordinator is not None:
-                await coordinator.stop_heartbeat()
-                await coordinator.mark_done()
-                await coordinator.aclose()
+                await coordinator.finish()
     else:
         log.info("apps: another worker is running this boot's app reconcile — "
                  "attaching to what is already installed instead")
@@ -303,63 +301,51 @@ def create_app() -> FastAPI:
         # this at the same instant — harmless (each row is upserted only
         # if `get_source(sid) is None`, see reconcile_sources_on_boot's own
         # per-row check) but wasteful, N redundant Postgres round-trips for
-        # convergence that only needs to happen once. `cooldown_acquire` is
-        # a one-shot "first worker through the door wins" claim: whichever
-        # worker wins the 30s window runs it, the rest skip. If Redis is
-        # unreachable (true in every environment today — see
-        # src/libs/redis_coord.py), fall back to today's behaviour and just
-        # run it locally, same as the watchdog lease two blocks down.
-        from src.libs.redis_coord import cooldown_acquire
-        try:
-            should_reconcile_sources = await cooldown_acquire(
-                "boot-marketplace-reconcile", seconds=30.0
-            )
-        except Exception:
-            should_reconcile_sources = True
-        if should_reconcile_sources:
-            reconcile_sources_on_boot()
+        # convergence that only needs to happen once. This is a "which worker
+        # runs this boot task" decision, so like every other one in this file
+        # it is now decided by flock and nothing else: one non-blocking try,
+        # held for the duration of the pass, and the losers skip. A worker
+        # that boots after the winner has already released re-runs it, which
+        # is harmless for the same per-row reason — and strictly better than
+        # the Redis `cooldown_acquire` this replaces, where an unreachable
+        # Redis (the normal case) meant every worker ran it.
+        from src.apps import fs_lock
+        _sources_fd = fs_lock.try_acquire(
+            fs_lock.lock_path("boot-marketplace-sources"))
+        if _sources_fd is not None:
+            try:
+                reconcile_sources_on_boot()
+            finally:
+                fs_lock.release(_sources_fd)
         # W1: gate WatchdogSupervisor's periodic tasks (CLI healer,
         # mcp-gateway rescan, zombie reaper, any app-contributed
-        # watchdog:tasks) on a Redis leader lease — at AW_WORKSPACE_WORKERS>1
+        # watchdog:tasks) on a leader lease — at AW_WORKSPACE_WORKERS>1
         # every worker's supervisor registers the SAME tasks below via
         # reconcile_on_boot; without this gate that's N concurrent copies,
         # and N CLI healers racing the same apt/npm install path is
-        # corruption, not just waste. resume()/pause() are idempotent and
-        # WatchdogSupervisor defaults to leader (see its module docstring),
-        # so if Redis is unreachable — no environment here has ever had the
-        # F5a companion, see src/libs/redis_coord.py — on_acquire simply
-        # never fires and this process keeps running its own tasks locally,
-        # unlike aw-backend's F3 (a replica with no leader runs nothing).
-        # At AW_WORKSPACE_WORKERS=1 (what ships) there's only ever one
-        # candidate, so behaviour is identical either way — the lease is
-        # still always attempted so a later scale-up to workers>1 needs no
-        # further change here.
+        # corruption, not just waste.
         #
-        # The reachability check below is ONLY for the loud log line (the
-        # lease itself is always started regardless of its result) — NOT
-        # awaited inline, matching this lifespan's own "don't gate serving
-        # on a slow check" rule two comments up (_boot_reconcile_and_sync).
-        # _redis_coord_status carries its own 3s connect + 3s ping timeout;
-        # inline here that's up to 6s added to EVERY app boot (every test
-        # using create_app() included) whenever Redis is unreachable — which
-        # is the CI runner's normal case today (no AW_REDIS_URL / Postgres-
-        # style ephemeral service wired for it, see .github/workflows/test.yml).
-        async def _log_watchdog_redis_status() -> None:
-            redis_status = await _redis_coord_status()
-            if not redis_status["reachable"]:
-                log.warning(
-                    "lifespan: Redis unreachable (%s) — WatchdogSupervisor has no "
-                    "leader lease to win; every periodic task runs locally in "
-                    "this process instead (today's single-worker behaviour; see "
-                    "doctor's `redis` check)",
-                    redis_status["note"],
-                )
-
-        asyncio.ensure_future(_log_watchdog_redis_status())
-
+        # Lock D (2026-10-03): `FlockLease`, not `RedisLease("core")`. The
+        # Redis lease had a third state — "unknown", for a poll that raised
+        # rather than answering — and that state deliberately left
+        # WatchdogSupervisor at its default leader=True so a worker would
+        # never go dark. With Redis unreachable (every environment here, see
+        # src/libs/redis_coord.py) that was not a fallback, it was the only
+        # path: confirmed live at 45/45 samples of GET /api/apps/-/watchdog
+        # reporting NO leader, meaning the periodic tasks were either
+        # ungated on every worker or not running at all. A flock cannot be
+        # unreachable — EAGAIN is itself the fact that another worker holds
+        # it — so the state is binary and the whole degrade-open branch is
+        # gone. See src/apps/fs_lock.py's FlockLease.
+        #
+        # At AW_WORKSPACE_WORKERS<=1 no lease is started at all: there is no
+        # rival to lose to, WatchdogSupervisor is ungated by default, and
+        # GET /api/apps/-/watchdog reports gate:"ungated" (routes.py's
+        # no-lease branch) — the single-worker golden rule, same as
+        # _is_boot_provisioner's early return.
         async def _on_watchdog_lease_acquire() -> None:
             log.warning(
-                "lifespan: acquired RedisLease(\"core\") — this worker runs the periodic watchdog tasks"
+                "lifespan: won the watchdog leader flock — this worker runs the periodic watchdog tasks"
             )
             app.state.app_runtime.watchdog.resume()
             # W7 one-shot, DELETE ONE RELEASE AFTER W7 (together with
@@ -374,18 +360,23 @@ def create_app() -> FastAPI:
 
         async def _on_watchdog_lease_release() -> None:
             log.warning(
-                "lifespan: released RedisLease(\"core\") — pausing this worker's periodic watchdog tasks"
+                "lifespan: lost/did not win the watchdog leader flock — pausing this worker's periodic watchdog tasks"
             )
             app.state.app_runtime.watchdog.pause()
 
-        from src.libs.redis_coord import RedisLease
-        watchdog_lease = RedisLease(
-            role="core",
-            on_acquire=_on_watchdog_lease_acquire,
-            on_release=_on_watchdog_lease_release,
-        )
-        await watchdog_lease.start()
-        app.state.watchdog_lease = watchdog_lease
+        app.state.watchdog_lease = None
+        if int(os.environ.get("AW_WORKSPACE_WORKERS", "1") or "1") > 1:
+            from src.apps.fs_lock import FlockLease
+            watchdog_lease = FlockLease(
+                WATCHDOG_LEADER_LOCK,
+                on_acquire=_on_watchdog_lease_acquire,
+                on_release=_on_watchdog_lease_release,
+            )
+            # Awaited, not backgrounded: start() contends once inline, and
+            # until a loser has been told it lost it is still running every
+            # periodic task (WatchdogSupervisor defaults to leader).
+            await watchdog_lease.start()
+            app.state.watchdog_lease = watchdog_lease
         # W3: subscribe to apps:changed BEFORE the boot reconcile starts, so
         # this worker cannot miss the broadcast the provisioning worker fires
         # at the end of its pass. redis_coord's relay is subscribe-then-listen
@@ -438,15 +429,14 @@ def create_app() -> FastAPI:
         task = app.state.boot_reconcile_task
         if not task.done():
             task.cancel()
-        # Best-effort: RedisLease.stop() re-raises whatever killed its
-        # internal renew loop (e.g. a connection error from a Redis outage
-        # that started after acquisition — redis_coord.py's _run() has no
-        # broad except around the redis calls) when it awaits that already-
-        # failed task. That's a shutdown-path detail of a lease we may never
-        # have actually won; it must not block or crash this process's own
-        # teardown.
+        # None at AW_WORKSPACE_WORKERS<=1 — no lease was ever started.
+        # Best-effort regardless: stop() releasing the flock promptly is what
+        # lets a surviving worker take leadership on its next poll instead of
+        # waiting for this process to actually die, but a shutdown must not
+        # block or crash on the teardown of a lock we may never have held.
         try:
-            await app.state.watchdog_lease.stop()
+            if app.state.watchdog_lease is not None:
+                await app.state.watchdog_lease.stop()
         except Exception:
             log.exception("lifespan: watchdog_lease.stop() raised during shutdown")
         # W3: drop the apps:changed subscription + the install-job mirror's

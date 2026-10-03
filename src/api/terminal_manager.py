@@ -237,7 +237,7 @@ def _get_redis():
     small control keys only. PTY bytes go through ``_get_redis_bytes``.
 
     The address comes from ``redis_coord.get_workspace_redis_url()`` so this
-    store can never disagree with ``RedisBroadcaster``/``RedisLease`` about
+    store can never disagree with ``RedisBroadcaster``/``RedisPollQueue`` about
     which Redis it is on. Failure is deliberately silent-but-logged and
     degrades to ``None``: a workspace with no Redis must still serve
     terminals exactly as it does today, which is the card's golden rule.

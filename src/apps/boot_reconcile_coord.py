@@ -2,218 +2,221 @@
 expensive boot-time app reconcile per fleet boot — even across a uvicorn
 worker respawn within that same boot.
 
-**The incident this replaces.** ``_is_boot_provisioner`` (``src/api/app.py``)
-used to call ``redis_coord.cooldown_acquire`` — a one-shot ``SET NX EX``
-with no renewal ("no release, it just expires"). Its 120s window was picked
-to cover "how far apart the workers of ONE boot start", but a live boot
-reconcile pass over the full app manifest measures 450s+
-(``src/apps/routes.py``'s ``_BOOT_RECONCILE_TIMEOUT = 1200.0`` is sized with
-margin over that). Any worker respawned by uvicorn AFTER the 120s window
-elapsed — because it was SIGKILLed for missing a liveness ping under memory
-pressure, say — re-called ``_is_boot_provisioner`` with the SAME inherited
-``boot_id`` (see ``src/api/boot_info.py``), found the claim already expired,
-and "won" it again: a SECOND full reconcile pass (47 GitHub fetches, pip
-installs, podman starts) starting on top of a FIRST one that might still be
-running. Live 2026-09-17 (workspace ``crispal``): up to 21 such passes over
-2+ hours, each one's rename-swap window (``src/apps/fetch.py``) and
-per-worker route-mounting race causing the installed-apps list to flap
-between "added" and "removed" on every mcp-gateway reload, forever, and the
-redundant concurrent installs themselves being a large share of what drove
-the container to 99% memory / 88% of its PID ceiling.
+**The incident this exists for.** ``_is_boot_provisioner``
+(``src/api/app.py``) originally called ``redis_coord.cooldown_acquire`` — a
+one-shot ``SET NX EX`` with no renewal ("no release, it just expires"). Its
+120s window was picked to cover "how far apart the workers of ONE boot
+start", but a live boot reconcile pass over the full app manifest measures
+450s+ (``src/apps/routes.py``'s ``_BOOT_RECONCILE_TIMEOUT = 1200.0`` is
+sized with margin over that). Any worker respawned by uvicorn AFTER the 120s
+window elapsed — because it was SIGKILLed for missing a liveness ping under
+memory pressure, say — re-called ``_is_boot_provisioner`` with the SAME
+inherited ``boot_id`` (see ``src/api/boot_info.py``), found the claim already
+expired, and "won" it again: a SECOND full reconcile pass (47 GitHub
+fetches, pip installs, podman starts) starting on top of a FIRST one that
+might still be running. Live 2026-09-17 (workspace ``crispal``): up to 21
+such passes over 2+ hours, each one's rename-swap window
+(``src/apps/fetch.py``) and per-worker route-mounting race causing the
+installed-apps list to flap between "added" and "removed" on every
+mcp-gateway reload, forever, and the redundant concurrent installs
+themselves being a large share of what drove the container to 99% memory /
+88% of its PID ceiling.
 
-**The fix.** Two Redis keys per ``boot_id``, both scoped under this
-workspace's own coordination namespace (``redis_coord._key_prefix()``):
+**The mechanism (Lock C, 2026-10-03).** Two FILES under
+``<AW_WORKSPACE_HOME>/locks`` (``src/apps/fs_lock.py``), no Redis anywhere —
+leadership is decided by ``flock`` and nothing else, per Frederico's
+instruction: *"for defining the leader, it should be flock only, it's not a
+fallback, it's the only logic"*.
 
-``boot-apps-reconcile-lease:<boot_id>``
-    Held by the ACTIVE leader — a real lease (``SET NX PX`` + a Lua
-    compare-and-swap renewal, the same primitive ``RedisLease`` uses for
-    its own leader election), renewed every ``heartbeat_interval`` seconds
-    for as long as the real reconcile pass runs. A leader that dies
-    mid-pass (OOM kill, crash) stops renewing and the lease expires
-    within ``lease_ttl`` seconds — bounding how long an abandoned pass can
-    block everyone else, without ever letting a genuinely-still-working
-    leader get preempted by a fixed clock the way ``cooldown_acquire`` did.
+``boot-reconcile.lock``
+    Held — as an open fd — by the ACTIVE leader for the whole pass. **The fd
+    IS the heartbeat**, which is why the lease-renewal half of the W4 fix
+    (``start_heartbeat``/``stop_heartbeat``/a Lua CAS renewal and two TTLs)
+    is gone rather than ported: a Redis key has to keep proving liveness
+    because it expires on a clock, where the kernel holds a flock exactly as
+    long as the process lives and drops it the instant it dies — exit, crash
+    or ``kill -9``. A leader that dies mid-pass releases instantly instead of
+    after a TTL; a leader still working can never be preempted.
 
-``boot-apps-reconcile-done:<boot_id>``
-    Set ONCE, when the leader's pass ends — success, exception, or its own
-    internal timeout give-up. A terminal fact for the rest of this boot's
-    lifetime: every later check, including a worker respawned five
-    separate times, sees it immediately and returns to the cheap
-    ``attach_on_boot`` path without touching the lease at all.
+``boot-reconcile-done-<boot_id>``
+    Written ONCE, atomically (tmp + ``os.replace``), when the leader's pass
+    ends — success, exception, or its own internal timeout give-up. This is
+    the one W4 fact a flock cannot express: *the pass already finished, so a
+    worker respawned later in this same boot must not re-lead.* A held fd
+    says "in progress"; the marker says "done". Two facts, two file
+    primitives, and no renewal code between them.
 
-Redis unreachable (the normal case in every environment before W3, and
-still possible if the per-workspace companion is down) fails OPEN exactly
-like ``cooldown_acquire`` did — ``coordinate()`` returns True (run it
-myself) rather than raising, so a coordination outage degrades to "every
-worker converges independently, wastefully but correctly", never to a
-workspace that never provisions at all.
+    NOT a ``.lock`` file, deliberately: ``fs_lock``'s never-unlink rule
+    exists because unlink-then-recreate puts two holders on two inodes.
+    Markers are the opposite — they must be removable, and the leader
+    unlinks the markers of OTHER boot_ids (only those) on its way out so
+    they don't accumulate in a host-mounted directory forever.
+
+Respawn correctness falls out of the pair: a worker that finds the marker
+attaches; one that finds the flock held waits; one that finds the flock free
+with no marker is looking at a leader that died mid-pass, and correctly
+re-leads.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
-import uuid
 from typing import Optional
 
-import redis.asyncio as aioredis
-
-from src.libs.redis_coord import _key_prefix, get_workspace_redis_url
+from src.apps import fs_lock
 
 logger = logging.getLogger(__name__)
 
-# Renews the lease only if we still hold it (our own token is still the
-# value) — the same shape RedisLease._try_renew uses, so a lease we lost
-# (another process's SET NX won after ours expired) is never accidentally
-# stomped back to "ours" by a late renewal call racing behind it.
-_RENEW_LUA = """
-if redis.call("get", KEYS[1]) == ARGV[1] then
-    return redis.call("pexpire", KEYS[1], ARGV[2])
-else
-    return 0
-end
-"""
+#: The leadership lock. One per fleet, not per boot: the done marker is what
+#: carries the boot identity, and a single lock file keeps "who is leading
+#: right now" answerable with one ``cat``.
+LOCK_NAME = "boot-reconcile"
+
+#: Done markers are ``<prefix><boot_id>`` — the prefix is also the glob used
+#: to sweep other boots' markers.
+DONE_PREFIX = "boot-reconcile-done-"
 
 
 class BootReconcileCoordinator:
     """One instance per worker process, constructed with this boot's
     ``boot_id``. Call :meth:`coordinate` once at boot; if it returns True,
-    call :meth:`start_heartbeat` immediately and :meth:`stop_heartbeat` +
-    :meth:`mark_done` in a ``finally`` once the real reconcile pass ends.
+    call :meth:`finish` in a ``finally`` once the real reconcile pass ends.
     """
 
     def __init__(
         self,
         boot_id: str,
         *,
-        redis_url: Optional[str] = None,
-        lease_ttl: float = 30.0,
-        heartbeat_interval: float = 10.0,
-        done_ttl: float = 3600.0,
+        lock_dir: Optional[str] = None,
         # Comfortably above _BOOT_RECONCILE_TIMEOUT (1200s): a waiter must
-        # never give up and race for leadership itself BEFORE the leader's
-        # own internal timeout would have made it give up first — that
-        # ordering is what guarantees at most one "give up and just do it"
-        # per boot instead of two workers deciding that within seconds of
-        # each other.
+        # never give up and run its own pass BEFORE the leader's own internal
+        # timeout would have made it give up first — that ordering is what
+        # guarantees at most one "give up and just do it" per boot instead of
+        # two workers deciding that within seconds of each other.
         max_wait_s: float = 1260.0,
         poll_interval: float = 2.0,
     ) -> None:
         self.boot_id = boot_id
-        self.lease_ttl = lease_ttl
-        self.heartbeat_interval = heartbeat_interval
-        self.done_ttl = done_ttl
         self.max_wait_s = max_wait_s
         self.poll_interval = poll_interval
-        self.token = uuid.uuid4().hex
-        self._redis_url = redis_url or get_workspace_redis_url()
-        self._lease_key = f"{_key_prefix()}boot-apps-reconcile-lease:{boot_id}"
-        self._done_key = f"{_key_prefix()}boot-apps-reconcile-done:{boot_id}"
-        self._client: Optional[aioredis.Redis] = None
-        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._lock_dir = lock_dir
+        self._fd: Optional[int] = None
 
-    def _get_client(self) -> aioredis.Redis:
-        if self._client is None:
-            self._client = aioredis.from_url(self._redis_url, decode_responses=True)
-        return self._client
+    @property
+    def lock_path(self) -> str:
+        return fs_lock.lock_path(LOCK_NAME, self._lock_dir)
 
-    async def aclose(self) -> None:
-        """Best-effort — call once this worker is done with the
-        coordinator entirely (after mark_done()/stop_heartbeat(), or after
-        a follower's coordinate() returned False). Never required for
-        correctness, only to release the connection promptly."""
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+    @property
+    def done_marker(self) -> str:
+        return self._marker_for(self.boot_id)
+
+    def _marker_for(self, boot_id: str) -> str:
+        base = self._lock_dir or fs_lock.lock_dir()
+        os.makedirs(base, exist_ok=True)
+        return os.path.join(base, f"{DONE_PREFIX}{boot_id}")
+
+    def _is_done(self) -> bool:
+        return os.path.exists(self.done_marker)
 
     async def coordinate(self) -> bool:
-        """Returns True if THIS call must run the full reconcile itself
-        (it won leadership, or every other candidate leader it waited on
-        died without finishing) — the caller should then call
-        start_heartbeat() immediately and, in a finally once the pass
-        ends, stop_heartbeat() + mark_done(). Returns False if another
-        worker already finished (fast path) or finished WHILE this call
-        was waiting — the caller should just attach_on_boot().
+        """Returns True if THIS call must run the full reconcile itself (it
+        won leadership, or every candidate leader it waited on died without
+        finishing) — the caller must then call :meth:`finish` in a ``finally``
+        once the pass ends. Returns False if another worker already finished
+        (fast path) or finished WHILE this call was waiting — the caller
+        should just ``attach_on_boot()``.
         """
-        client = self._get_client()
         deadline = time.monotonic() + self.max_wait_s
         while True:
-            if await client.get(self._done_key):
+            if self._is_done():
                 return False
-            won = await client.set(
-                self._lease_key, self.token, nx=True, px=int(self.lease_ttl * 1000))
-            if won:
+            fd = fs_lock.try_acquire(self.lock_path)
+            if fd is not None:
+                # MANDATORY re-check, not defensive: the leader may have
+                # finished (marker written, flock released) in the window
+                # between the check above and this acquire, in which case we
+                # just "won" leadership of a pass that is already done and
+                # would run a second full one on top of it — W4 in miniature.
+                if self._is_done():
+                    fs_lock.release(fd)
+                    return False
+                self._fd = fd
+                logger.info(
+                    "apps: won the boot reconcile lock %s (pid=%s, boot_id=%s) — "
+                    "this worker runs this boot's provisioning pass",
+                    self.lock_path, os.getpid(), self.boot_id)
                 return True
-            # Someone else holds the lease right now. Loop back: either the
-            # DONE marker appears (they finished — next iteration's GET
-            # catches it), or the lease itself disappears with no DONE
-            # marker (they died mid-pass — next iteration's SET NX wins it
-            # for us), or we've waited long enough that giving up and
-            # running our own pass beats staying unattached forever.
+            # Someone else holds it right now. Loop: either the DONE marker
+            # appears (they finished — next iteration catches it), or the
+            # flock frees up with no marker (they died mid-pass — next
+            # iteration wins it for us), or we wait long enough that running
+            # our own pass beats staying unattached forever.
             if time.monotonic() >= deadline:
                 logger.error(
                     "apps: boot reconcile coordination timed out after %ss "
-                    "waiting for another worker (boot_id=%s) — running our "
-                    "own pass rather than never attaching",
-                    self.max_wait_s, self.boot_id,
-                )
+                    "waiting for %s (boot_id=%s) — running our own pass rather "
+                    "than never attaching. Safe but unserialized at THIS layer; "
+                    "the provisioning lock (Lock A, src/apps/lifecycle.py) is "
+                    "what still keeps the two passes from racing apt.",
+                    self.max_wait_s, fs_lock.holder(self.lock_path), self.boot_id)
                 return True
             await asyncio.sleep(self.poll_interval)
 
-    async def start_heartbeat(self) -> None:
-        """Call once, immediately after coordinate() returns True.
-        Renews the lease every heartbeat_interval seconds for as long as
-        the real reconcile pass runs — this is what stops a genuinely
-        long-running pass from ever losing its own claim, unlike the
-        fixed-TTL cooldown_acquire this coordinator replaces."""
-        if self._heartbeat_task is not None:
-            return
-        self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
+    async def finish(self) -> None:
+        """Leader-only — call in a ``finally`` once the pass ends (success,
+        exception, or internal timeout give-up).
 
-    async def stop_heartbeat(self) -> None:
-        """Call in a finally around the reconcile pass, whether it
-        succeeded, raised, or hit its own internal timeout — leaving the
-        heartbeat running after the pass ends would keep renewing a lease
-        for work that is no longer happening."""
-        if self._heartbeat_task is not None:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            self._heartbeat_task = None
-
-    async def _heartbeat_loop(self) -> None:
-        client = self._get_client()
+        Records the terminal marker every later worker of this boot checks
+        first, sweeps other boots' markers, and releases the lock. Marker
+        write and sweep are best-effort: failing to record it just means a
+        respawned worker re-runs the pass, which is the pre-W4 behaviour, and
+        must never be the reason this worker's own boot raises.
+        """
         try:
-            while True:
-                await asyncio.sleep(self.heartbeat_interval)
-                try:
-                    await client.eval(
-                        _RENEW_LUA, 1, self._lease_key, self.token,
-                        int(self.lease_ttl * 1000))
-                except Exception:
-                    logger.warning(
-                        "apps: boot reconcile heartbeat renewal failed "
-                        "(Redis blip?) — will retry next interval (boot_id=%s)",
-                        self.boot_id, exc_info=True,
-                    )
-        except asyncio.CancelledError:
-            raise
-
-    async def mark_done(self) -> None:
-        """Leader-only — call once the pass ends (success, exception, or
-        internal timeout give-up), AFTER stop_heartbeat(). Sets the
-        terminal marker every later worker of this boot checks first,
-        before ever touching the lease again. Best-effort: a failure here
-        just means a later respawn re-runs the pass, same as today."""
-        client = self._get_client()
-        try:
-            await client.set(self._done_key, "1", ex=int(self.done_ttl))
+            await asyncio.to_thread(self._write_marker)
         except Exception:
             logger.warning(
-                "apps: could not record the boot reconcile done marker "
-                "(Redis blip?) — a respawned worker may re-run the pass "
-                "(boot_id=%s)", self.boot_id, exc_info=True,
-            )
+                "apps: could not record the boot reconcile done marker %s — a "
+                "respawned worker may re-run the pass (boot_id=%s)",
+                self.done_marker, self.boot_id, exc_info=True)
+        try:
+            await asyncio.to_thread(self._sweep_other_markers)
+        except Exception:
+            logger.warning("apps: could not sweep stale boot reconcile markers",
+                           exc_info=True)
+        # Last, and always: the marker says "finished", the lock says "in
+        # progress". Releasing before the marker exists opens exactly the
+        # window coordinate()'s re-check closes, so don't widen it here.
+        fs_lock.release(self._fd)
+        self._fd = None
+
+    def _write_marker(self) -> None:
+        """Atomic: a reader only ever sees the marker absent or complete.
+        ``coordinate()`` reads it with no lock held, so a half-written file
+        would be a torn read on the one fact the whole respawn story rests
+        on."""
+        marker = self.done_marker
+        tmp = f"{marker}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(f"pid={os.getpid()} at={time.time():.0f}\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, marker)
+
+    def _sweep_other_markers(self) -> None:
+        """Drop markers from OTHER boots. Unlinking is safe here in a way it
+        never is for a ``.lock`` file: a marker carries no kernel state, only
+        the leader of the current boot runs this, and it only ever touches
+        boot_ids that are not its own."""
+        base = self._lock_dir or fs_lock.lock_dir()
+        keep = os.path.basename(self.done_marker)
+        for entry in os.listdir(base):
+            if not entry.startswith(DONE_PREFIX) or entry == keep:
+                continue
+            try:
+                os.unlink(os.path.join(base, entry))
+            except OSError:
+                pass

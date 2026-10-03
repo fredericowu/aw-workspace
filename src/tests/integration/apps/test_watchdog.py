@@ -201,10 +201,10 @@ def test_watchdog_introspection_endpoint():
 
 
 # ---------------------------------------------------------------------------
-# W1: leader mode (RedisLease("core") on_acquire -> resume(), on_release ->
+# W1: leader mode (the leader lease's on_acquire -> resume(), on_release ->
 # pause()) — see WatchdogSupervisor's module docstring. These exercise the
-# supervisor in isolation (no Redis); the real cross-process lease handoff is
-# covered by test_watchdog_lease_multiworker.py.
+# supervisor in isolation (no lease at all); the real cross-process handoff
+# is covered by test_watchdog_flock_lease_multiworker.py.
 # ---------------------------------------------------------------------------
 
 def test_leader_defaults_true_and_flips_via_pause_resume():
@@ -289,8 +289,8 @@ def test_resume_is_idempotent_for_an_already_running_task():
 def test_resume_after_pause_reticks_run_immediately_task_but_not_a_deferred_one():
     """The exact mechanism a 2026-09-23 fix (Kanban
     3e45bf3b-9510-816d-b0e3-d94995d2168c, aw-app-agents-platform-runners'
-    identity-token-refresh watchdog) leans on: a RedisLease("core")
-    leadership handoff is pause() then resume() on this same
+    identity-token-refresh watchdog) leans on: a leader-lease
+    handoff is pause() then resume() on this same
     WatchdogSupervisor instance (not a fresh one), and _run() re-evaluates
     ``t.run_immediately`` on every call, not just the first — so a task
     registered with run_immediately=True fires again the moment a newly
@@ -315,7 +315,7 @@ def test_resume_after_pause_reticks_run_immediately_task_but_not_a_deferred_one(
         assert counts["immediate"] == 1  # ticked right away
         assert counts["deferred"] == 0  # still sleeping out its 10s interval
 
-        wd.pause()  # simulate: this process just lost RedisLease("core")
+        wd.pause()  # simulate: this process just lost the leader flock
         wd.resume()  # simulate: this process (or a peer) just regained it
 
         await asyncio.sleep(0.03)
