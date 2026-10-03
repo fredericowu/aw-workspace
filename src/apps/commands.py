@@ -33,6 +33,26 @@ permission) re-runs an app's own installer script whenever a CLI stops being
 healthy — the installer IS the app's heal logic, so no app needs to write or
 register anything extra.
 
+**The healer never goes through the provisioning lock, which is why installer
+scripts take their own.** ``AppRuntime._heal_system_clis`` → ``heal()`` →
+``run_installer`` is a watchdog tick on a worker thread; it has never touched
+``AppLifecycle.provision_lock`` (``src/apps/lifecycle.py``), and W1's leader
+lease — which was supposed to leave one healer running — defaults to
+``leader=True`` when Redis is unreachable, so in practice all ten workers heal.
+Two of them in ``apt-get`` at once against one ``/var/cache/apt`` is the
+reported mid-dpkg corruption, and ``_heal_guard`` below cannot see it: that
+lock is per-process, and it was only ever scoped to reentrancy *within* one
+process (the 7-concurrent-``install_copilot.sh`` incident). So ``_run`` holds
+an ``fcntl.flock`` on ``<lock dir>/system-cli-installers.lock``
+(``src/apps/fs_lock.py``) around every installer and revert subprocess —
+covering heal-vs-heal, install-vs-install and heal-vs-install across every
+worker, with or without Redis.
+
+Lock ordering is strictly provision-lock → installer-lock and never the
+reverse (a provisioning pass holding the first runs installers that take the
+second; the healer takes only the second; nothing that takes the second takes
+the first), which is what makes the pair deadlock-free.
+
 **Present is not healthy.** Health used to mean ``shutil.which(name) is not
 None``. That is a proxy, and it lied: a ``/usr/bin/git`` with an EMPTY
 ``/usr/lib/git-core`` (no package behind it) is on PATH and prints a version
@@ -60,12 +80,23 @@ import time
 from typing import Any
 
 from src.api.terminal_manager import kill_proc_tree
-from src.apps import paths
+from src.apps import fs_lock, paths
 
 log = logging.getLogger(__name__)
 
 # scripts can be slow (apt update + install); keep a generous ceiling.
 DEFAULT_TIMEOUT = float(os.environ.get("AW_APPS_CLI_INSTALL_TIMEOUT", "600"))
+
+#: One lock for every installer script in the workspace, not one per CLI: the
+#: resource being protected is the package manager's shared state
+#: (``/var/cache/apt``, the dpkg database, the global npm prefix), which two
+#: *different* CLIs' installers collide on just as readily as two runs of one.
+INSTALLER_LOCK_NAME = "system-cli-installers"
+
+#: Extra wait on top of ``self.timeout`` before giving up on the installer
+#: lock. One holder can legitimately run for the full timeout, so anything
+#: less would make a normal queue of two look like a failure.
+INSTALLER_LOCK_MARGIN_S = 120.0
 
 
 class CommandError(RuntimeError):
@@ -91,8 +122,13 @@ def _resolve(package_dir: str, script: str) -> str:
 class CommandInstaller:
     """Runtime-owned backend for the ``commands`` / ``system_clis`` surface."""
 
-    def __init__(self, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(self, timeout: float = DEFAULT_TIMEOUT,
+                 lock_dir: str | None = None) -> None:
         self.timeout = timeout
+        # Defaults to ``<AW_WORKSPACE_HOME>/locks`` (resolved lazily, at
+        # acquire time). Injectable because the default is the LIVE
+        # workspace's lock dir, which a real install may be holding.
+        self._lock_dir = lock_dir
         # (app_id, cli_name) -> (package_dir, installer_script) for every
         # install_system_cli call, so the healer can re-run the right script.
         self._system_clis: dict[tuple[str, str], tuple[str, str]] = {}
@@ -326,11 +362,34 @@ class CommandInstaller:
         return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
     def _run(self, package_dir: str, script: str, *, what: str) -> str:
+        """Run one installer/revert script, serialized against every other
+        one in the workspace (see the module docstring's lock section).
+
+        Unlike the provisioning lock this one does NOT proceed-anyway when
+        the wait elapses — it raises. There is no single-worker behaviour to
+        preserve here, and the thing on the other side of the lock is a
+        package manager: failing loud beats racing into a half-extracted
+        ``.deb``. For the healer that lands in ``record_heal_result``'s normal
+        backoff and gets retried on a later tick; for an install it surfaces
+        as the app's install error.
+        """
         path = _resolve(package_dir, script)
+        wait_s = self.timeout + INSTALLER_LOCK_MARGIN_S
+        lock_file = fs_lock.lock_path(INSTALLER_LOCK_NAME, self._lock_dir)
+        fd = fs_lock.acquire(lock_file, timeout=wait_s)
+        if fd is None:
+            raise CommandError(
+                f"{what} {script!r} not run: waited {wait_s:.0f}s for the "
+                f"cross-worker installer lock {lock_file} (held by "
+                f"{fs_lock.holder(lock_file)}) and did not get it. Running it "
+                f"anyway alongside another worker's package manager is what "
+                f"corrupts an apt/dpkg install.")
         try:
             proc = self._run_subprocess(["bash", path], cwd=package_dir, timeout=self.timeout)
         except subprocess.TimeoutExpired:
             raise CommandError(f"{what} {script!r} timed out after {self.timeout:.0f}s")
+        finally:
+            fs_lock.release(fd)
         if proc.returncode != 0:
             raise CommandError(
                 f"{what} {script!r} failed (exit {proc.returncode}): "

@@ -172,11 +172,20 @@ async def _is_boot_provisioner() -> tuple[bool, BootReconcileCoordinator | None]
        TTL with a renewed lease (dies with its holder, not with a clock)
        plus a terminal "done" marker every later check short-circuits on.
 
-    Redis unreachable — falls back to ``(True, None)``, i.e. today's
-    degrade-open behaviour: every worker converges independently,
-    wastefully but correctly. ``None`` rather than a coordinator because
-    there is nothing real to heartbeat against — the caller must check for
-    it before calling any coordinator method.
+    Redis unreachable — falls back to ``(True, None)``, i.e. degrade-open:
+    every worker converges independently, wastefully but correctly. ``None``
+    rather than a coordinator because there is nothing real to heartbeat
+    against — the caller must check for it before calling any coordinator
+    method.
+
+    "Wastefully but **correctly**" is only true because of what sits one
+    layer down. Until 2026-10-03 it was not: with Redis unreachable (the
+    normal case) all ten workers took this branch and ran a full provisioning
+    pass each, and the mutex meant to serialize them (``provision_lock``) also
+    degraded to a per-process ``asyncio.Lock`` in exactly that case — so ten
+    ``apt-get`` runs hit one ``/var/cache/apt`` and corrupted installs. The
+    lock is now an ``fcntl.flock`` (``src/apps/fs_lock.py``) that does not
+    depend on Redis, which is what makes the waste here merely waste.
     """
     if int(os.environ.get("AW_WORKSPACE_WORKERS", "1") or "1") <= 1:
         return True, None

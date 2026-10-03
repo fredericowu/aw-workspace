@@ -514,21 +514,26 @@ def test_provision_lock_is_reentrant_across_nested_installs():
     assert reconciler._provision_depth == 0
 
 
-def test_lifecycle_publish_and_lock_are_noops_without_redis(monkeypatch):
+def test_lifecycle_publish_and_lock_are_noops_without_redis(monkeypatch, tmp_path):
     """GOLDEN RULE: with no reachable Redis — every environment today, and
-    every unit test — nothing here may raise or block."""
+    every unit test — nothing here may raise or block.
+
+    The provisioning lock is the one thing that must now still WORK rather
+    than degrade: it used to yield ``False`` here (Redis down → no shared
+    lock → ten workers in ``apt`` at once), and the whole point of moving it
+    to ``flock`` is that an unreachable Redis costs it nothing."""
     from src.apps.lifecycle import AppLifecycle
 
     monkeypatch.setenv("AW_WORKSPACE_REDIS_URL", "redis://127.0.0.1:1/0")
     monkeypatch.setenv("AW_REDIS_URL", "redis://127.0.0.1:1/0")
-    lc = AppLifecycle()
+    lc = AppLifecycle(lock_dir=str(tmp_path / "locks"))
 
     async def run():
         started = await lc.start(lambda payload: asyncio.sleep(0))
         assert started is False  # unreachable, reported honestly
         await lc.publish("install", "w3app")  # must not raise
         async with lc.provision_lock("apps") as held:
-            assert held is False  # local lock only
+            assert held is True  # flock, not Redis — unaffected
         await lc.stop()
 
     asyncio.run(asyncio.wait_for(run(), timeout=20))

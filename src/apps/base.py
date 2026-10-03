@@ -298,10 +298,15 @@ class CommandsFacade(_Facade):
         # W3 PROVISION: this runs the app's installer script — `apt install
         # git` and friends — against the ONE filesystem every worker shares.
         # This is the exact shape W1 gated the CLI healer for: N concurrent
-        # apt/npm runs is corruption, not waste. record_system_cli still runs
-        # everywhere, because it is per-process registry state that the healer
-        # reads, and a worker that later wins W1's lease must know about this
-        # CLI to be able to heal it.
+        # apt/npm runs is corruption, not waste. The `provision` flag is the
+        # coarse half of that (only the provisioning worker runs it at all);
+        # the fine half is inside run_installer, which takes the cross-worker
+        # `system-cli-installers` flock — necessary because the CLI healer
+        # reaches the same script WITHOUT a provisioning pass around it. See
+        # src/apps/commands.py's module docstring.
+        # record_system_cli still runs everywhere, because it is per-process
+        # registry state that the healer reads, and a worker that later wins
+        # W1's lease must know about this CLI to be able to heal it.
         output = ""
         if self._ctx.provision:
             output = self._ctx._runtime.commands.run_installer(

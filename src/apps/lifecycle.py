@@ -60,10 +60,26 @@ is what ``pip``/``podman``/``git`` into one shared tree actually needs. Two
 real request pattern and it would otherwise put two ``pip install`` processes
 in the same venv — a race the single event loop used to prevent for free.
 
-Degrades on purpose: with Redis unreachable (the normal case today — see
-``src/libs/redis_coord.py``'s note on the F5a companion) the local
-``asyncio.Lock`` alone still holds, which at ``workers=1`` is exactly the
-serialization the event loop already gave. Behaviour identical to what ships.
+**It does not depend on Redis, and deliberately so.** It used to: a
+``SET NX PX`` key, with the local ``asyncio.Lock`` as the stated fallback
+"with Redis unreachable (the normal case today)". That fallback was not one.
+``AW_WORKSPACE_WORKERS=10`` is ten OS *processes*, and an ``asyncio.Lock`` is
+per-process state — so in the case the design called normal, there was no
+cross-worker mutex at all, and ten boot reconciles ran ``apt-get`` against one
+``/var/cache/apt`` concurrently. That is the reported corruption
+(``Could not open file /var/cache/apt/archives/...deb`` mid-dpkg, across
+different apps and workspaces), not a theoretical one.
+
+The authoritative guard is now an ``fcntl.flock`` on
+``<AW_WORKSPACE_HOME>/locks/apps-provision-<name>.lock``
+(``src/apps/fs_lock.py``) — every worker is a process inside one container
+sharing one filesystem, which is exactly the scope the lock needs to cover,
+and the kernel releases it on crash or ``kill -9`` instead of after a 900s
+TTL. The ``asyncio.Lock`` stays in front of it as the in-process layer
+(cheaper, and it is what ``in_process_exclusive`` shares).
+
+The Redis dependency that remains in this module is the ``apps:changed``
+broadcast below — a fan-out, not a mutex, and harmless when it is missing.
 """
 from __future__ import annotations
 
@@ -71,8 +87,9 @@ import asyncio
 import contextlib
 import logging
 import os
-import uuid
 from typing import Awaitable, Callable, Optional
+
+from src.apps import fs_lock
 
 log = logging.getLogger(__name__)
 
@@ -81,38 +98,18 @@ log = logging.getLogger(__name__)
 #: mirror anyway, so a coalesced burst of these costs one convergence pass.
 TOPIC_APPS_CHANGED = "apps:changed"
 
-#: How long a provisioning worker may hold the shared lock before it is
-#: considered dead and the lock expires. A cold install can genuinely take
-#: minutes (a GitHub fetch with retries + a pip install + an image pull), so
-#: this is deliberately generous; it is a crash backstop, not a timeout.
-PROVISION_LOCK_TTL_S = 900.0
-
-#: How long to wait for the lock before giving up and provisioning anyway.
-#: Giving up is the right call: refusing the install outright would turn a
-#: Redis hiccup into a user-visible failure, whereas proceeding is exactly
-#: today's single-worker behaviour.
-PROVISION_LOCK_WAIT_S = 120.0
-
-_LOCK_POLL_S = 0.5
-
-# Release-time CAS, same shape as redis_coord's — only delete the key if we
-# still own it, so a slow provisioner that outran its TTL can't drop the lock
-# a different worker has since acquired.
-_UNLOCK_LUA = """
-if redis.call('get', KEYS[1]) == ARGV[1] then
-    return redis.call('del', KEYS[1])
-else
-    return 0
-end
-"""
+#: How long to wait for the provisioning lock before proceeding anyway.
+#:
+#: Much longer than the 120s the Redis lock used, because the number now means
+#: something different. A Redis key could outlive its owner (900s TTL), so a
+#: short give-up hedged against waiting on a lock nobody held. ``flock`` cannot
+#: be stale — if we are still waiting, a real process is still provisioning —
+#: so the ceiling has to clear a genuine cold pass instead: the boot reconcile
+#: gets 1200s (``_BOOT_RECONCILE_TIMEOUT``, ``src/apps/routes.py``) and a cold
+#: pass has been measured at 450s+.
+PROVISION_LOCK_WAIT_S = 1800.0
 
 ChangedHandler = Callable[[dict], Awaitable[None]]
-
-
-def _lock_key(name: str) -> str:
-    from src.libs.redis_coord import _key_prefix
-
-    return f"{_key_prefix()}applock:{name}"
 
 
 class AppLifecycle:
@@ -124,16 +121,21 @@ class AppLifecycle:
     behaves exactly like a single-worker deployment.
     """
 
-    def __init__(self, redis_url: Optional[str] = None) -> None:
+    def __init__(self, redis_url: Optional[str] = None,
+                 lock_dir: Optional[str] = None) -> None:
         self._redis_url = redis_url
         self._broadcaster: Optional[object] = None
         self._handler: Optional[ChangedHandler] = None
         # Provisioning is serialized in-process too, not only across workers:
-        # at workers=1 with Redis down this lock is the ONLY thing left, and
-        # it is what reproduces today's "the single event loop serializes
-        # everything" behaviour for two concurrent installs.
+        # it is cheaper than the file lock for the common same-worker case,
+        # and it is the lock ``in_process_exclusive`` shares to keep a
+        # convergence pass from interleaving with a provisioning one.
         self._local_lock = asyncio.Lock()
-        self._client: Optional[object] = None
+        # Defaults to ``<AW_WORKSPACE_HOME>/locks`` (resolved lazily, at
+        # acquire time). Injectable because the default is the LIVE
+        # workspace's lock dir: a test taking that file could block behind,
+        # or block, a real provisioning pass on this very container.
+        self._lock_dir = lock_dir
 
     # ---- fan-out ---------------------------------------------------------
 
@@ -203,22 +205,8 @@ class AppLifecycle:
             with contextlib.suppress(Exception):
                 await self._broadcaster.stop()
             self._broadcaster = None
-        if self._client is not None:
-            with contextlib.suppress(Exception):
-                await self._client.aclose()
-            self._client = None
 
     # ---- the provisioning mutex ------------------------------------------
-
-    def _get_client(self):
-        if self._client is None:
-            import redis.asyncio as aioredis
-
-            from src.libs.redis_coord import get_workspace_redis_url
-
-            self._client = aioredis.from_url(
-                self._redis_url or get_workspace_redis_url(), decode_responses=True)
-        return self._client
 
     @contextlib.asynccontextmanager
     async def in_process_exclusive(self):
@@ -233,10 +221,10 @@ class AppLifecycle:
         the app in exactly that state and unmount an install that was
         succeeding.
 
-        Deliberately not the shared lock: a converge does no shared work, so
-        making every worker's convergence queue behind every other worker's
-        install would add cross-fleet latency to defend a purely local
-        invariant.
+        Deliberately NOT the cross-worker lock, and that is load-bearing: a
+        converge does no shared work, so queueing every worker's convergence
+        behind another worker's 450s+ cold provisioning pass would add
+        cross-fleet latency to defend a purely local invariant.
         """
         async with self._local_lock:
             yield
@@ -245,56 +233,34 @@ class AppLifecycle:
     async def provision_lock(self, name: str = "apps"):
         """Hold the cross-worker provisioning lock for the duration of a block.
 
-        Always acquires the in-process lock; additionally takes a Redis
-        ``SET NX PX`` lock when Redis is reachable. Yields ``True`` when it
-        actually holds the shared lock, ``False`` when it is running on the
-        local lock alone (Redis down, or the wait timed out) — the caller may
-        log that, but must proceed either way: blocking an install because a
-        coordination Redis is unavailable would be a worse failure than the
-        race it prevents.
+        Takes the in-process lock first, then an ``fcntl.flock`` on
+        ``<lock dir>/apps-provision-<name>.lock`` — the real cross-process
+        mutex (``src/apps/fs_lock.py`` for why a file lock and not Redis).
+
+        Yields ``True`` when it holds the file lock, ``False`` when the
+        :data:`PROVISION_LOCK_WAIT_S` ceiling elapsed first and it is
+        proceeding on the in-process lock alone. The caller may log that, but
+        must proceed either way: refusing an install outright is a worse
+        failure than the race, so proceed-anyway survives as the last resort
+        it was always described as — just no longer as the normal path.
+
+        Not reentrant, on purpose: ``flock`` on a second fd in the same
+        process blocks like any other contender. ``Reconciler._provisioning``'s
+        depth counter is what keeps ``install``'s recursion and ``reconcile``'s
+        per-app calls from deadlocking on themselves.
         """
         async with self._local_lock:
-            token = uuid.uuid4().hex
-            key = _lock_key(name)
-            held = await self._acquire_shared(key, token)
+            path = fs_lock.lock_path(f"apps-provision-{name}", self._lock_dir)
+            fd = await fs_lock.acquire_async(path, timeout=PROVISION_LOCK_WAIT_S)
+            if fd is None:
+                log.error(
+                    "apps: waited %.0fs for the provisioning lock %s (held by %s) "
+                    "and did not get it — proceeding ANYWAY, unserialized. "
+                    "Concurrent apt/pip/podman against one filesystem can corrupt "
+                    "a package install; this is the last-resort path, not a "
+                    "normal one. Check for a wedged provisioning process.",
+                    PROVISION_LOCK_WAIT_S, path, fs_lock.holder(path))
             try:
-                yield held
+                yield fd is not None
             finally:
-                if held:
-                    await self._release_shared(key, token)
-
-    async def _acquire_shared(self, key: str, token: str) -> bool:
-        deadline = None
-        try:
-            client = self._get_client()
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + PROVISION_LOCK_WAIT_S
-            while True:
-                won = await client.set(key, token, nx=True,
-                                       px=int(PROVISION_LOCK_TTL_S * 1000))
-                if won:
-                    return True
-                if loop.time() >= deadline:
-                    log.warning(
-                        "apps: waited %ss for the shared provisioning lock %r and "
-                        "did not get it — proceeding anyway (single-worker "
-                        "behaviour). If this repeats, a worker died holding it "
-                        "and the key clears after %ss.",
-                        PROVISION_LOCK_WAIT_S, key, PROVISION_LOCK_TTL_S)
-                    return False
-                await asyncio.sleep(_LOCK_POLL_S)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.debug("apps: shared provisioning lock unavailable (%r) — using the "
-                      "in-process lock only", key, exc_info=True)
-            return False
-
-    async def _release_shared(self, key: str, token: str) -> None:
-        try:
-            client = self._get_client()
-            await client.eval(_UNLOCK_LUA, 1, key, token)
-        except Exception:
-            log.debug("apps: could not release the shared provisioning lock %r — it "
-                      "expires on its own after %ss", key, PROVISION_LOCK_TTL_S,
-                      exc_info=True)
+                fs_lock.release(fd)

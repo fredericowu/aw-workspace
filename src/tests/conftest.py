@@ -26,6 +26,7 @@ import httpx
 import pytest
 
 from src.apps import catalog as catalog_mod
+from src.apps import fs_lock
 
 
 @pytest.fixture(autouse=True)
@@ -34,3 +35,19 @@ def _no_marketplace_catalog_network(monkeypatch):
         return httpx.Response(200, text='{"apps": []}', request=httpx.Request("GET", url))
 
     monkeypatch.setattr(catalog_mod.httpx, "get", _fake_get)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_app_lock_dir(tmp_path_factory, monkeypatch):
+    """No test may touch the LIVE provisioning/installer locks.
+
+    ``AppLifecycle`` and ``CommandInstaller`` default their lock dir to
+    ``<AW_WORKSPACE_HOME>/locks`` (``src/apps/fs_lock.py``), and this suite
+    runs inside the same container as a real workspace server — so a test
+    constructing either with no explicit ``lock_dir`` would contend with live
+    provisioning: blocking behind a real cold install, or worse, making one
+    wait on a test. Same class of mistake as the live-Redis-keyspace one,
+    caught before it shipped rather than after.
+    """
+    monkeypatch.setenv(fs_lock.LOCK_DIR_ENV,
+                       str(tmp_path_factory.mktemp("aw-locks")))
