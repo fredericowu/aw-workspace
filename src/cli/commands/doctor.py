@@ -48,6 +48,7 @@ def run(args: list[str]) -> int:
     _host_power(report.get("host_power") or {})
     problems += _mcp(report.get("mcp") or {})
     problems += _redis(report.get("redis") or {})
+    problems += _vault(report.get("vault") or {})
 
     print()
     if problems:
@@ -255,4 +256,34 @@ def _redis(section: dict) -> int:
         return 0
     print(f"Redis (redis_coord) — ✗ unreachable at {url}")
     print(f"      {section.get('note', '')}")
+    return 1
+
+
+def _vault(section: dict) -> int:
+    """The secret store, which until 2026-10-03 nothing reported on at all.
+
+    Every vault operation workspace-wide 500'd for hours that day while this
+    command printed "No silent degradation found" — see
+    ``src/apps/routes.py``'s ``_vault_status`` for the full account. The
+    consequence worth naming in the output is the one that stays invisible:
+    the key-push self-heal loops that re-assert production credentials every
+    300s just log a failed tick, so the vault being dead reads as nothing
+    anywhere.
+    """
+    print()
+    if not section:
+        print("Vault (secrets) — no report from the server")
+        return 0
+    if not section.get("configured"):
+        print("Vault (secrets) — not configured")
+        print(f"      {section.get('note', '')}")
+        return 0
+    if section.get("reachable"):
+        print(f"Vault (secrets) — reachable, {section.get('secrets', '?')} secret(s)")
+        return 0
+    print("Vault (secrets) — ✗ UNREACHABLE")
+    print(f"      {section.get('note', '')}")
+    print(f"      at {section.get('url', '?')}")
+    print("      every credential an agent, app or scheduled task reads comes")
+    print("      through here; the key-push self-heal loops fail silently")
     return 1

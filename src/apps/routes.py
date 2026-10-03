@@ -34,6 +34,7 @@ import os
 import re
 
 import anyio
+import httpx
 from fastapi import Body, Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -48,6 +49,7 @@ from src.apps.manifest import ManifestError, load_manifest
 from src.apps.reconciler import AppSpec, Reconciler
 from src.apps.containers import ContainerError, expand_env
 from src.apps.fetch import package_dir_for
+from src.apps.paths import workspace_home_path
 from src.apps.runtime import AppRuntime
 
 log = logging.getLogger(__name__)
@@ -697,6 +699,90 @@ async def _redis_coord_status() -> dict:
         await client.aclose()
     return {"reachable": True, "url": safe_url,
             "note": "redis_coord's resolved Redis answers PING"}
+
+
+def _vault_env(key: str) -> str:
+    """``key`` from the process env, falling back to ``<home>/.env``.
+
+    Same three keys and same fallback as ``src/cli/core_restart.py``'s
+    ``_env`` — kept here for the same reason it is kept there: core must not
+    hard-depend on an installed app's package to reach its own control plane.
+    """
+    if os.environ.get(key):
+        return os.environ[key]
+    path = os.path.join(workspace_home_path(), ".env")
+    prefix = f"{key}="
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(prefix):
+                    return line[len(prefix):].strip()
+    except OSError:
+        return ""
+    return ""
+
+
+async def _vault_status() -> dict:
+    """Whether this workspace's secret store actually answers right now.
+
+    The vault is not any one app's concern — every credential an agent, an
+    app or a scheduled task reaches for comes through aw-backend's
+    ``/api/workspaces/{slug}/approval/secrets``, and until this check existed
+    nothing said a word when that path broke. On 2026-10-03 every vault
+    operation workspace-wide hard-500'd for hours (aw-backend's vault client
+    still dialled ``aw-sandbox:9130`` after that container was decommissioned,
+    taking ``aw-vault`` — which shared its netns — with it) while ``status``,
+    ``/api/health`` and this very command all stayed green. The three
+    aw-knowledgeable key-push self-heal loops just logged a failed tick every
+    300s and moved on, so the "prod never holds a vault token, the loop
+    re-asserts within 300s" property was simply OFF and no human could have
+    seen it. That is the exact shape this command exists to catch.
+
+    LIST, not read: listing returns names and metadata only, never a value,
+    and is not behind the human approval gate — so it is safe on every doctor
+    pass, and it still exercises the whole chain (host token → aw-backend →
+    ``vault_client`` → the ``aw-vault`` service → Postgres). A reachable API
+    in front of a dead backing store fails this check, which is the whole
+    point: the 2026-10-03 outage was a 500 from a perfectly healthy
+    aw-backend.
+    """
+    backend_url = _vault_env("AW_BACKEND_URL").rstrip("/")
+    workspace = _vault_env("AW_WORKSPACE")
+    token = _vault_env("AW_WORKSPACE_HOST_TOKEN")
+    if not (backend_url and workspace and token):
+        # A BYOD workspace that never completed the /link handshake has no
+        # secret store to reach — absent, not degraded.
+        return {"configured": False, "reachable": None,
+                "note": "no cloud link (AW_BACKEND_URL/AW_WORKSPACE/"
+                        "AW_WORKSPACE_HOST_TOKEN unset) — no secret store to check"}
+    url = f"{backend_url}/api/workspaces/{workspace}/approval/secrets"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+    except Exception as e:  # noqa: BLE001 — the failure itself IS the finding
+        return {"configured": True, "reachable": False, "url": url,
+                "note": f"cannot reach the secret store: {e}"}
+    if resp.status_code != 200:
+        # aw-backend's own `detail` carries the real cause (the DNS failure
+        # behind the 2026-10-03 outage only ever appeared there), so pass it
+        # through rather than reporting a bare status code.
+        try:
+            detail = resp.json().get("detail") or resp.text[:200]
+        except Exception:  # noqa: BLE001
+            detail = resp.text[:200]
+        return {"configured": True, "reachable": False, "url": url,
+                "status": resp.status_code,
+                "note": f"secret store answered {resp.status_code}: {detail}"}
+    try:
+        secrets = resp.json().get("secrets") or []
+    except Exception:  # noqa: BLE001
+        return {"configured": True, "reachable": False, "url": url,
+                "note": "secret store answered 200 with a body that is not the "
+                        "expected {\"secrets\": [...]} shape"}
+    return {"configured": True, "reachable": True, "url": url,
+            "secrets": len(secrets),
+            "note": f"secret store answers — {len(secrets)} secret(s) listed"}
 
 
 def register_apps_routes(app: FastAPI) -> AppRuntime:
@@ -1422,6 +1508,11 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
           URL (W0) actually answers PING. That module has zero consumers
           today, so nothing else would ever surface it silently resolving
           to a dead address.
+        * ``vault`` — whether this workspace's secret store actually answers
+          (see ``_vault_status``). Unlike ``redis`` this IS folded into
+          ``ok``: every credential anything here reaches for comes through
+          it, and on 2026-10-03 it was dead workspace-wide for hours with
+          nothing anywhere saying so.
         """
         clis = runtime.commands.system_cli_report()
 
@@ -1485,6 +1576,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             expected_profiles=_referenced_gateway_profiles(runtime),
             expected_versions=mcp_expected_versions)
         redis_status = await _redis_coord_status()
+        vault_status = await _vault_status()
 
         host_offers = hostpower.host_grants()
         host_apps = []
@@ -1512,8 +1604,15 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             # breaks nothing yet — it's still reported below for a human (or
             # the CLI's own problem count) to see, just not treated as an
             # active production degradation until something depends on it.
+            # vault_status IS folded in, unlike redis_status above: a dead
+            # secret store is an active production degradation, not a
+            # dead-end nothing consumes yet. `reachable is False` rather
+            # than `not reachable` on purpose — an unlinked BYOD workspace
+            # reports None (no store to check), which must not read as
+            # broken.
             "ok": (not unhealthy and not permissions and not failing_app_checks
-                   and not mcp_status["degraded"] and not autostart_not_running),
+                   and not mcp_status["degraded"] and not autostart_not_running
+                   and vault_status.get("reachable") is not False),
             "app_checks": app_checks,
             "system_clis": {
                 "total": len(clis),
@@ -1534,6 +1633,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 **mcp_status,
             },
             "redis": redis_status,
+            "vault": vault_status,
         }
 
     @app.get("/api/apps/-/catalog")
