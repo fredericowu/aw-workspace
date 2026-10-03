@@ -636,6 +636,46 @@ keywords over the cluster's chunks and **mark the topic as
 `label_source: "keywords"`** so a degraded tree is visible rather than merely
 worse. The build must never hard-fail on a missing key.
 
+> **AMENDED 2026-10-03 — CLOSED DECISION.** The LLM call above now speaks
+> ap-mt, never a provider's own API. Frederico, verbatim (Telegram, 03/10):
+> *"cara, nao sei quantas vezes que falei que a gente nao vai usar chave de
+> LLM, vamos usar o ap-mt, tem como resolver e fechar essa assunto?"* —
+> `topics/label.py:229` was the last caller in this repo still going straight
+> at a provider (Anthropic `/v1/messages` with `x-api-key`, via
+> `topic_label_llm_api_key`). That transport is **deleted**, not disabled:
+> `core/llm.py` is gone, replaced by `core/apmt.py`, which has exactly one
+> function (`chat_complete`, ap-mt `/v1/chat/completions`) and no
+> provider-shaped names anywhere in it. **The rule, going forward: every LLM
+> call in this repo speaks ap-mt through `core/apmt.py` — adding a second
+> transport is re-opening a closed decision.** Enforced by
+> `backend/tests/test_no_llm_provider_transport.py`, which walks every `.py`
+> file under `backend/app` and fails if `api.anthropic.com` or `x-api-key`
+> appears anywhere, code or comments.
+>
+> Labelling got its own dedicated ap-mt agent, `knowledgeable-labeller`
+> (`claude-runner-haiku`, `provider=runner` — the only door with no provider
+> key), rather than reusing the extractor's: the two are different workloads
+> (short structured JSON vs. a long extraction prompt) and sharing one agent
+> would blur the per-slug run accounting that made the 2026-10-01 incident
+> diagnosable. The credential is a third narrow pushed ApiKey, same shape as
+> extraction's and the Playground's (`POST /api/topics/key`, vault secret
+> `knowledgeable-labeller-apmt-key`) — see the §11.2/§12 amendment below for
+> why the three stay separate.
+>
+> **Latency, declared.** The runner door cold-starts a container per call:
+> 83-125s measured, against ~3s for the deleted provider door. Label volume
+> is bounded by the clusterer, not the corpus — `cluster_count` clamps `k` at
+> `TOPIC_MAX_CLUSTERS=24` per level, so a tree is at most ≈28 topics
+> (24 L0 + ~3 L1 + 1 root). `kb-mapped-folders` (~156k chunks): ~28 calls at
+> concurrency 4 ≈ 10-15 minutes added to the build, ~$2.3-3.6. `kb-crispal`
+> (29 docs): ~13-20 calls ≈ 6-10 minutes, ~$1-2.6. Accepted. The lever if
+> volume ever grows is per-level batching or a low-latency ap-mt agent —
+> **never** a return to a provider door. The timeout this depends on is
+> `topic_label_apmt_timeout = 300.0`, not the old `30.0`: left at 30s, every
+> labelling call times out, the catch-all in `label_clusters` falls back to
+> keyword labels, and the build "succeeds" looking migrated while shipping a
+> keyword tree — the silent trap this number exists to close.
+
 **Retrieve** — `GET /api/search?q=…&mode=tree`:
 
 1. Embed the query (`query:` prefix).
@@ -1938,6 +1978,48 @@ knob stays as the default source, unchanged for every other caller.
   `POST /api/api-keys {agent_slugs: ["knowledgeable-playground"]}`, stored
   in the workspace vault for the backend to read.
 
+> **AMENDED 2026-10-03 — CLOSED DECISION.** `core/llm.py` no longer exists.
+> It is `core/apmt.py` now, and `complete()` — the Anthropic Messages
+> transport this bullet describes — is deleted along with every provider
+> credential header and base-url default. The reason is the same veto named
+> in §5's amendment above: Frederico vetoed a provider LLM key more than
+> once, and by 2026-10-03 it had to be closed structurally, not just
+> documentally. **Every LLM call this repo makes — extraction, Playground
+> synthesis, topic labelling — now goes through the one function
+> `core/apmt.py::chat_complete`, ap-mt `/v1/chat/completions`.** Adding a
+> second transport function, or a `provider=anthropic` agent on ap-mt's own
+> side, is re-opening this decision, not extending it (a provider-side agent
+> was considered and rejected: it moves the vetoed key instead of removing
+> it). The enforcement is a test, not a sentence —
+> `backend/tests/test_no_llm_provider_transport.py` fails CI if
+> `api.anthropic.com` or `x-api-key` reappears anywhere under `backend/app`,
+> including in a comment.
+>
+> This is also where the topic labeller's credential joins the pattern
+> described two bullets up for the Playground's: a third pushed ApiKey
+> (`POST /api/topics/key`, vault secret `knowledgeable-labeller-apmt-key`,
+> ap-mt agent `knowledgeable-labeller`). The three pushed credentials
+> (extraction, Playground, labelling) stay three separate secrets and three
+> separate endpoints rather than one generalized "LLM key" endpoint — this
+> repo decided that split twice already (`ingest_key_push.py`'s own module
+> docstring on the connector side): each reaches a different ap-mt agent, so
+> any one may be revoked, rotated or scoped differently without touching the
+> others, and the per-agent run accounting is what made the 2026-10-01
+> incident diagnosable in the first place.
+>
+> **The gate this closes.** `EXTRACTION_ENABLED` stays the durable
+> authorization flag for full-corpus extraction — it was NOT replaced by
+> "is there an ap-mt key", even though the provider door that justified the
+> distinction is now gone. Once all three push loops run, key *presence* is
+> automated and self-heals within ~300s; key *absence* is therefore a FAULT
+> state (`no_apmt_key`) an operator fixes, not a decision anyone made. And
+> with the same credential pattern now serving three callers, "no key" could
+> never have distinguished "labelling is allowed" from "the ~$18k phase-2
+> corpus-wide extraction is authorized" — only a human-set flag can carry
+> that distinction. `no_apmt_key` is the operational-pause word;
+> `EXTRACTION_ENABLED` is the authorization one. This also closes the point
+> QA raised on the §13 driver's card (`3ee5bf3b-9510-81ad-ab05-e219bdd3a337`).
+
 ### Rejected
 
 - **b1 and the hybrid** — above, with the unlock condition named.
@@ -2223,9 +2305,16 @@ renders `processing_status`).
    0-chunk document terminates in `ready`, not a retry loop, before the bulk
    run — one synthetic test.
 3. Topic trees don't build themselves per this card: after each subtree
-   completes, `POST /api/topics/build` per bucket (`api/topics.py:56`).
-   Clustering ~156k chunks in `kb-mapped-folders` is unmeasured — build
-   `kb-crispal` first and extrapolate before launching the big one.
+   completes, trigger a build per bucket. **Use `python -m backend.app.topics`
+   inside the container, not `POST /api/topics/build`** (2026-10-03 amendment):
+   the HTTP route runs synchronously behind the tunnel edge's 30s cut
+   (memory `tunnel-edge-cuts-requests-at-30s`), and since the same amendment
+   raised topic labelling's own call timeout to 300s (the runner door
+   cold-starts a container per call), a bucket with enough clusters to need
+   more than one labelling call will readily outlive 30s on its own, before
+   Neo4j or clustering cost anything. Clustering ~156k chunks in
+   `kb-mapped-folders` is unmeasured — build `kb-crispal` first and
+   extrapolate before launching the big one.
 4. Files > 10 MB are skipped with a journal reason (`documents.py:111`),
    never a driver crash. Expected count: ~0, but the report must say.
 5. The MERGE dedup must be atomic in Cypher, not check-then-create in Python
