@@ -1987,3 +1987,251 @@ knob stays as the default source, unchanged for every other caller.
 6. The ApiKey is a credential: vault only, never `.env`, never logged —
    commit `6f46811` is the precedent and the reasoning is in
    `core/secrets.py`.
+
+---
+
+## 13. The KB bulk-ingest driver — phase 1 over the whole corpus, extraction declared OFF (2026-10-03)
+
+Written by the Architect agent against card `3ee5bf3b-9510-81ad-ab05-e219bdd3a337`,
+from Frederico's 2026-10-03 request, verbatim: *"acho que agora a gente deveria
+fazer o ingest de tudo pra validar as coisas, ou seja, fazer o ingest de
+/opt/aw-workspace/.aw-workspace/knowledge_base completamente, ver o que falta"*.
+
+The card's own measurements are adopted, not re-derived: 12,324 files /
+181.5M chars (86% under `mapped_folders/`); ~181k chunks; embedding 0.91s/chunk
+CPU-only (phase 1 ≈ 46h, $0); extraction $0.1022/chunk and 108.9s/call
+(phase 2 ≈ $18,500 and ~57 days — **not authorized, and this design must not
+be able to start it by accident**). No feeding path exists today: connector
+v0.6.0 has `contributes.tasks: null`, none of the workspace's 17 tasks touches
+knowledgeable, and the connector tenant holds 10 test documents.
+
+### 13.0 The approach, in sentences someone can disagree with
+
+A **batch-and-journal driver inside the connector app** scans the KB tree,
+canonicalizes duplicates by content hash, and feeds `POST /api/documents`
+in bounded, backpressured batches into **four buckets, one per top-level
+subtree**. The server gains a **content-hash idempotency gate** so re-running
+never duplicates. The driver is advanced unattended by a **connector-contributed
+scheduled task** and driven manually by a **connector-contributed CLI command**
+— same engine, two doors. Entity extraction stays off via the flag that already
+exists, declared through the `paused_reason` vocabulary that already exists.
+The deliverable is the driver's **report**: scanned / uploaded / deduplicated /
+failed per bucket, plus before/after retrieval probes.
+
+### 13.1 Decision 1 — document unit, and which bucket receives what
+
+**One file = one `(:Document)`.** The KB tree is all `.md`; the file is the
+unit the KB sync itself maintains, the unit `heading_path` chunking (§4)
+expects, and the unit the report counts. The driver passes the file's
+KB-relative path as provenance (new optional `source_path` form field on
+`POST /api/documents`, stored as a document property — `label` stays the
+filename as today, `api/documents.py:120-125`).
+
+**Four buckets, one per top-level subtree** — `kb-notion`, `kb-memory`,
+`kb-crispal`, `kb-mapped-folders` — created via `POST /api/buckets`
+(`api/buckets.py:64`) before the first upload. Bucket is a permission
+boundary (§7bis), so the partition must follow *who may read*, and the four
+subtrees are four genuinely different permission classes: Kanban/Notion
+content, agent memory, a paying client's business knowledge (crispal), and
+generated code-maps of the repos. A future token scoped "crispal only" or
+"everything except memory" is expressible on day one.
+
+Rejected:
+- **One bucket for everything** — erases the only permission lever the
+  system has, and re-bucketing later is exactly the §11.8.3 re-stamp cost
+  (cheap now while there are no assertions; expensive forever after phase 2).
+- **Bucket per repo under `mapped_folders/`** — dozens of buckets with no
+  distinct permission story between them; `GET /api/buckets` and every
+  token-scope grant becomes noise. If a per-repo boundary is ever needed, it
+  is a re-bucketing of a subset, done before extraction ever runs.
+
+### 13.2 Decision 2 — dedup lives in BOTH layers, with different jobs
+
+The duplication is measured, not theoretical: the same document appears 3–4×
+under different prefixes (the monolith checkout carries a copy of the KB
+tree; `apps/<slug>` is a copy of `repos/aw-app-<slug>`).
+
+**The idempotency gate lives in `POST /api/documents`.** Upload computes
+`sha256(body)` and stores it as `content_hash` on the `(:Document)`; the
+create becomes a `MERGE` on `(tenant, bucket, content_hash)` — an upload whose
+hash already exists in that bucket returns the existing document with
+`deduplicated: true` instead of creating (and does not re-write bytes).
+This is what makes the driver re-runnable and resume safe *without trusting
+its own journal*, and it protects every other caller (UI, MCP tool) for free.
+Scope is deliberately **per (tenant, bucket)**: a cross-bucket server-side
+dedup would be an existence oracle — a `deduplicated: true` answer would leak
+that the same content lives in a bucket the token cannot see (§7bis).
+
+**Cross-prefix canonicalization lives in the driver**, because only the
+driver has the full-corpus view: it hashes every file first, groups by hash,
+uploads **one canonical copy**, and records the rest as aliases in its journal
+(never uploaded). Canonical priority: curated subtree (`crispal/`, `notion/`,
+`memory/`) beats `mapped_folders/`; within `mapped_folders/`,
+`repos/<name>/...` beats the monolith-checkout copy and the `apps/<slug>`
+copy. The server cannot make this call: at write time it has no path
+priority and must not have cross-bucket sight.
+
+Rejected: **driver-only dedup** (a lost journal, or any second caller, and the
+corpus duplicates silently — the card says dedup is mandatory, so it must be
+a server property, not a client discipline); **server-only dedup** (cannot
+catch the cross-bucket duplicates, which are precisely the measured ones).
+
+### 13.3 Decision 3 — `mapped_folders/` is IN this pass, ordered last
+
+The request was *"completamente"*, phase 1 costs $0, and `mapped_folders/`
+(the code-maps) is the only part of the corpus that validates traversal over
+code — excluding it would validate the graph on 14% of the body and call it
+done. So it is **in**.
+
+What the order buys instead of an exclusion: subtrees ingest
+**crispal → memory → notion → mapped_folders**. The three curated subtrees
+(1,572 files, ~25k chunks, ~6.3h of embedding) land first, so search, topic
+tree and Playground are validatable the same day; a stop after any batch
+leaves a coherent, reportable corpus; and `mapped_folders/`' KB-tree and
+`apps/<slug>` copies are already pruned by 13.2's canonicalization before its
+remaining files upload. Its real document count will be measured by the scan
+and stated in the report — that number (not 10,752) is the honest size of
+what the pass adds.
+
+### 13.4 Decision 4 — where the driver lives: one engine, two doors, both in the connector
+
+**Engine:** `knowledgeable_app/bulk_ingest.py` in `repos/aw-app-knowledgeable`
+— the connector already owns the auth plumbing (`mcp/client.py`'s
+`X-Internal-Secret` channel) and runs Tier-1 in-process with the KB tree on
+its own filesystem. Journal: sqlite at
+`AW_WORKSPACE_HOME/data/knowledgeable/bulk_ingest.sqlite`
+(rows: relpath, sha256, bucket, status ∈ pending/uploaded/alias/skipped/failed,
+external_id, error) — durable across reinstalls per the workspace's own
+storage convention (`src/apps/paths.py`).
+
+**Door 1 — CLI** (`apps/<slug>/commands/` auto-discovery,
+`src/cli/discovery.py:41-51`): `aw-workspace-cli knowledgeable-ingest
+scan | run [--max-batches N] | status | report`. The operator door: start,
+resume after anything, and produce the report.
+
+**Door 2 — contributed task** (`contributes.tasks`, type `agentic_output`,
+every 15 min): runs one bounded tick of the same engine. Exit 0 (progressed,
+or nothing to do) costs nothing; a notable exit (precondition violated,
+batch of failures, stall) dispatches an agent to triage. This is the task
+Frederico predicted ("vai ter alguma task lá que vai chamar o ingest"), and
+it is what makes a 46h pass advance unattended across restarts.
+
+Resumability and idempotency come from three independent layers: the journal
+(skip what's done), the server hash gate (re-POST of anything returns the
+existing doc), and the deterministic scan (a wiped journal just re-walks and
+re-POSTs, deduplicated server-side).
+
+Rejected: **task-only** (no operator door for resume/report, and a 15-min
+cadence is miserable to debug through); **CLI-only** (46h of unattended
+progress would depend on a human re-running it); **driver inside
+aw-knowledgeable itself** (the corpus lives on the workspace filesystem,
+which that service deliberately cannot see — the connector exists precisely
+because the two filesystems are different, `mcp/client.py:95-101`).
+
+### 13.5 Non-negotiables, wired to things that already exist
+
+1. **Extraction OFF, declared.** `extraction_enabled` stays `false`
+   (`config.py:97`, the default). The declaration is the existing vocabulary:
+   `/api/ingest/status` answers `paused_reason: "flag_disabled"` with its
+   `PAUSE_EXPLANATIONS` text (`ingest/extraction.py:342-347`,
+   `api/ingest.py::ingest_status`). No new flag.
+2. **Ignition guard.** Every uploaded document is necessarily born
+   `extraction_status: pending` (`api/documents.py:149`) — an inert backlog
+   while the flag is off, but live tinder if anyone flips it. So the driver,
+   **before every tick**, GETs `/api/ingest/status` and proceeds only if
+   `extraction.claiming == false`. If claiming is true it uploads nothing,
+   exits notable, and says exactly why. The driver never touches
+   `EXTRACTION_ENABLED`, never calls `/api/ingest/key`, and contributes no
+   config that could flip either.
+3. **No work without a ceiling** (the 228-container / 37.2 GB / 145-document
+   incident). Per tick: ≤ 200 uploads, and only while the backend's
+   `processing_status: pending` backlog is < 500 (requires the small status
+   addition in 13.6). Phase 1 spawns **zero** containers and makes **zero**
+   LLM calls; embedding is the worker's own sequential in-process loop
+   (`ingest/worker.py::drain_once`), which is its own ceiling. The breaker
+   (`extraction_breaker_threshold=3`) is untouched and irrelevant while
+   extraction is off — and stays visible in `/api/ingest/status` if that
+   ever changes.
+
+### 13.6 Where it lands — the full change list
+
+aw-knowledgeable (`repos/aw-knowledgeable/backend`):
+1. `content_hash` + MERGE-dedup on upload (`app/api/documents.py:100-160`,
+   `app/core/graph.py::create_document`), response gains
+   `deduplicated: bool`. Range index on `(tenant, bucket, content_hash)`.
+2. Optional `source_path` form field, stored on the document.
+3. `/api/ingest/status` (or a sibling counts route) gains
+   `processing: {pending, extracting, embedding, ready, failed}` counts —
+   the driver's backpressure signal. `list_documents` at 12k docs is not a
+   counts API; do not use it as one.
+
+aw-app-knowledgeable (`repos/aw-app-knowledgeable`):
+4. `knowledgeable_app/bulk_ingest.py` (scan/hash/canonicalize/batch/journal/
+   report) + `?bucket=` support on the upload path in `mcp/client.py`
+   (today only search passes `bucket`, `client.py:272`).
+5. `commands/` CLI module; `contributes.tasks` entry; version bump 0.6.0 →
+   0.7.0; tests mirroring `test_ingest_key_push.py`'s shape.
+
+Untouched: the worker pipeline, chunking, embeddings, topic-tree code, the
+extractor, the breaker, all §11 entity code, the frontend (the Library already
+renders `processing_status`).
+
+### 13.7 Preconditions the Coder must verify before the first real batch
+
+1. **The tenant.** Service callers write into `KNOWLEDGEABLE_SERVICE_TENANT_ID`;
+   Frederico's browser session resolves to a *minted* tenant
+   (`core/identity.py:267-287`) — two different tenants, the exact trap the
+   66-doc card documented. A browser JWT cannot drive a 46h unattended run,
+   so: **set `KNOWLEDGEABLE_SERVICE_TENANT_ID` to Frederico's real tenant id**
+   (read his row from `identity_tenant_db_path`'s sqlite) and recreate the
+   container — then the connector door and his browser read the same corpus.
+   The 10 test docs stay behind in the old service tenant, harmlessly.
+   If this is refused or blocked, the run still proceeds, but validation is
+   via connector tools only and the report must say so.
+2. **Prod's extraction state**: confirm `/api/ingest/status` live answers
+   `paused_reason: "flag_disabled"` (not merely `no_api_key` — the key-push
+   loop re-asserts a key every 300s, so "no key" is not a durable off-state;
+   the FLAG is).
+3. **Neo4j host disk**: ~181k chunks × 1024-dim vectors ≈ 0.8–3 GB of store
+   growth on the bare-metal aw-stack host — check THAT host's disk, not the
+   workspace container's (the estate's disk-full failure mode is silent).
+
+### 13.8 What this makes harder later
+
+- **Content-addressed and append-only.** A source file that *changes* re-ingests
+  as a NEW document; the stale predecessor stays until a future sync/GC
+  reconciles by `source_path` — which is why `source_path` is stored now.
+  This driver is a bulk load, not a sync; designing the sync later inherits
+  12k content-addressed docs to reconcile.
+- **Four buckets bake a permission taxonomy.** Re-partitioning after phase 2
+  means re-stamping assertions (§11.8.3). Re-bucket before extraction ever
+  runs, or live with the partition.
+- **Canonical-copy choice is frozen in the driver.** If a canonical subtree is
+  later unmapped, its aliases point at a deleted origin; the journal's
+  alias→canonical map is the recovery record — keep it in the report.
+- **The service tenant becomes Frederico's tenant.** The connector door turns
+  personal; a second human tenant later needs the real per-token work, not
+  another env flip.
+
+### 13.9 Risks for the Coders
+
+1. `contributes.tasks` is **seeded once, never updated**
+   (`src/apps/capabilities.py:39`): verify the task actually seeds on
+   `marketplace install --update` of an already-installed app; if it does
+   not, create it once by hand and say so in the report.
+2. Empty or near-empty `.md` files (code-maps include tiny ones): verify a
+   0-chunk document terminates in `ready`, not a retry loop, before the bulk
+   run — one synthetic test.
+3. Topic trees don't build themselves per this card: after each subtree
+   completes, `POST /api/topics/build` per bucket (`api/topics.py:56`).
+   Clustering ~156k chunks in `kb-mapped-folders` is unmeasured — build
+   `kb-crispal` first and extrapolate before launching the big one.
+4. Files > 10 MB are skipped with a journal reason (`documents.py:111`),
+   never a driver crash. Expected count: ~0, but the report must say.
+5. The MERGE dedup must be atomic in Cypher, not check-then-create in Python
+   — single uvicorn worker today, but §4 already records how reliably this
+   estate grows `--workers`.
+6. **The deliverable is the report, not the driver.** Run the pass for real
+   (or an honest, declared slice), and prove with `list_documents` + a
+   Playground search that the corpus answers something it could not answer
+   before. "The driver is ready" is not this card done.
