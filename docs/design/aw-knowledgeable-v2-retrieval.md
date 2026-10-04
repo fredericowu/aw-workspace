@@ -2020,6 +2020,96 @@ knob stays as the default source, unchanged for every other caller.
 > `EXTRACTION_ENABLED` is the authorization one. This also closes the point
 > QA raised on the §13 driver's card (`3ee5bf3b-9510-81ad-ab05-e219bdd3a337`).
 
+> **AMENDED 2026-10-03 (same day, later) — the migration above broke the
+> operator CLI for one build before anyone ran it live, and that is now
+> fixed.** Moving the labeller's key to an in-memory, push-only slot closed
+> the veto but silently broke `python -m backend.app.topics`: the pushed
+> key lives only inside the long-running `uvicorn` process that
+> `POST /api/topics/key` targets, and the CLI used to import
+> `build_bucket_topic_tree` and run the pass in a brand-new subprocess —
+> which always saw an unconfigured labeller, built a keyword-only tree, and
+> still reported `SUCCESS`. Live reproduction on `kb-crispal`: 1254 ms,
+> `label_source: {"keywords": 17}`, exit 0. The bug needs three things at
+> once — a pushed in-memory key, a fresh-subprocess entry point, and a
+> fallback that reports success — and the old CLI had all three.
+>
+> Also resolved in the same pass: the 30 s tunnel edge cut
+> (`tunnel-edge-cuts-requests-at-30s`) is a property of the public tunnel,
+> not of `POST /api/topics/build` itself. Verified live: `POST
+> http://localhost:8090/api/topics/build?bucket=kb-crispal` from inside the
+> container, authenticated with the container's own `X-Internal-Secret`,
+> returned HTTP 200 after 115.6 s — 3.8× past the 30 s figure — with
+> `label_source: {"llm": 17}` on all 17 topics. A loopback call never
+> crosses the tunnel, so the cut that motivated giving the CLI its own
+> in-process builder in the first place never applied to this door.
+>
+> **Fix:** `topics/__main__.py` is rewritten as a thin loopback client of
+> `POST /api/topics/build` — same documented operator command
+> (`docker exec aw-knowledgeable python -m backend.app.topics --tenant
+> ... --bucket ...`), same flags, but it now POSTs to its own
+> `http://localhost:{port}` with `X-Internal-Secret` instead of importing
+> and building. The key never exists outside the one server process that
+> needs it — stronger than the pre-migration env-var era, where every
+> `docker exec` subprocess inherited it. `--tenant` is validated against
+> `KNOWLEDGEABLE_SERVICE_TENANT_ID` before any HTTP call, since the route
+> binds the service tenant and a non-service-tenant CLI build has no door
+> until T2 mints per-tenant service tokens (today there is exactly one live
+> tenant, so this is an accepted, declared cost, not a regression). The
+> build report gains `llm_enabled` (`topics/build.py`), and the CLI now
+> **exits non-zero (3) when a build completed keyless**, unless
+> `--allow-keyword-labels` is passed explicitly — closing the exact
+> silent-success trap the regression above exploited. §5's "never hard-fail,
+> always fall back to keyword labels" stays server-side and unchanged; the
+> loud failure lives only at this CLI seam. `POST /api/topics/build` also
+> gained an optional `cap` query param, passed through to
+> `build_bucket_topic_tree(cap=...)`.
+>
+> **Standing rule for future entry points.** Any future `python -m` module
+> under `backend/app` must be a loopback client of the live server's own
+> HTTP surface, never an importer of a module that holds a pushed,
+> in-memory-only credential — a fresh subprocess cannot see that process's
+> memory, and a fallback that reports success on the way to keyword labels
+> will always look identical to the real thing until someone is specifically
+> checking `label_source`. Enforcement is `backend/tests/test_topics_cli.py`
+> (asserts a keyless build exits 3) plus the existing
+> `test_no_llm_provider_transport.py`; there is no CI grep for "is this
+> `__main__.py` a loopback client" because `find backend/app -name
+> __main__.py` turned up exactly one file to fix and no process scales a
+> rule enforced on a file count of one.
+>
+> **Rejected for this fix:** a key-read endpoint (turns a write-only
+> credential slot into an exportable one — any service-secret holder could
+> exfiltrate the ap-mt key); pushing the key to a file, tmpfs or Redis
+> (reopens the "key on disk" half of the original veto, or adds new
+> stateful infra for one CLI); the CLI pulling its own key from the vault
+> (production has no vault token by design — that is the entire reason the
+> connector pushes rather than this service pulling); an async
+> `202` + poll shape for the build route (unneeded now that loopback is
+> proven past the 30 s cut; revisit only if a single build outgrows one
+> `docker exec` session); keeping the old in-process CLI behind a flag (a
+> keyword-only door that still reports `SUCCESS` is the exact trap this
+> closes, flag or not).
+>
+> **Known, accepted cost — found live 2026-10-04, not a new bug.** Every
+> aw-knowledgeable deploy recreates the container, which empties
+> `topics/label.py`'s in-memory key slot the instant it restarts; the
+> connector's re-assert loop (`label_key_push.py`) restores it within one
+> push interval (300 s by default), with no operator action needed —
+> reproduced live: container restarted 00:01:10Z, key re-asserted 00:07:03Z.
+> A `POST /api/topics/build` that lands inside that window — whether from
+> this CLI, the UI, or an agent calling the route directly — still returns
+> `status: "built"`, because §5's never-hard-fail-always-fall-back-to-
+> keywords rule is server-side and applies to every caller alike, not just
+> the CLI. Only the CLI's own exit code (3, added above) turns a keyless
+> build into a loud failure; an HTTP caller gets nothing louder than
+> `llm_enabled: false` sitting in the response body, unflagged. Check
+> `llm_enabled`, not `status`, for a few minutes after any deploy. This is
+> the accepted cost of keeping the key push-only and off disk rather than
+> persisting it anywhere the key could survive a restart — not a gap to
+> close reflexively; whether `POST /api/topics/build` should surface this
+> more loudly to a non-CLI caller is an open question for whoever owns §5
+> next, not decided here.
+
 ### Rejected
 
 - **b1 and the hybrid** — above, with the unlock condition named.
@@ -2306,15 +2396,20 @@ renders `processing_status`).
    run — one synthetic test.
 3. Topic trees don't build themselves per this card: after each subtree
    completes, trigger a build per bucket. **Use `python -m backend.app.topics`
-   inside the container, not `POST /api/topics/build`** (2026-10-03 amendment):
-   the HTTP route runs synchronously behind the tunnel edge's 30s cut
-   (memory `tunnel-edge-cuts-requests-at-30s`), and since the same amendment
-   raised topic labelling's own call timeout to 300s (the runner door
-   cold-starts a container per call), a bucket with enough clusters to need
-   more than one labelling call will readily outlive 30s on its own, before
-   Neo4j or clustering cost anything. Clustering ~156k chunks in
-   `kb-mapped-folders` is unmeasured — build `kb-crispal` first and
-   extrapolate before launching the big one.
+   inside the container, not a direct `POST /api/topics/build` over the
+   tunnel** (2026-10-03 amendment, revised same day): the CLI is now itself
+   a loopback client of that exact route (`http://localhost:8090`,
+   not the tunnel), which is what makes it exempt from the tunnel edge's
+   30s cut (memory `tunnel-edge-cuts-requests-at-30s`) — the route itself
+   is identical either way. Since the same amendment raised topic
+   labelling's own call timeout to 300s (the runner door cold-starts a
+   container per call), a bucket with enough clusters to need more than
+   one labelling call will readily outlive 30s on its own, before Neo4j or
+   clustering cost anything; measured live on `kb-crispal` at 115.6s.
+   Clustering ~156k chunks in `kb-mapped-folders` is unmeasured — build
+   `kb-crispal` first and extrapolate before launching the big one. Check
+   the CLI's own exit code (3 = keyless build, not what you want) rather
+   than trusting `status: "built"` alone.
 4. Files > 10 MB are skipped with a journal reason (`documents.py:111`),
    never a driver crash. Expected count: ~0, but the report must say.
 5. The MERGE dedup must be atomic in Cypher, not check-then-create in Python
