@@ -292,13 +292,43 @@ def test_scope_delete_is_refused_while_a_key_references_it(env):
 
 
 @pytest.fixture()
-def client(env, monkeypatch):
+def client(env, tmp_path, monkeypatch):
+    """A real app over the throwaway schema, with the boot background task
+    neutered at BOTH ends.
+
+    ``reconcile_on_boot`` is stubbed for the documented reason (see
+    ``src/api/app.py``'s lifespan: it walks every configured app with real
+    network retries, and a TestClient exiting mid-pass cannot cancel the
+    thread already in flight).
+
+    ``sync_on_boot`` is stubbed for the same class of reason, and this file
+    is what makes it matter: it builds ~20 TestClients, so ~20 fire-and-
+    forget ``agent_sync.sync_all()`` threads would be left racing. Those
+    threads read ``AW_WORKSPACE_CONTAINER_DIR`` from the process environment
+    when they run, not when they were started, so one leaking out of this
+    file lands on whatever root a LATER test has monkeypatched — and
+    ``materialize()`` is an exact-mirror rewrite, so two of them on one tree
+    produce a torn tree rather than a redundant one (the same hazard
+    ``app.py`` documents for N workers). It cost a red CI run on
+    ``test_skills_routes.py``, which boots its own app and then asserts on
+    the tree that sync is supposed to produce.
+
+    ``AW_WORKSPACE_CONTAINER_DIR`` is pointed at a throwaway dir as well, so
+    nothing here can reach the live workspace tree even if something else
+    syncs — same posture as conftest's ``_isolated_app_lock_dir``.
+    """
     import src.api.app as app_mod
+
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
 
     async def noop_reconcile(app):
         return None
 
+    async def noop_sync():
+        return None
+
     monkeypatch.setattr(app_mod, "reconcile_on_boot", noop_reconcile)
+    monkeypatch.setattr(app_mod, "sync_on_boot", noop_sync)
     with TestClient(app_mod.create_app()) as c:
         yield c
 
