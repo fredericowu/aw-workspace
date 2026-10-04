@@ -139,3 +139,52 @@ class MarketplaceSource(SQLModel, table=True):
     # ``auth_type`` is "none".
     auth_host: str = Field(default="")
     created_at: Optional[float] = Field(default=None)
+
+
+class ApiScope(SQLModel, table=True):
+    """A named, reusable set of route rules a scoped API key can bind to.
+
+    See ``src/api/scoped_api_keys.py`` for the whole credential class and
+    ``docs/design/scoped-api-keys.md`` for why the scope — not the app's
+    ``auth_type`` — is the single authority on what a scoped key may reach.
+
+    ``rules`` is a list of ``{"app": slug, "paths": [...], "methods": [...]?}``.
+    Paths are **mount-relative** (``/tv/power``, ``/tv/*``): exact match or a
+    trailing ``/*`` prefix wildcard, no regex. Rules only ever name APP
+    routes — framework routes are structurally outside any scope in v1.
+    """
+
+    __tablename__ = "api_scopes"  # type: ignore[assignment]
+
+    id: str = Field(primary_key=True)
+    name: str = Field(unique=True, index=True)
+    rules: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSONB))
+    created_at: Optional[float] = Field(default=None)
+
+
+class ScopedApiKey(SQLModel, table=True):
+    """One scoped API key: opaque, DB-backed, revocable, bound to one scope.
+
+    Only ``key_hash`` (sha256 of the full ``awsk_…`` token) is stored — the
+    token itself is returned exactly once, by the mint route. ``key_hint``
+    (its first 10 chars) exists so the Settings list can identify a key
+    without holding anything secret.
+
+    Opaque-and-DB-backed rather than a signed token with the scope embedded:
+    "never expires" is an offered option here, and an unrevocable
+    never-expiring credential is disqualifying (design, rejected
+    alternative 4).
+    """
+
+    __tablename__ = "scoped_api_keys"  # type: ignore[assignment]
+
+    id: str = Field(primary_key=True)
+    name: str
+    scope_id: str = Field(foreign_key="api_scopes.id", index=True)
+    key_hash: str = Field(unique=True, index=True)
+    key_hint: str = Field(default="")
+    # NULL = never expires.
+    expires_at: Optional[float] = Field(default=None)
+    created_at: Optional[float] = Field(default=None)
+    revoked_at: Optional[float] = Field(default=None)
+    last_used_at: Optional[float] = Field(default=None)

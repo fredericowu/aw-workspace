@@ -132,18 +132,54 @@ def _headers_dict(scope: Scope) -> dict[bytes, bytes]:
     return {k.lower(): v for k, v in (scope.get("headers") or [])}
 
 
+class _NotAnApiKey:
+    """Sentinel type: no usable API key here — fall through to the JWT."""
+
+    __slots__ = ()
+
+
+_NOT_AN_API_KEY = _NotAnApiKey()
+
+
+def _resolve_api_key_header(api_key: str) -> "dict | None | _NotAnApiKey":
+    """Claims for an ``X-Api-Key`` value, ``None`` when it IS a scoped key but
+    not a valid one, or :data:`_NOT_AN_API_KEY` when there is nothing here to
+    authenticate with (no header, or a non-matching master key — both of
+    which fall through to the JWT, exactly as before).
+
+    The three-way return is what keeps the two credential classes from
+    bleeding into each other. A value carrying the scoped prefix (``awsk_``)
+    is resolved ONLY as a scoped key: if that fails the answer is ``None`` →
+    401/4401, never retried against the master key, or a mistyped scoped key
+    would silently fall back to a workspace-wide credential. A value without
+    the prefix takes today's master-key path, byte for byte.
+    """
+    from src.api.scoped_api_keys import is_scoped_key, resolve_scoped_key
+    from src.api.workspace_api_key import verify_workspace_api_key
+    if not api_key:
+        return _NOT_AN_API_KEY
+    if is_scoped_key(api_key):
+        return resolve_scoped_key(api_key)
+    if verify_workspace_api_key(api_key):
+        return {"sub": "workspace-api-key", "api_key": True}
+    return _NOT_AN_API_KEY
+
+
 def _default_verify_http(scope: Scope) -> dict | None:
     """Verify the identity JWT on an HTTP scope (bearer header or apex cookie),
-    or the workspace-wide ``X-Api-Key`` header (``src.api.workspace_api_key``)
-    — lets another app/MCP authenticate into ANY installed app's routes with
-    the shared workspace key instead of a browser-issued JWT (first consumer:
-    an external whiteboard MCP process)."""
+    or the ``X-Api-Key`` header — either the workspace-wide master key
+    (``src.api.workspace_api_key``), which lets another app/MCP authenticate
+    into ANY installed app's routes without a browser-issued JWT (first
+    consumer: an external whiteboard MCP process), or an ``awsk_`` scoped key
+    (``src.api.scoped_api_keys``), whose claims carry the route rules
+    :class:`IdentityGuard` then enforces."""
     from src.api.identity import decode_identity_jwt
-    from src.api.workspace_api_key import HEADER_NAME, verify_workspace_api_key
+    from src.api.workspace_api_key import HEADER_NAME
     headers = _headers_dict(scope)
     api_key = headers.get(HEADER_NAME.lower().encode(), b"").decode()
-    if api_key and verify_workspace_api_key(api_key):
-        return {"sub": "workspace-api-key", "api_key": True}
+    resolved = _resolve_api_key_header(api_key)
+    if not isinstance(resolved, _NotAnApiKey):
+        return resolved
     auth = headers.get(b"authorization", b"").decode()
     if auth.lower().startswith("bearer "):
         token = auth[7:].strip()
@@ -172,11 +208,12 @@ def _default_verify_ws(scope: Scope) -> dict | None:
     from urllib.parse import parse_qs
 
     from src.api.identity import decode_identity_jwt
-    from src.api.workspace_api_key import HEADER_NAME, verify_workspace_api_key
+    from src.api.workspace_api_key import HEADER_NAME
     headers = _headers_dict(scope)
     api_key = headers.get(HEADER_NAME.lower().encode(), b"").decode()
-    if api_key and verify_workspace_api_key(api_key):
-        return {"sub": "workspace-api-key", "api_key": True}
+    resolved = _resolve_api_key_header(api_key)
+    if not isinstance(resolved, _NotAnApiKey):
+        return resolved
     qs = parse_qs(scope.get("query_string", b"").decode())
     token = (qs.get("token") or [""])[0]
     if not token:
@@ -274,23 +311,70 @@ class IdentityGuard:
     ``scope["aw_identity"]`` so app WS/HTTP handlers can read who's calling
     (``websocket.scope.get("aw_identity")``) — a local-bypass request has no
     claims, so it's simply absent.
+
+    **Authorization, on top of authentication** (docs/design/scoped-api-keys.md):
+    once claims exist, two of the three credential classes are not
+    unconditionally allowed through, and both checks run in the relaxed
+    branch too — an explicitly presented credential must never grant, nor
+    masquerade as, more than it carries, and silently downgrading it to
+    anonymous would hide the misconfiguration instead of reporting it:
+
+    * an ``awsk_`` **scoped key** (``claims["scoped"]``) is allowed only on
+      routes its scope covers — otherwise **403** (HTTP) / close **4403**
+      (WS). 4403 and not 4401 so a caller can tell "wrong credential" from
+      "right credential, wrong route".
+    * the **master key** (``claims["api_key"]``) is refused with **403** on
+      an app configured ``auth_type: scoped``. That is the ONLY thing
+      ``auth_type`` does — it never gates scoped keys, whose scope is the
+      single authority (design, rejected alternative 3).
+
+    Both run AFTER ``_local_bypass`` and the share-link carve-out, which are
+    unconditional and deliberately never scope-checked: a loopback
+    ``local_paths`` call presents no credential to scope in the first place.
     """
 
     _LOCAL_HOSTS = ("127.0.0.1", "::1")
 
     def __init__(self, app: Any, verify_http=None, verify_ws=None,
                  local_paths: "list[str] | None" = None,
-                 auth_required: "bool | Callable[[], bool]" = True) -> None:
+                 auth_required: "bool | Callable[[], bool]" = True,
+                 app_id: str = "",
+                 auth_type: "str | Callable[[], str]" = "workspace") -> None:
         self.app = app
         self._verify_http = verify_http or _default_verify_http
         self._verify_ws = verify_ws or _default_verify_ws
         self._local_paths = frozenset(local_paths or [])
         self._auth_required = auth_required
+        self.app_id = app_id
+        self._auth_type = auth_type
 
     def _requires_auth(self) -> bool:
         if callable(self._auth_required):
             return bool(self._auth_required())
         return bool(self._auth_required)
+
+    def _auth_type_value(self) -> str:
+        """``"scoped"`` or ``"workspace"``. Anything else — including the
+        garbage ``_coerce_config`` (src/apps/routes.py) passes through
+        unvalidated — is treated as ``"workspace"``, i.e. today's behavior."""
+        raw = self._auth_type() if callable(self._auth_type) else self._auth_type
+        return "scoped" if str(raw) == "scoped" else "workspace"
+
+    def _denial(self, scope: Scope, claims: dict) -> str | None:
+        """403 detail for claims this route refuses, or ``None`` to proceed."""
+        if claims.get("scoped"):
+            from src.api.scoped_api_keys import scope_allows
+            # A WS handshake has no scope["method"]; it IS an HTTP GET
+            # upgrade, so that is what a rule's optional `methods` list is
+            # matched against.
+            method = (scope.get("method") or "GET").upper()
+            if not scope_allows(claims.get("rules"), self.app_id,
+                                get_route_path(scope), method):
+                return "forbidden: key scope does not cover this route"
+            return None
+        if claims.get("api_key") and self._auth_type_value() == "scoped":
+            return "forbidden: workspace key not accepted (auth_type=scoped)"
+        return None
 
     def _local_bypass(self, scope: Scope) -> bool:
         if not self._local_paths:
@@ -323,12 +407,20 @@ class IdentityGuard:
                 # scope["aw_identity"] to be set for a normal logged-in call.
                 claims = self._verify_http(scope)
                 if claims is not None:
+                    denial = self._denial(scope, claims)
+                    if denial is not None:
+                        await self._send_403(send, denial)
+                        return
                     scope["aw_identity"] = claims
                 await self.app(scope, receive, send)
                 return
             claims = self._verify_http(scope)
             if claims is None:
                 await self._send_401(send)
+                return
+            denial = self._denial(scope, claims)
+            if denial is not None:
+                await self._send_403(send, denial)
                 return
             scope["aw_identity"] = claims
         elif stype == "websocket":
@@ -338,12 +430,18 @@ class IdentityGuard:
             if not self._requires_auth():
                 claims = self._verify_ws(scope)
                 if claims is not None:
+                    if self._denial(scope, claims) is not None:
+                        await self._reject_ws(receive, send, code=4403)
+                        return
                     scope["aw_identity"] = claims
                 await self.app(scope, receive, send)
                 return
             claims = self._verify_ws(scope)
             if claims is None:
                 await self._reject_ws(receive, send)
+                return
+            if self._denial(scope, claims) is not None:
+                await self._reject_ws(receive, send, code=4403)
                 return
             scope["aw_identity"] = claims
         await self.app(scope, receive, send)
@@ -359,15 +457,31 @@ class IdentityGuard:
         await send({"type": "http.response.body", "body": body})
 
     @staticmethod
-    async def _reject_ws(receive: Receive, send: Send) -> None:
+    async def _send_403(send: Send, detail: str) -> None:
+        # 403, not 401: the credential IS valid, this route is just outside
+        # what it carries. Collapsing the two would tell a caller to go look
+        # for a better token when the token is fine.
+        body = json.dumps({"detail": detail}).encode()
+        await send({
+            "type": "http.response.start", "status": 403,
+            "headers": [(b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode())],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+    @staticmethod
+    async def _reject_ws(receive: Receive, send: Send, code: int = 4401) -> None:
         # Drain the connect event, accept, then close with the unauthorized code
         # (4401) — same handshake as terminal.py so the browser sees a real code.
+        # 4403 instead when the credential was valid but out of scope, so a
+        # caller can tell the two apart (a WS close has no response body to
+        # carry a detail string).
         try:
             await receive()  # websocket.connect
         except Exception:
             pass
         await send({"type": "websocket.accept"})
-        await send({"type": "websocket.close", "code": 4401})
+        await send({"type": "websocket.close", "code": code})
 
 
 class _DrainableApp:
@@ -1255,6 +1369,14 @@ class AppRuntime:
                        drainable,
                        local_paths=_local_paths_for(loaded),
                        auth_required=lambda: bool(loaded.config.get("auth_required", True)),
+                       app_id=app_id,
+                       # Same live-lambda as auth_required above: POST
+                       # /api/apps/<slug>/config reassigns loaded.config on an
+                       # already-mounted app (src/apps/routes.py), so a value
+                       # read once here would pin the guard to whatever
+                       # auth_type was set at mount time and make the flip a
+                       # silent no-op until the next restart.
+                       auth_type=lambda: str(loaded.config.get("auth_type", "workspace")),
                    )
                    if self.guard_identity else drainable)
         mount = Mount(f"/api/apps/{app_id}", app=guarded)

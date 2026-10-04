@@ -38,7 +38,7 @@ import httpx
 from fastapi import Body, Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
-from src.api.identity import authorize_ws, require_identity
+from src.api.identity import authorize_ws, require_identity, ws_close_code
 from src.apps import config_store
 from src.apps import hostpower
 from src.apps.catalog import get_catalog, is_marketplace_app, list_tags
@@ -1659,7 +1659,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         claims = await authorize_ws(websocket)
         if not claims:
             await websocket.accept()
-            await websocket.close(code=4401, reason="unauthorized")
+            await websocket.close(code=ws_close_code(claims), reason="unauthorized")
             return
         await websocket.accept()
         for job in await jobs.all_active_shared():

@@ -36,7 +36,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse
 
 from src.api.components import component_snapshot
-from src.api.identity import authorize_ws, require_identity
+from src.api.identity import authorize_ws, require_identity, ws_close_code
 from src.api.terminal_manager import (
     TerminalManager, kill_proc_tree,
 )
@@ -344,7 +344,7 @@ class TerminalRoutes:
         claims = await authorize_ws(websocket)
         if not claims:
             await websocket.accept()
-            await websocket.close(code=4401, reason="unauthorized")
+            await websocket.close(code=ws_close_code(claims), reason="unauthorized")
             return
 
         session = await asyncio.to_thread(self.mgr.get, session_id)
@@ -429,7 +429,7 @@ class TerminalRoutes:
         claims = await authorize_ws(websocket)
         if not claims:
             await websocket.accept()
-            await websocket.close(code=4401, reason="unauthorized")
+            await websocket.close(code=ws_close_code(claims), reason="unauthorized")
             return
         await websocket.accept()
         self.hub.add(websocket)

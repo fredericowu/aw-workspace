@@ -17,7 +17,7 @@ import logging
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-from src.api.identity import authorize_ws, require_identity
+from src.api.identity import authorize_ws, require_identity, ws_close_code
 from src.apps.containers import ContainerError
 
 log = logging.getLogger(__name__)
@@ -257,7 +257,7 @@ class ComponentRoutes:
         claims = await authorize_ws(websocket)
         if not claims:
             await websocket.accept()
-            await websocket.close(code=4401, reason="unauthorized")
+            await websocket.close(code=ws_close_code(claims), reason="unauthorized")
             return
         app_id, row = await asyncio.to_thread(_component_for, self.app, key)
         if app_id is None:

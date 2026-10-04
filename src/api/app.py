@@ -15,7 +15,7 @@ import re
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
-from fastapi import Depends, FastAPI, Header, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import Headers
 
@@ -32,6 +32,7 @@ from src.api.marketplace import reconcile_sources_on_boot, register_marketplace_
 from src.api.identity import _extract_token, decode_identity_jwt, require_identity
 from src.api.models import Setting
 from src.api.notifications import register_notification_routes
+from src.api import scoped_api_keys as scoped_keys
 from src.api.observability import register_observability_routes
 from src.api.skills_routes import register_skills_routes
 from src.api.terminal import register_terminal_routes
@@ -528,6 +529,101 @@ def create_app() -> FastAPI:
     @app.post("/api/settings/workspace-api-key/regenerate")
     async def regenerate_workspace_api_key_route(identity: dict = Depends(require_identity)):
         return {"key": await asyncio.to_thread(regenerate_workspace_api_key)}
+
+    # Scoped API keys (docs/design/scoped-api-keys.md) — the second
+    # credential class, next to the master key above. A *scope* is a named,
+    # reusable set of app-route rules; a *key* binds to one scope, has a
+    # selectable expiry and revokes instantly. Enforcement is entirely in
+    # IdentityGuard (src/apps/runtime.py); these routes only manage the
+    # definitions.
+    #
+    # All of them sit behind require_identity, which now 403s a scoped key on
+    # framework routes — so a scoped key can never reach here to mint itself
+    # a wider one. Only a workspace-authenticated caller (who already holds
+    # full access) can define scopes or mint keys, which is why this adds no
+    # privilege-escalation path.
+    @app.get("/api/settings/api-scopes")
+    async def list_api_scopes_route(identity: dict = Depends(require_identity)):
+        return {"scopes": await asyncio.to_thread(scoped_keys.list_scopes)}
+
+    @app.post("/api/settings/api-scopes")
+    async def create_api_scope_route(payload: dict,
+                                     identity: dict = Depends(require_identity)):
+        try:
+            scope = await asyncio.to_thread(
+                scoped_keys.create_scope, payload.get("name", ""), payload.get("rules"))
+        except ValueError as exc:
+            # "already exists" is the one ValueError that is a conflict rather
+            # than a malformed request.
+            status = 409 if "already exists" in str(exc) else 400
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        return scope
+
+    @app.put("/api/settings/api-scopes/{scope_id}")
+    async def update_api_scope_route(scope_id: str, payload: dict,
+                                     identity: dict = Depends(require_identity)):
+        """Edit a scope in place. Required because DELETE is refused while any
+        key references it (below) — without this there would be no way to
+        change a live scope's rules at all. Takes effect on the very next
+        request: nothing caches rules (see src/api/scoped_api_keys.py)."""
+        try:
+            scope = await asyncio.to_thread(
+                scoped_keys.update_scope, scope_id,
+                name=payload.get("name"), rules=payload.get("rules"))
+        except ValueError as exc:
+            status = 409 if "already exists" in str(exc) else 400
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        if scope is None:
+            raise HTTPException(status_code=404, detail="no such scope")
+        return scope
+
+    @app.delete("/api/settings/api-scopes/{scope_id}")
+    async def delete_api_scope_route(scope_id: str,
+                                     identity: dict = Depends(require_identity)):
+        result = await asyncio.to_thread(scoped_keys.delete_scope, scope_id)
+        if result == "not_found":
+            raise HTTPException(status_code=404, detail="no such scope")
+        if result == "in_use":
+            raise HTTPException(
+                status_code=409,
+                detail="keys still reference this scope — delete them first")
+        return {"ok": True}
+
+    @app.get("/api/settings/api-keys")
+    async def list_scoped_api_keys_route(identity: dict = Depends(require_identity)):
+        return {"keys": await asyncio.to_thread(scoped_keys.list_keys)}
+
+    @app.post("/api/settings/api-keys")
+    async def create_scoped_api_key_route(payload: dict,
+                                          identity: dict = Depends(require_identity)):
+        """Mint a key. The response is the ONLY place the full token ever
+        appears — only its sha256 is stored, so a lost token is re-minted,
+        never recovered. ``expires_in_seconds: null`` means never expires."""
+        try:
+            key = await asyncio.to_thread(
+                scoped_keys.create_key, payload.get("name", ""),
+                payload.get("scope_id", ""), payload.get("expires_in_seconds"))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return key
+
+    @app.post("/api/settings/api-keys/{key_id}/revoke")
+    async def revoke_scoped_api_key_route(key_id: str,
+                                          identity: dict = Depends(require_identity)):
+        key = await asyncio.to_thread(scoped_keys.revoke_key, key_id)
+        if key is None:
+            raise HTTPException(status_code=404, detail="no such key")
+        return key
+
+    @app.delete("/api/settings/api-keys/{key_id}")
+    async def delete_scoped_api_key_route(key_id: str,
+                                          identity: dict = Depends(require_identity)):
+        """Drop the row entirely — what the scope-delete 409 above tells you
+        to do first. Revoking keeps the key listed (and its scope pinned) for
+        the audit trail; deleting is how a scope is actually freed."""
+        if not await asyncio.to_thread(scoped_keys.delete_key, key_id):
+            raise HTTPException(status_code=404, detail="no such key")
+        return {"ok": True}
 
     # Recovery endpoint for a sibling process (aw-workspace-cli, an agent
     # runner container) whose local .env is missing/stale: unauthenticated

@@ -172,6 +172,66 @@ def _workspace_api_key_authorized(request: Request) -> bool:
     return verify_workspace_api_key(presented)
 
 
+# Framework routes are structurally outside every scope (v1 — scope rules
+# only name app routes), so a scoped key reaching one is always refused. The
+# distinction that matters is WHICH refusal: a key that resolves is a real
+# credential being used where it does not apply (403), while one that
+# doesn't is no credential at all (401, same as any other bad token). This
+# is what stops a scoped key from minting more keys, reading settings, or
+# touching /api/apps CRUD — the capability its whole point is to withhold.
+_SCOPED_ON_FRAMEWORK_DETAIL = "scoped keys cannot access framework routes"
+
+
+def _scoped_key_presented(presented: str) -> bool:
+    from src.api.scoped_api_keys import is_scoped_key
+
+    return is_scoped_key(presented)
+
+
+def _scoped_key_valid(presented: str) -> bool:
+    """Blocking — hits Postgres. Call via ``asyncio.to_thread``, same
+    reasoning as ``_workspace_api_key_authorized`` above."""
+    from src.api.scoped_api_keys import resolve_scoped_key
+
+    return resolve_scoped_key(presented) is not None
+
+
+def _presented_api_key(carrier: Request | WebSocket) -> str:
+    from src.api.workspace_api_key import HEADER_NAME
+
+    return carrier.headers.get(HEADER_NAME, "")
+
+
+class _ScopedKeyRefused:
+    """``authorize_ws``'s third answer: the handshake carried a VALID scoped
+    key, which framework WS routes refuse (the HTTP sibling raises 403).
+
+    **Falsy on purpose.** ``authorize_ws``'s contract is "claims or
+    nothing, never raises", and every caller gates on ``if not claims`` —
+    so a sentinel that is false can only ever be treated as a rejection,
+    never mistaken for an identity, even by a call site that has never
+    heard of it. What a caller gains by knowing about it is the close
+    *code*: ``ws_close_code`` turns it into 4403 instead of 4401, so the
+    other end can tell "this credential is not valid" from "this
+    credential is valid but not for this route" — the same distinction the
+    403 carries over HTTP.
+    """
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return False
+
+
+SCOPED_KEY_REFUSED = _ScopedKeyRefused()
+
+
+def ws_close_code(claims: object) -> int:
+    """Close code for a rejected handshake: 4403 for a refused scoped key,
+    4401 (the existing unauthenticated code) for everything else."""
+    return 4403 if claims is SCOPED_KEY_REFUSED else 4401
+
+
 async def require_identity(request: Request, authorization: str = Header(default="")) -> dict:
     """FastAPI dependency — returns the verified JWT claims dict or 401s.
 
@@ -184,7 +244,16 @@ async def require_identity(request: Request, authorization: str = Header(default
     request with it. It short-circuits without touching the DB when no key
     header is present (the browser/JWT path), which is why this only ever
     showed up for API-key callers — the MCP gateway, apps, and this
-    workspace's own CLI."""
+    workspace's own CLI.
+
+    A scoped (``awsk_``) key is handled before the master-key check and
+    never falls through to it — see ``_SCOPED_ON_FRAMEWORK_DETAIL``."""
+    presented = _presented_api_key(request)
+    if _scoped_key_presented(presented):
+        if await asyncio.to_thread(_scoped_key_valid, presented):
+            raise HTTPException(status_code=403, detail=_SCOPED_ON_FRAMEWORK_DETAIL)
+        raise HTTPException(status_code=401, detail="unauthorized")
+
     if await asyncio.to_thread(_workspace_api_key_authorized, request):
         return {"sub": "workspace-api-key", "api_key": True}
 
@@ -199,7 +268,7 @@ async def require_identity(request: Request, authorization: str = Header(default
     return claims
 
 
-async def authorize_ws(websocket: WebSocket) -> dict | None:
+async def authorize_ws(websocket: WebSocket) -> "dict | None | _ScopedKeyRefused":
     """Verify a WebSocket handshake, returning claims or None.
 
     Checked in order: the workspace-wide ``X-Api-Key`` header (mirrors
@@ -223,7 +292,17 @@ async def authorize_ws(websocket: WebSocket) -> dict | None:
     Run inline, either one freezes that worker's ONE loop thread and every
     other in-flight request with it — the HTTP sibling was fixed for exactly
     this, the WS path was not.
+
+    A scoped (``awsk_``) key is checked first and never falls through to the
+    master-key compare: valid → :data:`SCOPED_KEY_REFUSED` (falsy, and
+    ``ws_close_code`` turns it into 4403), invalid → ``None`` (4401).
     """
+    presented = _presented_api_key(websocket)
+    if _scoped_key_presented(presented):
+        if await asyncio.to_thread(_scoped_key_valid, presented):
+            return SCOPED_KEY_REFUSED
+        return None
+
     if await asyncio.to_thread(_workspace_api_key_authorized, websocket):
         return {"sub": "workspace-api-key", "api_key": True}
     token = websocket.query_params.get("token") or websocket.cookies.get(COOKIE_NAME, "")

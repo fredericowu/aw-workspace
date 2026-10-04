@@ -19,7 +19,7 @@ import logging
 
 from fastapi import Body, Depends, FastAPI, WebSocket, WebSocketDisconnect
 
-from src.api.identity import authorize_ws, require_identity
+from src.api.identity import authorize_ws, require_identity, ws_close_code
 from src.api.notification_db import NotificationDB
 from src.libs.redis_coord import RedisBroadcaster
 
@@ -241,7 +241,7 @@ class NotificationRoutes:
         claims = await authorize_ws(websocket)
         if not claims:
             await websocket.accept()
-            await websocket.close(code=4401, reason="unauthorized")
+            await websocket.close(code=ws_close_code(claims), reason="unauthorized")
             return
 
         await websocket.accept()
