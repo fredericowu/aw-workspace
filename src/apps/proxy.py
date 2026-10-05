@@ -180,7 +180,7 @@ class ContainerReverseProxy:
             return
 
         out_headers = [(k.encode("latin-1"), v.encode("latin-1"))
-                       for k, v in resp.headers.items()
+                       for k, v in resp.headers.multi_items()
                        if k.lower().encode() not in _HOP_BY_HOP]
         # The one place this proxy is NOT a pure passthrough — and only ever
         # additive, never a rewrite (see _cache_control_override).
