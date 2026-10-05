@@ -83,6 +83,99 @@ def _make_app_repo(tmp_path, slug="widget", version="1.0.0", dependencies=None,
     return str(src)
 
 
+def _write_app_manifest(dir_path: Path, slug, version="1.0.0", dependencies=None):
+    """Like ``_make_app_repo``, but writes INTO an existing directory instead
+    of creating its own ``src_<slug>_<version>`` child — for building a
+    dependency app nested inside a parent app's own checkout (e.g.
+    aw-app-crispal/deploy)."""
+    import json
+    dir_path.mkdir(parents=True, exist_ok=True)
+    deps_json = ""
+    if dependencies:
+        deps_json = ',\n      "dependencies": ' + json.dumps({"apps": dependencies})
+    (dir_path / "aw-app.json").write_text(textwrap.dedent(f"""
+    {{
+      "manifest_version": 1,
+      "id": "{slug}",
+      "name": "{slug}",
+      "version": "{version}",
+      "tier": "inprocess",
+      "runtime": {{"entrypoint": "plugin:AppPlugin"}},
+      "permissions": ["routes:register"],
+      "contributes": {{"routes": [{{"prefix": "/api/apps/{slug}"}}]}}
+      {deps_json}
+    }}
+    """))
+    (dir_path / "plugin.py").write_text(textwrap.dedent(f"""
+        from fastapi import FastAPI
+        class AppPlugin:
+            async def activate(self, ctx):
+                api = FastAPI()
+                @api.get("/")
+                async def root():
+                    return {{"app": "{slug}", "ok": True}}
+                ctx.routes.register(api)
+            async def deactivate(self):
+                return None
+    """))
+    return str(dir_path)
+
+
+def test_sideloaded_dependency_package_dir_relative_resolves_against_parent(tmp_path, monkeypatch):
+    """crispal-dev:sideload-breaks-on-crispal-deploy-package-dir — a
+    dependency nested inside the parent app's own checkout (e.g.
+    aw-app-crispal/deploy) must resolve against wherever THIS install
+    actually put the parent, not a path baked in for one install mode.
+
+    A sideload's package_dir is an arbitrary directory under repos/, never
+    apps_root()/<slug> — ``package_dir_relative`` is what lets the nested
+    dependency still be found there."""
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    parent_dir = tmp_path / "sideload-checkout"
+    _write_app_manifest(
+        parent_dir, "crispal",
+        dependencies=[{"id": "crispal-deploy", "required": True,
+                       "package_dir_relative": "deploy"}],
+    )
+    _write_app_manifest(parent_dir / "deploy", "crispal-deploy")
+
+    async def run():
+        summary = await rc.install(AppSpec(app_id="crispal", package_dir=str(parent_dir)))
+        assert summary["dependencies_installed"] == ["crispal-deploy"]
+        assert rt.is_loaded("crispal-deploy")
+        assert rt.is_loaded("crispal")
+
+    _async(run())
+
+
+def test_dependency_hardcoded_marketplace_package_dir_breaks_under_sideload(tmp_path, monkeypatch):
+    """The bug itself: a dependency's package_dir hardcoded to the
+    MARKETPLACE extraction path (apps_root()/<parent>/deploy) resolves for a
+    marketplace install but not a sideload, whose package_dir is an
+    unrelated directory elsewhere — exactly what deinstalled aw-app-crispal
+    on every sideload. Guards against the hardcoded-absolute pattern
+    reappearing now that package_dir_relative is the supported fix."""
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    parent_dir = tmp_path / "sideload-checkout"
+    marketplace_dep_path = str(Path(fetch_mod.package_dir_for("crispal")) / "deploy")
+    _write_app_manifest(
+        parent_dir, "crispal",
+        dependencies=[{"id": "crispal-deploy", "required": True,
+                       "package_dir": marketplace_dep_path}],
+    )
+    _write_app_manifest(parent_dir / "deploy", "crispal-deploy")
+
+    async def run():
+        with pytest.raises(ValueError, match="crispal-deploy"):
+            await rc.install(AppSpec(app_id="crispal", package_dir=str(parent_dir)))
+
+    _async(run())
+
+
 def _make_app_repo_with_permissions(tmp_path, slug, version, permissions):
     """Same shape as _make_app_repo, with the manifest's permission list under
     test — the thing an update is supposed to re-read."""

@@ -739,9 +739,22 @@ class Reconciler:
         }
 
     def _dependency_spec(self, dep: dict[str, Any],
-                         known_rows: dict[str, dict[str, Any]] | None = None) -> AppSpec:
+                         known_rows: dict[str, dict[str, Any]] | None = None,
+                         parent_package_dir: str | None = None) -> AppSpec:
         app_id = dep["id"]
-        if dep.get("repo") or dep.get("package_dir"):
+        # ``package_dir_relative`` resolves against wherever THIS install of
+        # the parent app actually landed — apps_root()/<parent> for a
+        # marketplace install, an arbitrary repos/ checkout for a sideload —
+        # instead of a path baked in at manifest-authoring time. A dependency
+        # nested inside the parent's own repo (e.g. aw-app-crispal/deploy)
+        # must use this, not a literal ``package_dir``: a hardcoded absolute
+        # path is only ever correct for the one install mode it was written
+        # for. See crispal-dev:sideload-breaks-on-crispal-deploy-package-dir.
+        package_dir = dep.get("package_dir")
+        relative = dep.get("package_dir_relative")
+        if not package_dir and relative and parent_package_dir:
+            package_dir = os.path.join(parent_package_dir, relative)
+        if dep.get("repo") or package_dir:
             return AppSpec(
                 app_id=app_id,
                 version=dep.get("version", "") or "",
@@ -750,7 +763,7 @@ class Reconciler:
                 granted_permissions=list(dep.get("granted_permissions") or []),
                 config=dict(dep.get("config") or {}),
                 signed=bool(dep.get("signed", False)),
-                package_dir=dep.get("package_dir"),
+                package_dir=package_dir,
             )
 
         rows = known_rows if known_rows is not None else self._known_dependency_rows()
@@ -766,7 +779,8 @@ class Reconciler:
             "in the registry, local mirror, or marketplace catalog")
 
     async def _install_dependencies(self, manifest, *, write_cloud: bool,
-                                    stack: tuple[str, ...]) -> list[str]:
+                                    stack: tuple[str, ...],
+                                    parent_package_dir: str | None = None) -> list[str]:
         installed: list[str] = []
         # to_thread: _known_dependency_rows does BOTH a cloud-registry HTTP
         # call and a local-mirror DB read, either of which would otherwise
@@ -779,7 +793,7 @@ class Reconciler:
                 raise ValueError(f"cyclic app dependency chain: {chain}")
             if self.runtime.is_loaded(dep_id):
                 continue
-            dep_spec = self._dependency_spec(dep, known_rows)
+            dep_spec = self._dependency_spec(dep, known_rows, parent_package_dir=parent_package_dir)
             # _install_provisioned, not install: the caller already holds the
             # provisioning mutex and will publish once for the whole install.
             # One apps:changed per transitive dependency would make every
@@ -940,7 +954,8 @@ class Reconciler:
         granted_req = list(manifest.permissions)
 
         deps_installed = await self._install_dependencies(
-            manifest, write_cloud=write_cloud, stack=_dependency_stack or (manifest.id,))
+            manifest, write_cloud=write_cloud, stack=_dependency_stack or (manifest.id,),
+            parent_package_dir=package_dir)
 
         # runtime.load enforces the F2 grant filter (trust tier) itself and
         # returns the manifest; capture the *effective* grant for the mirror.
