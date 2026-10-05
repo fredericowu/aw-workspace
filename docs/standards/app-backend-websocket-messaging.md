@@ -320,6 +320,60 @@ reporting a version that is not the code that is running.
 control plane may never make a new host→control-plane frame load-bearing
 without a negotiated fallback.
 
+##### 2.6.2a Corollary — change a frame's FIELDS additively, never in place
+
+Added 2026-10-05 from `bug:tunnel-link-multi-header-collapse-go-and-python`
+(`3f0c4132-9691-8144-8ac0-c77f2c658ba5`): the `/link` tunnel collapsed every
+repeated HTTP header to one value, because `headers` is a JSON object. Three
+`Set-Cookie`s from a WooCommerce add-to-cart arrived as one, so the cart always
+read back empty.
+
+§2.6.2 above covers adding a **frame**. The same asymmetry applies to changing
+a **field** inside an existing frame, and the rule is stronger there, because
+the failure is silent:
+
+> **Add a new field alongside the old one; never change the type of a field
+> that is already on the wire.** Keep the legacy field's content and type
+> byte-for-byte as they were, and have new decoders prefer the new field by
+> its **presence**.
+
+Why presence rather than a capability (which §2.6.2 would suggest): the relay's
+*receiving* worker does not own the `/link` connection, so it has no
+`_connected[...]["caps"]` to consult — gating would mean plumbing caps through
+Redis, more machinery than a key lookup, and able to go stale. The host still
+advertises `http_headers_multi` in `Caps`, but **nothing gates on it**; it
+exists so an operator can answer "which hosts are still collapsing headers?".
+That does not violate §2.6.2, which forbids waiting on a *frame* without a
+fallback — nothing here waits on anything.
+
+Why in-place would have been worse than a crash: the Go decoder does
+`v.(map[string]any)` on this field. A JSON array there yields an **empty map
+with no error**, so every un-upgraded host would have silently dropped *all*
+request headers, auth cookie included, with nothing in any log.
+
+Two things that make this concrete, and that a later "cleanup" must not undo:
+
+- **Which value survives into the legacy field is frozen per DIRECTION.**
+  Response (built in Go, `internal/link/link.go`'s `headersWire`) is
+  first-value-wins; request (built here, `host_link.py`'s `headers_wire`) is
+  last-value-wins — a plain `dict(pairs)`. They are genuinely different.
+  Unifying them changes what an un-upgraded host on the other end receives.
+- **Confine the dual format to one layer per side.** `headers_wire` /
+  `decode_headers` in `host_link.py`, and `headersWire` / `headersFromFrame` in
+  `link.go`, are the only code that knows both shapes; above them the type is
+  the faithful one (`http.Header` in Go, a list of pairs in Python). A decoder
+  must fall back to the legacy field when the new one is unusable, rather than
+  returning nothing.
+
+Cost, accepted deliberately: the wire carries headers twice, permanently.
+Dropping the legacy field needs the whole BYOD fleet upgraded, which in
+practice means never. **Every bridge for the frame must be updated, not just
+the obvious one** — `host_link_relay.py` carries ~9 of 10 production requests
+at `AW_BACKEND_WORKERS=10`, so fixing only `workspace_tunnel_proxy.py` passes
+CI and still fails in production, intermittently. Verify all four
+old/new × old/new combinations, especially (old host, new control plane) — that
+is the one that proves no coordinated deploy is needed.
+
 #### 2.6.3 Rule — the bridge forwards the close, it does not invent one
 
 Both receivers used to hardcode the browser-facing close to `1000`
