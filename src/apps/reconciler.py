@@ -363,39 +363,69 @@ class Reconciler:
         flag makes a stdio server's ``cwd`` (and therefore its relative-path
         ``command``/``args``) resolve against the REAL package_dir; a bare
         mcp.json copy would silently point it at an empty directory. That
-        combination needs a real (repo=) install, not this workaround."""
+        combination needs a real (repo=) install, not this workaround.
+
+        Same treatment for ``gateway-profiles.json`` (``contributes.mcp.profiles``,
+        see ``gateway_profiles.py``) — the gateway scans it from the same
+        ``apps_root()/<slug>`` tree, by the same ``scan_app_gateway_profiles()``
+        mechanism as ``mcp.json``, and a sideloaded app's profile is just as
+        invisible until this copies it too. By the time this runs,
+        ``runtime.load()``/``_load_container()`` has already called
+        ``_render_gateway_profiles()`` for this app (``provision=True``, same
+        activation pass that renders ``mcp.json``), so the file already exists
+        at ``package_dir/gateway-profiles.json`` whenever the manifest declares
+        any profiles — nothing here needs to render it itself. Unlike
+        ``mcp.json`` this has no ``cwd_app_dir``-style escape hatch to check: a
+        profile is a literal scope declaration with no server of its own to
+        run, so a bare copy is always safe. Confirmed live 2026-10-05: a
+        sideloaded aw-app-crispal's ``crispal-full`` profile (and
+        aw-app-marketing's ``marketing`` profile) never reached the gateway's
+        scan root, leaving their scoped agents with zero tools."""
         dest_dir = fetch_mod.package_dir_for(app_id)
         if os.path.abspath(dest_dir) == os.path.abspath(package_dir):
             return  # marketplace install already lives there
+
         src = os.path.join(package_dir, "mcp.json")
-        if not os.path.isfile(src):
-            return
-        try:
-            with open(src, encoding="utf-8") as f:
-                spec = json.load(f)
-        except (OSError, ValueError):
-            log.exception("apps: could not read %s to check mcp-gateway scan "
-                          "visibility for %s", src, app_id)
-            return
-        servers = spec.get("mcpServers") if isinstance(spec, dict) else None
-        if isinstance(servers, dict) and any(
-                isinstance(s, dict) and s.get("cwd_app_dir") for s in servers.values()):
-            log.warning(
-                "apps: %s's mcp.json sets cwd_app_dir — a bare copy into %s "
-                "would break its relative paths, and the mcp-gateway "
-                "container cannot see %s directly. This sideloaded app needs "
-                "a real (repo=) install to be visible to the gateway.",
-                app_id, dest_dir, package_dir)
-            return
-        try:
-            os.makedirs(dest_dir, exist_ok=True)
-            shutil.copyfile(src, os.path.join(dest_dir, "mcp.json"))
-            log.info("apps: copied %s's mcp.json into %s for mcp-gateway scan "
-                     "visibility (sideloaded package_dir %s is outside the "
-                     "gateway container's mount)", app_id, dest_dir, package_dir)
-        except OSError:
-            log.exception("apps: failed to copy mcp.json for mcp-gateway scan "
-                          "visibility (%s)", app_id)
+        if os.path.isfile(src):
+            try:
+                with open(src, encoding="utf-8") as f:
+                    spec = json.load(f)
+            except (OSError, ValueError):
+                log.exception("apps: could not read %s to check mcp-gateway scan "
+                              "visibility for %s", src, app_id)
+                spec = None
+            servers = spec.get("mcpServers") if isinstance(spec, dict) else None
+            if isinstance(servers, dict) and any(
+                    isinstance(s, dict) and s.get("cwd_app_dir") for s in servers.values()):
+                log.warning(
+                    "apps: %s's mcp.json sets cwd_app_dir — a bare copy into %s "
+                    "would break its relative paths, and the mcp-gateway "
+                    "container cannot see %s directly. This sideloaded app needs "
+                    "a real (repo=) install to be visible to the gateway.",
+                    app_id, dest_dir, package_dir)
+            elif spec is not None:
+                try:
+                    os.makedirs(dest_dir, exist_ok=True)
+                    shutil.copyfile(src, os.path.join(dest_dir, "mcp.json"))
+                    log.info("apps: copied %s's mcp.json into %s for mcp-gateway scan "
+                             "visibility (sideloaded package_dir %s is outside the "
+                             "gateway container's mount)", app_id, dest_dir, package_dir)
+                except OSError:
+                    log.exception("apps: failed to copy mcp.json for mcp-gateway scan "
+                                  "visibility (%s)", app_id)
+
+        profiles_src = os.path.join(package_dir, gateway_profiles.OUTPUT_NAME)
+        if os.path.isfile(profiles_src):
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+                shutil.copyfile(profiles_src, os.path.join(dest_dir, gateway_profiles.OUTPUT_NAME))
+                log.info("apps: copied %s's %s into %s for mcp-gateway scan "
+                         "visibility (sideloaded package_dir %s is outside the "
+                         "gateway container's mount)", app_id, gateway_profiles.OUTPUT_NAME,
+                         dest_dir, package_dir)
+            except OSError:
+                log.exception("apps: failed to copy %s for mcp-gateway scan "
+                              "visibility (%s)", gateway_profiles.OUTPUT_NAME, app_id)
 
     # ---- W3: the provision/attach seam --------------------------------------
 

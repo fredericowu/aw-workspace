@@ -754,6 +754,40 @@ def test_install_copies_a_sideloaded_apps_mcp_json_into_the_gateway_scan_root(
     assert (Path(package_dir) / "aw-app.json").is_file()
 
 
+def test_install_copies_a_sideloaded_apps_gateway_profiles_into_the_scan_root(
+        tmp_path, monkeypatch):
+    """contributes.mcp.profiles renders gateway-profiles.json into
+    package_dir during activate() (_render_gateway_profiles) — this must
+    mirror that rendered file the same way it mirrors mcp.json, or a
+    sideloaded app's named profile (e.g. aw-app-crispal's crispal-full)
+    never reaches the gateway's scan root and its scoped agents see zero
+    tools. Confirmed live 2026-10-05."""
+    calls = []
+    _patch_reload(monkeypatch, calls)
+
+    import json
+
+    slug = "widget-sideload-profile"
+    package_dir = _make_app_repo(tmp_path, slug, reload_mcp_gateway_on_save=True)
+    manifest = json.loads((Path(package_dir) / "aw-app.json").read_text())
+    manifest["contributes"]["mcp"] = {
+        "profiles": {f"{slug}-full": {"upstreams": [slug]}}}
+    (Path(package_dir) / "aw-app.json").write_text(json.dumps(manifest))
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    _async(rc.install(AppSpec(app_id=slug, package_dir=package_dir)))
+
+    assert len(calls) == 1
+    copied = Path(fetch_mod.package_dir_for(slug))
+    rendered = (copied / "gateway-profiles.json")
+    assert rendered.is_file()
+    assert json.loads(rendered.read_text()) == {
+        "profiles": {f"{slug}-full": {"upstreams": [slug]}}}
+    # The real dev checkout kept its own rendered copy too.
+    assert (Path(package_dir) / "gateway-profiles.json").is_file()
+
+
 def test_install_does_not_copy_mcp_json_for_a_normal_marketplace_app(tmp_path, monkeypatch):
     """package_dir already IS apps_root()/<slug> for a repo= install — no
     separate copy to make, _ensure_mcp_scan_visible must no-op."""
