@@ -686,10 +686,12 @@ worse. The build must never hard-fail on a missing key.
 4. The envelope carries `topic_path` per result, the `strategy` actually used,
    and the scope (§7).
 
-**If a bucket has no tree yet, fall back to flat vector search and say
-`strategy: "flat"` in the envelope.** Never a silent empty and never a silent
-downgrade — `aw-knowledgeable-buckets.md:445-449` is explicit that an agent
-reading an unlabelled thin result concludes the knowledge does not exist.
+**If a bucket has no tree yet, or if `bucket` is omitted entirely (an
+unscoped query spans every readable bucket, so there is no single tree to
+descend), fall back to flat vector search and say `strategy: "flat"` in the
+envelope.** Never a silent empty and never a silent downgrade —
+`aw-knowledgeable-buckets.md:445-449` is explicit that an agent reading an
+unlabelled thin result concludes the knowledge does not exist.
 
 ### Why this, and why the derived edges are a separate type
 
