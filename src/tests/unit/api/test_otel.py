@@ -190,3 +190,92 @@ def test_dynamic_log_exporter_is_a_silent_no_op_with_no_target():
     otel._set_target(None)
     exporter = otel._DynamicLogExporter()
     assert exporter.export([]) == LogExportResult.SUCCESS
+
+
+# --- the aw-app-signoz-connector hop ----------------------------------------
+#
+# When the connector app is installed it is a FORWARDER, so it becomes this
+# process's next hop instead of the final destination (design §3.3). These
+# pin the three things that are easy to get wrong: that it wins over the
+# auto/local swap, that it applies to `custom` too, and that a workspace
+# which resolved nothing still exports nothing.
+
+
+def _connector_runtime(loaded=("signoz-connector",),
+                       base_url="http://aw-app-signoz-connector:4318"):
+    """A runtime that reports the given app ids as loaded.
+
+    Note the default ``_runtime()`` above deliberately has NO ``is_loaded``
+    at all, which ``connector_installed`` reads as "no connector" — that is
+    what keeps every pre-existing test in this file on the old code path.
+    """
+    def _base_url(app_id):
+        return base_url if app_id == "signoz-connector" else "http://aw-app-signoz:8080"
+
+    return SimpleNamespace(
+        is_loaded=lambda app_id: app_id in loaded,
+        containers=SimpleNamespace(base_url=_base_url),
+    )
+
+
+def test_connector_installed_routes_through_its_internal_container_url():
+    with patch("src.api.observability.resolve",
+               return_value=_resolved("custom", "https://central.example.com")):
+        target = otel.ensure_export_state(_connector_runtime())
+
+    assert target["endpoint"] == "http://aw-app-signoz-connector:4318"
+
+
+def test_connector_hop_carries_no_auth_header():
+    """The resolved api_key authenticates to the FINAL destination, and the
+    connector is what presents it upstream. Its own receiver is
+    internal-only with no gate, so core must not ship the credential to a
+    hop that never checks it."""
+    with patch("src.api.observability.resolve",
+               return_value=_resolved("custom", "https://central.example.com",
+                                      api_key="the-central-ingest-token")):
+        target = otel.ensure_export_state(_connector_runtime())
+
+    assert target["headers"] == {}
+
+
+def test_connector_takes_precedence_over_the_auto_local_signoz_swap():
+    """Both apps installed. The connector is the forwarder, so it wins —
+    otherwise a workspace with both would export straight past it and the
+    connector's queue/doctor guarantees would silently not apply."""
+    runtime = _connector_runtime(loaded=("signoz-connector", "signoz"))
+    with patch("src.api.observability.resolve",
+               return_value=_resolved("auto", "https://signoz.app.ws.example.com")):
+        target = otel.ensure_export_state(runtime)
+
+    assert target["endpoint"] == "http://aw-app-signoz-connector:4318"
+
+
+def test_connector_internal_lookup_failure_exports_nothing_not_the_public_url():
+    """Same rule as the signoz branch, and for the same recorded reason: the
+    public endpoint was never this consumer's target and is known to hang
+    (25+ minute CI stall, 2026-09-03), so a failed internal lookup disables
+    export instead of redirecting to it."""
+    def _boom(app_id):
+        raise RuntimeError("no container registered")
+
+    runtime = SimpleNamespace(is_loaded=lambda app_id: app_id == "signoz-connector",
+                              containers=SimpleNamespace(base_url=_boom))
+    with patch("src.api.observability.resolve",
+               return_value=_resolved("custom", "https://central.example.com")):
+        target = otel.ensure_export_state(runtime)
+
+    assert target is None
+    assert otel.current_target() is None
+
+
+def test_connector_installed_but_nothing_resolved_still_exports_nothing():
+    """§8.8 of the design doc: "no runtime → export nothing, never fall back
+    to the public URL" — and nothing resolved is the same class. Exporting
+    into the connector here would fill its disk-backed queue with telemetry
+    that has no destination to drain to."""
+    with patch("src.api.observability.resolve", return_value=_none_resolved()):
+        target = otel.ensure_export_state(_connector_runtime())
+
+    assert target is None
+    assert otel.current_target() is None

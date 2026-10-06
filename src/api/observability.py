@@ -70,6 +70,15 @@ SETTING_KEY = "observability"
 #: what "Local (auto)" resolves against.
 SIGNOZ_APP_ID = "signoz"
 
+#: The aw-app-signoz-connector manifest id. A light, single-container OTel
+#: Collector that FORWARDS this workspace's telemetry to wherever this
+#: setting resolves — it is not a destination of its own and deliberately
+#: adds no mode here. When it is installed it becomes the next hop for
+#: core's own export (see :func:`src.api.otel.ensure_export_state`) and the
+#: resolved destination is pushed into its container config by
+#: :func:`_push_connector_config` below.
+SIGNOZ_CONNECTOR_APP_ID = "signoz-connector"
+
 MODES = ("auto", "off", "local", "custom")
 
 #: What a workspace that has never touched this setting gets — see the
@@ -120,6 +129,25 @@ def signoz_installed(runtime) -> bool:
     if runtime is None or not hasattr(runtime, "is_loaded"):
         return False
     return bool(runtime.is_loaded(SIGNOZ_APP_ID))
+
+
+def connector_installed(runtime) -> bool:
+    """Whether ``aw-app-signoz-connector`` is currently loaded.
+
+    Same contract and same safe default as :func:`signoz_installed` — a
+    missing/None runtime reads as "not installed", so a process with no apps
+    subsystem wired (unit tests) behaves as if there were no connector and
+    every existing export path is unchanged.
+
+    Note what this does NOT do: the connector is not a *destination*, so it
+    deliberately has no mode in :data:`MODES` and never appears in
+    :func:`resolve`'s output. It only changes (a) which hop core's own
+    exporters send to — :func:`src.api.otel.ensure_export_state` — and (b)
+    that the resolved destination gets pushed into its container config on
+    save. The observability setting stays the single source of truth."""
+    if runtime is None or not hasattr(runtime, "is_loaded"):
+        return False
+    return bool(runtime.is_loaded(SIGNOZ_CONNECTOR_APP_ID))
 
 
 def local_target() -> dict:
@@ -271,6 +299,74 @@ async def _notify_agents_platform_runners() -> dict:
     return {"ok": False, "reason": reason}
 
 
+# --- push to the signoz connector app ----------------------------------------
+
+
+async def _push_connector_config(resolved: dict | None) -> dict:
+    """Push the resolved OTLP destination into ``aw-app-signoz-connector``'s
+    stored config, so the collector it runs forwards this workspace's
+    telemetry to wherever this setting now points.
+
+    This goes through the app framework's ORDINARY config-save route rather
+    than reaching into the runtime directly, and that is the whole design:
+    ``POST /api/apps/{slug}/config`` already persists to the config store and
+    the local mirror, pushes to the cloud registry, and — via
+    ``src/apps/routes.py::_apply_runtime_config`` — **recreates the container
+    when the resolved ``${config.x}`` env actually changes**. So "how does the
+    connector pick up a new destination at runtime" has a one-word answer,
+    restart, on a seam that already exists and is already tested. Nothing
+    polls, and there is no custom reload endpoint to maintain.
+
+    Same loopback-with-the-workspace-API-key shape as
+    :func:`_notify_agents_platform_runners` above, for the same reason: the
+    route is identity-gated, and this process authenticates to itself exactly
+    like any other caller instead of bypassing the gate.
+
+    A ``None``/empty destination pushes EMPTY strings, deliberately: the
+    connector must stop forwarding when this workspace is set to Desligado,
+    not keep shipping to the last place it was told about. Its schema
+    defaults are empty for the same reason.
+
+    Best-effort and never raised into the caller — the settings save already
+    succeeded and is the source of truth. The outcome is returned so the PUT
+    response can surface a failure instead of swallowing it; a connector left
+    on a stale destination is exactly what the app's ``contributes.doctor``
+    check exists to make visible."""
+    port = os.environ.get("AW_PORT", "9030")
+    url = f"http://127.0.0.1:{port}/api/apps/{SIGNOZ_CONNECTOR_APP_ID}/config"
+    body = {
+        "config": {
+            "endpoint": str((resolved or {}).get("endpoint") or ""),
+            "api_key": str((resolved or {}).get("api_key") or ""),
+        }
+    }
+    reason = "unknown error"
+    for attempt in range(1, NOTIFY_MAX_ATTEMPTS + 1):
+        try:
+            # to_thread for the same reason as the runners push: minting/
+            # reading the key uses the SYNCHRONOUS get_session.
+            api_key = await asyncio.to_thread(get_or_create_workspace_api_key)
+            # Generous relative to the 5s used for the runners push: this one
+            # can recreate a container on the far side (_apply_runtime_config
+            # → containers.start), which is slower than a config write.
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(url, json=body,
+                                         headers={API_KEY_HEADER: api_key})
+            resp.raise_for_status()
+            return {"ok": True, "reason": None}
+        except Exception as exc:  # noqa: BLE001 — any leg failure is a retry candidate
+            reason = str(exc)
+
+        log.warning("observability: connector config push attempt %d/%d failed: %s",
+                    attempt, NOTIFY_MAX_ATTEMPTS, reason)
+        if attempt < NOTIFY_MAX_ATTEMPTS:
+            await asyncio.sleep(NOTIFY_RETRY_BACKOFF_S)
+
+    log.error("observability: giving up pushing config to %s after %d attempts — "
+              "last error: %s", SIGNOZ_CONNECTOR_APP_ID, NOTIFY_MAX_ATTEMPTS, reason)
+    return {"ok": False, "reason": reason}
+
+
 # --- routes ------------------------------------------------------------------
 
 
@@ -305,10 +401,27 @@ def register_observability_routes(app: FastAPI) -> None:
             )
         except ObservabilityError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Push the new destination into the connector BEFORE re-pointing this
+        # process's own exporters at it. Order matters and is not cosmetic:
+        # ensure_export_state below makes core export THROUGH the connector
+        # whenever it is installed, so doing that first would hand core's
+        # telemetry to a collector still configured for the previous
+        # destination (or for none at all, on a first save) — a window of
+        # silently misrouted or dropped data. Configuring the next hop first
+        # makes the worst case "core still exports directly for a moment",
+        # which loses nothing.
+        connector_push = None
+        if connector_installed(runtime):
+            connector_push = await _push_connector_config(result.get("resolved"))
         # Re-evaluate what the core process's own OTel exporters should send
         # to right NOW, so a save takes effect immediately — no restart, no
         # waiting for the next boot reconcile. See src/api/otel.py.
         from src.api.otel import ensure_export_state
         await asyncio.to_thread(ensure_export_state, runtime)
         push = await _notify_agents_platform_runners()
-        return {**result, "push": push}
+        out = {**result, "push": push}
+        # Only present when the connector is actually installed, so the
+        # response shape is unchanged for every workspace without it.
+        if connector_push is not None:
+            out["connector_push"] = connector_push
+        return out

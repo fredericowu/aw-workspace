@@ -305,3 +305,137 @@ async def test_notify_exhausted_retries_logs_a_warning_per_attempt_and_one_final
     # last reason, so a human reading logs doesn't have to reconstruct it.
     error_args = log_mock.error.call_args[0]
     assert str(observability.NOTIFY_MAX_ATTEMPTS) in [str(a) for a in error_args]
+
+
+# --- connector_installed ------------------------------------------------------
+
+
+def test_connector_installed_true_when_runtime_reports_loaded():
+    assert observability.connector_installed(_runtime(True)) is True
+
+
+def test_connector_installed_false_when_not_loaded():
+    assert observability.connector_installed(_runtime(False)) is False
+
+
+def test_connector_installed_false_without_a_runtime():
+    """Same safe default as signoz_installed: a process with no apps
+    subsystem wired behaves as if there were no connector, so every existing
+    export path is unchanged."""
+    assert observability.connector_installed(None) is False
+
+
+def test_connector_installed_checks_the_connector_id_not_the_signoz_one():
+    """The two helpers must not be interchangeable — a workspace with only
+    the full app installed has no connector, and vice versa."""
+    only_signoz = SimpleNamespace(is_loaded=lambda slug: slug == "signoz")
+    only_connector = SimpleNamespace(is_loaded=lambda slug: slug == "signoz-connector")
+
+    assert observability.connector_installed(only_signoz) is False
+    assert observability.signoz_installed(only_signoz) is True
+    assert observability.connector_installed(only_connector) is True
+    assert observability.signoz_installed(only_connector) is False
+
+
+# --- _push_connector_config ---------------------------------------------------
+
+
+def _connector_response(status, json_body=None):
+    request = httpx.Request(
+        "POST", "http://127.0.0.1:9030/api/apps/signoz-connector/config")
+    return httpx.Response(status, json=json_body or {}, request=request)
+
+
+@pytest.mark.asyncio
+async def test_connector_push_posts_the_resolved_destination_to_the_config_route():
+    """Goes through the app framework's ORDINARY config-save route, which is
+    what recreates the container on an env change
+    (src/apps/routes.py::_apply_runtime_config) — not a bespoke reload."""
+    post = AsyncMock(return_value=_connector_response(200, {"ok": True}))
+    client = MagicMock()
+    client.post = post
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.object(observability.httpx, "AsyncClient", return_value=client):
+        out = await observability._push_connector_config(
+            {"endpoint": "https://otlp.aw.tekflox.com", "api_key": "ingest-token",
+             "source": "custom"})
+
+    assert out == {"ok": True, "reason": None}
+    url, kwargs = post.call_args[0][0], post.call_args[1]
+    assert url == "http://127.0.0.1:9030/api/apps/signoz-connector/config"
+    assert kwargs["json"] == {
+        "config": {"endpoint": "https://otlp.aw.tekflox.com", "api_key": "ingest-token"}
+    }
+    # Identity-gated route: this process authenticates to itself like any
+    # other caller rather than bypassing the gate.
+    assert kwargs["headers"][observability.API_KEY_HEADER] == "the-workspace-key"
+
+
+@pytest.mark.asyncio
+async def test_connector_push_sends_empty_strings_when_nothing_resolved():
+    """Desligado must STOP the connector forwarding, not leave it shipping to
+    whatever it was last told about."""
+    post = AsyncMock(return_value=_connector_response(200, {"ok": True}))
+    client = MagicMock()
+    client.post = post
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.object(observability.httpx, "AsyncClient", return_value=client):
+        out = await observability._push_connector_config(None)
+
+    assert out["ok"] is True
+    assert post.call_args[1]["json"] == {"config": {"endpoint": "", "api_key": ""}}
+
+
+@pytest.mark.asyncio
+async def test_connector_push_swallows_a_connection_failure_and_reports_it():
+    """The settings save already succeeded and is the source of truth, so a
+    failed push must never be raised into the caller — but it must be
+    REPORTED, not swallowed silently."""
+    client = MagicMock()
+    client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.object(observability.httpx, "AsyncClient", return_value=client):
+        out = await observability._push_connector_config({"endpoint": "https://x/", "api_key": ""})
+
+    assert out["ok"] is False
+    assert "connection refused" in out["reason"]
+    assert client.post.await_count == observability.NOTIFY_MAX_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_connector_push_retries_then_succeeds():
+    post = AsyncMock(side_effect=[httpx.ConnectError("boom"),
+                                  _connector_response(200, {"ok": True})])
+    client = MagicMock()
+    client.post = post
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.object(observability.httpx, "AsyncClient", return_value=client):
+        out = await observability._push_connector_config({"endpoint": "https://x/", "api_key": ""})
+
+    assert out == {"ok": True, "reason": None}
+    assert post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_connector_push_treats_a_404_as_a_failure():
+    """App uninstalled between the is_loaded check and this call — a real
+    race, and it must not read as a successful push."""
+    post = AsyncMock(return_value=_connector_response(404, {"error": "not installed"}))
+    client = MagicMock()
+    client.post = post
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.object(observability.httpx, "AsyncClient", return_value=client):
+        out = await observability._push_connector_config({"endpoint": "https://x/", "api_key": ""})
+
+    assert out["ok"] is False
+    assert out["reason"]

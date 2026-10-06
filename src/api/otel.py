@@ -125,6 +125,17 @@ def ensure_export_state(runtime: Any = None) -> dict[str, Any] | None:
     at a *different* workspace's signoz, which this process only has a
     public path to.
 
+    ``aw-app-signoz-connector`` takes PRECEDENCE over both of those when it
+    is installed: it is a forwarder, so it becomes this process's next hop
+    for every source (``custom`` included) and the resolved destination is
+    pushed into its own config instead — see the inline comment below and
+    ``src.api.observability._push_connector_config``. The known cost, named
+    in the design doc's "what this makes harder later": with the connector
+    installed, core→connector→destination is one more link that can break,
+    and a misconfigured connector now *silences* telemetry that a direct
+    export would have delivered. The connector's file-backed sending queue
+    and its ``contributes.doctor`` check exist for exactly that.
+
     If that internal lookup itself raises (malformed ``runtime.containers``,
     ``is_loaded()`` lying about liveness — Architect finding #7), the public
     endpoint was NEVER this consumer's intended target and is known to hang
@@ -133,7 +144,12 @@ def ensure_export_state(runtime: Any = None) -> dict[str, Any] | None:
     what stalled CI 25+ minutes when pytest ran with no real ``AppRuntime``.
     """
     try:
-        from src.api.observability import SIGNOZ_APP_ID, resolve
+        from src.api.observability import (
+            SIGNOZ_APP_ID,
+            SIGNOZ_CONNECTOR_APP_ID,
+            connector_installed,
+            resolve,
+        )
         from src.api.workspace_api_key import HEADER_NAME
 
         result = resolve(runtime)
@@ -141,6 +157,45 @@ def ensure_export_state(runtime: Any = None) -> dict[str, Any] | None:
         target = None
         if resolved and resolved.get("endpoint"):
             endpoint = str(resolved["endpoint"]).rstrip("/")
+            if connector_installed(runtime):
+                # aw-app-signoz-connector is installed, so it — not the final
+                # destination — is this process's next hop. Exactly the same
+                # swap the auto/local branch below does for the local signoz
+                # app, for the same reason (an internal container URL instead
+                # of the public edge), with two differences:
+                #
+                #  * It applies whatever the resolved SOURCE is, including
+                #    `custom`. That is the point of a forwarder: the
+                #    connector holds the real destination (pushed into its
+                #    config by observability.py's PUT handler) and owns the
+                #    retry/queue behaviour, so core hands it everything and
+                #    stops caring where it ends up.
+                #  * NO auth header. The resolved api_key is a credential for
+                #    the FINAL destination, and the connector is the one that
+                #    presents it upstream. Its own OTLP receiver is
+                #    internal-only with no gate (the app exposes nothing
+                #    publicly), so forwarding the key here would be noise at
+                #    best and a credential on a hop that does not check it.
+                #
+                # Still gated on something having resolved at all: an
+                # unconfigured workspace exports NOTHING rather than filling
+                # the connector's disk-backed queue with telemetry that has
+                # nowhere to go.
+                try:
+                    endpoint = runtime.containers.base_url(
+                        SIGNOZ_CONNECTOR_APP_ID).rstrip("/")
+                except Exception:
+                    log.warning(
+                        "otel: could not resolve aw-app-signoz-connector's internal "
+                        "container URL — exporting nothing rather than falling back "
+                        "to the public endpoint, which is known to hang (Architect "
+                        "finding #2)",
+                        exc_info=True)
+                    _set_target(None)
+                    return None
+                target = {"endpoint": endpoint, "headers": {}}
+                _set_target(target)
+                return target
             if resolved.get("source") in ("auto", "local") and runtime is not None:
                 try:
                     endpoint = runtime.containers.base_url(SIGNOZ_APP_ID).rstrip("/")
