@@ -70,11 +70,13 @@ class FakeBroadcaster:
 class FakeSupervisor:
     """The slice of ServiceSupervisor the relay actually calls."""
 
-    def __init__(self, *, owns: bool = False, pid: int = 4242) -> None:
+    def __init__(self, *, owns: bool = False, pid: int = 4242,
+                 log_lines: list[str] | None = None) -> None:
         self.owns = owns
         self.pid = pid
         self.calls: list[str] = []
         self.raises: Exception | None = None
+        self.log_lines = log_lines if log_lines is not None else []
 
     def owns_locally(self, app_id: str, service_id: str) -> bool:
         return self.owns
@@ -94,6 +96,12 @@ class FakeSupervisor:
     def restart(self, app_id, service_id):
         self.pid += 1  # a restart is a new process
         return self._act("restart", app_id, service_id)
+
+    def logs(self, app_id, service_id):
+        self.calls.append("logs")
+        if self.raises is not None:
+            raise self.raises
+        return list(self.log_lines)
 
 
 @pytest.fixture
@@ -314,6 +322,91 @@ def test_an_unknown_action_is_never_reflected_into_the_supervisor(bus, lease_hel
             await relay.dispatch("app", "svc", "forget_all_for")
         assert sup.calls == []
         await relay.stop()
+
+    asyncio.run(run())
+
+
+def test_fetch_logs_reads_locally_when_this_worker_owns_the_service(bus, lease_held):
+    async def run():
+        sup = FakeSupervisor(owns=True, log_lines=["hello", "world"])
+        relay = await _relay(sup)
+        lines = await relay.fetch_logs("app", "svc")
+        assert lines == ["hello", "world"]
+        assert sup.calls == ["logs"]
+        assert bus.published == []
+        await relay.stop()
+
+    asyncio.run(run())
+
+
+def test_fetch_logs_forwards_to_the_worker_that_owns_the_service(bus, lease_held):
+    """The exact gap that made this service's own startup hang undiagnosable:
+    a log request landing on a non-owner must reach the real owner instead of
+    silently returning an empty backlog."""
+    async def run():
+        owner_sup = FakeSupervisor(owns=True, log_lines=["real output line 1"])
+        other_sup = FakeSupervisor(owns=False, log_lines=["should never be seen"])
+        owner = await _relay(owner_sup)
+        other = await _relay(other_sup)
+        lease_held["held"] = True
+
+        lines = await other.fetch_logs("app", "svc")
+
+        assert lines == ["real output line 1"]
+        assert owner_sup.calls == ["logs"]
+        assert other_sup.calls == []
+        await owner.stop()
+        await other.stop()
+
+    asyncio.run(run())
+
+
+def test_fetch_logs_falls_back_to_the_local_backlog_when_no_owner_answers(bus, lease_held):
+    async def run():
+        sup = FakeSupervisor(owns=False, log_lines=[])
+        relay = await _relay(sup, timeout=0.2)
+        lease_held["held"] = True  # a lease exists, but nobody answers
+
+        lines = await relay.fetch_logs("app", "svc")
+
+        assert lines == []
+        assert sup.calls == ["logs"]  # fell back locally
+        await relay.stop()
+
+    asyncio.run(run())
+
+
+def test_fetch_logs_reads_locally_when_nobody_owns_the_service(bus, lease_held):
+    async def run():
+        sup = FakeSupervisor(owns=False, log_lines=[])
+        relay = await _relay(sup)
+        lease_held["held"] = False
+
+        lines = await relay.fetch_logs("app", "svc")
+
+        assert lines == []
+        assert sup.calls == ["logs"]
+        assert bus.published == []
+        await relay.stop()
+
+    asyncio.run(run())
+
+
+def test_fetch_logs_raises_when_the_owner_fails(bus, lease_held):
+    async def run():
+        owner_sup = FakeSupervisor(owns=True)
+        owner_sup.raises = ServiceError("no such service")
+        other_sup = FakeSupervisor(owns=False)
+        owner = await _relay(owner_sup)
+        other = await _relay(other_sup, timeout=5.0)
+        lease_held["held"] = True
+
+        with pytest.raises(ServiceError, match="no such service"):
+            await other.fetch_logs("app", "svc")
+
+        assert other_sup.calls == []
+        await owner.stop()
+        await other.stop()
 
     asyncio.run(run())
 

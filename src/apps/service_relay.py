@@ -81,7 +81,18 @@ TOPIC_SERVICE_REPLY = "service:reply"
 #: The only actions a broadcast command may name. Anything else is dropped
 #: rather than reflected into ``getattr(supervisor, action)`` — this is a
 #: control channel now, not only a notification one.
-ACTIONS = ("start", "stop", "restart")
+#:
+#: ``logs`` is a read, not a mutation — it goes through the same
+#: broadcast-and-filter dispatch (:meth:`ServiceCommandRelay.fetch_logs`)
+#: because the problem is identical: a request for a service's output can
+#: land on any of the ``AW_WORKSPACE_WORKERS`` workers, and only the one
+#: holding the real ``Popen`` has anything in ``ServiceSupervisor.log_lines``
+#: to return. Without this, ``log_stream``/``GET .../logs`` call
+#: ``rt.services.logs()`` on whichever worker answered the request — almost
+#: always not the owner — and silently return an empty backlog forever,
+#: which is exactly the gap that made this service's own startup hang
+#: undiagnosable (see the google-workspace-mcp dead-upstream investigation).
+ACTIONS = ("start", "stop", "restart", "logs")
 
 #: Deliberately under the tunnel edge's 30s cut (see the module docstring).
 DEFAULT_TIMEOUT_S = 20.0
@@ -287,3 +298,57 @@ class ServiceCommandRelay:
 
     async def _act_locally(self, services, app_id: str, service_id: str, action: str) -> dict:
         return await asyncio.to_thread(getattr(services, action), app_id, service_id)
+
+    async def fetch_logs(self, app_id: str, service_id: str) -> list[str]:
+        """Read-only counterpart to :meth:`dispatch`, same ownership rules —
+        except there is nothing to fall back to acting "locally" other than
+        this worker's own (possibly empty) backlog, and a missing/dead owner
+        is not an error: an empty log is a normal, reportable answer, not a
+        failure the caller needs raised at it.
+        """
+        services = self._services()
+        if services is None:
+            raise ServiceError("this worker has no service supervisor")
+
+        # (1) I own it — no Redis round-trip.
+        if services.owns_locally(app_id, service_id):
+            return await asyncio.to_thread(services.logs, app_id, service_id)
+
+        # (3)/(5) Nobody owns it, or there is no relay to forward over — this
+        # worker's own backlog is the only honest answer (empty if it never
+        # ran the process locally).
+        held = await asyncio.to_thread(is_lease_held_anywhere, app_id, service_id)
+        if not held or self._broadcaster is None:
+            return await asyncio.to_thread(services.logs, app_id, service_id)
+
+        # (2) Someone else owns it — broadcast and wait for whoever that is.
+        corr_id = uuid.uuid4().hex
+        queue: asyncio.Queue = asyncio.Queue()
+        self._pending[corr_id] = queue
+        try:
+            await self._broadcaster.publish(TOPIC_SERVICE_CMD, {
+                "corr_id": corr_id,
+                "app_id": app_id,
+                "service_id": service_id,
+                "action": "logs",
+                "origin_pid": os.getpid(),
+            })
+            reply = await asyncio.wait_for(queue.get(), timeout=self.timeout)
+        except asyncio.TimeoutError:
+            log.warning(
+                "apps: no worker answered a log request for service %s/%s within "
+                "%ss (corr_id=%s) — returning this worker's own (likely empty) backlog",
+                app_id, service_id, self.timeout, corr_id)
+            return await asyncio.to_thread(services.logs, app_id, service_id)
+        except Exception:
+            log.exception(
+                "apps: could not forward a log request for service %s/%s — "
+                "returning this worker's own backlog", app_id, service_id)
+            return await asyncio.to_thread(services.logs, app_id, service_id)
+        finally:
+            self._pending.pop(corr_id, None)
+
+        if not reply.get("ok"):
+            raise ServiceError(
+                reply.get("error") or "the owning worker failed to read its service logs")
+        return list(reply.get("status") or [])
