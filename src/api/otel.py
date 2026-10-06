@@ -133,8 +133,11 @@ def ensure_export_state(runtime: Any = None) -> dict[str, Any] | None:
     in the design doc's "what this makes harder later": with the connector
     installed, core→connector→destination is one more link that can break,
     and a misconfigured connector now *silences* telemetry that a direct
-    export would have delivered. The connector's file-backed sending queue
-    and its ``contributes.doctor`` check exist for exactly that.
+    export would have delivered. The connector's own sending queue absorbs a
+    transient outage; note it is in-memory rather than the file-backed one
+    the design asked for (the app could not write its ``$AW_APP_DATA`` mount
+    as a non-root image — see that repo's README), so a misconfiguration
+    outliving a container recreate does lose data.
 
     If that internal lookup itself raises (malformed ``runtime.containers``,
     ``is_loaded()`` lying about liveness — Architect finding #7), the public
@@ -179,8 +182,8 @@ def ensure_export_state(runtime: Any = None) -> dict[str, Any] | None:
                 #
                 # Still gated on something having resolved at all: an
                 # unconfigured workspace exports NOTHING rather than filling
-                # the connector's disk-backed queue with telemetry that has
-                # nowhere to go.
+                # the connector's (bounded, in-memory) queue with telemetry
+                # that has nowhere to drain to.
                 try:
                     endpoint = runtime.containers.base_url(
                         SIGNOZ_CONNECTOR_APP_ID).rstrip("/")
