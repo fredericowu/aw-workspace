@@ -226,6 +226,13 @@ async def _app_doctor_checks(runtime) -> list[dict]:
     judging on what comes back keeps the "unreadable = failing" invariant while
     putting the content-type and a body snippet in ``detail``, so the next
     person sees why rather than an empty dict.
+
+    A check carrying a ``port`` is dialled at the app's own container on that
+    port over real HTTP instead of through its mounted proxy — a Tier-2 app has
+    exactly one proxied port and its health endpoint may live elsewhere (see
+    :attr:`Manifest.doctor_checks`). Only the transport forks: the verdict
+    rules below are single-sourced across both, so neither path can drift into
+    judging an answer differently from the other.
     """
     import httpx
 
@@ -240,14 +247,38 @@ async def _app_doctor_checks(runtime) -> list[dict]:
         inner = getattr(loaded.drainable, "app", None)
         for check in checks:
             row = {"app": slug, "label": check["label"], "route": check["route"]}
-            if inner is None:
+            port = check.get("port")
+            if port is None and inner is None:
                 out.append({**row, "ok": False,
                             "detail": "app declares a doctor check but mounted no routes"})
                 continue
             try:
-                transport = httpx.ASGITransport(app=inner)
-                async with httpx.AsyncClient(transport=transport,
-                                             base_url="http://app") as client:
+                # ONLY the transport forks here. Everything below — status
+                # first, parse regardless of content-type, dict shape, then
+                # bool(body["ok"]) — stays single-sourced, so both transports
+                # get the same verdict rules and the same test coverage.
+                if port is not None:
+                    # Dial the app's own container directly: a Tier-2 app has
+                    # exactly one proxied port and its health endpoint may not
+                    # be on it (see Manifest.doctor_checks). Reusing
+                    # base_url()'s host inherits its network/proxy-host branch.
+                    from urllib.parse import urlsplit
+                    try:
+                        split = urlsplit(runtime.containers.base_url(slug))
+                    except Exception as exc:                   # noqa: BLE001
+                        # No container registration — a Tier-1 app that
+                        # declared a port. A failing check, never a skip.
+                        out.append({**row, "ok": False,
+                                    "detail": f"doctor check declares port {port} but this "
+                                              f"app has no container to dial "
+                                              f"({type(exc).__name__}: {exc})"})
+                        continue
+                    base = f"{split.scheme}://{split.hostname}:{port}"
+                    client_kwargs = {"base_url": base}
+                else:
+                    client_kwargs = {"transport": httpx.ASGITransport(app=inner),
+                                     "base_url": "http://app"}
+                async with httpx.AsyncClient(**client_kwargs) as client:
                     resp = await client.get(check["route"], timeout=_DOCTOR_CHECK_TIMEOUT_S)
                 # Status first: a non-200 is the more useful answer than
                 # whatever an error page's body happens to parse to.

@@ -125,3 +125,89 @@ def test_json_with_the_right_content_type_still_works():
 
 def test_an_app_declaring_no_checks_contributes_no_rows():
     assert asyncio.run(_app_doctor_checks(_Runtime(_app(lambda r: Response()), []))) == []
+
+
+# ---- a check with an explicit port dials the container, not the proxy -------
+# A Tier-2 app gets exactly one proxied port, and its health endpoint may not
+# be on it: the connector answers on 13133 while runtime.port must stay 4318
+# for core's OTLP export. See Manifest.doctor_checks.
+
+class _Containers:
+    def __init__(self, url="http://aw-app-demo:4318"):
+        self._url = url
+
+    def base_url(self, slug):
+        if self._url is None:
+            raise RuntimeError(f"no container registered for {slug!r}")
+        return self._url
+
+
+def _port_runtime(app, port, container_url="http://aw-app-demo:4318"):
+    rt = _Runtime(app, [{"label": "forwarding", "route": "/healthz", "port": port}])
+    rt.containers = _Containers(container_url)
+    return rt
+
+
+def test_a_port_check_dials_the_container_host_on_that_port(monkeypatch):
+    seen: dict = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, route, timeout=None):
+            seen["route"] = route
+            seen["timeout"] = timeout
+            import httpx as _h
+            return _h.Response(200, text='{"ok": true}',
+                               headers={"content-type": "text/plain"})
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    rows = asyncio.run(_app_doctor_checks(_port_runtime(None, 13133)))
+
+    assert seen["base_url"] == "http://aw-app-demo:13133"   # port swapped, host kept
+    assert "transport" not in seen                          # real HTTP, not ASGI
+    assert seen["route"] == "/healthz"
+    assert seen["timeout"] == 20.0                           # _DOCTOR_CHECK_TIMEOUT_S
+    assert rows[0]["ok"] is True
+
+
+def test_a_port_check_on_an_app_with_no_container_fails_cleanly():
+    """Tier-1 app declaring a port: a FAILING check, never a skip."""
+    rt = _port_runtime(_app(lambda r: JSONResponse({"ok": True})), 13133,
+                       container_url=None)
+    rows = asyncio.run(_app_doctor_checks(rt))
+    assert rows[0]["ok"] is False
+    assert "no container to dial" in rows[0]["detail"]
+
+
+def test_a_port_check_still_works_when_the_app_mounted_no_routes(monkeypatch):
+    """`inner is None` must not short-circuit a check that never needed it."""
+    rows = []
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, route, timeout=None):
+            import httpx as _h
+            return _h.Response(200, json={"ok": True})
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    rows = asyncio.run(_app_doctor_checks(_port_runtime(None, 13133)))
+    assert rows[0]["ok"] is True
+    assert "mounted no routes" not in str(rows[0]["detail"])

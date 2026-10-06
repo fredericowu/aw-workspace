@@ -235,3 +235,34 @@ class TestAppContributedDoctorChecks:
     def test_the_cli_counts_app_checks_as_problems(self):
         source = open("src/cli/commands/doctor.py").read()
         assert "problems += _app_checks(" in source
+
+
+class TestDoctorCheckPort:
+    """``contributes.doctor`` entries may name a port on the app's own
+    container — for a health endpoint that is not on ``runtime.port``."""
+
+    def _m(self, contributes):
+        from src.apps.manifest import Manifest
+        return Manifest(id="x", name="X", version="1.0.0", tier="container",
+                        contributes=contributes)
+
+    def test_a_valid_port_is_parsed(self):
+        checks = self._m({"doctor": [
+            {"label": "forwarding", "route": "/healthz", "port": 13133}]}).doctor_checks
+        assert checks == [{"label": "forwarding", "route": "/healthz", "port": 13133}]
+
+    def test_a_numeric_string_port_is_accepted(self):
+        assert self._m({"doctor": [
+            {"route": "/healthz", "port": "13133"}]}).doctor_checks[0]["port"] == 13133
+
+    def test_no_port_means_the_proxied_path(self):
+        assert "port" not in self._m({"doctor": [{"route": "/healthz"}]}).doctor_checks[0]
+
+    def test_a_bad_port_is_absent_not_a_dropped_entry(self):
+        """A manifest typo must surface as a red doctor row, not silently
+        remove the check that was supposed to be watching."""
+        for bad in (0, 65536, -1, "nope", None, [13133]):
+            checks = self._m({"doctor": [
+                {"route": "/healthz", "port": bad}]}).doctor_checks
+            assert len(checks) == 1, f"{bad!r} dropped the whole entry"
+            assert "port" not in checks[0], f"{bad!r} was accepted"

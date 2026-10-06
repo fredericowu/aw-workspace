@@ -169,10 +169,29 @@ class Manifest:
         one app's provisioning state by name would invert the whole point of
         the framework; an app declaring "ask me this" does not.
 
+        Optional ``port`` — ``{"label": ..., "route": "/healthz", "port": 13133}``
+        — dials the app's OWN container directly at that port instead of going
+        through its mounted proxy. A Tier-2 app gets exactly one proxied port
+        (``runtime.port``, the single URL ``containers.base_url()`` returns), so
+        an app whose health endpoint lives elsewhere was unreachable: measured
+        2026-10-06 on aw-app-signoz-connector, whose ``health_check`` extension
+        answers on 13133 while ``runtime.port`` must stay 4318 because core's
+        OTLP export dials ``base_url()``. Without this the only honest option
+        was to declare no check at all. It crosses no boundary the existing
+        code doesn't — the in-process ASGI dial already bypasses the host
+        router's identity gate.
+
+        ``port`` targets the app's own container, never a ``ui_sidecar``; a
+        future ``container`` field can extend that without breaking this one.
+
         Entries missing a route, or naming an absolute/dotted path, are dropped
         rather than raising: a bad doctor entry must never stop an app loading,
         because the thing it would break is the tool you reach for when things
-        are broken.
+        are broken. An out-of-range or non-numeric ``port`` is treated as
+        ABSENT rather than dropping the entry — the check then dials the
+        default proxied path and shows up as a red doctor row, so a manifest
+        typo surfaces instead of silently removing the check that was supposed
+        to be watching.
         """
         out = []
         for entry in self.contributes.get("doctor", []) or []:
@@ -181,7 +200,17 @@ class Manifest:
             route = str(entry.get("route") or "")
             if not route.startswith("/") or ".." in route:
                 continue
-            out.append({"label": str(entry.get("label") or route), "route": route})
+            check: dict[str, Any] = {
+                "label": str(entry.get("label") or route), "route": route}
+            raw_port = entry.get("port")
+            if raw_port is not None:
+                try:
+                    port = int(raw_port)
+                except (TypeError, ValueError):
+                    port = 0
+                if 1 <= port <= 65535:
+                    check["port"] = port
+            out.append(check)
         return out
 
     @property
