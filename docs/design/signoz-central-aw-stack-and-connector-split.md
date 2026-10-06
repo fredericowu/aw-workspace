@@ -16,6 +16,11 @@ declined per §9.5. Phase A scope as dispatched is §6's revised list.
 Rev 4 (2026-10-06, post-delivery): §2.1 added — two §2 requirements
 (doctor check, `file_storage` queue) turned out to need core enablers the
 app repo could not ship unilaterally; both decided, both stay requirements.
+Rev 5 (2026-10-06, post-`ab7adc0`): the doctor fix shipped but the
+Architect-flagged port verification came back negative — the doctor route
+proxies to `runtime.port` (4318, the OTLP receiver), never the health
+extension on 13133. §2.1 gains the third enabler: `contributes.doctor`
+entries learn an optional `port` for a direct container dial.
 
 ## The decision, in five sentences
 
@@ -289,6 +294,89 @@ marketplace connector v0.2.2 declaring `--user` against a core that rejects
 unknown flags fails at register). After core ships, connector v0.2.2
 re-adds the volume + `fs:workspace-data`, the `file_storage` config, the
 `contributes.doctor` entry, and deletes the two pin-the-absence tests.
+
+**Rev 5 (2026-10-06): doctor needs a port, not just a parser.** The
+content-type fix shipped in `ab7adc0` and is correct, but the verification
+rev 4 flagged ("confirm the routed port reaches the health extension")
+came back negative, measured live: `:13133/healthz` answers
+`{"ok":true,...}`; `:4318/healthz` is `404 page not found` from the OTLP
+receiver. The cause is structural: `_app_doctor_checks`
+(`src/apps/routes.py:240-251`) dials `loaded.drainable.app`, which for a
+Tier-2 app is `ContainerReverseProxy` (`src/apps/proxy.py:89`) holding the
+**one** `base_url` from `containers.py:1067-1071` —
+`http://<container>:<runtime.port>`. `runtime.port` must stay 4318 because
+`src/api/otel.py::ensure_export_state` dials `base_url()` to export OTLP
+(§3.3, already live in `46cb560`). One proxied port, two consumers needing
+different ones; the collector cannot merge them — `health_check` and the
+OTLP HTTP receiver are separate listeners by upstream design.
+
+**Decision: `contributes.doctor` entries gain an optional `port`, and a
+check that declares one is dialled directly at
+`http://<container-host>:<port><route>` instead of through the mounted
+proxy.** Where it lands:
+
+* `src/apps/manifest.py::doctor_checks` (line 158): parse `port` —
+  coerce to `int`, accept 1–65535, anything invalid is treated as absent
+  (the entry survives and dials the default path, so a manifest typo
+  surfaces as a red doctor row instead of vanishing — same
+  never-break-loading posture as the existing route sanitation, but
+  visible). Docstring documents the field.
+* `src/apps/routes.py::_app_doctor_checks`: when a check carries `port`,
+  take the host from `runtime.containers.base_url(slug)` (`urlsplit`, swap
+  the port — this inherits the `c.name if c.network else self._proxy_host`
+  branch at `containers.py:1070` for free) and issue a real
+  `httpx.AsyncClient` GET with the same `_DOCTOR_CHECK_TIMEOUT_S`. An app
+  that declares `port` but runs no container (Tier-1, or `base_url`'s
+  `_require` raises) reports as a FAILING check — "the app could not tell
+  us" stays a red row, never a skip. **Constraint for the Coder: one
+  verdict path.** Only the transport/URL may fork; the status-first /
+  parse-regardless-of-content-type / dict-shape / `bool(body.get("ok"))`
+  block stays single-sourced so the three literals
+  `tests/unit/apps/test_capabilities.py:219-236` pins and the new
+  `test_app_doctor_checks.py` suite keep covering both paths.
+* `port` targets the app's **own** container, not `ui_sidecar` (the
+  `proxy_key` indirection at `src/apps/runtime.py:1547-1551` is a UI
+  concern). An app whose doctor endpoint lives on a sidecar is out of
+  scope; a future `container` field extends this without breaking it.
+* Connector manifest (v0.2.2+): doctor entry becomes
+  `{label, route: "/healthz", port: 13133}`, with 13133 declared in the
+  collector config's `health_check` extension as today.
+
+Trust posture: this is *more* in the doctor docstring's spirit, not less —
+the in-process ASGI dial already bypasses the host router's identity gate
+(it talks to the inner mounted app), so a direct container dial on the
+workspace-internal podman network crosses no boundary the current code
+doesn't. Container ports are reachable within the app network regardless of
+publish, so no new exposure is created.
+
+Rejected (rev 5):
+
+* **A second proxied port per app** (the "strictly bigger" option): touches
+  `register`, `_Container`, the mount, and `base_url()`'s one-URL contract,
+  and puts a health listener on the public-facing mount where it then needs
+  identity-gating — framework surface nobody browses. All cost, no reach
+  the direct dial doesn't already have.
+* **Dropping the doctor entry and striking the §2 requirement**: the app
+  whose only job is "telemetry reaches the destination", with an in-memory
+  queue that drops silently on sustained outage, is the *last* app doctor
+  should be mute about — §2's own rationale.
+* **Repointing `runtime.port` at 13133 and hardcoding `:4318` in
+  `otel.py`**: inverts the special case — the OTLP receiver *is* this
+  app's main surface, and every other `base_url` consumer (status, window
+  mount, Apps tile) would then target the health port.
+* **Upstream-config workarounds** (serving health on the OTLP port, a
+  custom image): the listeners are separate by collector design; custom
+  image violates §2 stock-pinned-image, same as rev 4.
+
+What rev 5 makes harder later: doctor traffic for ported checks is
+out-of-band from the one observable proxy path, and the framework now has
+a second way an app names a container port (`runtime.port` + per-check
+`port`) — acceptable, both are manifest-declared facts, but a future "all
+app ingress through one seam" refactor must remember doctor. Sequencing is
+*soft* for this field, unlike `--user`: old core's `doctor_checks` ignores
+unknown keys inside an entry, so a `port`-declaring manifest on old core
+degrades to today's red row, not a register failure. It still rides the
+same core-restart-then-v0.2.2 train as `--user`, which is hard-gated.
 
 ## 3. Settings: extend Observability, don't invent Integrations schema
 
