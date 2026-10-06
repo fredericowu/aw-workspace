@@ -5,6 +5,9 @@ Kanban: `3f15bf3b-9510-81ce-98ce-e3b484fafdb9`. Requested by Frederico
 (Telegram, 2026-10-06), evolving his 2026-07-27 decision that observability =
 two apps (light connector + heavy optional local server — see Kanban backlog
 card `feature:aw-app-otel-collector` and `feature:aw-app-signoz`).
+Revised 2026-10-06 (same day) after Frederico's review: scope note in §2
+(zero new app-server installs this phase) and new §9 (Phase B — Tier-2
+container-log coverage inside the workspace). §1/§3/§4/§5 unchanged.
 
 ## The decision, in five sentences
 
@@ -158,6 +161,14 @@ Four long-lived services added, following the file's own precedents:
   architecture constraint.
 
 ## 2. The app split
+
+**Scope confirmation (Frederico, 2026-10-06 review):** the full app-server
+is installed in **zero** workspaces this phase — not pre-installed, not
+actively offered in any Settings flow. It stays in the marketplace and
+existing installs keep working, but the only thing this phase puts inside
+workspaces is the connector. The `local` observability mode and the `auto`
+local-first rung remain in the code for the workspaces that already have
+the app; nothing new points anyone at it.
 
 **`aw-app-signoz` does not change.** It is already exactly what the request
 calls the "application server": ClickHouse + query-service/UI + embedded
@@ -343,10 +354,13 @@ workspace comes with the connector pre-installed". There is **no
 default-apps-on-provision mechanism** in aw-backend or core today (verified
 by search; apps reconcile from each workspace's own desired state, which
 starts empty). Building one is real scope with fleet-wide blast radius, and
-Phase A.2 already delivers the *outcome* (telemetry flows to central by
-default) without it. If the PO wants the connector container itself to be
-the default vehicle (e.g. for future container-log tailing inside
-workspaces), that's a new card for a seed-apps mechanism.
+Phase A.2 already delivers the *outcome* for core telemetry (it flows to
+central by default) without it. **This answer was materially revised by
+§9**: once the connector is also the thing that ships Tier-2 container
+logs — a job `auto` mode can never cover, because core only exports its own
+Python logs — a workspace without the connector has a real, permanent
+observability gap, and pre-installing stops being redundant. The sharpened
+recommendation to the PO is in §9.5.
 
 ## 7. What this makes harder later
 
@@ -413,3 +427,168 @@ workspaces), that's a new card for a seed-apps mechanism.
    directly (not a workspace tunnel), and `aw-otelcol-edge` proves that path
    end to end. Don't "simplify" the connector's egress onto a workspace
    tunnel URL.
+
+## 9. Phase B — Tier-2 container-log coverage inside the workspace
+
+Added 2026-10-06 after Frederico's review. The gap: every Tier-2 app
+container a workspace hosts (Penpot-class apps, Crispal, Browser, Windows —
+anything that isn't our own instrumented Python/JS) logs only to `podman
+logs` and never reaches any SigNoz. The bare metal already solved this for
+the central's own host via the filelog-on-`/hostfs` pattern
+(`agentic-workspace/docs/knowledge_base/memory/docker-container-logs-filelog-signoz-2026-07-21.md`);
+Frederico wants the same coverage *inside* each workspace, via the
+connector. This section is analysis + decision — **no Phase B code ships
+with this card** (see §9.4).
+
+### 9.1 Measured facts the design rests on (verified live, 2026-10-06)
+
+* Tier-2 app containers run on the workspace's podman (docker-compat API,
+  `AW_CONTAINER_SOCKET` — `src/apps/containers.py` module docstring). Log
+  driver reports `json-file` (podman's alias for **k8s-file**), and the
+  files live at
+  `<graphroot>/overlay-containers/<id>/userdata/ctr.log` — on the **podman
+  host's** filesystem (measured on the `aw` workspace:
+  `/home/aw-remote-host/.local/share/containers/storage/...`), not inside
+  the workspace container.
+* That `userdata/` directory also holds each container's **full OCI spec,
+  env included** — i.e. every sibling app's secrets in plaintext next to
+  the log file. Any design that mounts the storage tree leaks them.
+* `src/apps/containers.py` sets **no `LogConfig` today** (grep: zero hits)
+  — podman defaults apply, which also means today's `ctr.log` files grow
+  **unrotated and unbounded**. Phase B fixes this as a side effect.
+* **Proven this session against the live engine**: podman's docker-compat
+  API honors a per-container log-path override —
+  `docker run --log-opt path=/tmp/aw-test-logpath.log ...` succeeded and
+  `.LogPath` reported the custom path. So the process that creates every
+  Tier-2 container (core) can *choose where the log files land*.
+* **Disqualifier found**: `otel/opentelemetry-collector-contrib` has **no
+  receiver that reads container logs over the docker/podman API**
+  (`docker_stats` is metrics-only). A vanilla collector can only tail
+  files. Any socket-based log design therefore needs a custom pump
+  component regardless of its permission story — the permission debate is
+  moot before it starts.
+
+### 9.2 Decision: core redirects the log files; the connector tails them
+
+Three pieces, each on an existing seam:
+
+1. **Core, `src/apps/containers.py`**: when creating any Tier-2 container
+   (app container and every sidecar), set
+   `LogConfig(type="json-file", config={"path": <logs-root>/<app_id>/<container-name>.log, "max-size": ...})`,
+   where `<logs-root>` is a new core-owned directory under the workspace
+   home (`paths.workspace_home()/data/container-logs/` — the same
+   durable tree `$AW_APP_DATA` binds already resolve against, which is what
+   guarantees the path is podman-host-resolvable). `docker logs` /
+   `aw-workspace-cli logs` keep working — podman serves them from the
+   recorded `LogPath`. Existing containers migrate **lazily**: the path
+   changes on their next recreate (update, config save, reinstall); no
+   fleet restart.
+2. **Framework, `src/apps/runtime.py::_container_volumes`**: one new
+   reserved volume source, `$AW_CONTAINER_LOGS`, expanding to `<logs-root>`
+   **forced read-only**, gated by a **new capability**
+   `observability:container-logs`. Its risk description must be honest:
+   "read the stdout/stderr of every app in this workspace" — apps print
+   secrets into logs, so this is *not* `fs:workspace-data`-equivalent and
+   gets its own grant. The `$AW_MCP_JSON`-behind-`mcp:register-gateway`
+   entry in the same function is the exact precedent for a
+   single-purpose, capability-gated source.
+3. **Connector, same app (`aw-app-signoz-connector`)**: a second, optional
+   pipeline — `filelog` receiver with the collector's `container` parser
+   (k8s-file format, *not* docker-json), include glob
+   `<mount>/*/*.log*`, checkpointed via the `file_storage` extension it
+   already has (§2). The volume + permission are **optional**: not
+   granted → the mount is absent → the connector's entrypoint renders the
+   OTLP-only config it ships in Phase A. One app, graceful degradation —
+   the same shape `host_power_optional` set for device grants
+   (`src/apps/hostpower.py::resolve_optional`).
+
+### 9.3 Rejected for §9
+
+* **Hand the connector the podman socket** (what made this look like a
+  Tier-1-vs-Tier-2 reopener). Dead on two independent grounds: (a) the
+  disqualifier in §9.1 — no otelcol log-over-API receiver exists, so the
+  socket alone collects nothing without writing a custom pump; (b) a
+  socket is *manage* power (create/exec/kill every sibling), categorically
+  more than read-logs — it would drag the connector into the
+  `containers:manage`/socket-proxy tier for a read-only job. The tier
+  question does NOT reopen: the connector stays Tier-2.
+* **Transplant the bare-metal `/hostfs` pattern** (mount the graphroot /
+  `overlay-containers` read-only and glob `ctr.log`). The central
+  collector gets away with it because it is operator infrastructure;
+  inside a workspace this mounts every sibling's OCI spec **env vars
+  included** (§9.1) into a marketplace app. Rejected outright, whatever
+  capability gates it.
+* **Per-file binds of each `ctr.log`**: inode pinning — the aw-stack
+  README documents this bug class twice; every container recreate would
+  leave the connector tailing an orphaned inode.
+* **Core pumps logs itself** (stream via its existing socket client into
+  its own OTel pipeline — no new capability, works with zero apps
+  installed). **Runner-up, kept on file**: it is the fallback if the PO
+  rejects both seed-apps and the coverage gap, because it is the only
+  shape that covers container logs with no connector installed. Rejected
+  as primary: unbounded log I/O, backpressure and retry land inside the
+  single-event-loop core process, reinventing what the collector's
+  `memory_limiter`/`file_storage`/queue already do, and tails die with
+  every core restart.
+* **A second app** ("signoz-logs-agent") instead of extending the
+  connector: two marketplace entries forwarding to the same destination
+  with one config between them; the optional-grant degradation in §9.2.3
+  gets the same security isolation without the split.
+
+### 9.4 Same card or new card — decision: new card
+
+Phase B is a **separate card**, sequenced after Phase A, designed here so
+the context lives in one doc. Three reasons: Phase A is complete and
+deployable without it (nothing in §1–§6 waits on §9); Phase B's center of
+gravity is a *core framework* change (new capability + volume source + log
+redirection), not an observability change, and new capabilities have a
+hard rollout order (core validator ships before any manifest that declares
+the capability — the `core-validator-change-must-precede-the-app` lesson);
+and its risk profile (touching how every Tier-2 container is created) must
+not ride along inside a telemetry cutover window.
+
+### 9.5 The seed-apps answer, revised
+
+§6 originally said pre-installing the connector was redundant because
+`auto` mode already ships core telemetry. **§9 changes the premise**:
+container-log coverage is a connector-exclusive job — core's `auto` mode
+exports only core's own Python logs and never will tail other containers
+(that is the rejected runner-up). So without the connector, every
+workspace has a permanent, silent gap exactly where the hardest debugging
+happens (the apps that aren't our code). Updated recommendation to the PO:
+**approve a seed-apps mechanism as part of the Phase B card** — connector
+pre-installed with `observability:container-logs` granted — or explicitly
+accept one of the two alternatives: (a) the gap stays until someone
+installs the connector by hand, or (b) the core-pump runner-up gets built
+instead, with its §9.3 costs. Still the PO's call; it is scope, and this
+section only sharpens what is being traded.
+
+### 9.6 Phase B risks for the Coders
+
+1. **`log-opt path` through docker-py**: proven at the engine (this
+   session, via CLI) but not yet through docker-py's `LogConfig` — its
+   `config` dict passes through unvalidated, but verify end-to-end,
+   including that `max-size` actually rotates k8s-file on this podman
+   version, before relying on either.
+2. **Rotation glob**: with `max-size` set, podman renames rolled files;
+   the filelog include pattern must match rotations (`*.log*`) and the
+   `container` parser must be validated against a **real** `ctr.log` line
+   (k8s-file ≠ docker-json — the bare-metal config's `json_parser` chain
+   will NOT parse it).
+3. **Self-tailing loop**: the connector's own container log lands in the
+   same `<logs-root>`. Exclude it in the filelog config (`exclude:
+   */signoz-connector/*` or equivalent) — a failing exporter logging
+   errors that get tailed and re-exported is the same amplification loop
+   `src/api/otel.py::_AMPLIFICATION_PREFIXES` exists to kill on the Python
+   side.
+4. **Capability rollout order**: core (validator + volume source +
+   redirection) deploys first, connector manifest second — the reverse
+   order fails every install with an unknown-capability validation error.
+5. **Uninstall hygiene**: `<logs-root>/<app_id>/` must be cleaned by the
+   journaled uninstall replay (the same mechanism that removes the
+   container), or the directory accumulates logs of apps that no longer
+   exist — including anything secret they printed.
+6. **Path resolution is podman-host-relative**: the redirect path core
+   writes must be the podman-host-visible form, not the workspace
+   container's own view — use the identical resolution `$AW_APP_DATA`
+   binds already go through, never a hardcoded translation.
