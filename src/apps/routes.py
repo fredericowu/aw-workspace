@@ -212,6 +212,20 @@ async def _app_doctor_checks(runtime) -> list[dict]:
     silent degradation this command is for, and swallowing it would make doctor
     green because a check is broken — the worst possible failure mode for the
     tool you reach for when things are broken.
+
+    The body is parsed regardless of the declared ``Content-Type``. This used
+    to gate on ``application/json`` and treat anything else as ``{}`` — which
+    read as a failing check with ``{}`` for a detail, i.e. the right verdict
+    with none of the evidence, and locked out servers whose body is valid JSON
+    but whose header says otherwise. Measured on 2026-10-06: the
+    OpenTelemetry Collector's ``health_check`` extension serves exactly the
+    ``{"ok": ...}`` shape this wants, labels it ``text/plain; charset=utf-8``,
+    and *ignores its own* accepted ``response_headers`` override — an upstream
+    bug no app can work around from a manifest, which cost
+    aw-app-signoz-connector its doctor entry entirely. Parsing first and
+    judging on what comes back keeps the "unreadable = failing" invariant while
+    putting the content-type and a body snippet in ``detail``, so the next
+    person sees why rather than an empty dict.
     """
     import httpx
 
@@ -235,10 +249,24 @@ async def _app_doctor_checks(runtime) -> list[dict]:
                 async with httpx.AsyncClient(transport=transport,
                                              base_url="http://app") as client:
                     resp = await client.get(check["route"], timeout=_DOCTOR_CHECK_TIMEOUT_S)
-                body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                # Status first: a non-200 is the more useful answer than
+                # whatever an error page's body happens to parse to.
                 if resp.status_code != 200:
                     out.append({**row, "ok": False,
                                 "detail": f"HTTP {resp.status_code} from {check['route']}"})
+                    continue
+                ctype = resp.headers.get("content-type", "") or "none"
+                try:
+                    body = resp.json()
+                except ValueError:
+                    out.append({**row, "ok": False,
+                                "detail": f"unparseable body (content-type {ctype}): "
+                                          f"{resp.text[:200]!r}"})
+                    continue
+                if not isinstance(body, dict):
+                    out.append({**row, "ok": False,
+                                "detail": f"expected a JSON object, got {type(body).__name__} "
+                                          f"(content-type {ctype})"})
                     continue
                 out.append({**row, "ok": bool(body.get("ok")), "detail": body})
             except Exception as exc:                       # noqa: BLE001

@@ -299,7 +299,8 @@ def _registry_auth(image: str) -> dict | None:
     return {"username": cred[0], "password": cred[1]}
 
 
-def _parse_run_flags(run_flags: list[str] | None) -> dict:
+def _parse_run_flags(run_flags: list[str] | None, app_id: str = "",
+                     expand: bool = False) -> dict:
     """Map a manifest's ``run_flags_needed`` CLI flags to ``docker`` SDK kwargs.
 
     Only the small, safe subset apps actually need is understood; ``--privileged``
@@ -311,6 +312,36 @@ def _parse_run_flags(run_flags: list[str] | None) -> dict:
     exists, because this channel carries none of that one's checks: a run flag
     is not matched against a capability and not matched against the host's
     opt-in, so honouring it would be a way around both.
+
+    ``--user`` is NOT in that class and is allowed. Container-root is already
+    what every ``USER``-less image gets today (core runs several), so this flag
+    only selects among identities an image author could have baked in with a
+    ``USER`` line anyway, and it bypasses no capability and no host opt-in —
+    which is the actual admission rule the paragraph above states.
+
+    It exists for the inverse of ``$AW_APP_DATA``'s ownership problem. An image
+    that runs as a fixed non-root uid (``otel/opentelemetry-collector-contrib``
+    is ``USER 10001:10001``) cannot write the bind-mounted data directory core
+    creates for it, because that directory belongs to the workspace's own uid
+    at mode 0755 — measured on 2026-10-06, where it crash-looped
+    aw-app-signoz-connector's ``file_storage`` queue on "permission denied".
+    Moving the PROCESS to the directory's uid is the only fix that survives:
+    chowning the directory to a manifest-declared uid gets re-broken by the
+    sweep that recursively chowns the whole mount to the workspace uid on every
+    redeploy (see :func:`app_data_owner`, ``core:workspace-redeploy-chowns-app-
+    data-dirs``). So the manifest declares the derived value, not a literal::
+
+        "run_flags_needed": ["--user=${data.uid}:${data.gid}"]
+
+    ``expand`` is the register/start split, and it is load-bearing.
+    :meth:`ContainerSupervisor.register` validates run flags up front so a bad
+    manifest fails at register rather than at run — but ``${data.uid}`` must
+    not be *resolved* there, because ``expand_env`` runs before
+    ``_container_volumes`` creates the per-app directory on a first install, so
+    the number would be derived from a directory that does not exist yet.
+    Register therefore shape-checks only (``expand=False``, the default) and
+    :meth:`start` resolves (``expand=True``), by which point the directory is
+    real.
     """
     kwargs: dict = {}
     for flag in run_flags or []:
@@ -324,6 +355,35 @@ def _parse_run_flags(run_flags: list[str] | None) -> dict:
             if not value:
                 raise ContainerError("--shm-size requires a value (e.g. --shm-size=1g)")
             kwargs["shm_size"] = value
+        elif name == "--user":
+            if not value:
+                raise ContainerError(
+                    "--user requires a value (e.g. --user=${data.uid}:${data.gid})")
+            if not expand:
+                continue
+            # Expanded per half, not as one string: the placeholder grammar is
+            # deliberately WHOLE-VALUE (see expand_value), so
+            # "${data.uid}:${data.gid}" matches nothing and would pass straight
+            # through to docker as that literal text. uid and gid are two
+            # values that happen to share a flag.
+            resolved: list[str] = []
+            for part in value.split(":", 1):
+                one = expand_value(part, None, app_id)
+                if one is None or not one.strip():
+                    resolved = []
+                    break
+                resolved.append(one.strip())
+            if not resolved:
+                # Unresolvable means "run as the image's own user", matching
+                # expand_env's convention that an unresolved placeholder drops
+                # the variable instead of forcing an empty one. Passing "" to
+                # docker would be read as uid 0 — silently promoting the app to
+                # container root is the one outcome worse than not honouring
+                # the flag at all.
+                log.warning("apps: %s --user=%s unresolved — leaving the image's "
+                            "own user in place", app_id or "?", value)
+                continue
+            kwargs["user"] = ":".join(resolved)
         else:
             raise ContainerError(f"unsupported run flag {name!r}")
     return kwargs
@@ -814,7 +874,7 @@ class ContainerSupervisor:
             # removes the container outright — no conflict with the policy).
             "restart_policy": {"Name": "unless-stopped"},
         }
-        kwargs.update(_parse_run_flags(c.run_flags))
+        kwargs.update(_parse_run_flags(c.run_flags, app_id=c.app_id, expand=True))
         kwargs.update(_resource_kwargs(c.resources))
         # Merge, not overwrite: hostpower.docker_kwargs() returns its own
         # "cap_add" for an app with host_power grants (e.g. gpu), and a bare

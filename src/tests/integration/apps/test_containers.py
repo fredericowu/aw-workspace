@@ -273,6 +273,77 @@ def test_privileged_flag_rejected():
         sup.register("app", "img", 8080, run_flags=["--privileged"])
 
 
+# ---- --user ----------------------------------------------------------------
+# An image with a fixed non-root USER cannot write the $AW_APP_DATA directory
+# core creates for it (owned by the workspace uid, 0755). --user moves the
+# process to that uid instead of chowning the directory, which the redeploy
+# sweep would undo. See _parse_run_flags' docstring.
+
+def test_user_flag_placeholder_resolves_at_start(monkeypatch):
+    from src.apps import containers as mod
+
+    monkeypatch.setattr(mod, "app_data_owner", lambda app_id: (1001, 1001))
+    fake = _FakeDocker()
+    sup = ContainerSupervisor(socket="/dev/null", client=fake)
+    sup.register("conn", "img", 4318,
+                 run_flags=["--user=${data.uid}:${data.gid}"])
+    sup.start("conn")
+    assert fake.run_calls[-1]["user"] == "1001:1001"
+
+
+def test_user_flag_is_not_resolved_at_register(monkeypatch):
+    """Register must SHAPE-check only.
+
+    ``expand_env`` runs before ``_container_volumes`` creates the per-app
+    directory on a first install, so resolving here would derive the uid from a
+    directory that does not exist yet.
+    """
+    from src.apps import containers as mod
+
+    calls: list = []
+    monkeypatch.setattr(mod, "app_data_owner",
+                        lambda app_id: calls.append(app_id) or (1001, 1001))
+    sup = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
+    sup.register("conn", "img", 4318,
+                 run_flags=["--user=${data.uid}:${data.gid}"])
+    assert calls == []            # nothing derived yet
+    sup.start("conn")
+    # Once per half (uid, gid) — same as a manifest's ${data.uid}/${data.gid}
+    # env pair, and a bounded scandir either way.
+    assert calls == ["conn", "conn"]
+
+
+def test_user_flag_literal_value_passes_through():
+    fake = _FakeDocker()
+    sup = ContainerSupervisor(socket="/dev/null", client=fake)
+    sup.register("app", "img", 8080, run_flags=["--user=1234:1234"])
+    sup.start("app")
+    assert fake.run_calls[-1]["user"] == "1234:1234"
+
+
+def test_user_flag_requires_a_value():
+    sup = ContainerSupervisor(socket="/dev/null", client=_FakeDocker())
+    with pytest.raises(ContainerError):
+        sup.register("app", "img", 8080, run_flags=["--user"])
+
+
+def test_unresolvable_user_flag_leaves_the_images_own_user(monkeypatch):
+    """Never pass "" to docker — it reads as uid 0.
+
+    Silently promoting an app to container root is worse than not honouring
+    the flag, so an unresolved placeholder drops it (expand_env's convention).
+    """
+    from src.apps import containers as mod
+
+    monkeypatch.setattr(mod, "expand_value",
+                        lambda raw, config, app_id: None)
+    fake = _FakeDocker()
+    sup = ContainerSupervisor(socket="/dev/null", client=fake)
+    sup.register("app", "img", 8080, run_flags=["--user=${data.uid}:${data.gid}"])
+    sup.start("app")
+    assert "user" not in fake.run_calls[-1]
+
+
 def test_unavailable_without_socket():
     sup = ContainerSupervisor(socket="", network=None)
     assert sup.available is False
