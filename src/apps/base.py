@@ -433,6 +433,14 @@ class NotificationsFacade(_Facade):
             source=self._ctx.app_id, url=url, **kwargs,
         )
 
+    def event(self, event: str, data: dict[str, Any] | None = None) -> None:
+        """Push an ephemeral ``app_event`` WS frame — a UI nudge, not a
+        persisted notification (no entry in the notification panel).
+        """
+        self._ctx._enforce("notifications:send")
+        mgr = self._ctx._runtime.host.state.notification_mgr
+        mgr.emit_app_event(self._ctx.app_id, event, data)
+
 
 class ServicesFacade(_Facade):
     """``ctx.services`` — register + control a start/stop background service.

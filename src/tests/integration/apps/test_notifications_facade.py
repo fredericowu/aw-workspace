@@ -122,6 +122,63 @@ _PROBE_PLUGIN = """
 """
 
 
+_EVENT_PLUGIN = """
+    class AppPlugin:
+        async def activate(self, ctx):
+            ctx.notify.event("oauth_completed", {"email": "a@b.com", "usable": True})
+        async def deactivate(self):
+            return None
+"""
+
+
+def test_granted_app_fires_app_event_via_engine(tmp_path, host):
+    pkg = _write_app(tmp_path, "eventapp", _EVENT_PLUGIN, ["notifications:send"])
+
+    async def run():
+        rt = AppRuntime(host, journal=ActionJournal())
+        await rt.load(pkg, granted_permissions=["notifications:send"])
+        # No assertion on delivery here (no WS listener attached, and
+        # emit_app_event is intentionally not persisted to Postgres) — this
+        # only proves the granted call does not raise and reaches the real
+        # NotificationManager singleton.
+        await rt.unload("eventapp")
+
+    _async(run())
+
+
+_PROBE_EVENT_PLUGIN = """
+    RESULT = {}
+
+    class AppPlugin:
+        async def activate(self, ctx):
+            try:
+                ctx.notify.event("should not be delivered")
+            except PermissionError as e:
+                RESULT["event"] = str(e)
+        async def deactivate(self):
+            return None
+"""
+
+
+def test_ungranted_app_denied_app_event_and_journaled(tmp_path, host):
+    import sys
+
+    pkg = _write_app(tmp_path, "noperms2", _PROBE_EVENT_PLUGIN, [])
+
+    async def run():
+        rt = AppRuntime(host, journal=ActionJournal())
+        await rt.load(pkg, granted_permissions=[])
+
+        result = sys.modules[f"{rt.get('noperms2').module_prefix}.plugin"].RESULT
+        assert "notifications:send" in result["event"]
+
+        kinds = [(e.kind, e.target) for e in rt.journal.entries_for("noperms2")]
+        assert ("capability:denied", "notifications:send") in kinds
+        await rt.unload("noperms2")
+
+    _async(run())
+
+
 def test_ungranted_app_denied_and_journaled(tmp_path, host):
     import sys
 

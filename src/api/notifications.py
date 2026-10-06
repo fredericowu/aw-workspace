@@ -136,6 +136,25 @@ class NotificationManager:
             )
         return notif
 
+    def emit_app_event(self, app_id: str, event: str, data: dict | None = None) -> None:
+        """Push an ephemeral ``app_event`` frame to any open ``/ws/notifications``
+        listener — NOT persisted to Postgres (no replay; a closed window needs
+        no backlog). Routed through the same cross-worker ``_publish`` path
+        ``add_notification`` uses, never ``_broadcast`` directly — with
+        WORKERS>1 the browser's WS listener usually lives on a different
+        worker than the one handling the request that triggered this event.
+        """
+        if not self._loop:
+            return
+        payload = {
+            "type": "app_event",
+            "data": {"app": app_id, "event": event, **(data or {})},
+        }
+        self._loop.call_soon_threadsafe(
+            asyncio.ensure_future,
+            self._publish(payload),
+        )
+
     def dismiss(self, notif_id: int):
         """Mark notification as read."""
         self._db.mark_read(notif_id)
