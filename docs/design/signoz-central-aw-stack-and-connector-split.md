@@ -13,6 +13,9 @@ is operator-internal only** — §3.1's automatic env injection is REMOVED from
 Phase A (no trustworthy "operator-owned workspace" signal exists today; see
 §10 for the audit), `central` mode is deferred to post-T2, and seed-apps is
 declined per §9.5. Phase A scope as dispatched is §6's revised list.
+Rev 4 (2026-10-06, post-delivery): §2.1 added — two §2 requirements
+(doctor check, `file_storage` queue) turned out to need core enablers the
+app repo could not ship unilaterally; both decided, both stay requirements.
 
 ## The decision, in five sentences
 
@@ -231,6 +234,61 @@ trap for new app repos).
   creates/destroys a ClickHouse is a data-loss UI affordance; two apps make
   the heavy/light choice an install-time fact with honest
   `resource_estimate`s (~6 GB vs ~256 MB).
+
+### 2.1 Phase A findings → core enablers (decided 2026-10-06, rev 4)
+
+The Coder delivered the connector (v0.2.1) with two §2 items honestly
+dropped, both measured live rather than inferred, both blocked by core, and
+pinned the absence with regression tests. Decisions:
+
+**Doctor check — core fix, requirement stands.** The collector's
+`health_check` extension serves a JSON body (`{"ok": ...}`, pipeline-aware
+via `check_collector_pipeline`) but labels it `text/plain`, and its
+`response_headers` override is accepted-then-ignored upstream. Core's
+`src/apps/routes.py::_app_doctor_checks` (line 238) only parses bodies whose
+content-type starts with `application/json`, so the check would read as a
+permanent false red. **Decision: core parses the body regardless of
+content-type** — attempt `resp.json()` always; a body that genuinely isn't
+JSON reports as a FAILING check with the content-type and a body snippet in
+`detail` (an upgrade over today's silent `{}`), preserving the
+"unreadable = failing" invariant the docstring and
+`tests/unit/apps/test_capabilities.py` pin. Rejected: a second container
+(violates §2 one-container), a custom image (violates stock-pinned-image),
+waiting on an upstream otel-collector fix (file it, don't depend on it).
+
+**`file_storage` queue — core learns `--user`, requirement stands.** The
+stock image is `USER 10001:10001`; core `makedirs`'s `$AW_APP_DATA` as the
+workspace uid mode 0755; `CAP_CHOWN` only helps images whose entrypoint runs
+as root and chowns (the collector's doesn't); and the redeploy sweep rewrites
+the whole mount's ownership to the workspace uid anyway
+(`src/apps/containers.py:91-102`, tracked
+`core:workspace-redeploy-chowns-app-data-dirs`), so any chown-to-a-declared-
+uid scheme rots exactly the way aw-app-blender's PUID did. **Decision:
+invert it — run the process as the uid that already owns the data.**
+`_parse_run_flags` (`src/apps/containers.py:302`) learns `--user`, mapped to
+the docker SDK `user` kwarg, with the value passed through `expand_value`
+at `start()` time so the manifest can say
+`run_flags_needed: ["--user=${data.uid}:${data.gid}"]` — `app_data_owner()`
+(`containers.py:82`) already derives exactly this number for the same
+reason. Register-time validation (`containers.py:659`) shape-checks only
+(value required), it does not resolve placeholders. The collector is a
+static Go binary with no uid assumptions, so running it as the workspace
+uid costs nothing. Trust call: `--user` is NOT in `--privileged`'s class —
+container-root is already what every USER-less image gets today, so the
+flag can only select among identities an image author could bake in anyway;
+it bypasses no capability or host-opt-in gate. Rejected: chown
+`$AW_APP_DATA` to a manifest-declared uid (fights the redeploy sweep
+forever, adds a manifest field + start-time machinery for a worse
+invariant), accept in-memory permanently (the queue exists precisely to
+survive the recreate a destination change causes — the one moment it would
+be empty), a non-bind writable path (nothing durable), wrapper/custom image
+(violates stock-image).
+
+Rollout for both: **core before app** (the validator-first rule — a
+marketplace connector v0.2.2 declaring `--user` against a core that rejects
+unknown flags fails at register). After core ships, connector v0.2.2
+re-adds the volume + `fs:workspace-data`, the `file_storage` config, the
+`contributes.doctor` entry, and deletes the two pin-the-absence tests.
 
 ## 3. Settings: extend Observability, don't invent Integrations schema
 
