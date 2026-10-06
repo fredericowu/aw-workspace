@@ -485,6 +485,19 @@ class ServicesFacade(_Facade):
         self._ctx._enforce("service:manage")
         return self._ctx._runtime.services.status(self._ctx.app_id, service_id)
 
+    async def logs(self, service_id: str) -> list[str]:
+        """The service's captured stdout/stderr backlog, forwarded to
+        whichever worker actually owns the process (see
+        ``src/apps/service_relay.py``) — a plain
+        ``self._ctx._runtime.services.logs()`` only ever sees THIS worker's
+        own backlog, empty on the ``AW_WORKSPACE_WORKERS - 1`` workers that
+        never spawned it locally."""
+        self._ctx._enforce("service:manage")
+        relay = getattr(self._ctx._runtime.host.state, "service_relay", None)
+        if relay is not None:
+            return await relay.fetch_logs(self._ctx.app_id, service_id)
+        return self._ctx._runtime.services.logs(self._ctx.app_id, service_id)
+
 
 class ContainersFacade(_Facade):
     """``ctx.containers`` — run + control a Tier-2 sidecar container.

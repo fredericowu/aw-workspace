@@ -270,8 +270,12 @@ class ComponentRoutes:
 
         if key.startswith("service:"):
             _, svc_app_id, service_id = key.split(":", 2)
+            relay = getattr(self.app.state, "service_relay", None)
             try:
-                lines = await asyncio.to_thread(rt.services.logs, svc_app_id, service_id)
+                if relay is not None:
+                    lines = await relay.fetch_logs(svc_app_id, service_id)
+                else:
+                    lines = await asyncio.to_thread(rt.services.logs, svc_app_id, service_id)
                 if lines:
                     await websocket.send_text("\n".join(lines) + "\n")
                 else:
