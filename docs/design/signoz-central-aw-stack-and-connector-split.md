@@ -8,6 +8,11 @@ card `feature:aw-app-otel-collector` and `feature:aw-app-signoz`).
 Revised 2026-10-06 (same day) after Frederico's review: scope note in §2
 (zero new app-server installs this phase) and new §9 (Phase B — Tier-2
 container-log coverage inside the workspace). §1/§3/§4/§5 unchanged.
+Revised again 2026-10-06 (rev 3, final before Coder dispatch): **the central
+is operator-internal only** — §3.1's automatic env injection is REMOVED from
+Phase A (no trustworthy "operator-owned workspace" signal exists today; see
+§10 for the audit), `central` mode is deferred to post-T2, and seed-apps is
+declined per §9.5. Phase A scope as dispatched is §6's revised list.
 
 ## The decision, in five sentences
 
@@ -240,24 +245,25 @@ schema beside it would be the two-sources-of-truth bug by construction.
 
 Changes:
 
-1. **New mode `central`** in `MODES` + resolve/update: endpoint + api key
-   come from control-plane-injected workspace env
-   (`AW_OTLP_CENTRAL_ENDPOINT`, `AW_OTLP_CENTRAL_KEY` — injected by
-   aw-backend's placement drivers at provision/recreate, the same mechanism
-   that already delivers `AW_WORKSPACE_API_KEY`/`AW_CONTROL_PLANE`; exact
-   injection point for the coder: the env assembly in
-   `aw-backend/src/api/placement/docker_driver.py` / `hosted_driver.py` /
-   `remote_host_driver.py`). A workspace without those env vars simply
-   doesn't offer `central` (`central_available: false` in the GET payload,
-   same pattern as `local_available`).
-2. **`auto` gains a fall-through**: local signoz app installed → local
-   (unchanged, existing installs keep exactly today's behaviour); else
-   central available → central; else nothing. This single line is what makes
-   "default por workspace = manda pro central" true for every workspace that
-   never touched the setting — **without** requiring the connector to be
-   installed, because core's dynamic exporters can ship direct (they already
-   do, to whatever `resolve()` returns).
-3. **Connector integration**: when the connector app is installed,
+1. ~~New mode `central` + control-plane env injection~~ — **REMOVED from
+   Phase A (rev 3, Frederico 2026-10-06: "o central signoz é só interno e
+   só vou instalar ele nas minhas workspaces e que cada tenant instale o
+   seu").** Automatic injection would have pointed every hosted tenant's
+   telemetry at the operator's central by default — the exact opposite of
+   the constraint — and §10's audit found **no trustworthy signal** to gate
+   it on today. Phase A ships **zero** placement-driver changes and no new
+   mode. Operator workspaces reach the central through the **existing
+   `custom` mode** (`src/api/observability.py:197-206`): endpoint = the
+   central ingest hostname (§1), api_key = the shared ingest token (§4),
+   set by the operator in each of his own workspaces' Settings — explicit,
+   per-workspace, default-deny by construction. `central` as a first-class
+   auto-resolvable mode returns post-T2, gated on
+   `workspace.tenant_id == <operator tenant>` (§10).
+2. ~~`auto` fall-through to central~~ — **REMOVED with it** (rev 3). `auto`
+   keeps today's exact meaning: local app installed → local, else nothing.
+   A workspace that configures nothing sends nothing — Frederico's accepted
+   outcome ("nem todo mundo vai rodar o signoz e tudo bem").
+3. **Connector integration** (unchanged, still Phase A): when the connector app is installed,
    `ensure_export_state` swaps the core's own export target to the
    connector's internal container URL — the exact swap `otel.py:144` already
    does for the local app — and the observability PUT handler additionally
@@ -292,12 +298,15 @@ workspace's own core** in front of its own app routes — the central is not a
 workspace, so that credential cannot be "reused" there in any meaningful
 sense; a workspace key means nothing to aw-stack.
 
-**Decision: one shared ingest token for the whole fleet, v1.** Generated
-once into aw-stack's `.env` (`AW_OTLP_INGEST_TOKEN`), validated by the
-central collector itself via the `bearertokenauth` extension on the OTLP
-receiver (collector-native, no new proxy component), and distributed to
-workspaces by aw-backend as `AW_OTLP_CENTRAL_KEY` (§3.1). aw-caddy fronts
-`otlp.aw.tekflox.com` with TLS only; auth stays in the collector.
+**Decision: one shared ingest token, v1 — handed out by the operator, not
+by code.** Generated once into aw-stack's `.env` (`AW_OTLP_INGEST_TOKEN`),
+validated by the central collector itself via the `bearertokenauth`
+extension on the OTLP receiver (collector-native, no new proxy component).
+Distribution (rev 3): the operator pastes it into the `custom`-mode api_key
+field of **his own workspaces only** (§3.1) — no control-plane delivery, no
+driver injection, so no workspace ever holds it unless a human put it
+there. aw-caddy fronts `otlp.aw.tekflox.com` with TLS only; auth stays in
+the collector.
 
 Why shared-token is enough *today*: every workspace in this fleet belongs to
 the operator; the central UI is operator-only; the threat a per-workspace
@@ -339,15 +348,19 @@ honest comparison. Out of scope now, deliberately.
 
 ## 6. What ships when, and what is the PO's call
 
-Phase A (this card's scope):
+Phase A (this card's scope, as revised in rev 3 — this is the dispatched
+list):
 1. aw-stack adoption of the 4 services + awserv repoint + ingest hostname +
-   shared token (§1, §4).
-2. `central` mode + `auto` fall-through + env injection in aw-backend (§3).
-   At the end of Phase A every untouched workspace is already shipping core
-   telemetry to the central — the requested default outcome — with no new
-   app installed.
-3. `aw-app-signoz-connector` app + push-on-save integration (§2, §3.3),
-   installable from the marketplace.
+   shared ingest token on the central side (§1, §4). **No aw-backend
+   placement-driver work** (§3.1 rev 3, §10).
+2. Connector↔core integration only (§3.3): push-on-save of the resolved
+   observability destination into the connector's config, and
+   `ensure_export_state`'s swap to the connector's internal URL when
+   installed. No new modes, no `resolve()` semantic changes.
+3. `aw-app-signoz-connector` app (§2), installable from the marketplace.
+4. Operator runbook step (docs, not code): set `custom` mode +
+   endpoint/token in each operator-owned workspace that should ship to the
+   central.
 
 **Explicitly routed to the Product Owner, not absorbed here:** "every new
 workspace comes with the connector pre-installed". There is **no
@@ -371,11 +384,11 @@ recommendation to the PO is in §9.5.
 * **The shared ingest token bakes in operator-trust** (§4); third-party
   tenant onboarding inherits a rotation-coupling debt until per-workspace
   tokens land.
-* **`auto`'s meaning grows**: it was "local or nothing", it becomes a
-  two-step fall-through. Every future destination (a second central? a
-  partner's collector?) must become an explicit mode, not another silent
-  rung in `auto`, or the setting's "four explicit states" design rationale
-  erodes.
+* ~~`auto`'s meaning grows~~ — no longer true in rev 3 (`auto` keeps
+  today's exact meaning). The constraint it stated survives for the
+  post-T2 card though: when `central` mode returns (§10), every future
+  destination must be an explicit mode, not another silent rung in `auto`,
+  or the setting's "four explicit states" design rationale erodes.
 * **Two live "central-ish" instances during/after Phase A** (the aw-stack
   central and the `aw` workspace's app that aw-backend currently ships to).
   Until the PO decides §1's consolidation question, dashboards split across
@@ -550,18 +563,27 @@ not ride along inside a telemetry cutover window.
 ### 9.5 The seed-apps answer, revised
 
 §6 originally said pre-installing the connector was redundant because
-`auto` mode already ships core telemetry. **§9 changes the premise**:
+`auto` mode already ships core telemetry. **§9 changed the premise**:
 container-log coverage is a connector-exclusive job — core's `auto` mode
 exports only core's own Python logs and never will tail other containers
 (that is the rejected runner-up). So without the connector, every
 workspace has a permanent, silent gap exactly where the hardest debugging
-happens (the apps that aren't our code). Updated recommendation to the PO:
-**approve a seed-apps mechanism as part of the Phase B card** — connector
-pre-installed with `observability:container-logs` granted — or explicitly
-accept one of the two alternatives: (a) the gap stays until someone
-installs the connector by hand, or (b) the core-pump runner-up gets built
-instead, with its §9.3 costs. Still the PO's call; it is scope, and this
-section only sharpens what is being traded.
+happens (the apps that aren't our code).
+
+**DECLINED by Frederico (2026-10-06, rev 3) — conditionally, not
+permanently.** His reasoning, which the doc's own §5 supports: seeding the
+connector fleet-wide only makes sense if its default destination is safe
+for *every* workspace, and the central has no real per-tenant isolation
+(`workspace.slug` is client-set; §5 says in as many words it is not a
+security boundary). "Se isso não for garantido, não quero." Recorded
+condition for reopening: seed-apps returns to the table **if and when the
+central gets genuine per-tenant isolation** — per-tenant ClickHouse
+databases or the paid SigNoz tier, the same "honest comparison" §5 already
+names as the bar for any tenant read-access. Until then: the Tier-2
+container-log gap (Phase B) stands, nobody installs the connector by
+default, each tenant that wants observability installs their own stack
+(connector → their own destination, or the full app-server), and the
+central stays operator-internal (§10).
 
 ### 9.6 Phase B risks for the Coders
 
@@ -592,3 +614,48 @@ section only sharpens what is being traded.
    writes must be the podman-host-visible form, not the workspace
    container's own view — use the identical resolution `$AW_APP_DATA`
    binds already go through, never a hardcoded translation.
+
+## 10. Operator-only central: the signal audit behind rev 3's default-deny
+
+Added 2026-10-06 (rev 3). Frederico's constraint: the central receives
+telemetry **only from workspaces he owns** — never from a paying tenant's
+workspace, hosted or BYOD. The question was which signal in aw-backend
+says "this workspace belongs to the platform operator". Answer, after
+reading the real code: **none that can be trusted today.** All three
+candidates fail:
+
+| Candidate | Where | Why it fails as the gate |
+|---|---|---|
+| `is_hosted` / `is_hosted_workspace()` | `aw-backend/src/api/placement/hosted_driver.py:436` | Means "a workspace on **our metal**" (durable `container_name` match) — by its own docstring it exists so a *paying hosted customer's* console badge is correct. Paying host-with-us customers are exactly `is_hosted=true`; it measures who runs the infra, not who owns the account. |
+| `placement_driver == "hosted"` | `workspace` table, `db_models.py:895` block | **Mutable, by design**: `host_link.py` flips it `hosted → remote-host` the moment the outer host dials `/link` (that is why `is_hosted_workspace()` exists at all). Also fails the other direction: BYOD customers and the operator's own workspaces are *both* `remote-host`. |
+| `workspace.tenant_id == <operator tenant>` | `db_models.py` (T1, live) | The right **shape**, broken **today**: 112 of 115 `tenant_members` rows still point at the shared `tenant-bootstrap` tenant (open card `identity:t2-backfill-preexisting-tenant-bootstrap-memberships`), so "operator tenant" is not yet distinguishable from almost everyone else. |
+
+Two additional facts that killed automatic injection independently of the
+signal question:
+
+* The hosted driver's env surface is a fixed 3-key dict for the **outer**
+  container (`hosted_driver.py:523`); reaching the **nested** workspace's
+  core process goes through aw-remote-host's `EnvPassthrough` — a fixed
+  allowlist in Go + `bootstrap/workspace/install.sh`, in a different repo.
+  "Just inject two env vars" was never a one-repo change.
+* The failure mode of a wrong gate is **silent tenant telemetry flowing to
+  the operator's ClickHouse** — a privacy breach that no test in aw-backend
+  would catch, discovered only if a tenant audits their egress.
+
+**Decision: default-deny, no gate at all in Phase A.** Nothing in
+aw-backend decides who may ship to the central, because nothing injects
+the credential anywhere — the operator pastes endpoint+token into the
+existing `custom` mode (§3.1 rev 3) in his own workspaces, one by one.
+A paying tenant can only reach the central by the operator deliberately
+handing them the token, which is the correct bar.
+
+**The automated path, when it becomes safe:** after the T2 backfill makes
+`tenant_id` trustworthy, reintroduce `central` mode with injection gated on
+`workspace.tenant_id == <operator tenant id>` (an aw-stack/.env-configured
+id, not a hardcoded slug list), plus the aw-remote-host `EnvPassthrough`
+leg for hosted/BYOD-shaped placements. That future card should also revisit
+§4's shared token → per-workspace tokens, since the same control-plane
+delivery it builds is what per-workspace credentials need. Runner-up
+rejected for the interim: an `AW_OTLP_CENTRAL_WORKSPACES` slug allowlist in
+aw-backend's env — it duplicates ownership truth into a hand-maintained
+list that silently drifts from the tenant table T2 is about to make real.
