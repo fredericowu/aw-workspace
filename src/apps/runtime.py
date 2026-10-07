@@ -37,7 +37,7 @@ from src.apps.base import AppContext, Plugin
 from src.apps.capabilities import filter_grants
 from src.apps.commands import CommandInstaller, HealInFlightError
 from src.apps.containers import (WORKSPACE_HOST_ENV, ContainerError, ContainerSupervisor,
-                                 expand_env)
+                                 expand_env, expand_value)
 from src.apps.journal import ActionJournal
 from src.apps.manifest import Manifest, load_manifest
 from src.apps.proxy import ContainerReverseProxy
@@ -553,6 +553,58 @@ class LoadedApp:
     module_prefix: str = ""
 
 
+#: One ``${source.name}`` occurrence (optionally chained with ``|``), anywhere
+#: inside a larger string — same grammar as ``src/apps/mcp_template.py``'s
+#: ``_EMBEDDED``, applied here to a declarative window's ``spec_data``
+#: instead of ``mcp.json``. Kept as its own copy rather than imported: this
+#: one additionally has to know which occurrences to REFUSE (see
+#: ``_expand_window_node`` below), which mcp_template's does not.
+_WINDOW_PLACEHOLDER = re.compile(r"\$\{(?:config|env|app)\.[A-Za-z_][A-Za-z0-9_.]*"
+                                 r"(?:\|(?:config|env|app)\.[A-Za-z_][A-Za-z0-9_.]*)*\}")
+
+
+def _window_secret_config_keys(manifest: Manifest) -> set[str]:
+    props = manifest.effective_config_schema.get("properties") or {}
+    return {key for key, spec in props.items()
+            if isinstance(spec, dict) and spec.get("x-secret")}
+
+
+def _expand_window_node(node: Any, config: dict[str, Any], app_id: str,
+                        secret_keys: set[str]) -> Any:
+    """Walk a declarative window's ``spec_data``, expanding ``${config.x}`` /
+    ``${env.x}`` / ``${app.url}`` against the app's own saved config —
+    same placeholder grammar ``runtime.env`` and ``mcp.template.json``
+    already speak (``src.apps.containers.expand_value``).
+
+    ``spec_data`` is served straight to the SPA and rendered client-side
+    (``AppWindow.jsx``) with no auth gate of its own beyond "can this
+    caller load this app's window" — nothing here re-checks who is asking.
+    So any occurrence naming a key in ``secret_keys`` (an ``x-secret: true``
+    config field) is left UNRESOLVED on purpose, not expanded and sent to
+    the browser: that is the one thing a future edit to this function must
+    never relax. Named risk #1 on the design that added this (SigNoz
+    Connector's own ``query_api_key`), which is also why there is a pinning
+    test for it — see ``test_window_spec_resolution.py``.
+    """
+    if isinstance(node, dict):
+        return {k: _expand_window_node(v, config, app_id, secret_keys) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_expand_window_node(v, config, app_id, secret_keys) for v in node]
+    if isinstance(node, str):
+        def _sub(match: "re.Match[str]") -> str:
+            token = match.group(0)
+            names = re.findall(r"(?:config|env|app)\.([A-Za-z_][A-Za-z0-9_.]*)", token)
+            if any(name in secret_keys for name in names):
+                log.warning("apps: window spec for %s references a secret config "
+                            "key in %r — left unresolved rather than sent to the SPA",
+                            app_id, token)
+                return token
+            value = expand_value(token, config, app_id)
+            return value if value is not None else token
+        return _WINDOW_PLACEHOLDER.sub(_sub, node)
+    return node
+
+
 class AppRuntime:
     """Owns the set of loaded Tier-1 apps for one host FastAPI process."""
 
@@ -1022,6 +1074,13 @@ class AppRuntime:
         carries a ``body.spec`` file ref (``windows/main.json``), which was never
         served — so the window was unreachable (F6 Cap 2). Resolve it here, once
         per contributions fetch, path-scoped to the app's own package.
+
+        Also expands ``${config.x}`` / ``${env.x}`` / ``${app.url}`` in the
+        loaded spec (``_expand_window_node``) — a window with no backend of
+        its own (e.g. an ``iframe`` widget's ``src``) had no way to carry a
+        managed config value before this, short of a Tier-2 app running its
+        own route just to redirect. ``x-secret`` config fields are skipped
+        there on purpose: see that function's docstring.
         """
         body = entry.get("body") or {}
         spec_ref = body.get("spec")
@@ -1040,6 +1099,8 @@ class AppRuntime:
             log.exception("apps: failed to load window spec %r for %s",
                           spec_ref, app.manifest.id)
             return entry
+        secret_keys = _window_secret_config_keys(app.manifest)
+        spec_data = _expand_window_node(spec_data, app.config, app.manifest.id, secret_keys)
         return {**entry, "body": {**body, "spec_data": spec_data}}
 
     # ---- load / unload --------------------------------------------------

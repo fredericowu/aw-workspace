@@ -123,10 +123,14 @@ def test_custom_round_trips_endpoint_and_key(ctx):
     assert put.status_code == 200
     assert put.json()["resolved"] == {
         "endpoint": "https://other.example.com", "api_key": "k", "source": "custom",
+        "query_mcp_url": "", "query_api_key": "", "web_ui_url": "",
     }
 
     got = client.get("/api/settings/observability")
-    assert got.json()["custom"] == {"endpoint": "https://other.example.com", "api_key": "k"}
+    assert got.json()["custom"] == {
+        "endpoint": "https://other.example.com", "api_key": "k",
+        "query_mcp_url": "", "query_api_key": "", "web_ui_url": "",
+    }
 
 
 def test_custom_without_endpoint_is_400(ctx):

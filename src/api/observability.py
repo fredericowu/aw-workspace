@@ -115,6 +115,13 @@ def _custom(stored: dict) -> dict:
     return {
         "endpoint": str(custom.get("endpoint") or ""),
         "api_key": str(custom.get("api_key") or ""),
+        # Query read-path (design §11) — all three optional, unlike endpoint
+        # above. Only meaningful for a `custom` destination: `auto`/`local`
+        # point at this workspace's OWN aw-app-signoz, which already serves
+        # its own query tools locally and needs none of this pushed anywhere.
+        "query_mcp_url": str(custom.get("query_mcp_url") or ""),
+        "query_api_key": str(custom.get("query_api_key") or ""),
+        "web_ui_url": str(custom.get("web_ui_url") or ""),
     }
 
 
@@ -208,7 +215,9 @@ def resolve(runtime) -> dict:
 
 
 def update(mode: str, custom_endpoint: str | None, custom_api_key: str | None,
-           runtime) -> dict:
+           runtime, custom_query_mcp_url: str | None = None,
+           custom_query_api_key: str | None = None,
+           custom_web_ui_url: str | None = None) -> dict:
     """Validate + persist a new mode. Raises :class:`ObservabilityError`."""
     mode = (mode or "").strip()
     if mode not in MODES:
@@ -228,9 +237,23 @@ def update(mode: str, custom_endpoint: str | None, custom_api_key: str | None,
             raise ObservabilityError("custom mode requires a non-empty endpoint")
         if not (endpoint.startswith("http://") or endpoint.startswith("https://")):
             raise ObservabilityError("custom endpoint must be an http(s) URL")
+        # The three query fields are optional (design §11) — a workspace can
+        # run `custom` purely for ingest, with no query read-path configured
+        # at all, same as it could before this existed.
+        query_mcp_url = (custom_query_mcp_url or "").strip()
+        if query_mcp_url and not (query_mcp_url.startswith("http://")
+                                   or query_mcp_url.startswith("https://")):
+            raise ObservabilityError("custom query_mcp_url must be an http(s) URL")
+        web_ui_url = (custom_web_ui_url or "").strip()
+        if web_ui_url and not (web_ui_url.startswith("http://")
+                                or web_ui_url.startswith("https://")):
+            raise ObservabilityError("custom web_ui_url must be an http(s) URL")
         stored["custom"] = {
             "endpoint": endpoint,
             "api_key": (custom_api_key or "").strip(),
+            "query_mcp_url": query_mcp_url,
+            "query_api_key": (custom_query_api_key or "").strip(),
+            "web_ui_url": web_ui_url,
         }
 
     _save(stored)
@@ -325,7 +348,18 @@ async def _push_connector_config(resolved: dict | None) -> dict:
     A ``None``/empty destination pushes EMPTY strings, deliberately: the
     connector must stop forwarding when this workspace is set to Desligado,
     not keep shipping to the last place it was told about. Its schema
-    defaults are empty for the same reason.
+    defaults are empty for the same reason. Same for the query read-path
+    fields (design §11) — ``resolved`` only ever carries them for a
+    ``custom`` destination (:func:`_custom`); ``auto``/``local`` resolve to
+    the local ``aw-app-signoz``, which serves its own query tools and has
+    nothing here to push.
+
+    ``web_ui_url`` falls back to ``query_mcp_url`` at PUSH time, not in the
+    connector's own schema default: an operator who filled in the query MCP
+    URL but left the web UI one blank still gets a working window instead of
+    an empty iframe, on a central deployment where today both are the same
+    host. Deliberately not persisted back into the stored setting — this is
+    a presentation-time default, not a value the operator asked to save.
 
     Best-effort and never raised into the caller — the settings save already
     succeeded and is the source of truth. The outcome is returned so the PUT
@@ -334,10 +368,16 @@ async def _push_connector_config(resolved: dict | None) -> dict:
     check exists to make visible."""
     port = os.environ.get("AW_PORT", "9030")
     url = f"http://127.0.0.1:{port}/api/apps/{SIGNOZ_CONNECTOR_APP_ID}/config"
+    resolved = resolved or {}
+    query_mcp_url = str(resolved.get("query_mcp_url") or "")
+    web_ui_url = str(resolved.get("web_ui_url") or "") or query_mcp_url
     body = {
         "config": {
-            "endpoint": str((resolved or {}).get("endpoint") or ""),
-            "api_key": str((resolved or {}).get("api_key") or ""),
+            "endpoint": str(resolved.get("endpoint") or ""),
+            "api_key": str(resolved.get("api_key") or ""),
+            "query_mcp_url": query_mcp_url,
+            "query_api_key": str(resolved.get("query_api_key") or ""),
+            "web_ui_url": web_ui_url,
         }
     }
     reason = "unknown error"
@@ -398,6 +438,9 @@ def register_observability_routes(app: FastAPI) -> None:
                 custom_endpoint=custom.get("endpoint"),
                 custom_api_key=custom.get("api_key"),
                 runtime=runtime,
+                custom_query_mcp_url=custom.get("query_mcp_url"),
+                custom_query_api_key=custom.get("query_api_key"),
+                custom_web_ui_url=custom.get("web_ui_url"),
             )
         except ObservabilityError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -805,3 +805,104 @@ delivery it builds is what per-workspace credentials need. Runner-up
 rejected for the interim: an `AW_OTLP_CENTRAL_WORKSPACES` slug allowlist in
 aw-backend's env — it duplicates ownership truth into a hand-maintained
 list that silently drifts from the tenant table T2 is about to make real.
+
+## 11. Query MCP + web UI, central-side (implemented, card 3f25bf3b...)
+
+Closes the gap §10 left standing: a connector-only workspace could forward
+telemetry to the central but had no way to **query** it or even **see** it
+— only a full `aw-app-signoz` install got query tools, and only for its
+own local instance. Shipped:
+
+**aw-stack** — `aw-signoz-mcp-server` (`signoz/signoz-mcp-server:v0.14.0`,
+the same image `aw-app-signoz`'s own `mcp` sidecar runs, pointed at this
+central's `aw-signoz` instead), public at `signoz-mcp.aw.tekflox.com`
+(`custom_domains`, same TLS mechanism as §4's `otlp.aw.tekflox.com`). Gated
+at the edge by a Caddy `forward_auth` subrequest to `aw-signoz:8080`'s
+`GET /api/v1/service_accounts/me` — closes the "tools/list with no auth at
+all" residual named when this section was still a comment thread: any
+request without a valid `SIGNOZ-API-KEY` never reaches the MCP server.
+`aw-signoz-mcp-provisioner` (`config/signoz/mcp_provisioner.py`, a sibling
+of `aw-app-signoz`'s own provisioner against the identical v0.128.0 API)
+mints a **viewer**-role key — never `signoz-admin` — and writes it to a
+file (`./data/signoz-mcp/query_api_key`) instead of POSTing anywhere, since
+there is no per-workspace app here to own the result. Same default-deny
+distribution as §4's ingest token: nothing injects this key anywhere, an
+operator reads the file and pastes it by hand.
+
+**aw-backend** — `custom_domains` entries gain an optional
+`forward_auth: {host, port, uri}` key (`src/libs/caddy_template.py`),
+rendered before the entry's own `reverse_proxy`. Generic — any future
+`custom_domains` entry with an upstream that has no request-level auth of
+its own can opt in the same way.
+
+**aw-app-signoz-connector** (0.3.0) — three new MANAGED config fields
+(`query_mcp_url`, `query_api_key`, `web_ui_url`), pushed by the same
+`observability.py::_push_connector_config` seam that already manages
+`endpoint`/`api_key`. A new `mcp.template.json` (`type: http`, precedent:
+`aw-app-browser` — no sidecar) renders a `signoz-query` MCP server pointed
+at `${config.query_mcp_url}`; empty disables it (the same
+`mcp_template.py` seam `aw-app-signoz` already proves) rather than
+connecting and 401ing. A new declarative window uses the existing `iframe`
+widget, `src: "${config.web_ui_url}"`, for the destination's own web UI —
+**no start/stop/restart control of the destination**, by construction: the
+widget is a plain iframe, and the window's own lifecycle controls (if any)
+govern the *connector's* container, never the remote one.
+
+**aw-workspace core** — `observability.py`'s `custom` mode gained the same
+three fields, all optional (unlike `endpoint`, which stays required). Only
+`custom` resolves them: `auto`/`local` point at this workspace's own
+`aw-app-signoz`, which already serves its own query tools locally and has
+nothing here to push. `web_ui_url` falls back to `query_mcp_url` at PUSH
+time (not in the connector's schema default, not persisted) so a pasted
+`query_mcp_url` with no `web_ui_url` still gets a working window rather
+than an empty iframe. `src/apps/runtime.py::_resolve_window` gained
+`${config.x}` expansion for declarative window specs — the one piece that
+was missing for ANY app to put a managed config value into a window with
+no backend route of its own. **The risk this section exists to flag**:
+`spec_data` is served straight to the SPA with no further auth check, so
+the expansion explicitly refuses any placeholder naming an `x-secret: true`
+config key (`query_api_key` chief among them) — pinned by
+`src/tests/unit/apps/test_window_spec_resolution.py`. Do not relax that
+without re-reading why it's there.
+
+**aw-workspace-ui** — the generic `iframe` widget gained an empty-`src`
+guard (`AppWindow.jsx`, mirroring `app_iframe`'s own), so an unconfigured
+`web_ui_url` hides the window instead of loading the SPA's own document
+into itself.
+
+### Operator runbook — order matters
+
+Pasting a value before its target exists is harmless to resolve (empty
+stays empty) but pointless to retry — the field just sits there wrong
+until redone. Sequence, one step at a time:
+
+1. **Deploy aw-stack first.** `aw-signoz-mcp-server` and
+   `aw-signoz-mcp-provisioner` (`Deploy aw-stack` workflow,
+   `services: "aw-signoz-mcp-server aw-signoz-mcp-provisioner"`), after
+   `aw-signoz` itself is already healthy — see that repo's README "Deploy
+   order" section for the full 1–6 sequence. Confirm
+   `https://signoz-mcp.aw.tekflox.com/mcp` answers through the edge (any
+   HTTP status is fine as a liveness check; a 401 with no key is correct).
+2. **Deploy aw-backend** with the `forward_auth` support (manual deploy —
+   this repo has no auto-deploy-on-push). Without this live, step 1's
+   hostname is reachable but ungated — an anonymous caller could still get
+   `tools/list`.
+3. **Mint or read the viewer key.** `AW_SIGNOZ_ROOT_EMAIL`/
+   `AW_SIGNOZ_ROOT_PASSWORD`/`AW_SIGNOZ_ROOT_ORG_ID` set in aw-stack's
+   `.env` → the provisioner writes `./data/signoz-mcp/query_api_key`
+   automatically. Unset → create a viewer-role service account key by hand
+   through the central SigNoz's own UI instead (Settings → API Keys /
+   Service Accounts).
+4. **Only now** paste `query_mcp_url`
+   (`https://signoz-mcp.aw.tekflox.com/mcp`) and `query_api_key` (the file
+   from step 3) into each workspace's Settings → Observability → Custom.
+   `web_ui_url` is optional (falls back to `query_mcp_url`'s value) but
+   worth setting explicitly to the central's own UI host
+   (`https://signoz.app.aw.tekflox.com`) for a real UI rather than a
+   fallback that happens to load.
+
+An empty `query_mcp_url`/`query_api_key` never breaks anything — the
+connector's upstream just stays disabled and the window stays hidden, the
+same safe-by-default shape §4's ingest token already has. The only way to
+get this order wrong in a way that *looks* broken is step 4 before step 1:
+a pasted URL that 404s/refuses because the hostname doesn't exist yet.

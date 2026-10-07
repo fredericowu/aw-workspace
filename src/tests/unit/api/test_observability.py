@@ -136,7 +136,23 @@ def test_custom_resolves_to_the_stored_endpoint_and_key(monkeypatch):
     result = observability.resolve(_runtime(False))
     assert result["resolved"] == {
         "endpoint": "https://other.example.com", "api_key": "k", "source": "custom",
+        "query_mcp_url": "", "query_api_key": "", "web_ui_url": "",
     }
+
+
+def test_custom_resolves_the_optional_query_read_path_fields_too(monkeypatch):
+    _store(monkeypatch, {
+        "mode": "custom",
+        "custom": {
+            "endpoint": "https://otlp.aw.tekflox.com", "api_key": "k",
+            "query_mcp_url": "https://signoz-mcp.aw.tekflox.com/mcp",
+            "query_api_key": "viewer-key", "web_ui_url": "https://signoz.app.aw.tekflox.com",
+        },
+    })
+    result = observability.resolve(_runtime(False))
+    assert result["resolved"]["query_mcp_url"] == "https://signoz-mcp.aw.tekflox.com/mcp"
+    assert result["resolved"]["query_api_key"] == "viewer-key"
+    assert result["resolved"]["web_ui_url"] == "https://signoz.app.aw.tekflox.com"
 
 
 def test_custom_with_no_endpoint_yet_resolves_to_nothing(monkeypatch):
@@ -190,7 +206,32 @@ def test_update_to_custom_persists_endpoint_and_key(monkeypatch):
     observability.update("custom", "https://other.example.com/", "k", _runtime(False))
     assert state["value"]["custom"] == {
         "endpoint": "https://other.example.com/", "api_key": "k",
+        "query_mcp_url": "", "query_api_key": "", "web_ui_url": "",
     }
+
+
+def test_update_to_custom_persists_the_optional_query_read_path_fields(monkeypatch):
+    state = _store(monkeypatch)
+    observability.update(
+        "custom", "https://otlp.aw.tekflox.com/", "ingest-key", _runtime(False),
+        custom_query_mcp_url="https://signoz-mcp.aw.tekflox.com/mcp",
+        custom_query_api_key="viewer-key",
+        custom_web_ui_url="https://signoz.app.aw.tekflox.com",
+    )
+    assert state["value"]["custom"] == {
+        "endpoint": "https://otlp.aw.tekflox.com/", "api_key": "ingest-key",
+        "query_mcp_url": "https://signoz-mcp.aw.tekflox.com/mcp",
+        "query_api_key": "viewer-key", "web_ui_url": "https://signoz.app.aw.tekflox.com",
+    }
+
+
+def test_update_rejects_a_non_http_query_mcp_url(monkeypatch):
+    _store(monkeypatch)
+    with pytest.raises(observability.ObservabilityError, match="query_mcp_url"):
+        observability.update(
+            "custom", "https://otlp.aw.tekflox.com/", "k", _runtime(False),
+            custom_query_mcp_url="not-a-url",
+        )
 
 
 def test_update_rejects_an_unknown_mode(monkeypatch):
@@ -366,11 +407,58 @@ async def test_connector_push_posts_the_resolved_destination_to_the_config_route
     url, kwargs = post.call_args[0][0], post.call_args[1]
     assert url == "http://127.0.0.1:9030/api/apps/signoz-connector/config"
     assert kwargs["json"] == {
-        "config": {"endpoint": "https://otlp.aw.tekflox.com", "api_key": "ingest-token"}
+        "config": {"endpoint": "https://otlp.aw.tekflox.com", "api_key": "ingest-token",
+                   "query_mcp_url": "", "query_api_key": "", "web_ui_url": ""}
     }
     # Identity-gated route: this process authenticates to itself like any
     # other caller rather than bypassing the gate.
     assert kwargs["headers"][observability.API_KEY_HEADER] == "the-workspace-key"
+
+
+@pytest.mark.asyncio
+async def test_connector_push_sends_the_query_read_path_fields_for_a_custom_destination():
+    post = AsyncMock(return_value=_connector_response(200, {"ok": True}))
+    client = MagicMock()
+    client.post = post
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.object(observability.httpx, "AsyncClient", return_value=client):
+        await observability._push_connector_config({
+            "endpoint": "https://otlp.aw.tekflox.com", "api_key": "ingest-token",
+            "query_mcp_url": "https://signoz-mcp.aw.tekflox.com/mcp",
+            "query_api_key": "viewer-key", "web_ui_url": "https://signoz.app.aw.tekflox.com",
+            "source": "custom",
+        })
+
+    assert post.call_args[1]["json"]["config"] == {
+        "endpoint": "https://otlp.aw.tekflox.com", "api_key": "ingest-token",
+        "query_mcp_url": "https://signoz-mcp.aw.tekflox.com/mcp",
+        "query_api_key": "viewer-key", "web_ui_url": "https://signoz.app.aw.tekflox.com",
+    }
+
+
+@pytest.mark.asyncio
+async def test_connector_push_falls_web_ui_url_back_to_query_mcp_url_when_blank():
+    """An operator who pastes query_mcp_url but leaves web_ui_url blank still
+    gets a working SigNoz window instead of an empty iframe — the fallback
+    is presentation-time only, never written back into the stored setting."""
+    post = AsyncMock(return_value=_connector_response(200, {"ok": True}))
+    client = MagicMock()
+    client.post = post
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.object(observability.httpx, "AsyncClient", return_value=client):
+        await observability._push_connector_config({
+            "endpoint": "https://otlp.aw.tekflox.com", "api_key": "ingest-token",
+            "query_mcp_url": "https://signoz-mcp.aw.tekflox.com/mcp",
+            "query_api_key": "viewer-key", "web_ui_url": "",
+            "source": "custom",
+        })
+
+    assert post.call_args[1]["json"]["config"]["web_ui_url"] == \
+        "https://signoz-mcp.aw.tekflox.com/mcp"
 
 
 @pytest.mark.asyncio
@@ -387,7 +475,10 @@ async def test_connector_push_sends_empty_strings_when_nothing_resolved():
         out = await observability._push_connector_config(None)
 
     assert out["ok"] is True
-    assert post.call_args[1]["json"] == {"config": {"endpoint": "", "api_key": ""}}
+    assert post.call_args[1]["json"] == {
+        "config": {"endpoint": "", "api_key": "",
+                   "query_mcp_url": "", "query_api_key": "", "web_ui_url": ""}
+    }
 
 
 @pytest.mark.asyncio
