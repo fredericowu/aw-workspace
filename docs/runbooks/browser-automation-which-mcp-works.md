@@ -77,17 +77,28 @@ with exactly that CDP error, and this runbook (plus the `aw-kali-linux`
 skill, v0.17.0) concluded that `aw-app-browser` was **not installed** and
 that the Kali tools were the only ones that worked.
 
-That was wrong. The app was installed and its container had been `Up` for
-16 hours — spanning the entire measurement. The failures were the stale
-gateway upstream above, and a `restart mcp-gateway` on 2026-10-08 brought all
-three back. The false conclusion came from inferring "not installed" from a
-tool error plus a misread of `aw-workspace-cli apps` — while that same
-document asserted `apps` was "the authoritative check".
+**That measurement was correct when taken, and stale within hours.** Another
+agent installed the `browser` app later the same day (confirmed by the
+workspace owner, 2026-10-08) — the container's uptime at the time of writing
+dates its start to roughly 16 hours *after* the original measurement, not
+before it. So nothing was misread: the app genuinely was absent at 01:30 UTC
+on 2026-10-07, and genuinely present by 09:16 UTC on 2026-10-08.
 
-The transferable lesson is not about browsers:
+That makes this a **shelf-life** problem, not an accuracy one, and it is the
+more uncomfortable lesson:
 
-- A tool erroring is evidence about **one call path**, not about what exists.
-- `tools/list` showing a tool proves its MCP server is up, nothing more.
-- But the inverse trap is just as real: a tool **failing** does not prove its
-  backend is absent. Check the container and the endpoint before writing
-  anything down.
+- A reachability fact in this workspace can expire in hours, because any agent
+  can install or remove an app at any time. Document the *timestamp* and the
+  *command to re-check*, never the bare conclusion.
+- "X is not installed" is the single worst thing to write down, because it
+  reads as permanent and is the easiest to falsify later. Prefer "as of
+  <time>, `aw-workspace-cli apps` did not list X — re-run it".
+- A tool erroring is evidence about **one call path** at **one moment**.
+  `tools/list` showing a tool proves only that its MCP server is up; a tool
+  failing does not prove its backend is absent. Check the app list, the
+  container and the endpoint — and date the answer.
+
+The first correction to this document over-corrected: it blamed a misread of
+`aw-workspace-cli apps` that did not happen. Both the original claim and that
+self-blame were confident statements about a world that had changed
+underneath them.
