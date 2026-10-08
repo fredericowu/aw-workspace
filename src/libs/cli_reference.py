@@ -92,14 +92,86 @@ def _write_doc(rel_path: Path, source_label: str, doc_type: str, body: str, capt
 
 # --- CLI --help -----------------------------------------------------------
 
+#: Card quality:procedural-genre-absent-from-both-knowledge-indexes,
+#: measured follow-up: indexing the raw ``--help`` closed the CONTENT gap
+#: but not the RETRIEVAL gap — asked in English naming the command,
+#: `cli_reference/apps.md` scored 0.847 (the best in the whole experiment);
+#: asked as "Como eu listo os apps instalados de uma workspace?" the same
+#: doc wasn't in the top 5, because nothing in the embedding space bridges
+#: terse English argparse output to a conversational Portuguese question.
+#: This table gives the built-in top-level commands a real bilingual
+#: question (not a mechanical translation — no LLM call does the
+#: translating, a human phrased these once) to put above the verbatim
+#: ``--help``. It deliberately only covers this repo's own top-level
+#: commands: a subcommand or an app-contributed command falls back to the
+#: mechanical phrasing in ``_intent_questions`` below, which is less fluent
+#: but still bilingual and still names the command verbatim.
+_PT_QUESTIONS: dict[str, str] = {
+    "": "Como eu uso o `aw-workspace-cli`?",
+    "agent": "Como eu sincronizo os agentes (skills, AGENTS.md e MCP) na workspace?",
+    "apps": "Como eu listo os apps instalados de uma workspace?",
+    "doctor": "Como eu verifico se tem algo degradado silenciosamente na workspace?",
+    "folders": "Como eu mapeio uma pasta na workspace?",
+    "help": "Como eu vejo a ajuda do aw-workspace-cli?",
+    "kb-reference": "Como eu regenero a referência de CLI e skills na base de conhecimento?",
+    "logs": "Como eu vejo os logs de um componente da workspace?",
+    "marketplace": "Como eu instalo ou atualizo um app pelo marketplace?",
+    "restart": "Como eu restarto a aw-workspace rodando?",
+    "sideload": "Como eu instalo um app a partir de uma pasta local, pra testar?",
+    "start": "Como eu inicio um componente da workspace?",
+    "status": "Como eu vejo o status da workspace?",
+    "stop": "Como eu paro um componente da workspace?",
+    "test": "Como eu rodo os testes da workspace?",
+    "update": "Como eu atualizo a aw-workspace rodando?",
+}
+_EN_QUESTIONS: dict[str, str] = {
+    "": "How do I use `aw-workspace-cli`?",
+    "agent": "How do I sync agents (skills, AGENTS.md, MCP) in the workspace?",
+    "apps": "How do I list the apps installed on a workspace?",
+    "doctor": "How do I check whether anything is silently degraded in the workspace?",
+    "folders": "How do I map a folder into the workspace?",
+    "help": "How do I see aw-workspace-cli's help?",
+    "kb-reference": "How do I regenerate the CLI and skills reference in the knowledge base?",
+    "logs": "How do I see a workspace component's logs?",
+    "marketplace": "How do I install or update an app from the marketplace?",
+    "restart": "How do I restart a running workspace?",
+    "sideload": "How do I install an app from a local directory, to test it?",
+    "start": "How do I start a workspace component?",
+    "status": "How do I see the workspace's status?",
+    "stop": "How do I stop a workspace component?",
+    "test": "How do I run the workspace's test suite?",
+    "update": "How do I update a running workspace?",
+}
 
-def _subcommands(module) -> list[str]:
-    """Names of a command's own subcommands, if it declares any via
-    argparse subparsers. Only modules exposing a module-level
-    ``_build_parser()`` are introspectable this way (``agent``,
-    ``marketplace``, ``folders``, ...); a command whose argparse logic
-    lives in an imported app package (e.g. ``secrets``) is walked as a
-    single top-level entry only — still correct, just not recursed into."""
+
+def _intent_questions(command_path: list[str]) -> tuple[str, str]:
+    """(pt_question, en_question) for the bilingual intent surface. A
+    top-level command in the tables above gets the hand-phrased pair; a
+    subcommand or an app-contributed command (not in either table) falls
+    back to a mechanical phrasing that still names the full command
+    verbatim, so every doc gets a bilingual surface either way."""
+    key = command_path[0] if command_path else ""
+    if len(command_path) <= 1 and key in _PT_QUESTIONS:
+        return _PT_QUESTIONS[key], _EN_QUESTIONS[key]
+    full = (CLI_BIN + " " + " ".join(command_path)).strip()
+    return f"Como eu uso o comando `{full}`?", f"How do I use `{full}`?"
+
+
+def _subcommands(module) -> list[tuple[str, str]]:
+    """(name, description) pairs for a command's own subcommands, if it
+    declares any via argparse subparsers. Only modules exposing a
+    module-level ``_build_parser()`` are introspectable this way
+    (``agent``, ``marketplace``, ``folders``, ...); a command whose
+    argparse logic lives in an imported app package (e.g. ``secrets``) is
+    walked as a single top-level entry only — still correct, just not
+    recursed into.
+
+    The name list comes from ``action.choices`` (populated for every
+    subcommand regardless of how it was declared); the description comes
+    from ``action._choices_actions``, which argparse only populates for a
+    subcommand whose own ``add_parser(..., help=...)`` call supplied one —
+    a subcommand without one just gets an empty description, not a crash.
+    """
     build_parser = getattr(module, "_build_parser", None)
     if build_parser is None:
         return []
@@ -109,7 +181,8 @@ def _subcommands(module) -> list[str]:
         return []
     for action in parser._actions:
         if isinstance(action, argparse._SubParsersAction):
-            return sorted(action.choices)
+            help_by_name = {p.dest: p.help or "" for p in action._choices_actions}
+            return [(name, help_by_name.get(name, "")) for name in sorted(action.choices)]
     return []
 
 
@@ -132,20 +205,28 @@ def sync_cli_reference() -> ReferenceSyncResult:
     result = ReferenceSyncResult()
     captured = date.today().isoformat()
 
-    command_paths: list[list[str]] = [[]]
+    # (command_path, one-sentence description) — the description is this
+    # repo's own cost-free source for the intent surface's prose line: a
+    # top-level command's own ``DESCRIPTION``, or a subcommand's
+    # ``add_parser(..., help=...)`` text when it declared one.
+    entries: list[tuple[list[str], str]] = [([], "List and run every aw-workspace-cli command.")]
     for name, module in sorted(discover_commands().items()):
-        command_paths.append([name])
-        for sub in _subcommands(module):
-            command_paths.append([name, sub])
+        entries.append(([name], getattr(module, "DESCRIPTION", "") or ""))
+        for sub, sub_description in _subcommands(module):
+            entries.append(([name, sub], sub_description))
 
-    for command_path in command_paths:
+    for command_path, description in entries:
         label = (CLI_BIN + " " + " ".join(command_path)).strip()
         text = _capture_help(command_path)
         if text is None:
             result.failed.append(label)
             continue
         slug = "-".join(command_path) or "root"
-        body = f"# {label} --help\n\n`{label}`\n\n```\n{text.rstrip()}\n```\n"
+        pt_question, en_question = _intent_questions(command_path)
+        intent = f"**{pt_question}** / **{en_question}**\n\n"
+        if description:
+            intent += f"{description}\n\n"
+        body = f"# {label} --help\n\n{intent}`{label}`\n\n```\n{text.rstrip()}\n```\n"
         _write_doc(Path("cli_reference") / f"{slug}.md", label, "cli-reference", body, captured)
         result.written += 1
 

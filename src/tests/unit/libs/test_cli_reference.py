@@ -51,12 +51,44 @@ def test_command_name_appears_verbatim_in_title_and_body(kb_home, monkeypatch):
     assert not result.failed
 
 
+def test_a_mapped_command_gets_its_hand_phrased_bilingual_question(kb_home, monkeypatch):
+    """Card quality:procedural-genre-absent-from-both-knowledge-indexes,
+    measured follow-up: indexing the raw --help closed the content gap but
+    not the retrieval gap — a doc needs a real PT question above the
+    --help, not just the English command name, or a conversational
+    Portuguese query never finds it."""
+    monkeypatch.setattr(cli_reference, "discover_commands",
+                         lambda: {"update": types.SimpleNamespace(DESCRIPTION="Update the workspace")})
+    monkeypatch.setattr(cli_reference.subprocess, "run",
+                         lambda cmd, **kw: _stub_proc("usage: aw-workspace-cli update ..."))
+
+    cli_reference.sync_cli_reference()
+
+    doc = (kb_home / "knowledge_base" / "cli_reference" / "update.md").read_text()
+    assert "Como eu atualizo a aw-workspace" in doc
+    assert "how do i update a running workspace" in doc.lower()
+    assert "Update the workspace" in doc  # the one-sentence description
+
+
+def test_an_unmapped_command_falls_back_to_a_mechanical_bilingual_question(kb_home, monkeypatch):
+    monkeypatch.setattr(cli_reference, "discover_commands",
+                         lambda: {"sideload-x": types.SimpleNamespace()})
+    monkeypatch.setattr(cli_reference.subprocess, "run",
+                         lambda cmd, **kw: _stub_proc("usage: aw-workspace-cli sideload-x ..."))
+
+    cli_reference.sync_cli_reference()
+
+    doc = (kb_home / "knowledge_base" / "cli_reference" / "sideload-x.md").read_text()
+    assert "Como eu uso o comando `aw-workspace-cli sideload-x`?" in doc
+    assert "How do I use `aw-workspace-cli sideload-x`?" in doc
+
+
 def test_subcommands_are_discovered_via_build_parser(kb_home, monkeypatch):
     def _build_parser():
         parser = argparse.ArgumentParser()
         sub = parser.add_subparsers(dest="cmd")
-        sub.add_parser("sync")
-        sub.add_parser("status")
+        sub.add_parser("sync", help="Run the unified sync")
+        sub.add_parser("status")  # no help= — must not crash the walk
         return parser
 
     module = types.SimpleNamespace(_build_parser=_build_parser)
@@ -69,6 +101,11 @@ def test_subcommands_are_discovered_via_build_parser(kb_home, monkeypatch):
     names = {p.stem for p in (kb_home / "knowledge_base" / "cli_reference").iterdir()}
     assert names == {"root", "agent", "agent-sync", "agent-status"}
     assert result.written == 4
+
+    sync_doc = (kb_home / "knowledge_base" / "cli_reference" / "agent-sync.md").read_text()
+    assert "Run the unified sync" in sync_doc  # from add_parser's own help= text
+    status_doc = (kb_home / "knowledge_base" / "cli_reference" / "agent-status.md").read_text()
+    assert "How do I use `aw-workspace-cli agent status`?" in status_doc  # mechanical fallback
 
 
 def test_a_failed_capture_is_recorded_not_raised(kb_home, monkeypatch):
