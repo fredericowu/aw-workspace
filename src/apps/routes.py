@@ -1819,6 +1819,98 @@ async def _start_gateway_rescan_when_loaded(app: FastAPI, *, poll_s: float = 2.0
     runtime.start_mcp_gateway_rescan()
 
 
+# Cadence of the convergence watchdog below. Deliberately long: this is a
+# safety net for a boot pass that did not finish, not a poller. A converged
+# workspace's tick is nearly free (the reconciler only acts on apps that
+# aren't loaded), and the supervisor's own exponential backoff
+# (min(interval * 2**n, 1800s)) stretches it further if a tick raises, so a
+# wedged registry can't turn this into a retry storm.
+DEFAULT_CONVERGENCE_RECONCILE_INTERVAL_S = float(
+    os.environ.get("AW_APPS_CONVERGENCE_RECONCILE_INTERVAL_S", "900"))
+
+_CONVERGENCE_APP_ID = "core"
+_CONVERGENCE_TASK_ID = "apps-convergence-reconcile"
+
+
+def _start_convergence_watchdog(
+        app: FastAPI,
+        interval_s: float = DEFAULT_CONVERGENCE_RECONCILE_INTERVAL_S) -> None:
+    """Register the periodic reconcile that finishes what a timed-out boot
+    pass left undone.
+
+    ``reconcile_on_boot``'s timeout branch used to say, accurately, "there is
+    no periodic reconcile watchdog today — convergence only resumes on the
+    next restart or a manual POST /api/apps/reconcile". That sentence was the
+    other half of the 2026-10-08 incident (see ``boot_reconcile_coord``'s W5
+    note): a boot that ran out of its 1200s budget left the workspace
+    permanently short of converged, the only cure was another boot, and every
+    boot restarted the same expensive pass from scratch — while also being
+    another chance for ten workers to stampede it. With 60 apps installing at
+    concurrency 3, overrunning the budget is not a rare edge.
+
+    Registered through ``WatchdogSupervisor``, which supplies the three
+    things this must not reimplement: the ``FlockLease`` leader gate, so at
+    ``AW_WORKSPACE_WORKERS>1`` exactly ONE worker ticks it rather than all
+    ten (the entire lesson of ``boot_reconcile_coord``); exponential backoff
+    on exceptions; and cancellation with the rest of the fleet's tasks. Like
+    the other four starters it is registered in EVERY worker and spun only in
+    the flock holder's supervisor, so a worker that later wins the lease on
+    failover already has it (see ``attach_on_boot``'s docstring).
+
+    ``run_immediately=False`` — the boot pass either just finished or just
+    gave up seconds ago, and re-running it this instant is the stampede
+    behaviour, not the fix. Idempotent; a non-positive interval disables it,
+    which is the escape hatch back to restart-only semantics.
+    """
+    runtime = app.state.app_runtime
+    if interval_s <= 0:
+        log.info("apps: convergence reconcile watchdog disabled (interval=%s)", interval_s)
+        return
+    if _CONVERGENCE_TASK_ID in runtime.watchdog.task_ids_for(_CONVERGENCE_APP_ID):
+        return
+
+    reconciler: Reconciler = app.state.app_reconciler
+    in_flight = {"running": False}
+
+    async def _tick() -> None:
+        # Reentrancy guard. A pass can legitimately outlast the interval (a
+        # cold pass measures 450s+ against a 900s interval, and a degraded
+        # network widens that), and two concurrent passes over one venv and
+        # one podman socket is the exact failure this module is scar tissue
+        # from. Reset in a finally, not on the happy path: a lease flap can
+        # cancel the task mid-pass and resume() start a fresh loop.
+        if in_flight["running"]:
+            log.warning("apps: skipping convergence reconcile — the previous "
+                        "pass is still running")
+            return
+        in_flight["running"] = True
+        try:
+            result = await asyncio.wait_for(
+                reconciler.reconcile(), timeout=_BOOT_RECONCILE_TIMEOUT)
+            # Only when it DID something — a converged workspace would
+            # otherwise log an identical line every interval forever.
+            if result:
+                log.info("apps: convergence reconcile — %s", result)
+        except asyncio.TimeoutError:
+            # Deliberately not re-raised. Feeding the supervisor's backoff
+            # here would punish the slow-but-progressing case, where each
+            # pass installs some apps and leaves fewer for the next, by
+            # stretching the interval to 30min — the opposite of what a
+            # partially-converged workspace needs.
+            log.warning(
+                "apps: convergence reconcile exceeded %ss — apps may still be "
+                "partially converged; the next tick resumes where this left "
+                "off (no restart needed)", _BOOT_RECONCILE_TIMEOUT)
+        finally:
+            in_flight["running"] = False
+
+    runtime.watchdog.register(
+        _CONVERGENCE_APP_ID, _CONVERGENCE_TASK_ID, _tick,
+        interval_s, run_immediately=False,
+    )
+    log.info("apps: convergence reconcile watchdog armed (every %ss)", interval_s)
+
+
 async def reconcile_on_boot(app: FastAPI) -> None:
     """Reconcile to the cloud registry on startup (ADR Decision 5).
 
@@ -1841,11 +1933,12 @@ async def reconcile_on_boot(app: FastAPI) -> None:
         log.info("apps: boot reconcile — %s", result)
     except asyncio.TimeoutError:
         log.error(
-            "apps: boot reconcile exceeded %ss — giving up for this boot; "
-            "apps may be partially converged. There is no periodic reconcile "
-            "watchdog today — convergence only resumes on the next restart "
-            "or a manual POST /api/apps/reconcile",
-            _BOOT_RECONCILE_TIMEOUT,
+            "apps: boot reconcile exceeded %ss — giving up for THIS BOOT; "
+            "apps may be partially converged. The convergence watchdog "
+            "registered below picks the remainder up on its own cadence "
+            "(every %ss), so a restart is no longer required; POST "
+            "/api/apps/reconcile still forces it immediately.",
+            _BOOT_RECONCILE_TIMEOUT, DEFAULT_CONVERGENCE_RECONCILE_INTERVAL_S,
         )
     except Exception:
         log.exception("apps: boot reconcile failed")
@@ -1877,6 +1970,10 @@ async def reconcile_on_boot(app: FastAPI) -> None:
     # registers; only the leader's supervisor spins it, so it is still one
     # writer against the container engine.
     app.state.app_runtime.start_workspace_host_healer()
+    # Resume convergence WITHOUT needing another boot — the half of the
+    # 2026-10-08 incident the timeout branch above used to name out loud.
+    # Same every-worker/leader-spins split as the healers around it.
+    _start_convergence_watchdog(app)
     # At boot an already-running mcp-gateway will have scanned BEFORE the
     # inprocess apps above activated and (re)wrote their own mcp.json, and
     # nothing in that path is ordered — so reload once, now that they have.
@@ -1954,5 +2051,9 @@ async def attach_on_boot(app: FastAPI) -> None:
     app.state.app_runtime.start_mcp_gateway_rescan()
     app.state.app_runtime.start_zombie_reaper()
     app.state.app_runtime.start_workspace_host_healer()
+    # Registered here too, for the same reason the four above are: only the
+    # watchdog-leader flock holder's supervisor spins it, so every worker
+    # must have it registered to cover a later failover.
+    _start_convergence_watchdog(app)
     from src.api.otel import ensure_export_state
     ensure_export_state(app.state.app_runtime)

@@ -56,6 +56,46 @@ Respawn correctness falls out of the pair: a worker that finds the marker
 attaches; one that finds the flock held waits; one that finds the flock free
 with no marker is looking at a leader that died mid-pass, and correctly
 re-leads.
+
+**W5 (2026-10-08) — the stampede that outlived two rewrites.** Everything
+above was in place and none of it was what failed. ``coordinate()``'s
+``max_wait_s`` branch was: it returned True — *run your own pass* — the
+moment a wall clock elapsed, **without ever asking whether the leader was
+still alive**, which flatly contradicts this module's own invariant three
+paragraphs up ("a leader still working can never be preempted"). It
+survived the W4 Redis→lease rewrite and the Lock C Redis→flock rewrite
+unchanged, because both rewrites replaced the liveness PRIMITIVE and left
+the one branch that ignores liveness alone.
+
+Observed on this project's own host at ``AW_WORKSPACE_WORKERS=10``:
+
+* The margin was never real. 1260s against the leader's 1200s
+  ``_BOOT_RECONCILE_TIMEOUT`` assumed both clocks start together. They do
+  not: a follower's starts when ITS process boots, the leader's only when
+  its reconcile call begins, tens of seconds later behind worker start skew
+  and the priority-app install. 60s of paper margin went negative.
+* All nine followers expired at once — they began waiting together, so they
+  reached the deadline within milliseconds of each other and every one of
+  them decided the same thing in the same instant. Ten concurrent passes
+  over one venv and one podman socket is *slower* than one, so the leader
+  overran its own timeout too and the next boot repeated it. The logs are
+  unambiguous: "coordination timed out" 18x, "another worker is running
+  this boot's app reconcile" **0x** — not one follower ever attached.
+
+Downstream, that is also where a pile of symptoms that looked unrelated
+came from: the workspace never reached convergence (hence fewer running
+containers than the remote host's healthcheck expects, hence *unhealthy*),
+podman containers churned continuously (every create/destroy reloads
+aardvark-dns, which is the whole of the "intermittent DNS"
+``[Errno -3]``/``[Errno -5]`` failures), and the in-process
+``agents-platform-runners`` app's routes sat unmounted ~6.5min per boot,
+which is what agents-platform-multitenant saw as ``/execute`` → 404.
+
+The fix is to ask the question the deadline was a proxy for. ``flock``
+makes it exact — EAGAIN *is* the fact that a live process holds the lock,
+with no reachability caveat a Redis SET NX would have had. So the deadline
+now gates on the lock still being held, and backs off instead of
+preempting. See ``coordinate()``.
 """
 
 from __future__ import annotations
@@ -63,6 +103,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import time
 from typing import Optional
 
@@ -79,6 +120,11 @@ LOCK_NAME = "boot-reconcile"
 #: to sweep other boots' markers.
 DONE_PREFIX = "boot-reconcile-done-"
 
+#: Ceiling on a single deadline extension in coordinate()'s backoff. Half an
+#: hour between "still alive, still waiting" lines is rare enough not to be
+#: noise and frequent enough that a genuinely stuck fleet stays visible.
+_MAX_WAIT_EXTENSION_S = 1800.0
+
 
 class BootReconcileCoordinator:
     """One instance per worker process, constructed with this boot's
@@ -91,12 +137,16 @@ class BootReconcileCoordinator:
         boot_id: str,
         *,
         lock_dir: Optional[str] = None,
-        # Comfortably above _BOOT_RECONCILE_TIMEOUT (1200s): a waiter must
-        # never give up and run its own pass BEFORE the leader's own internal
-        # timeout would have made it give up first — that ordering is what
-        # guarantees at most one "give up and just do it" per boot instead of
-        # two workers deciding that within seconds of each other.
-        max_wait_s: float = 1260.0,
+        # How long to wait before CHECKING WHETHER THE LEADER IS STILL ALIVE
+        # — no longer "how long before taking over regardless", which is the
+        # W5 bug (see the module docstring). It was 1260.0, a bare 60s over
+        # _BOOT_RECONCILE_TIMEOUT (1200s), on the reasoning that a waiter
+        # must never give up before the leader's own timeout would have. The
+        # ordering argument was right; the margin was imaginary, because the
+        # two clocks do not start at the same moment. Now that expiry only
+        # triggers a liveness check rather than a takeover, this value sets
+        # how often a long pass is reported, not whether it is interrupted.
+        max_wait_s: float = 2400.0,
         poll_interval: float = 2.0,
     ) -> None:
         self.boot_id = boot_id
@@ -130,6 +180,7 @@ class BootReconcileCoordinator:
         should just ``attach_on_boot()``.
         """
         deadline = time.monotonic() + self.max_wait_s
+        waits_past_deadline = 0
         while True:
             if self._is_done():
                 return False
@@ -152,18 +203,46 @@ class BootReconcileCoordinator:
             # Someone else holds it right now. Loop: either the DONE marker
             # appears (they finished — next iteration catches it), or the
             # flock frees up with no marker (they died mid-pass — next
-            # iteration wins it for us), or we wait long enough that running
-            # our own pass beats staying unattached forever.
+            # iteration wins it for us).
+            #
+            # **Reaching the deadline is not permission to preempt.** This
+            # branch used to `return True` unconditionally here, and that one
+            # line is the W5 stampede: nine followers of one boot all expire
+            # in the same millisecond and all start competing passes over one
+            # venv and one podman socket. We only got to this point because
+            # `try_acquire` just returned None, and with flock that means a
+            # LIVE process holds the lock — the kernel drops it on exit,
+            # crash or kill -9, so "held" and "alive" are the same fact. The
+            # leader is working. Waiting is correct; report and keep waiting.
+            #
+            # The deadline's real job — never wait forever on a leader that
+            # will never finish — is already done by the two loop exits
+            # above, both of which fire the moment the lock is released.
             if time.monotonic() >= deadline:
-                logger.error(
-                    "apps: boot reconcile coordination timed out after %ss "
-                    "waiting for %s (boot_id=%s) — running our own pass rather "
-                    "than never attaching. Safe but unserialized at THIS layer; "
-                    "the provisioning lock (Lock A, src/apps/lifecycle.py) is "
-                    "what still keeps the two passes from racing apt.",
-                    self.max_wait_s, fs_lock.holder(self.lock_path), self.boot_id)
-                return True
-            await asyncio.sleep(self.poll_interval)
+                waits_past_deadline += 1
+                # Exponential, capped. The cap is the point: this must stay
+                # observable, so the log line keeps firing at a decreasing
+                # but non-zero rate for as long as the anomaly lasts, rather
+                # than going silent.
+                extension = min(
+                    self.max_wait_s * (2 ** (waits_past_deadline - 1)),
+                    _MAX_WAIT_EXTENSION_S,
+                )
+                deadline = time.monotonic() + extension
+                logger.warning(
+                    "apps: boot reconcile has been running for over %ss "
+                    "(holder=%s, boot_id=%s), which is longer than expected — "
+                    "but it still HOLDS the flock, so it is alive and working. "
+                    "NOT starting a competing pass: that is the 10-worker "
+                    "stampede of 2026-10-08 (see this module's W5 note). "
+                    "Waiting a further %ss; check %d past the deadline.",
+                    self.max_wait_s, fs_lock.holder(self.lock_path),
+                    self.boot_id, extension, waits_past_deadline)
+            # Jittered so the N followers of one boot never poll — or reach a
+            # deadline — in lockstep. Polling together is harmless by itself;
+            # DECIDING together is what turned one impatient follower into a
+            # nine-way herd.
+            await asyncio.sleep(self.poll_interval * (0.5 + random.random()))
 
     async def finish(self) -> None:
         """Leader-only — call in a ``finally`` once the pass ends (success,

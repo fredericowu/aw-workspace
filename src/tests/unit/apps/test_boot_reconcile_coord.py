@@ -50,23 +50,66 @@ def test_first_caller_leads(lock_dir):
     assert leader._fd is not None, "the leader must HOLD the lock, not just win it"
 
 
-def test_follower_behind_a_live_leader_eventually_gives_up_and_leads(lock_dir):
-    """No done marker ever appears and the leader never releases (a wedged
-    pass) — the follower must not wait forever; it gives up at max_wait_s and
-    runs its own pass rather than never attaching. Safe in a way it was not
-    before Lock A existed: the two passes still serialize on the provisioning
-    mutex one layer down."""
+def test_follower_never_preempts_a_leader_that_still_holds_the_lock(lock_dir):
+    """W5 regression (2026-10-08). This test asserted the OPPOSITE until
+    then — that a follower gives up at ``max_wait_s`` and runs its own pass
+    even while the leader still held the flock — and that assertion was the
+    bug, not the contract. At ``AW_WORKSPACE_WORKERS=10`` it meant nine
+    followers expiring in the same millisecond and starting nine competing
+    passes; ten concurrent reconciles over one venv and one podman socket is
+    slower than the one pass they were impatient with, so the leader overran
+    its own 1200s timeout too and the next boot did it again. Logs:
+    "coordination timed out" 18x, "another worker is running this boot's app
+    reconcile" 0x.
+
+    With flock, a HELD lock is a LIVE process — the kernel drops it on exit,
+    crash or kill -9 — so "still held" and "still working" are one fact, and
+    the module docstring's own invariant ("a leader still working can never
+    be preempted") applies without exception. The deadline's real job, never
+    waiting forever on a leader that will never finish, is served by the two
+    loop exits that fire the instant the lock is released — covered by
+    ``test_follower_takes_over_when_the_leader_dies_without_finishing``."""
     leader = _coordinator("boot-1", lock_dir)
-    follower = _coordinator("boot-1", lock_dir, max_wait_s=0.15, poll_interval=0.02)
+    # max_wait_s far below the observation window, so the deadline fires many
+    # times during the test — a surviving takeover would be caught repeatedly.
+    follower = _coordinator("boot-1", lock_dir, max_wait_s=0.05, poll_interval=0.01)
 
-    assert asyncio.run(_run(leader.coordinate())) is True
+    async def scenario():
+        assert await leader.coordinate() is True
+        waiting = asyncio.ensure_future(follower.coordinate())
+        await asyncio.sleep(1.0)  # ~20 deadline periods
+        still_waiting = not waiting.done()
+        waiting.cancel()
+        return still_waiting
 
-    t0 = time.monotonic()
-    result = asyncio.run(_run(follower.coordinate()))
-    elapsed = time.monotonic() - t0
+    assert asyncio.run(_run(scenario())) is True, (
+        "follower preempted a leader that still held the flock — this is the "
+        "10-worker reconcile stampede of 2026-10-08"
+    )
 
-    assert result is True
-    assert 0.12 <= elapsed <= 0.6, f"gave up too fast or too slow: {elapsed}s"
+
+def test_nine_followers_do_not_stampede_a_live_leader(lock_dir):
+    """The incident's real shape: not one impatient follower but a fleet
+    expiring together. Every follower of one boot starts waiting at roughly
+    the same moment, so a wall-clock deadline makes them all decide the same
+    thing at the same instant — a textbook thundering herd. None may take
+    over while the leader holds the lock."""
+    leader = _coordinator("boot-herd", lock_dir)
+    followers = [
+        _coordinator("boot-herd", lock_dir, max_wait_s=0.05, poll_interval=0.01)
+        for _ in range(9)
+    ]
+
+    async def scenario():
+        assert await leader.coordinate() is True
+        waiting = [asyncio.ensure_future(f.coordinate()) for f in followers]
+        await asyncio.sleep(1.0)
+        took_over = sum(1 for w in waiting if w.done() and w.result() is True)
+        for w in waiting:
+            w.cancel()
+        return took_over
+
+    assert asyncio.run(_run(scenario())) == 0, "followers stampeded a live leader"
 
 
 def test_done_marker_short_circuits_a_follower_immediately(lock_dir):
@@ -88,7 +131,13 @@ def test_a_working_leader_cannot_lose_its_own_claim(lock_dir):
     """What the heartbeat/renewal machinery used to buy, now for free. The
     lease this replaced had to keep proving liveness against a TTL — the gap
     that let a long pass lose its own claim. A held fd has no TTL, so a
-    follower polling for ten lease-TTLs' worth of time still never wins."""
+    follower polling for ten lease-TTLs' worth of time still never wins.
+
+    W5 (2026-10-08): the assertion below used to be ``is True`` — the
+    follower "gave up and led" — which contradicted this very docstring's
+    "still never wins" and was the stampede bug. A held fd has no TTL, so
+    the claim cannot be lost; the follower waits.
+    """
     leader = _coordinator("boot-3", lock_dir)
     follower = _coordinator("boot-3", lock_dir, max_wait_s=0.4, poll_interval=0.02)
 
@@ -96,10 +145,14 @@ def test_a_working_leader_cannot_lose_its_own_claim(lock_dir):
         assert await leader.coordinate() is True
         # Any amount of elapsed time: nothing is being renewed, and nothing
         # needs to be.
-        return await follower.coordinate(), fs_lock.holder(leader.lock_path)
+        waiting = asyncio.ensure_future(follower.coordinate())
+        await asyncio.sleep(1.2)  # several of the follower's deadlines
+        won = waiting.done() and waiting.result() is True
+        waiting.cancel()
+        return won, fs_lock.holder(leader.lock_path)
 
-    gave_up_and_led, breadcrumb = asyncio.run(_run(scenario()))
-    assert gave_up_and_led is True, "the follower should have given up, not won"
+    follower_won, breadcrumb = asyncio.run(_run(scenario()))
+    assert follower_won is False, "the leader lost a claim a held fd cannot lose"
     assert f"pid={os.getpid()}" in breadcrumb, (
         "the lock file must name its holder — that breadcrumb is how a "
         "minutes-long wait is diagnosed instead of looking like a hang")
