@@ -1,61 +1,93 @@
 # How to use a browser using MCP in this workspace
 
-**Short answer: use the `aw__kali__aw__playwright__*` tools.** In this
-workspace they are the only browser automation that actually works. Measured
-live 2026-10-06/07.
+**All four browser MCP families work.** Verified live 2026-10-08 09:16 UTC by
+calling each one:
 
-They drive the `kali-linux` container's own headed Chromium on `DISPLAY=:0`,
-so they depend on nothing else being installed.
+| Tool family | Drives | Verified |
+|---|---|---|
+| `aw__playwright__*` | the shared `aw-app-browser` Chromium over CDP | navigated, returned a snapshot |
+| `aw__devctl_browser__*` | the same shared Chromium | returned title + URL |
+| `aw__mini_browser__browser_*` | the same shared Chromium | navigated, `ok: true` |
+| `aw__kali__aw__playwright__*` | the `kali-linux` container's OWN headed Chromium | works independently of `aw-app-browser` |
+
+`aw-app-browser` **is** installed (`browser`, 0.28.0, Tier-2 container) and
+serves CDP on `aw-app-browser:9223` (measured: `Chrome/154.0.8037.57`).
+
+## Which to pick
+
+- **`aw__playwright__*`** for most automation — it returns an accessibility
+  snapshot with a `ref` per element, so you target elements by `ref` instead
+  of pixel coordinates.
+- **`aw__kali__aw__playwright__*`** when you need isolation from whatever
+  else is using the shared browser, or a session that persists independently.
+  It has its own Chromium, so it is unaffected by `aw-app-browser`'s state.
+- **`aw__devctl_browser__*` / `aw__mini_browser__*`** for quick coordinate
+  clicks, JS eval/inject, and screenshots against the shared browser.
+
+Note the three shared-browser families all pilot the **same** Chromium — a
+navigation through one is visible to the others. That is a feature when you
+want it and a surprise when you don't.
 
 ## The recipe
 
-1. **Go somewhere** — `aw__kali__aw__playwright__browser_navigate` with a URL.
-2. **See the page** — `browser_snapshot` returns the accessibility tree with a
-   `ref` for every element; prefer it over `browser_take_screenshot`, which is
-   for showing a human what the page looks like.
+1. **Go somewhere** — `browser_navigate` with a URL.
+2. **See the page** — `browser_snapshot` (accessibility tree with `ref`s) for
+   acting on; `browser_take_screenshot` for showing a human.
 3. **Act** — `browser_click`, `browser_type`, `browser_fill_form`,
    `browser_press_key`, `browser_select_option`, `browser_hover`,
-   `browser_drag` / `browser_drop`, `browser_file_upload`. Target elements by
-   the `ref` from the snapshot, not by pixel coordinates.
-4. **Read results** — `browser_evaluate` to run JS in the page,
-   `browser_console_messages` for console output,
-   `browser_network_requests` for what the page actually fetched.
-5. **Wait** — `browser_wait_for` on text appearing or disappearing, rather
-   than sleeping.
+   `browser_drag` / `browser_drop`, `browser_file_upload`.
+4. **Read results** — `browser_evaluate` to run JS,
+   `browser_console_messages`, `browser_network_requests`.
+5. **Wait** — `browser_wait_for` on text appearing or disappearing, not sleeps.
 6. **Tabs and teardown** — `browser_tabs`, then `browser_close`.
 
-The session is persistent between calls, so a login survives into the next
-call. A Google session was already signed in when this was measured.
+## The real trap: a CDP error does NOT mean the app is missing
 
-## Every other browser MCP here fails at call time
+If a browser tool fails with
 
-`aw-app-browser` is **not installed** in this workspace — `aw-workspace-cli
-apps` lists `proxy`, `kali-linux`, `devctl`, `mini-browser`, and no `browser`.
-Every other browser MCP is a CDP *client* of that missing container, so they
-fail when called, not when discovered:
+```
+aw-app-browser not reachable over CDP (:9223) and could not be started
+```
 
-| Tool family | Result when called |
-|---|---|
-| `aw__kali__aw__playwright__*` | **works** — the Kali container's own Chromium |
-| `aw__mini_browser__browser_*` | `aw-app-browser not reachable over CDP (:9223) and could not be started` |
-| `aw__devctl_browser__browser_*` | same — points at the same absent container |
-| `aw__playwright__*` (top level) | configured against `aw-app-browser`'s CDP endpoint; unreachable |
+the overwhelmingly likely cause is a **stale gateway upstream**, not a
+missing app. The MCP gateway holds long-lived upstream connections; when one
+goes bad it keeps serving the tool name while every call fails. `doctor` says
+so, in these words:
 
-## The trap: a listed tool is not a working tool
+```
+an upstream the gateway failed to connect to serves zero tools
+until a reload; the runtime re-checks every 60s
+```
 
-The gateway's `tools/list` reports a tool whenever its MCP *server* is up. It
-says nothing about whether that server's *backend* exists. `mini-browser` and
-`devctl` are installed and answer fine — they just have nothing to drive. So
-a populated tool list is not evidence of capability, and neither is a green
-`doctor`. `aw-workspace-cli apps` is the authoritative check.
+The fix is `aw-workspace-cli restart mcp-gateway`. Be aware it blinds every
+agent session's MCP client for ~1 minute, so say so before doing it.
 
-## Why searching the knowledge base did not answer this
+**Diagnose in this order, cheapest first:**
 
-The knowledge base documents **code**, not **reachability**. Asking it how to
-use a browser over MCP returns the implementations (`devctl_browser.py`,
-`mini_browser_browser.py`) and the gateway architecture — all correct, all
-useless for picking a tool that answers. It is a map, not a dial tone. When a
-task depends on a backend being alive, check the app list and make one cheap
-live call before building on it.
+1. `aw-workspace-cli apps` — read the whole list, not a grep.
+2. `docker ps | grep aw-app-browser` — is the container actually up?
+3. From inside the gateway container, hit the CDP endpoint directly:
+   `urllib.request.urlopen("http://aw-app-browser:9223/json/version")`.
+4. Only then conclude anything about the app being absent.
 
-See also: the `aw-kali-linux` skill (v0.17.0+) carries the same table.
+## A cautionary tale — this document used to say the opposite
+
+On 2026-10-07 these three shared-browser families were measured **failing**
+with exactly that CDP error, and this runbook (plus the `aw-kali-linux`
+skill, v0.17.0) concluded that `aw-app-browser` was **not installed** and
+that the Kali tools were the only ones that worked.
+
+That was wrong. The app was installed and its container had been `Up` for
+16 hours — spanning the entire measurement. The failures were the stale
+gateway upstream above, and a `restart mcp-gateway` on 2026-10-08 brought all
+three back. The false conclusion came from inferring "not installed" from a
+tool error plus a misread of `aw-workspace-cli apps` — while that same
+document asserted `apps` was "the authoritative check".
+
+The transferable lesson is not about browsers:
+
+- A tool erroring is evidence about **one call path**, not about what exists.
+- `tools/list` showing a tool proves its MCP server is up, nothing more.
+- But the inverse trap is just as real: a tool **failing** does not prove its
+  backend is absent. Check the container and the endpoint before writing
+  anything down.
