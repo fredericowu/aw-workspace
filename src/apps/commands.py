@@ -335,8 +335,44 @@ class CommandInstaller:
             with self._heal_guard:
                 self._healing.discard(key)
 
+    def _installer_env(self) -> dict[str, str]:
+        """Environment for an installer/revert script.
+
+        Adds ``AW_BIN_DIR`` — the persistent, already-on-PATH bin dir
+        (``<AW_WORKSPACE_HOME>/bin``, see ``paths.bin_dir``) — so a script
+        that drops a binary puts it somewhere that SURVIVES A CONTAINER
+        RECREATE.
+
+        Why this exists (measured on this host 2026-10-08): the install
+        scripts hardcoded ``/usr/local/bin``, which lives in the container's
+        own writable layer, not the host bind mount. Every workspace Update
+        recreates the container, so terraform/node/go/pnpm/yarn/brew/cursor
+        and friends were WIPED and re-downloaded from the internet on the
+        next boot — while the Apps panel sat empty. The scripts already
+        guard with "if the binary is here and the version matches, skip",
+        and that guard was dead on arrival because the binary could never
+        still be there.
+
+        It compounds with ``_run``'s global installer lock: every installer
+        in the workspace runs strictly one at a time (concurrent apt/dpkg
+        corrupts), so each avoidable download sits on the critical path of
+        every app behind it. Turning a 60s download into a 0.2s version
+        check is removing it from a serial queue, not from a parallel pool.
+
+        Scripts opt in with ``AW_BIN_DIR="${AW_BIN_DIR:-/usr/local/bin}"``,
+        so an app that has not adopted it behaves exactly as before. This
+        does NOT help apt-based installers (gcloud, git, gh, python, ...) —
+        those write to system dirs this cannot redirect, and they need the
+        packages baked into the image instead. See the KB note.
+        """
+        env = dict(os.environ)
+        env["AW_BIN_DIR"] = paths.bin_dir()
+        return env
+
     def _run_subprocess(self, cmd: list[str], *, cwd: str | None,
-                         timeout: float) -> subprocess.CompletedProcess:
+                         timeout: float,
+                         env: dict[str, str] | None = None,
+                         ) -> subprocess.CompletedProcess:
         """``subprocess.run``-alike, except the whole process TREE is killed
         on timeout instead of just the direct child.
 
@@ -353,6 +389,7 @@ class CommandInstaller:
         """
         with subprocess.Popen(
             cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=env,
         ) as proc:
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)
@@ -385,7 +422,9 @@ class CommandInstaller:
                 f"anyway alongside another worker's package manager is what "
                 f"corrupts an apt/dpkg install.")
         try:
-            proc = self._run_subprocess(["bash", path], cwd=package_dir, timeout=self.timeout)
+            proc = self._run_subprocess(["bash", path], cwd=package_dir,
+                                         timeout=self.timeout,
+                                         env=self._installer_env())
         except subprocess.TimeoutExpired:
             raise CommandError(f"{what} {script!r} timed out after {self.timeout:.0f}s")
         finally:
