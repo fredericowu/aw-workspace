@@ -74,34 +74,6 @@ ARG AW_IMAGE_PROFILE=default
 COPY image /opt/aw-workspace-image
 RUN bash /opt/aw-workspace-image/bake.sh "$AW_IMAGE_PROFILE"
 
-# nvm lives on the HOST MOUNT, and interactive shells have to be told so by
-# the image — not by ~/.profile.
-#
-# src/apps/paths.py:nvm_dir() moves NVM_DIR under AW_WORKSPACE_HOME so nvm,
-# node and every `npm install -g` package survive a container recreate (see
-# that docstring for the 577s this cost per boot). That alone would have
-# broken terminals in a way that takes a while to notice:
-#
-#   * nvm's own installer writes `export NVM_DIR=...` into ~/.profile, which
-#     lives in the container layer and dies with every recreate.
-#   * install_nvm.sh exits early when $NVM_DIR/nvm.sh already exists — and
-#     once nvm is on the host mount it ALWAYS exists. So the installer would
-#     never run again, and therefore never rewrite the profile.
-#
-# Net effect without this file: nvm persists perfectly and no interactive
-# shell can find it. Putting the export in /etc/profile.d ties it to the
-# IMAGE, which is rebuilt on every release, instead of to a dotfile that is
-# deleted on every recreate.
-#
-# The fallback mirrors paths.py's own (DEFAULT_WORKSPACE_CONTAINER_DIR), so
-# the two cannot drift apart silently; `.` is guarded because a workspace
-# that has not installed nvm yet must still get a working shell.
-RUN printf '%s\n' \
-        'export NVM_DIR="${AW_WORKSPACE_HOME:-/opt/aw-workspace/.aw-workspace}/nvm"' \
-        '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"' \
-        > /etc/profile.d/aw-nvm.sh \
-    && chmod 0644 /etc/profile.d/aw-nvm.sh
-
 # `ubuntu` user (UID/GID 1001, standard Ubuntu first-user convention) — this
 # is now the container's DEFAULT user (see `USER ubuntu` below), not just an
 # opt-in option. Every process (the app itself, `docker exec`/terminal

@@ -367,7 +367,6 @@ class CommandInstaller:
         """
         env = dict(os.environ)
         env["AW_BIN_DIR"] = paths.bin_dir()
-        env["NVM_DIR"] = paths.nvm_dir()
         return env
 
     def _run_subprocess(self, cmd: list[str], *, cwd: str | None,
