@@ -48,6 +48,81 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
+# System CLIs that apps install at runtime, baked here instead — the same
+# trade Chromium's libraries above already make, for the same reason, and
+# measured on the aw host 2026-10-09.
+#
+# Every workspace Update recreates the container, and these packages live in
+# the container's writable layer, so each one was re-downloaded on the next
+# boot. They do not merely cost their own time: CommandInstaller._run holds
+# ONE global flock around every installer script in the workspace (concurrent
+# apt/dpkg corrupts), so the installs are strictly serial and each sits on
+# the critical path of every app queued behind it. The boot reconcile blew
+# its 1200s budget on two consecutive boots because of this, leaving the Apps
+# panel empty for 20+ minutes.
+#
+# Measured cost of what is baked here: ffmpeg alone took 311s (sampled live),
+# and the rest ~30s each. Baking makes them free, because each app's
+# installer already opens with a guard — `if command -v gh; then echo
+# "already installed"; exit 0` — that could never fire while the binary was
+# wiped on every recreate. The guards are unchanged and still the fallback
+# for a workspace on an older image; this just lets them win.
+#
+# NOT baked, deliberately: awscli (133s), gcloud (210s) and docker. They are
+# the expensive ones in IMAGE size — gcloud alone is ~1GB — so they are a
+# size-vs-boot trade to decide with usage data, not a default. Their
+# installers are untouched and keep working exactly as today.
+#
+# Package names verified against this exact base (python:3.12-slim = Debian
+# 13 trixie) by running apt-cache in it, not copied from a shell's memory —
+# the Chromium block above says why that matters.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        vim telnet netcat-openbsd iputils-ping rsync openssh-client ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# `gh` is not in Debian — it ships from GitHub's own apt repo, so baking it
+# means reproducing the keyring + source list that aw-app-git's install_gh.sh
+# does at runtime. Worth the extra layer: `gh` is used by the git app on
+# essentially every workspace, and the runtime path pays an apt-get update
+# against a third-party repo on every single container recreate.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates gpg \
+    && mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# nvm lives on the HOST MOUNT, and interactive shells have to be told so by
+# the image — not by ~/.profile.
+#
+# src/apps/paths.py:nvm_dir() moves NVM_DIR under AW_WORKSPACE_HOME so nvm,
+# node and every `npm install -g` package survive a container recreate (see
+# that docstring for the 577s this cost per boot). That alone would have
+# broken terminals in a way that takes a while to notice:
+#
+#   * nvm's own installer writes `export NVM_DIR=...` into ~/.profile, which
+#     lives in the container layer and dies with every recreate.
+#   * install_nvm.sh exits early when $NVM_DIR/nvm.sh already exists — and
+#     once nvm is on the host mount it ALWAYS exists. So the installer would
+#     never run again, and therefore never rewrite the profile.
+#
+# Net effect without this file: nvm persists perfectly and no interactive
+# shell can find it. Putting the export in /etc/profile.d ties it to the
+# IMAGE, which is rebuilt on every release, instead of to a dotfile that is
+# deleted on every recreate.
+#
+# The fallback mirrors paths.py's own (DEFAULT_WORKSPACE_CONTAINER_DIR), so
+# the two cannot drift apart silently; `.` is guarded because a workspace
+# that has not installed nvm yet must still get a working shell.
+RUN printf '%s\n' \
+        'export NVM_DIR="${AW_WORKSPACE_HOME:-/opt/aw-workspace/.aw-workspace}/nvm"' \
+        '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"' \
+        > /etc/profile.d/aw-nvm.sh \
+    && chmod 0644 /etc/profile.d/aw-nvm.sh
+
 # `ubuntu` user (UID/GID 1001, standard Ubuntu first-user convention) — this
 # is now the container's DEFAULT user (see `USER ubuntu` below), not just an
 # opt-in option. Every process (the app itself, `docker exec`/terminal

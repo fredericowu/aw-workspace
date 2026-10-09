@@ -46,6 +46,32 @@ def test_installer_env_points_at_the_persistent_bin_dir():
     assert env["AW_BIN_DIR"] != "/usr/local/bin"
 
 
+def test_installer_env_points_nvm_at_the_persistent_dir():
+    """The biggest single cost in a boot. nvm defaults to $HOME/.nvm —
+    /home/ubuntu/.nvm here, i.e. the CONTAINER layer — so a recreate wiped
+    nvm, node and every npm -g package (claude/codex/copilot/cursor):
+    577s for code-agent-clis alone, plus node's share of essentials, all
+    serialized behind the global installer lock.
+
+    AW_BIN_DIR does not cover it: the persisted `claude` symlink points
+    INTO $NVM_DIR, so after a recreate it survives pointing at nothing."""
+    env = CommandInstaller()._installer_env()
+
+    assert env["NVM_DIR"] == paths.nvm_dir()
+    assert env["NVM_DIR"].startswith(paths.workspace_home())
+    assert not env["NVM_DIR"].startswith("/home/"), (
+        "NVM_DIR under $HOME is the container's writable layer — the whole "
+        "point is that it must outlive a container recreate"
+    )
+
+
+def test_nvm_and_bin_dirs_are_distinct():
+    """Sharing one dir would let nvm's own tree collide with the shims the
+    command facade drops into bin/."""
+    env = CommandInstaller()._installer_env()
+    assert env["NVM_DIR"] != env["AW_BIN_DIR"]
+
+
 def test_installer_env_keeps_the_rest_of_the_environment():
     """A script still needs PATH, HOME, proxy vars and the rest — this adds
     one variable, it does not replace the environment."""

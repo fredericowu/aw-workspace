@@ -143,6 +143,42 @@ def bin_dir() -> str:
     return d
 
 
+def nvm_dir() -> str:
+    """Where nvm — and therefore node, npm and every ``npm install -g``
+    package — is installed.
+
+    Under ``AW_WORKSPACE_HOME`` (host-mounted) rather than nvm's own default
+    of ``$HOME/.nvm``, which on this image is ``/home/ubuntu/.nvm``: the
+    CONTAINER's writable layer. Every workspace Update recreates the
+    container, so nvm, node and all four agent CLIs (claude, codex, copilot,
+    cursor) were wiped and reinstalled from scratch on the next boot.
+
+    This was the single most expensive thing in a boot, measured on the aw
+    host 2026-10-09: the code-agent-clis app alone spent 577s, plus node's
+    share of essentials' 320s — and all of it serialized behind
+    ``CommandInstaller._run``'s global installer flock, so it delayed every
+    app queued behind it too.
+
+    ``AW_BIN_DIR`` does NOT cover this. It persists the ``claude`` symlink,
+    but the symlink's target lives inside ``$NVM_DIR``, so after a recreate
+    the link survives pointing at nothing, ``[ -x ... ]`` follows it and
+    fails, and the installer re-runs anyway.
+
+    Costs nothing on the app side: ``install_nvm.sh``, ``install_node.sh``,
+    ``install_codex.sh`` and ``install_copilot.sh`` already open with
+    ``NVM_DIR="${NVM_DIR:-$HOME/.nvm}"``, so exporting it is all that was
+    ever needed — no app release involved, and an app that somehow ignores
+    it keeps today's behaviour.
+
+    Migration is self-healing and one-time: a workspace whose nvm is still at
+    the old path simply has it reinstalled once at the new one, by the same
+    installer that would have reinstalled it on the next recreate anyway.
+    """
+    d = os.path.join(workspace_home(), "nvm")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def secrets_dir() -> str:
     d = os.path.join(workspace_home(), "secrets")
     os.makedirs(d, mode=0o700, exist_ok=True)
