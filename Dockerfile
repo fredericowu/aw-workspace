@@ -48,52 +48,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
-# System CLIs that apps install at runtime, baked here instead — the same
-# trade Chromium's libraries above already make, for the same reason, and
-# measured on the aw host 2026-10-09.
+# System CLIs that apps install at runtime, pre-provisioned here instead —
+# the same trade the Chromium library block above already makes, and measured
+# on the aw host 2026-10-09.
 #
-# Every workspace Update recreates the container, and these packages live in
-# the container's writable layer, so each one was re-downloaded on the next
-# boot. They do not merely cost their own time: CommandInstaller._run holds
-# ONE global flock around every installer script in the workspace (concurrent
-# apt/dpkg corrupts), so the installs are strictly serial and each sits on
-# the critical path of every app queued behind it. The boot reconcile blew
-# its 1200s budget on two consecutive boots because of this, leaving the Apps
-# panel empty for 20+ minutes.
+# WHAT goes in is declared in image/baked.json, not here. That file carries
+# the rule that decides it (only the CONTAINER layer can be baked; anything
+# under /opt/aw-workspace is a host mount the image cannot reach) and the
+# measured cost of each entry. Changing the image's contents — or adding a
+# profile for a future workspace template — is then editing data and flipping
+# AW_IMAGE_PROFILE, not rewriting Dockerfile layers.
 #
-# Measured cost of what is baked here: ffmpeg alone took 311s (sampled live),
-# and the rest ~30s each. Baking makes them free, because each app's
-# installer already opens with a guard — `if command -v gh; then echo
-# "already installed"; exit 0` — that could never fire while the binary was
-# wiped on every recreate. The guards are unchanged and still the fallback
-# for a workspace on an older image; this just lets them win.
+# Why it matters here: a workspace Update recreates the container, so these
+# land in the writable layer and were re-downloaded on every boot. Worse than
+# per-app waste, because CommandInstaller._run holds ONE global flock around
+# every installer script (concurrent apt/dpkg corrupts) — the installs are
+# strictly serial, so each sits on the critical path of every app behind it.
+# The boot reconcile blew its 1200s budget on two consecutive boots.
 #
-# NOT baked, deliberately: awscli (133s), gcloud (210s) and docker. They are
-# the expensive ones in IMAGE size — gcloud alone is ~1GB — so they are a
-# size-vs-boot trade to decide with usage data, not a default. Their
-# installers are untouched and keep working exactly as today.
-#
-# Package names verified against this exact base (python:3.12-slim = Debian
-# 13 trixie) by running apt-cache in it, not copied from a shell's memory —
-# the Chromium block above says why that matters.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        vim telnet netcat-openbsd iputils-ping rsync openssh-client ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-
-# `gh` is not in Debian — it ships from GitHub's own apt repo, so baking it
-# means reproducing the keyring + source list that aw-app-git's install_gh.sh
-# does at runtime. Worth the extra layer: `gh` is used by the git app on
-# essentially every workspace, and the runtime path pays an apt-get update
-# against a third-party repo on every single container recreate.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates gpg \
-    && mkdir -p -m 755 /etc/apt/keyrings \
-    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
-    && rm -rf /var/lib/apt/lists/*
+# Each app's installer already opens with a guard ("if command -v gh; then
+# echo already installed; exit 0") that could never fire while the binary was
+# wiped on every recreate. Nothing about the guards changes; baking just lets
+# them win, and they stay the fallback for a workspace on an older image.
+ARG AW_IMAGE_PROFILE=default
+COPY image /opt/aw-workspace-image
+RUN bash /opt/aw-workspace-image/bake.sh "$AW_IMAGE_PROFILE"
 
 # nvm lives on the HOST MOUNT, and interactive shells have to be told so by
 # the image — not by ~/.profile.

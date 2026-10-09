@@ -1,0 +1,84 @@
+{
+  "$comment": [
+    "O que a IMAGEM do workspace pré-provisiona, por perfil.",
+    "",
+    "REGRA QUE DEFINE ESTE ARQUIVO: só entra aqui o que vive na CAMADA DO",
+    "CONTAINER. Tudo sob /opt/aw-workspace é bind mount do host e a imagem",
+    "não o alcança — apps/ é explicitamente excluído do syncWorkspaceSource",
+    "(aw-remote-host), e .aw-workspace/ é estado de runtime. Logo:",
+    "",
+    "  apt, e binários soltos em /usr/local  -> ASSAR AQUI",
+    "  npm -g, venvs, bundles de app         -> NÃO assar: resolver com",
+    "                                           persistência (NVM_DIR,",
+    "                                           AW_BIN_DIR, .data no fetch)",
+    "",
+    "Por isso code-agent-clis e agents-platform-runners NÃO estão aqui: o",
+    "primeiro instala via npm -g dentro do NVM_DIR (que agora vive no host",
+    "mount, então a imagem não pode semeá-lo) e o segundo monta um venv sob",
+    "apps/<id>/.data. Assar qualquer um dos dois seria trabalho jogado fora",
+    "no primeiro recreate.",
+    "",
+    "CADA ENTRADA PRECISA CASAR COM A GUARDA DO INSTALADOR DA APP. Os scripts",
+    "abrem com 'if command -v X; then exit 0'. Se a imagem instalar um X que a",
+    "guarda não reconheça (nome errado, versão diferente da pinada), a guarda",
+    "falha, o instalador roda assim mesmo e o bake vira peso morto silencioso.",
+    "test_baked_manifest.py cobre o lado estrutural disso."
+  ],
+
+  "profiles": {
+    "default": [
+      "essentials",
+      "git",
+      "ssh",
+      "playwright-record",
+      "aws",
+      "google-cloud"
+    ]
+  },
+
+  "apps": {
+    "essentials": {
+      "why": "vim/telnet/nc/ping ~30s cada, serializados atrás do lock global",
+      "apt": ["vim", "telnet", "netcat-openbsd", "iputils-ping"]
+    },
+    "git": {
+      "why": "gh não existe no Debian; o runtime paga apt-get update num repo de terceiro a cada recreate",
+      "apt": ["gh"],
+      "apt_repo": "github-cli"
+    },
+    "ssh": {
+      "why": "~30s cada",
+      "apt": ["rsync", "openssh-client"]
+    },
+    "playwright-record": {
+      "why": "311s medidos por amostragem direta — o maior item de apt",
+      "apt": ["ffmpeg"]
+    },
+    "aws": {
+      "why": "133s. NÃO é apt: zip oficial awscli-exe, mesmo --bin-dir/--install-dir que install_aws.sh usa, senão a guarda 'command -v aws' não encontra",
+      "installer": "awscli-v2"
+    },
+    "google-cloud": {
+      "why": "210s. ~1GB de imagem — decisão explícita de Frederico 2026-10-09 de aceitar o tamanho em troca do boot",
+      "apt": ["google-cloud-cli"],
+      "apt_repo": "google-cloud"
+    }
+  },
+
+  "apt_repos": {
+    "github-cli": {
+      "key_url": "https://cli.github.com/packages/githubcli-archive-keyring.gpg",
+      "keyring": "/etc/apt/keyrings/githubcli-archive-keyring.gpg",
+      "key_is_armored": false,
+      "list": "/etc/apt/sources.list.d/github-cli.list",
+      "repo": "https://cli.github.com/packages stable main"
+    },
+    "google-cloud": {
+      "key_url": "https://packages.cloud.google.com/apt/doc/apt-key.gpg",
+      "keyring": "/usr/share/keyrings/cloud.google.gpg",
+      "key_is_armored": true,
+      "list": "/etc/apt/sources.list.d/google-cloud-sdk.list",
+      "repo": "https://packages.cloud.google.com/apt cloud-sdk main"
+    }
+  }
+}
