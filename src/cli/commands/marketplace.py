@@ -4,6 +4,7 @@ Apps SPA uses (see ``src/apps/routes.py``)."""
 from __future__ import annotations
 
 import argparse
+import os
 import time
 
 from src.cli import local_client
@@ -12,7 +13,23 @@ COMMAND = "marketplace"
 DESCRIPTION = "Install or update apps from the marketplace catalog"
 
 _POLL_INTERVAL = 1.0
-_POLL_TIMEOUT = 180.0
+
+#: Quanto esperar um install terminar, do lado do CLIENTE.
+#:
+#: Era 180s, mais curto que a espera do SERVIDOR, o que tornava o timeout
+#: inevitável em vez de excepcional. ``CommandInstaller._run``
+#: (``src/apps/commands.py``) segura um flock global em volta de TODO script
+#: de instalador do workspace — apt/dpkg concorrentes corrompem — e espera
+#: por ele até ``DEFAULT_TIMEOUT`` (600s) + ``INSTALLER_LOCK_MARGIN_S``
+#: (120s). Isso é 720s por SCRIPT, e uma app como essentials roda uma dezena
+#: deles. O cliente desistia antes do servidor sequer parar de esperar.
+#:
+#: Visto em 2026-10-09: ``marketplace update-all`` com 8 apps timed out em
+#: todas as 8. Não é um valor que possa ficar menor que o orçamento do
+#: servidor; se aquelas constantes subirem, esta precisa subir junto. Não são
+#: importadas daqui de propósito — ``src.apps.commands`` puxa a stack do
+#: FastAPI, e este CLI roda de um container irmão magro.
+_POLL_TIMEOUT = float(os.environ.get("AW_MARKETPLACE_POLL_TIMEOUT_S", "1800"))
 
 # Always force a fresh fetch of the merged catalog. The server caches it behind
 # an in-memory TTL (``src/apps/catalog.py::get_catalog``), so a CLI install run
@@ -210,10 +227,34 @@ def _update_all() -> int:
 
     order = _dependency_order(outdated)
     print(f"updating {len(order)} outdated app(s) in dependency order: {', '.join(order)}")
-    failed = [slug for slug in order if _update_one(slug) != 0]
 
-    if failed:
-        print(f"done — {len(order) - len(failed)} ok, {len(failed)} failed: {', '.join(failed)}")
+    # Sequencial E com parada na primeira que não concluir. Os installers de
+    # TODAS as apps serializam num único flock global
+    # (``CommandInstaller._run``), então disparar a próxima enquanto a
+    # anterior ainda roda não paraleliza nada: só empilha na fila, deixa cada
+    # uma mais lenta e garante o timeout da seguinte. Foi exatamente a
+    # cascata vista em 2026-10-09, com as 8 apps "falhando" em sequência por
+    # causa da primeira. A ordem é de dependência, então seguir em frente
+    # depois de uma incompleta é pior ainda — instala o dependente antes da
+    # dependência.
+    done = 0
+    stopped_at: str | None = None
+    for i, slug in enumerate(order):
+        if _update_one(slug) == 0:
+            done += 1
+            continue
+        stopped_at = slug
+        remaining = order[i + 1:]
+        if remaining:
+            print(f"parando aqui — {len(remaining)} app(s) não tentada(s): "
+                  f"{', '.join(remaining)}")
+            print("  os installers de todas as apps compartilham um lock, "
+                  "então enfileirar as próximas agora só deixaria tudo mais "
+                  "lento. Rode de novo quando esta terminar.")
+        break
+
+    if stopped_at is not None:
+        print(f"done — {done} de {len(order)} ok, parou em: {stopped_at}")
         return 1
     print(f"done — all {len(order)} app(s) up to date")
     return 0
@@ -249,5 +290,10 @@ def _poll_until_done(app_id: str) -> bool:
                 print(f"{app_id}: failed — {body.get('error')}")
                 return False
         time.sleep(_POLL_INTERVAL)
-    print(f"{app_id}: timed out waiting for the install job to finish")
+    # NÃO é "falhou". O job vive no servidor e segue rodando depois que
+    # paramos de olhar — dizer o contrário fez um update-all inteiro parecer
+    # oito falhas quando na verdade era uma fila.
+    print(f"{app_id}: ainda instalando depois de {_POLL_TIMEOUT:.0f}s — o job "
+          f"continua no servidor, parei só de acompanhar.")
+    print(f"  acompanhe com: aw-workspace-cli marketplace info")
     return False
