@@ -42,6 +42,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -650,8 +651,70 @@ class Reconciler:
 
     # ---- resolve a package dir for a spec (fetch unless already on disk) ----
 
+    #: A ``ref`` we can compare against an installed ``aw-app.json`` version.
+    #: Deliberately strict: ``HEAD``, a branch or a bare sha carries no version
+    #: to match, so it must always fall through to a real fetch.
+    _VERSION_REF = re.compile(r"^v?\d+(\.\d+)*$")
+
+    @staticmethod
+    def _same_version(ref: str | None, installed: str | None) -> bool:
+        if not ref or not installed:
+            return False
+        if not Reconciler._VERSION_REF.match(ref.strip()):
+            return False
+        return ref.strip().lstrip("v") == str(installed).strip().lstrip("v")
+
+    def _package_dir_if_current(self, spec: AppSpec) -> str | None:
+        """The on-disk package dir when it is ALREADY the version ``spec``
+        wants — otherwise ``None``, meaning "fetch it".
+
+        Why this exists. Every boot re-fetched every app unconditionally: the
+        only skip in the whole path is ``already-loaded``, which is in-process
+        and therefore empty on a fresh process. Measured on the aw host
+        2026-10-09, that is not merely a wasted download — ``fetch_app_repo``
+        replaces the package dir by ``os.replace``, so it takes the app's own
+        ``.data`` with it. The google-workspace-mcp venv (246s) and the
+        codegraph bundle (98s) were rebuilt from scratch on every single boot,
+        and both sit behind ``CommandInstaller._run``'s global installer lock,
+        delaying every app queued behind them.
+
+        It is also what makes an app shippable IN the image at all: a fresh
+        workspace is seeded from the image by ``podman cp`` (aw-remote-host's
+        bootstrap/workspace/install.sh), and without this check the first
+        reconcile would throw that seed away and re-download it.
+
+        **The rule is by VERSION, not by presence**, and the difference
+        matters: keeping a ``.data`` built for v1 while serving v2 is worse
+        than rebuilding it. So a version change still takes the normal fetch
+        path, whose rename-swap wipes ``.data`` — which is exactly the
+        behaviour wanted there, and comes for free.
+
+        Integrity: ``fetch_app_repo`` only ever publishes a package dir via an
+        atomic rename, so a dir that exists is a complete tree, not a
+        half-written one. A missing or unparseable ``aw-app.json`` is still
+        treated as absent rather than trusted — that is the one state this
+        can see that the rename cannot rule out.
+        """
+        if not spec.repo:
+            return None
+        dest = fetch_mod.package_dir_for(spec.app_id)
+        manifest = os.path.join(dest, "aw-app.json")
+        try:
+            with open(manifest, encoding="utf-8") as f:
+                installed = json.load(f).get("version")
+        except (OSError, ValueError):
+            return None
+        if not self._same_version(spec.ref, installed):
+            return None
+        log.info("apps: %s already on disk at %s — skipping the fetch",
+                 spec.app_id, installed)
+        return dest
+
     def _resolve_package_dir(self, spec: AppSpec) -> str:
         if spec.repo:
+            current = self._package_dir_if_current(spec)
+            if current is not None:
+                return current
             return self._fetch(spec.repo, spec.ref, slug=spec.app_id)
         if spec.package_dir and os.path.isdir(spec.package_dir):
             return spec.package_dir
