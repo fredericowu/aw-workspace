@@ -395,6 +395,35 @@ class DbFacade(_Facade):
         return self._ctx._runtime.db_tables.session(self._ctx.app_id, metadata)
 
 
+class StateFacade(_Facade):
+    """``ctx.state`` — an app's own cross-worker state: a TTL'd kv registry,
+    a named lease, and a topic broadcast. Gated by ``state:own``.
+
+    Exactly three sub-namespaces, each capability-checking itself (defence
+    in depth, same as every other facade's methods): ``kv``/``broadcast``
+    are Redis-backed and degrade open; ``lease`` is flock-backed
+    (``src/apps/fs_lock.py``) and has no degrade mode. See
+    ``src/apps/state_facade.py`` and ``docs/design/app-shared-state-facade.md``
+    (+ §11 amendment, 2026-10-09 — lease is flock-backed, not Redis-backed).
+    """
+
+    def __init__(self, ctx: "AppContext") -> None:
+        super().__init__(ctx)
+        from src.apps.state_facade import _BroadcastNamespace, _KvNamespace, _LeaseNamespace
+        self.kv = _KvNamespace(ctx)
+        self.broadcast = _BroadcastNamespace(ctx)
+        self.lease = _LeaseNamespace(ctx)
+        ctx.on_deactivate(self.lease.release_all)
+        ctx.on_deactivate(self.broadcast.aclose)
+
+    @property
+    def degraded(self) -> bool:
+        """kv/broadcast only — lease (flock) has no degrade mode."""
+        self._ctx._enforce("state:own")
+        from src.apps.state_facade import breaker_status
+        return breaker_status()["degraded"]
+
+
 class WatchdogFacade(_Facade):
     """``ctx.watchdog`` — register in-process periodic (watchdog) tasks.
 
@@ -555,6 +584,7 @@ _FACADES: dict[str, tuple[str, type[_Facade]]] = {
     "watchdog:tasks":   ("watchdog", WatchdogFacade),
     "notifications:send": ("notify", NotificationsFacade),
     "containers:manage": ("containers", ContainersFacade),
+    "state:own":         ("state", StateFacade),
 }
 
 
@@ -645,6 +675,10 @@ class AppContext:
     @property
     def containers(self) -> ContainersFacade:
         return self._get_facade("containers", "containers:manage")  # type: ignore[return-value]
+
+    @property
+    def state(self) -> StateFacade:
+        return self._get_facade("state", "state:own")  # type: ignore[return-value]
 
     def on_deactivate(self, hook: Callable[[], Awaitable[None] | None]) -> None:
         """Register a callback run on unload (e.g. cancel a long-poll/WS)."""

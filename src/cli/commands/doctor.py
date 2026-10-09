@@ -49,6 +49,7 @@ def run(args: list[str]) -> int:
     problems += _mcp(report.get("mcp") or {})
     problems += _redis(report.get("redis") or {})
     problems += _vault(report.get("vault") or {})
+    problems += _state_facade(report.get("state_facade") or {})
 
     print()
     if problems:
@@ -257,6 +258,29 @@ def _redis(section: dict) -> int:
     print(f"Redis (redis_coord) — ✗ unreachable at {url}")
     print(f"      {section.get('note', '')}")
     return 1
+
+
+def _state_facade(section: dict) -> int:
+    """``ctx.state`` (app-shared-state-facade.md). Not folded into ``ok``
+    (see the server-side note) — same posture as ``redis`` above, for the
+    same reason: zero migrated consumers today. A bypass hit DOES count as
+    a problem — it's a real violation of the capability boundary, not a
+    dead end waiting for a consumer."""
+    print()
+    if not section:
+        print("ctx.state facade — no report from the server")
+        return 0
+    if section.get("degraded"):
+        print(f"ctx.state facade — ✗ kv/broadcast DEGRADED since {section.get('since')}")
+    else:
+        print("ctx.state facade — kv/broadcast ok (lease is flock-backed, no degrade mode)")
+    bypass = section.get("bypass") or []
+    if not bypass:
+        return 0
+    print(f"  ✗ {len(bypass)} file(s) importing redis_coord directly, bypassing ctx.state:")
+    for row in bypass:
+        print(f"      {row['app']}: {row['file']}")
+    return len(bypass)
 
 
 def _vault(section: dict) -> int:

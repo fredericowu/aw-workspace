@@ -356,3 +356,63 @@ hand-rolls had:
    and does not flag `aw-app-agents-platform-runners`.
 6. Regression posture per the mutation-test lesson: un-apply the facade in
    the architecture migration card and confirm its cross-worker test fails.
+
+## 11. Amendment (2026-10-09) — `ctx.state.lease` is flock-backed, not Redis-backed
+
+Ruled by the Architect (Agents Platform run `e01007d23e514169bb06d7a5333d1c77`),
+after commit `11b9109` (2026-10-03, three days after this doc was approved)
+deleted `RedisLease` and made every ownership decision in core an
+`fcntl.flock` (`src/apps/fs_lock.py`), on an explicit owner ruling ("for
+defining the leader, it should be flock only, it's not a fallback, it's the
+only logic") and on live evidence: with this Redis unreachable by default,
+degrade-open WAS the behaviour — 45/45 watchdog samples reported no leader,
+and the `RedisLease` multiworker test silently skipped in every environment,
+CI included.
+
+- **`ctx.state.lease` wraps `fs_lock.try_acquire`/`release`, not SET NX PX.**
+  Lock files: `<AW_WORKSPACE_HOME>/locks/apps/<app_id>/<name>.lock` — own
+  subdirectory so an app can never collide with a core lock name or another
+  app's; `<name>` facade-validated (`[a-z0-9_.-]`, no path separators), same
+  discipline as the kv prefix.
+- **API: `claim(name) -> bool` (one-shot, non-blocking), `release(name)`,
+  `is_held(name) -> bool`.** No `ttl`, no `renew`: the held
+  open-file-description IS the liveness proof, dropped by the kernel on
+  exit/crash/kill — accepting a ttl the backend ignores would be an API that
+  lies. `is_held` is an acquire-probe (win → release → False; EAGAIN → True);
+  the microsecond probe hold is documented and matches the flock limitation
+  `service_lease.py`'s docstring already names. Synchronous, not `async` —
+  these are O(1) syscalls, not wrapped in `asyncio.to_thread`.
+- **§6 as applied to lease is void: lease has NO degrade mode.** flock has no
+  reachability failure — EAGAIN is itself the fact that someone holds the
+  lock. `ctx.state.degraded` describes kv/broadcast only. A broken lock dir
+  (read-only, full) raises — a real error, not a degrade path (same ruling
+  as `fs_lock._try_acquire`). Never unlink a lock file (fs_lock.py's rule).
+- **kv and broadcast stay Redis-backed, unchanged** — the line
+  `redis_coord.py`'s docstring draws: messaging/fan-out is genuinely
+  Redis-shaped and degrades to staleness; ownership degrades to "two
+  processes both think they own this" and therefore does not ride Redis.
+- **§8 cross-host argument survives:** `ctx` is in-process only (§8), so
+  every possible lease consumer shares one filesystem by construction. The
+  API carries no transport detail; a future cross-host surface swaps the
+  backend behind the facade.
+- **§10 item 4 amended:** lease is unaffected by Redis state; its
+  multiworker test must RUN in CI, not skip — the deleted `RedisLease`
+  test's silent skip is the cautionary tale.
+
+Rejected: re-deriving SET NX PX + degrade-open (mutual exclusion that is
+fiction by default; the pattern core just excised; a test CI never runs);
+fail-closed Redis (inherits unreachable-by-default → an op that never
+grants); deferring lease (a PO scope change, and unjustified — the flock
+backend is smaller than the Redis one it replaces).
+
+Implementation risks flagged alongside the ruling:
+
+1. **Release on the app's deactivate.** A held fd surviving an app reload
+   strands the lease in a process whose app is no longer active — every
+   facade instance's held fds are released from the app's `on_deactivate`
+   hook.
+2. **`claim` is one-shot and non-blocking** (`fs_lock.try_acquire` —
+   "leadership is decided by one try, not by waiting"). Not wrapped in
+   `to_thread`: two O(1) syscalls, inline on the event loop is correct.
+3. **The lease test follows `test_flock_lease.py` and a real multi-process
+   proof** — no Redis, no skip anywhere, including CI.

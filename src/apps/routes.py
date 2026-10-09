@@ -760,6 +760,22 @@ async def _redis_coord_status() -> dict:
             "note": "redis_coord's resolved Redis answers PING"}
 
 
+def _state_facade_status(runtime) -> dict:
+    """``ctx.state`` (design doc app-shared-state-facade.md §4.3/§6): the
+    kv/broadcast breaker's own degraded snapshot, plus every installed
+    Tier-1 app file that imports ``src.libs.redis_coord`` directly instead
+    of going through the facade — path-based, cheap, not folded into ``ok``
+    for the same reason ``redis`` above isn't: no app has migrated onto the
+    facade yet (each hand-roll is its own follow-up card), so nothing
+    depends on it today. ``lease`` has no degraded state (flock, §11) and
+    is not part of this report.
+    """
+    from src.apps.state_facade import breaker_status, bypass_report
+    status = breaker_status()
+    status["bypass"] = bypass_report(runtime)
+    return status
+
+
 def _vault_env(key: str) -> str:
     """``key`` from the process env, falling back to ``<home>/.env``.
 
@@ -1636,6 +1652,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             expected_versions=mcp_expected_versions)
         redis_status = await _redis_coord_status()
         vault_status = await _vault_status()
+        state_facade_status = _state_facade_status(runtime)
 
         host_offers = hostpower.host_grants()
         host_apps = []
@@ -1693,6 +1710,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             },
             "redis": redis_status,
             "vault": vault_status,
+            "state_facade": state_facade_status,
         }
 
     @app.get("/api/apps/-/catalog")
