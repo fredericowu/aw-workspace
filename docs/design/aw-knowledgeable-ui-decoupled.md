@@ -12,6 +12,11 @@ The request, verbatim (Frederico, Telegram, 28/09):
 > pra falar com o back, react com python, se inspira no design do
 > agents-platform-multitenant"
 
+**Amendment 2026-10-10:** §0's "the visual half stays per-app" clause is
+superseded — Frederico asked for AP-MT's actual look (dark theme + sidebar
+shell). See `aw-knowledgeable-ui-visual-parity.md` (card
+`3f55bf3b-9510-81ca-bba7-d7afe271ac87`). Everything else here stands.
+
 ---
 
 ## 0. The decision, in five sentences someone could disagree with
