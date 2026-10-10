@@ -14,7 +14,8 @@ The request, verbatim (Frederico, Telegram, 28/09):
 
 **Amendment 2026-10-10:** §0's "the visual half stays per-app" clause is
 superseded — Frederico asked for AP-MT's actual look (dark theme + sidebar
-shell). See `aw-knowledgeable-ui-visual-parity.md` (card
+shell), and, in a same-day follow-up, a Dashboard home route at `/` (Library
+moves to `/library`). See `aw-knowledgeable-ui-visual-parity.md` (card
 `3f55bf3b-9510-81ca-bba7-d7afe271ac87`). Everything else here stands.
 
 ---
