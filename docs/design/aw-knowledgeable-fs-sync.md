@@ -414,6 +414,51 @@ acceptable, do not over-optimize. Sequence:
 ~1,873 files, far under the measured 46h-CPU full-corpus cost; most are
 step-2 moves, not uploads.
 
+### 8.1 As built (2026-10-10, card `3f55bf3b-9510-810c-99b4-cc473cd87815`)
+
+The bucket half of §8 shipped as `repos/aw-knowledgeable/scripts/
+collapse_to_main.py` plus the connector retarget in
+`aw-app-knowledgeable/knowledgeable_app/bulk_ingest.py`. The plan above held;
+four things it did not name had to be decided, and are recorded here rather
+than left in a run log:
+
+1. **The `workspace_slug`/`rev` backfill (step 1) was NOT done.** It belongs
+   to §1's path-identity regime, which this card did not ship — nothing reads
+   either property yet, and writing them now would fabricate a `rev: 1` for
+   documents whose next write is still `create_document`, not
+   `upsert_document_by_path`. Left to the card that lands §1.1.
+2. **The Collection spine is torn down and rebuilt, not moved.** A
+   collection's `external_id` hashes its bucket
+   (`_collection_external_id`, §15.1), so a Collection carried along by a
+   bucket move keeps an id nothing recomputes to — a saved anchor would miss
+   it. The script deletes every Collection node in the tenant and lets
+   `ensure_schema()`'s own §15.7 spine backfill rebuild the tree from the
+   surviving documents' `source_path`. §15.1's "nobody human deletes them"
+   holds: the teardown is derived-data GC, not a delete the approval list in
+   §7 should ever see.
+3. **The shared entity layer needed two steps §8 does not mention.** An
+   `(:Entity)` carries no `bucket` (§11.1), so it is neither moved by a
+   bucket move nor removed by deleting the documents that evidenced it.
+   `MENTIONS` from a `(:Chunk)` is its only tie to a document, so the script
+   runs ONE tenant-wide sweep (`delete_orphan_entities`) after every delete
+   — never per-document — and then re-stamps the `ASSERTS` edges left
+   pointing at a torn-down bucket onto `main`, because `ASSERTS` is the one
+   edge type carrying a bucket of its own (§11.1) and
+   `entity_visible_predicate` arm 2 never fires for one stamped at a bucket
+   that no longer exists.
+4. **Empty registry rows are dropped; `default` keeps its row.** Eleven empty
+   `kb-*`/pilot rows in `GET /api/buckets` is the opposite of "one bucket
+   named `main`". `default` is exempt for §2's reason: every tenant
+   implicitly holds it and `mark_bucket_dirty` MERGEs its row back on demand.
+
+Journal (step 4): the `bucket` column is **rewritten** to `main` and the rows
+under the two skip prefixes are **deleted**, both as idempotent DML on every
+journal connect (`_migrate_journal_to_main`). Accepting re-dedup on
+`content_hash` instead was rejected — `run_tick`'s own SELECT filters on that
+column, so a stale value means those rows are simply never picked up again.
+`last_synced_hash` is not set: the column belongs to §3.2's journal
+extension, which this card did not ship.
+
 ---
 
 ## 9. The owner-visibility blocker (`resolve_tenant_id`)
