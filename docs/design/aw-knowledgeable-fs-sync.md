@@ -18,9 +18,12 @@ also anchor it right? If so, let's do both."*
 
 Assumes Postgres as the identity store's destination (the SQLite exit is
 card `3f55bf3b-9510-8124-ae31-d67ea0cc96dd`, same target) — nothing here
-adds new SQLite state on the aw-knowledgeable side. The connector's journal
-stays SQLite: it is per-workspace scratch under `AW_WORKSPACE_HOME/data/`,
-not service state, and the SQLite-exit card does not cover it.
+adds new SQLite state on the aw-knowledgeable side. **Amended 2026-10-10 by
+the SQLite-exit design (`aw-knowledgeable-sqlite-exit.md`):** the earlier
+claim here that the connector's journal "stays SQLite" is overruled — the
+SQLite-exit card names `bulk_ingest.py`'s journal as its second store, and
+it moves to the workspace Postgres via `ctx.db` (`db:own-tables`). Nothing
+in this design depends on the journal's storage engine.
 
 Verified against the working tree this session:
 
