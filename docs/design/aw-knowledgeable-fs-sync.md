@@ -8,6 +8,14 @@ against card `3f55bf3b-9510-8147-9171-d1357c9d26ec` (target
 taken as given; two of them have sharp edges that are named in §12 but
 designed around, not reopened.
 
+**Addendum 2026-10-10, same card:** §15 adds **collections** (a source-path
+prefix as retrieval scope) and **anchors** (a node a traversal starts from)
+— the third axis next to bucket (who can see) and topic (what it's about).
+It changes §14's sequencing and the scope of its step 2; §14 is rewritten
+accordingly. Frederico's decision, verbatim: *"I believe anchor is the thing
+but I like the collection idea too, folders can be collections and we can
+also anchor it right? If so, let's do both."*
+
 Assumes Postgres as the identity store's destination (the SQLite exit is
 card `3f55bf3b-9510-8124-ae31-d67ea0cc96dd`, same target) — nothing here
 adds new SQLite state on the aw-knowledgeable side. The connector's journal
@@ -584,19 +592,442 @@ retrieval surface, `aw-workspace` core (dependency only).
     the claim queue matches indexed equality on it; a pending-delete doc
     that re-enters `pending` gets re-chunked while awaiting deletion.
 
-## 14. Sequencing
+## 14. Sequencing (rewritten by the §15 addendum)
 
-1. `restart core` (human/deploy) → `state:own` live. Everything else is
-   blocked behind this single step.
-2. aw-knowledgeable server work (§1, §2, §9 — templates, endpoints,
-   constraint, allowlist, backfill). Deployable alone; nothing calls the
-   new seams yet. Deploy is manual (aw-backend-style: service's own build
-   first, then stack re-pull).
-3. Migration (§8, steps 2–4) — operator-run scripts, one sitting.
-4. Connector work (§3–§7) + manifest bump; ship via marketplace.
-5. Enable the sync task; watch one full day of ticks; then (optionally,
+A correction to this section's first version, forced by thinking through
+what §15 actually depends on: **`restart core` gates only the connector**
+(steps 4–5 — `ctx.state`/`state:own` are consumed by `fs_sync.py`, nothing
+else). The aw-knowledgeable server work never needed it, and §15's retrieval
+work needs *neither* the restart *nor* the sync engine — the 9,108
+already-ingested documents already carry `source_path` (bulk-ingest always
+sent it), so collection-scoped retrieval is shippable against the live
+corpus **today**, buckets still `kb-*`, before any migration.
+
+1. **Step 2b first: collections + anchors (§15).** aw-knowledgeable only.
+   Chunk `source_path` denormalization + backfill, `(:Collection)` spine +
+   backfill, the retrieval pre-filter, the anchor expansion, API/MCP params.
+   No dependency on anything else in this doc; immediate user value
+   (`collection=notion/kanban/done/` against `bucket=kb-notion` works the
+   day it deploys). Deploy is manual (service's own build first, then stack
+   re-pull).
+2. **Step 2a: sync server seams (§1, §2, §9)** — templates, endpoints,
+   constraint, allowlist, backfill. Deployable alone; nothing calls the new
+   seams yet. 2a and 2b touch the same files (`graph.py`, `documents.py`,
+   `ensure_schema()`) — if parallelized across coders, 2b owns the retrieval
+   templates and 2a the write seams, and whoever lands second rebases; the
+   `ensure_schema()` migration slot is append-only so backfills compose.
+3. `restart core` (human/deploy) → `state:own` live. Gates steps 4–5 only.
+4. Migration (§8, steps 2–4) — operator-run scripts, one sitting. The §15.7
+   collection-spine backfill re-runs (idempotent MERGE) after the bucket
+   moves so `main`'s spine is complete.
+5. Connector work (§3–§7) + manifest bump; ship via marketplace.
+6. Enable the sync task; watch one full day of ticks; then (optionally,
    phase 2) inotify.
+
+**Cost of the addendum on the old step 2:** roughly +50% on the
+aw-knowledgeable half — ~6 new/changed Cypher templates, 1 constraint +
+2 indexes, 2 one-time backfills, the §15.6 API rows and their validation-
+matrix entries, K5/K5-ANN guard extensions, and the frontend Collection
+node type in graph view + legend. The connector half grows only the §15.6
+tool-schema passthrough (small). Nothing in §15 adds connector runtime work,
+which is why 2b jumps the queue.
 
 QA gates: K3/K5 green with the new templates; the direction-refusal 403;
 the valve test (simulated empty tree → zero marks); two-worker lease test
 (two processes, one tick runs); echo-loop test (pull → next scan no-ops).
+Addendum gates: the §15.10-1 starved-collection escalation test; the
+collection-scoped `mode=tree` bypass envelope test; the anchor∩collection
+composition test; K5-ANN's third dimension.
+
+---
+
+## 15. Addendum (2026-10-10): collections and anchors — the third axis
+
+The graph already separates **who can see** (bucket — permission + tenant,
+rule 7 binds them 1:1) from **what it's about** (topic — derived from
+content by the labeller). What Frederico is asking for is the third axis
+the data already carries but retrieval cannot use: **where it came from** —
+the source tree. Two named concepts, both delivered:
+
+- A **collection** is a source-path prefix inside one bucket
+  (`notion/`, `notion/kanban/done/`, `memory/`, `skills/`), used as a
+  **hard scope filter** on retrieval. Deterministic, human-legible, full
+  depth — what six flat buckets never gave.
+- An **anchor** is a node a traversal **starts from** — "answer this query,
+  but start at this Notion card / this entity / this folder and follow the
+  edges."
+
+Verified for this addendum, beyond the header list: `graph.py:949-1004`
+(the three ANN/exact/diagnose templates and their WHERE-on-window filter),
+`graph.py:3431-3585` (`vector_search`'s escalation decision at `:3520`),
+`graph.py:931` (`count_chunks_in_scope`), `graph.py:2591` (`get_graph`,
+depth 1..2), `graph.py:4160` (`topic_document_counts`' PARENT_OF/COVERS
+walk), `graph.py:4128` (`related_to_neighbors`), `api/search.py:159-378`
+(`run_search`'s knob matrix; the `buckets is not None → no descent` bypass
+at `:293`), `topics/retrieve.py:90` (`tree_search`),
+`aw-app-knowledgeable/knowledgeable_app/mcp/client.py:321-363` + `:455`
+(the `search_graph` passthrough and schema). Measured live 2026-10-10:
+`search_graph(q="watchdog leader election flock", bucket="kb-notion",
+mode="tree", include_traversal=true)` — the width-3 beam descent **pruned**
+topic `t-kb-notion-l0-016`, labelled literally *"Watchdog leader election"*,
+88 documents beneath, score 0.4414, while keeping "Thesis matching
+methodology" (0.483) and "componente, documentação, bdd" (0.479). The
+derived hierarchy is not a navigation structure you can trust; the folder
+tree is.
+
+### 15.1 The central decision: materialize the skeleton, derive the membership
+
+**`(:Collection)` nodes are materialized; `CONTAINS` edges to documents are
+not.** The folder tree becomes first-class nodes —
+
+```
+(:Collection {tenant, bucket, workspace_slug, path, label, external_id})
+(:Collection)-[:PARENT {tenant}]->(:Collection)      // child -> parent
+```
+
+— but a collection's *document membership* stays **virtual**, derived at
+read time from the one property that cannot drift because it IS the
+identity key (§1): `d.source_path STARTS WITH c.path`. Splitting the
+decision this way is the heart of the addendum:
+
+- **Filtering never touches collection nodes.** The retrieval pre-filter
+  (§15.2) is a string-prefix predicate on an indexed property — it works on
+  the live corpus before any spine exists, keeps working if the spine is
+  ever wrong, and adds zero joins to the hot path.
+- **Anchoring and navigation get real nodes.** A collection appears in
+  `get_graph`, can be the `anchor` of a search, renders in the UI as the
+  deterministic navigational spine next to the derived topic tree.
+- **No edge maintenance liability.** A materialized `CONTAINS` edge per
+  document (~9,108 today) would have to be written by every path-keyed
+  writer, migrated by every bucket move, and GC'd by every delete — and any
+  drift makes the graph lie about exactly the thing the filter answers
+  truthfully from the property. Membership that is *derived from identity*
+  cannot disagree with identity.
+
+Identity and shape:
+
+- `path` is normalized: relative, no leading slash, **always
+  trailing-slash-terminated** (`notion/kanban/`) so prefix matching is
+  segment-safe (`notion/kan` can never match `notion/kanban/`).
+- `external_id` is **deterministic**: `col-` + short hash of
+  `(workspace_slug, bucket, path)` — a GC'd-and-recreated folder yields the
+  same id, so saved anchors survive folder churn.
+- `label` = last path segment, for display.
+- Constraint, next to §1.1's:
+  `CREATE CONSTRAINT collection_identity IF NOT EXISTS FOR (c:Collection)
+  REQUIRE (c.tenant, c.bucket, c.workspace_slug, c.path) IS UNIQUE`.
+- **Who writes them:** the server, not the connector — `upsert_document_by_path`
+  (§1.1) MERGEs the full ancestor chain + `PARENT` edges in the same
+  transaction as the document upsert, derived from `source_path` at the
+  seam. Any future path-keyed writer maintains the spine for free. A
+  backfill in `ensure_schema()`'s migration slot builds the spine for the
+  existing corpus (§15.7).
+- **Who deletes them:** nobody human. Collections are derived data (like
+  topics, unlike documents): after a document hard-delete, a sweep removes
+  collection nodes whose prefix matches zero remaining documents —
+  including `pending_delete` ones, which are still members until approved
+  (§15.7). No approval UI for collections; the §7 approval list stays
+  documents-only.
+
+### 15.2 Collection as filter: a PRE-filter in the vector search's own WHERE
+
+The measured pruning above is why this cannot be a post-filter: a beam
+descent that already discarded the right branch, or an ANN top-k that spent
+its window on other folders, legitimately returns zero rows that match the
+prefix afterwards. The filter must ride **inside** the search, next to
+tenant and bucket. Mechanically, in `core/graph.py`:
+
+1. **Denormalize `source_path` onto `(:Chunk)` at write time** — one more
+   property in `write_chunks`' `chunk.properties` (`graph.py:920-924`),
+   plus a one-time backfill via `PART_OF` (§15.7). This is what lets the
+   collection predicate sit in the *same* WHERE as tenant/bucket in all
+   three templates, uniformly on the node the index yields — not after the
+   document join. Safe to denormalize because path identity (§1) makes
+   `source_path` write-once per node: renames are delete+create (§12.1),
+   so the copy cannot drift. (The §8 bucket moves already accept this
+   pattern for `bucket`, which chunks carry since v2.)
+2. `vector_search_ann` (`graph.py:949`): the window WHERE gains
+   `AND ($collection IS NULL OR node.source_path STARTS WITH $collection)`.
+   Same for the document side of the join, same as `<<in_scope:d>>` today.
+3. `vector_search_exact` (`graph.py:987`): same predicate in the WHERE
+   immediately on the MATCH, **before** `LIMIT $scan_cap` — with the new
+   composite range index `(c.tenant, c.bucket, c.source_path)` this is a
+   seek, so a narrow collection makes the exact scan *cheaper*, not a
+   cap-burning full walk.
+4. `count_chunks_in_scope` (`graph.py:931`) gains the same predicate.
+   **Load-bearing:** `vector_search`'s escalation decision (`:3520`) is
+   `len(deduped) >= k OR in_scope_total <= len(raw_rows)` — if the count
+   ignores the collection, a small collection can never satisfy the second
+   arm and every query over it escalates forever; worse, a count that
+   overstates the corpus makes a complete answer look starved.
+5. `vector_search_diagnose` (`graph.py:973`) gains a third CASE arm,
+   `dropped_by_collection`, and `_starving_filter` (`:3588`) can now answer
+   `"collection"` — the §2 rule that the escalation log names the starving
+   filter extends to the new dimension, and K4's observable check with it.
+6. The K5-ANN guard (`test_k5_ann_templates_filter_tenant_and_bucket`)
+   grows the third dimension; the predicate is written `($collection IS
+   NULL OR ...)` verbatim so the guard can see it.
+
+Validation at the API seam (`api/search.py`, the §12 matrix):
+`collection` is valid with `mode=semantic|tree` only (400 on lexical — the
+link picker never scopes by folder); it **requires an explicit `bucket`**
+(400 without: a collection is a subtree of one bucket's source tree and
+inherits its tenant — rule 7 unchanged, §2 untouched, `main` stays the one
+synced bucket). The value is normalized server-side (strip slashes, append
+the trailing `/`, reject `..` and absolute paths). The envelope's `scope`
+gains the axis: `scope: {bucket, collection: "notion/kanban/"}`. Pathless
+ad-hoc documents have no `source_path` on their chunks and therefore match
+no collection — correct: they are in no folder (§4's "adopt into
+`authored/`" future action is also where they would join the spine).
+
+### 15.3 `mode=tree` + explicit collection: bypass the descent, declared
+
+**Decision: an explicit `collection` skips the topic tree entirely.** The
+descent's job is to *find* the scope of the question; here the human handed
+the scope over. Descending "within the subset" would mean re-scoring every
+level's centroids against collection membership (the centroids aggregate
+across folders, so they are wrong for the subset) and would still inherit
+the hierarchy the live measurement just showed pruning its own best branch.
+The precedent is already in the code: `run_search` at `search.py:293`
+declines to descend when `buckets is not None`, for exactly this shape of
+reason ("whichever bucket happened to be bound would be the wrong one").
+
+Contract: `mode=tree` + `collection` runs the §15.2-filtered flat search;
+the envelope says `strategy: "flat"` (the existing enum value — the
+discriminator is `scope.collection`, already machine-readable; a new enum
+value was considered and rejected, §15.8-5), `traversal.kind: "flat"` with
+`reason: "collection_scope"`, and `not_applied: ["beam_width"]` if the
+caller set one — §12's runtime-inapplicability rule, verbatim. Results in a
+collection-scoped tree-mode call carry **no `topic_path`** (nothing was
+walked to produce one); attaching it via a reverse COVERS walk per result
+was considered and rejected (§15.8-6). `mode=semantic` + `collection` is
+the same filtered flat search with today's `ann|exact` strategies — no
+contract change beyond the filter and the scope field.
+
+### 15.4 Anchor: what starts a traversal, what it walks, how it orders
+
+**What can anchor:** a `(:Document)`, an `(:Entity)`, or a `(:Collection)`
+— by `external_id`, plus the sugar `anchor="path:notion/kanban/"` resolved
+to the collection node server-side. **`(:Topic)` cannot anchor**: topics
+are rebuilt wholesale (a saved topic anchor dies on the next rebuild — the
+same fragility behind the link-picker-leak card), and the measured descent
+above is the standing evidence the derived hierarchy should not be a
+navigation contract.
+
+**Expansion** (new template family, `anchor_expand`): from the anchor,
+collect the candidate **document set** —
+
+- Document anchor: the document itself (hop 0) plus neighbours over
+  `LINKS_TO {tenant}` and `RELATED_TO {tenant}` (both endpoints
+  bucket-checked, the `graph.py:634-648` rule), up to `anchor_depth`.
+  `related_vias` — the existing knob, same `{topic, embedding, entity}`
+  vocabulary (`search.py:103`) — selects which `RELATED_TO` vias the
+  expansion follows; default all three plus `LINKS_TO`.
+- Entity anchor: documents reachable under the entity visibility rule
+  (`graph.py:382-405` — a `MENTIONS` from a chunk in the reader's bucket,
+  or an `ASSERTS` stamped with it) are the hop-1 set; further hops expand
+  as document anchors do.
+- Collection anchor: the member set by prefix (hop 0 — this is
+  collection-as-anchor vs collection-as-filter made concrete: the anchor is
+  a *starting set the edges may leave*, the filter is a *boundary results
+  may not cross*), then edges as above.
+
+`anchor_depth` ∈ 0..2, default 1 — `get_graph`'s clamp (`graph.py:2593`)
+is the precedent, and depth 0 is meaningful ("answer from this card
+alone"). Fan-out is capped per hop (`anchor_expand_cap`, a setting per §2's
+"bounds are not optional", suggested 200 docs/hop); what the cap cuts is
+declared as `anchor.truncated: true`, never silent.
+
+**Scoring:** the candidate set is small and known, so no ANN — a new
+`vector_score_documents` template scores the candidates' chunks exactly
+against the query (the `vector.similarity.cosine` shape of
+`vector_search_exact`, seeded by document ids instead of a bucket scan),
+then the existing dedup-collapse and cut to `k` in `vector_search`'s
+Python. `q` stays required (semantic modes already require it,
+`search.py:225`; query-less neighbourhood *browsing* is `get_graph`'s job,
+not retrieval's). **Ranking is by query score alone; `anchor_hops` is a
+declared per-result field, never a rank input** — a hop-discounted blended
+score was rejected (§15.8-7). Envelope: `strategy: "anchored"` (a genuinely
+different algorithm earns a new enum value where a narrower filter did
+not), plus `anchor: {id, kind, depth, vias, expanded_documents, truncated}`.
+
+### 15.5 Composition: anchor ∩ collection
+
+"Anchor on this Notion card, follow the entity edges, but stay inside
+`memory/`" is:
+
+```
+search_graph(q=..., bucket="main",
+             anchor="<card doc external_id>", anchor_depth=2,
+             related_vias=["entity"], collection="memory/")
+```
+
+Rule: **edges are walked regardless of collection; the collection filters
+which candidates are *kept*.** An expansion that hops *through* a document
+outside `memory/` at depth 1 to reach one inside it at depth 2 is exactly
+the point of anchoring — the filter is on result membership, not on the
+path. (The inverse — constraining the walk itself — was rejected, §15.8-8.)
+Both axes land in the envelope: `scope.collection` + the `anchor` block.
+`anchor` + `mode=tree` bypasses the descent exactly as §15.3 does
+(`traversal.reason: "anchor_scope"`), so the full matrix stays two rules,
+not four.
+
+### 15.6 API / MCP surface
+
+`GET /api/search` (and `run_search`, so the Playground inherits it):
+
+| Param | Validity | Semantics |
+|---|---|---|
+| `collection` | `semantic`/`tree`, requires `bucket` | §15.2 pre-filter; normalized prefix; `scope.collection` in the envelope. |
+| `anchor` | `semantic`/`tree`, requires `bucket`, requires non-empty `q` | `external_id` of a Document/Entity/Collection, or `path:<prefix>` sugar. 404 if it doesn't resolve in the caller's tenant (existing K1 posture). |
+| `anchor_depth` | only with `anchor` | 0–2, default 1. 400 outside the range, 400 without `anchor`. |
+| (`related_vias`) | unchanged | With `anchor`: additionally selects the expansion's `RELATED_TO` vias (§15.4). Without: today's meaning exactly. |
+
+`GET /api/graph` (`get_graph`): `focus` now also accepts a Collection
+`external_id`; its neighbours are its `PARENT` parent, its child
+collections, and its **direct-member** documents (prefix match, one extra
+path segment), returned with synthesized `kind: "derived"` edges of type
+`contains` — computed at read time, consistent with §15.1's
+virtual-membership rule, same bounded shape as today (no whole-graph
+endpoint — the `infra.md` rejection stands). Frontend: Collection node type
+in the legend + graph view; the Library gains a collection breadcrumb
+filter driven by the same `collection` param on the list endpoint (cheap:
+one more STARTS WITH on `GET /api/documents`).
+
+Connector (`aw-app-knowledgeable`): `search_graph` tool schema + passthrough
+gain `collection`, `anchor`, `anchor_depth` (coerce-and-forward,
+`client.py:321`'s existing pattern — the backend's validation matrix stays
+the single source of truth); `get_graph` passthrough unchanged. Tool
+descriptions must state the two-concept model in one line each: *collection
+= stay inside this folder; anchor = start from this node.*
+
+### 15.7 Impact on the decisions above
+
+- **§1 (identity):** `upsert_document_by_path` additionally MERGEs the
+  collection chain (§15.1) — same transaction, same template family.
+  `write_chunks` carries `source_path` (§15.2-1). The §1.1 re-chunk on
+  update keeps the chunk property (it re-writes chunks from the same
+  document). New indexes: `(d.tenant, d.bucket, d.source_path)` and
+  `(c.tenant, c.bucket, c.source_path)` range indexes — prefix seeks for
+  the filter, the virtual membership, and the GC sweep.
+- **Backfills** (both in `ensure_schema()`'s one-time slot, §8-1's
+  pattern): (a) `c.source_path = d.source_path` via `PART_OF` for every
+  chunk whose document has one; (b) build the Collection spine from
+  `DISTINCT` ancestor prefixes of existing `source_path`s. Both idempotent;
+  (b) re-runs after the §8 bucket moves so `main`'s spine is complete.
+- **§7 (two-phase delete):** a folder vanishing from disk is only ever
+  observed as its *files* vanishing — the ≥2-scans rule, the valve, and the
+  approval list all operate on documents, unchanged. The collection node
+  outlives its documents until the deletes are **approved**, then the GC
+  sweep (same transaction as the hard delete, or the next tick) removes
+  spine nodes with zero remaining members. `pending_delete` documents count
+  as members — the Library's pending list can still show their breadcrumb.
+- **§2 / rule 7:** unchanged. `(:Collection)` carries `{tenant, bucket}`
+  like every node (the `graph.py:235` two-columns rule); collections live
+  inside a bucket and inherit its tenant; `main` stays the single synced
+  bucket — this addendum exists precisely so folder scope with full depth
+  never argues for re-splitting buckets.
+- **§13-roster:** the coders' risk list gains §15.10.
+
+### 15.8 Rejected alternatives (addendum)
+
+1. **Property-filter only, no materialization** (collection as pure prefix,
+   anchors restricted to documents/entities). Cheaper, but a folder you
+   cannot anchor or see in the graph is half of what was asked for —
+   Frederico explicitly chose both, and the spine is what makes the folder
+   tree a *navigational* counterpart to the topic tree rather than a query
+   trick.
+2. **Full materialization with `CONTAINS` edges to documents.** The edge
+   duplicates what `source_path` already states, must be maintained by
+   every writer/mover/deleter forever, and any drift is a lie in the graph.
+   Virtual membership from the identity property cannot drift (§15.1).
+3. **Post-filtering ANN/beam results by prefix.** The live measurement is
+   the refutation: the descent pruned the literally-correct branch, so a
+   post-filter over it returns zero legitimately. Dead on arrival.
+4. **Descending the topic tree within the collection subset.** Re-scoring
+   centroids per level against membership is expensive, and the subset
+   centroids are wrong anyway (built over the whole bucket); the human
+   already supplied the scope the descent exists to find (§15.3).
+5. **A new `strategy` enum value for collection-scoped flat search.**
+   `scope.collection` already discriminates machine-readably; a new value
+   would make every existing strategy-switch consumer re-learn the enum for
+   zero information gain. (Contrast `"anchored"`, §15.4, which IS a new
+   algorithm.)
+6. **Reverse-COVERS `topic_path` on collection-scoped tree results.**
+   Possible (the `topic_document_counts` walk inverted, `graph.py:4160`),
+   but it reports a tree that was *not walked* as if it had been —
+   provenance theater. If wanted later it must be a separately-named field,
+   not `topic_path`.
+7. **Hop-discounted blended ranking for anchored search.** An unmeasurable
+   blend of two honest signals; the consumer is an agent that can re-rank
+   with both fields visible (`score`, `anchor_hops`).
+8. **Collection as a traversal constraint (edges must stay inside).**
+   Breaks the headline composition: "start at the card, follow entity
+   edges, land in `memory/`" requires crossing folders mid-walk.
+9. **Six buckets back, folders as buckets.** The standing restriction:
+   buckets are permission boundaries (one tenant each, rule 7); folders are
+   provenance with unlimited depth. One `main` bucket, collections inside
+   it.
+
+### 15.9 What the addendum makes harder later
+
+1. **`source_path` now lives in two places** (Document + Chunk). The §12.1
+   rename story, when it comes, must rewrite chunks too — the
+   delete+create shape handles it today, but a future in-place rename
+   optimization inherits a second property to move.
+2. **`anchor_depth ≤ 2` bakes in shallow traversal.** Deep multi-hop
+   research walks ("follow the chain five entities out") need different
+   machinery — iterative expansion with its own budget, not a bigger clamp
+   on this one.
+3. **The envelope grows again.** `scope.collection`, `anchor{}`,
+   `anchor_hops` — every consumer that pattern-matches envelopes (the
+   Playground UI, agent prompts that teach the tool) needs the new fields
+   taught, and the tool description is already long.
+4. **Virtual membership means collection reads cost a prefix query** per
+   `get_graph` focus — indexed and bounded, but a future "collection sizes
+   on every node in the overview" feature would N+1 it; that feature needs
+   a counted projection, not a loop.
+5. **The deterministic `external_id` hash pins the triple.** If
+   `workspace_slug` semantics ever change (multi-workspace merge), every
+   saved collection anchor changes identity with it.
+
+### 15.10 Risks for the coders (addendum)
+
+1. **The escalation count is the trap.** If `count_chunks_in_scope` does
+   not carry the collection predicate (§15.2-4), every narrow-collection
+   query either escalates forever or returns starved results that look
+   complete. The test: a 30-chunk collection, `k=10`, must answer
+   `strategy: "ann"`-or-`"exact"` with the right rows *and* the right
+   `escalated` flag — assert on the envelope, not just the rows.
+2. **Chunk backfill before filter deploy, atomically.** The ANN predicate
+   on `node.source_path` silently excludes every chunk the backfill hasn't
+   reached (NULL fails STARTS WITH) — ship the backfill in the same deploy
+   as the templates, and verify `count(c.source_path IS NULL AND d.source_path
+   IS NOT NULL) == 0` before calling it live.
+3. **Normalization is segment-safety.** Forgetting the trailing-slash rule
+   makes `collection=notion/kan` match `notion/kanban/` — a wrong-scope
+   result that looks right. Test the adversarial prefix explicitly.
+4. **The spine MERGE must not resurrect GC'd parents mid-delete.** Order
+   inside the delete transaction: remove documents, then sweep collections
+   — a concurrent upsert re-MERGEing the chain is fine (it has a live
+   member), but the sweep must re-check membership, not trust a cached
+   count.
+5. **`search_nodes` will offer Collections as link targets** the moment
+   they carry `label` — the exact (:Topic) leak already on the backlog
+   (`bug:aw-knowledgeable-topic-nodes-linkable-wedge-rebuild`). Land the
+   label-restriction fix (Document|Entity only) in the same change that
+   creates the first Collection node, or a human link onto a Collection
+   wedges the GC sweep the way topic links wedge rebuilds.
+6. **K5 applies to every new template** — `anchor_expand`,
+   `vector_score_documents`, the spine MERGEs, the GC sweep: `{tenant,
+   bucket}` on node patterns, `{tenant}` on relationships, `ASSERTS` with
+   `bucket` (`graph.py:54`). The anchor expansion's `RELATED_TO` must
+   bucket-check **both** endpoints (`graph.py:634-648`'s recorded reason).
+7. **`anchor` + omitted `bucket` must 400 before resolution.** The anchor
+   resolves inside one bucket's scope; resolving it against whatever
+   `bucket_ctx` defaulted to answers from the wrong corpus with a valid-
+   looking envelope.
+8. **Entity anchors cross collections by design** — an entity's hop-1
+   documents come from MENTIONS/ASSERTS visibility, not from any folder.
+   Don't "optimize" the expansion by pushing the collection predicate into
+   it; §15.5's keep-vs-walk rule is the contract.
