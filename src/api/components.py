@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 
 from src.api.identity import authorize_ws, require_identity, ws_close_code
 from src.apps.containers import ContainerError
+from src.apps.degradations import invalidate_cache as invalidate_degradation_cache
 
 log = logging.getLogger(__name__)
 
@@ -246,6 +247,10 @@ class ComponentRoutes:
         except Exception as e:  # ServiceError or subprocess failure
             return JSONResponse({"error": str(e)}, status_code=400)
 
+        # /api/health answers from a ~5s cache; a deliberate start/stop is
+        # exactly the moment a human refreshes and must not be told the old
+        # answer (src/apps/degradations.py).
+        invalidate_degradation_cache()
         updated = next((c for c in _service_snapshot(self.app) if c["key"] == key), row)
         payload = {"key": updated["key"], "action": action, **updated, "result": result}
         hub = getattr(self.app.state, "status_hub", None)

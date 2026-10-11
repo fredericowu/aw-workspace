@@ -11,8 +11,14 @@ local worker's ``Popen`` state. A request that happens to land on a
 non-owning worker therefore sees ``running=False`` and, if it then starts or
 restarts, spawns a REAL second subprocess that collides with the one already
 running elsewhere on the service's port (confirmed live: the proxy app's
-``OSError: Address already in use``, masked by a separate bug in
-``apps/proxy/proxy_app/proxy_server.py``).
+``OSError: Address already in use``, which used to be masked by a separate
+bug in ``apps/proxy/proxy_app/proxy_server.py`` — that mask is gone since
+``ThreadPoolHTTPServer.__init__`` builds its pool before ``TCPServer.__init__``,
+so a bind collision now surfaces as the real ``OSError`` on the child's
+stdout. :class:`~src.apps.services.ServiceSupervisor` reads it back out of
+that captured stdout and converts it into an immediate ``gave_up`` with
+``reason=orphan-suspected`` instead of a backoff loop that can never win —
+see ``docs/standards/core-restart-blast-radius.md`` §2).
 
 This module is the ownership record that closes that gap for every
 ``ctx.services``-backed app, not just proxy — reused by
@@ -41,8 +47,10 @@ else to check ownership against.
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
+import time
 import uuid
 from typing import Optional
 
@@ -95,6 +103,89 @@ def _get_shared_client(redis_url: Optional[str] = None) -> "sync_redis.Redis":
 
 def _lease_key(app_id: str, service_id: str) -> str:
     return f"{_key_prefix()}service-lease:{app_id}:{service_id}"
+
+
+def _gave_up_key(app_id: str, service_id: str) -> str:
+    return f"{_key_prefix()}svc:gaveup:{app_id}:{service_id}"
+
+
+# ---------------------------------------------------------------------------
+# Give-up markers — the DURABLE half of the restart loop's state
+# ---------------------------------------------------------------------------
+# The lease above answers "who is running this right now" and is deliberately
+# short-lived (30s TTL, heartbeat-renewed) so a dead worker's claim expires.
+# A give-up decision is the opposite kind of fact: the supervisor has stopped
+# trying, and that must stay true until a human (or an install) says
+# otherwise. It is therefore written WITHOUT a TTL and read by every worker,
+# `doctor` and `/api/health` — the backoff counters themselves stay per-worker
+# memory (see the design doc's "What this makes harder later").
+#
+# Same degrade-open contract as the lease: Redis away means the marker cannot
+# be written or read, which costs visibility, never correctness — the owning
+# worker's in-memory `state == "gave_up"` is what actually stops respawning.
+
+
+def set_gave_up(app_id: str, service_id: str, *, reason: str,
+                exit_code: Optional[int] = None, detail: str = "",
+                redis_url: Optional[str] = None) -> bool:
+    """Record that the supervisor has stopped respawning this service."""
+    payload = json.dumps({
+        "app": app_id, "service": service_id, "reason": reason,
+        "exit_code": exit_code, "detail": detail, "at": time.time(),
+    })
+    try:
+        _get_shared_client(redis_url).set(_gave_up_key(app_id, service_id), payload)
+        return True
+    except Exception:
+        log.warning(
+            "service_lease: could not record the give-up marker for %s/%s — "
+            "this worker still stops respawning it, but no other worker, doctor "
+            "or /api/health can see why", app_id, service_id, exc_info=True)
+        return False
+
+
+def clear_gave_up(app_id: str, service_id: str, *,
+                  redis_url: Optional[str] = None) -> bool:
+    """Drop the marker — a manual start/restart, an install/update, or a
+    config save re-arms the restart loop (see ``ServiceSupervisor``)."""
+    try:
+        _get_shared_client(redis_url).delete(_gave_up_key(app_id, service_id))
+        return True
+    except Exception:
+        log.warning("service_lease: could not clear the give-up marker for %s/%s",
+                    app_id, service_id, exc_info=True)
+        return False
+
+
+def gave_up_markers(pairs: list[tuple[str, str]], *,
+                    redis_url: Optional[str] = None,
+                    ) -> tuple[dict[tuple[str, str], dict], bool]:
+    """``(markers, redis_reachable)`` for many services in ONE round-trip.
+
+    One ``MGET`` rather than a key-per-service lookup: this is on
+    ``/api/health``'s path, which uptime monitors and container healthchecks
+    poll every few seconds. The boolean is the only Redis-reachability signal
+    that path has, and it decides whether health reports its answer as
+    fleet-wide or ``health_scope: local-worker``.
+    """
+    if not pairs:
+        return {}, True
+    try:
+        raw = _get_shared_client(redis_url).mget(
+            [_gave_up_key(a, s) for (a, s) in pairs])
+    except Exception:
+        log.warning("service_lease: could not read give-up markers — falling back "
+                    "to the local-only view", exc_info=True)
+        return {}, False
+    out: dict[tuple[str, str], dict] = {}
+    for pair, value in zip(pairs, raw):
+        if not value:
+            continue
+        try:
+            out[pair] = json.loads(value)
+        except ValueError:
+            out[pair] = {"reason": "unknown"}
+    return out, True
 
 
 def is_lease_held_anywhere(app_id: str, service_id: str, *, redis_url: Optional[str] = None) -> bool:
@@ -188,7 +279,18 @@ class ServiceLease:
     def release(self) -> None:
         self._heartbeat_stop.set()
         if self._heartbeat_thread is not None:
-            self._heartbeat_thread.join(timeout=2.0)
+            try:
+                self._heartbeat_thread.join(timeout=2.0)
+            except RuntimeError:
+                # "cannot join thread before it is started": release() raced
+                # start_heartbeat() between constructing the thread and
+                # starting it. ServiceSupervisor.start() now arms the
+                # heartbeat before the reader thread that calls this, which
+                # closes that window — but release() must not be able to
+                # raise INTO a caller's finally block whatever the ordering,
+                # because the one that matters is the pump's, and an
+                # exception there loses the process's exit entirely.
+                pass
             self._heartbeat_thread = None
         if self._owned:
             try:

@@ -42,6 +42,8 @@ from src.api.identity import authorize_ws, require_identity, ws_close_code
 from src.apps import config_store
 from src.apps import hostpower
 from src.apps.catalog import get_catalog, is_marketplace_app, list_tags
+from src.apps.degradations import (degradations,
+                                   invalidate_cache as invalidate_degradation_cache)
 from src.apps.install_jobs import InstallJobs
 from src.apps.lifecycle import AppLifecycle
 from src.apps.service_relay import ServiceCommandRelay
@@ -109,38 +111,17 @@ def _autostart_not_running(runtime) -> list[dict]:
     doctor never cross-checked it, so a stopped auto-start app read as
     "No silent degradation found" for hours — once, 3.5h, after a manual
     test left aw-app-proxy's service stopped (2026-10-01).
+
+    **The check itself moved to ``src/apps/degradations.py``** on 2026-10-11:
+    ``/api/health`` needs the same answer, and the one thing it must not do
+    to get it is call this doctor route (seconds of podman/CLI/app-route
+    fan-out on an endpoint uptime monitors poll — design §C). What is left
+    here is the doctor-side projection of that shared primitive: every key it
+    produces except the ones only health wants.
     """
-    out: list[dict] = []
-    for slug in runtime.loaded_slugs():
-        loaded = runtime.get(slug)
-        if loaded is None:
-            continue
-        props = (loaded.manifest.effective_config_schema or {}).get("properties") or {}
-        if "auto_start" not in props:
-            continue
-        if not (loaded.config or {}).get("auto_start", True):
-            continue  # already reported by _autostart_disabled
-        for app_id, service_id in runtime.services.registered():
-            if app_id != slug:
-                continue
-            status = runtime.services.status(app_id, service_id)
-            if not status.get("running"):
-                out.append({
-                    "app": slug, "tier": loaded.manifest.tier,
-                    "component": f"{app_id}:{service_id}",
-                    "last_exit_code": status.get("last_exit_code"),
-                    "last_error": status.get("last_error"),
-                })
-        for app_id, _container in runtime.containers.registered():
-            if app_id != slug:
-                continue
-            try:
-                status = runtime.containers.status(app_id)
-            except ContainerError:
-                status = {"running": False}
-            if not status.get("running"):
-                out.append({"app": slug, "tier": loaded.manifest.tier, "component": app_id})
-    return out
+    return [{k: v for k, v in row.items()
+             if k not in ("kind", "service", "autostart")}
+            for row in degradations(runtime)]
 
 
 def _referenced_gateway_profiles(runtime) -> dict[str, str]:
@@ -1135,6 +1116,18 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 log.exception("apps: config save for %s did not reach the cloud registry", slug)
 
         await _apply_runtime_config(runtime, loaded, previous)
+
+        # A save is a statement that the operator changed something about how
+        # this app runs, so a service the supervisor had GIVEN UP on gets a
+        # fresh budget (design §B.2: give-up is cleared by a manual
+        # start/restart, an app update/reinstall, or a config save). It
+        # deliberately does not START anything — same rule
+        # _apply_runtime_config follows for containers, for the same reason:
+        # a config save must not resurrect a component the user stopped.
+        clear_gave_up_for = getattr(runtime.services, "clear_gave_up_for", None)
+        if callable(clear_gave_up_for):
+            await asyncio.to_thread(clear_gave_up_for, slug)
+        invalidate_degradation_cache()
 
         # Let the app react to its own new config first (e.g. an app with
         # contributes.mcp.reload_on_save regenerates its own mcp.json on

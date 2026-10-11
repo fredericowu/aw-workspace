@@ -280,6 +280,34 @@ above; aw-console and aw-backend's `_wait_for_workspace_version` also read
 `/api/health`) — add fields here, never repurpose or remove
 `status`/`workspace`/`version`/`boot_id`/`git_head`/`started_at`.
 
+### `status` is no longer always `"ok"` (2026-10-11)
+
+`/api/health` now answers `status: "degraded"` with a `degraded[]` list
+whenever a component configured to auto-start is not running — the same
+check `doctor` trusts (`src/apps/degradations.py`), not a doctor sweep.
+**A degraded workspace still returns HTTP 200**: a 5xx would make an
+orchestrator healthcheck restart core, which is the restart that caused the
+incident behind this change. `?strict=1` opts into 503 for callers that want
+gate semantics.
+
+So: poll `boot_id`/`git_head` for "did it restart", and `status`/`degraded`
+for "is anything broken" — any script asserting `status == "ok"` will now
+alarm on a degraded workspace, which is the point.
+
+### Before you `restart` anything, or `kill -9` a service
+
+Read **`docs/standards/core-restart-blast-radius.md`**. Two things in it
+contradict the obvious assumption:
+
+- a **container** restart kills core, every Tier-1 managed service *and*
+  every Tier-2 app container (podman runs inside the container), while a
+  **core-process/worker** restart kills none of them — Tier-1 services
+  orphan, alive with their ports still bound;
+- `kill -9` on a managed service is **no longer a way to stop it**: the
+  supervisor respawns it within about a second, with backoff, and gives up
+  only after five startup crashes. Deliberate downtime goes through
+  `aw-workspace-cli stop <app>`.
+
 ## `aw-workspace-cli update <workspace|remote-host>`
 
 Calls **aw-backend** (the cloud control plane), not this workspace:

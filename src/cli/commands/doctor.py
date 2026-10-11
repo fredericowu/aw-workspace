@@ -161,6 +161,18 @@ def _autostart_not_running(rows: list) -> int:
     for row in rows:
         print(f"  ✗ {row['app']:<14} auto_start is on ({row.get('tier', '?')}) "
               f"but {row['component']} is off right now")
+        # The supervisor's own verdict, when it has one (src/apps/services.py):
+        # "backing_off" means recovery is already in flight and this line will
+        # clear itself; "gave_up" means it will NOT, and no amount of waiting
+        # changes that — only a restart, a reinstall or a config save does.
+        state = row.get("state")
+        if state == "backing_off":
+            print("      the supervisor is retrying this with backoff — recheck in a minute")
+        elif state == "gave_up":
+            print(f"      the supervisor GAVE UP on it ({row.get('reason') or 'unknown'}) "
+                  f"— it will not retry until you restart it")
+        elif state == "stopped":
+            print("      deliberately stopped (not a crash) — nothing will restart it")
         if row.get("last_error"):
             print(f"      exit {row.get('last_exit_code')}: {row['last_error']}")
     print("      restart it: aw-workspace-cli restart <app>, then find out why it stopped")

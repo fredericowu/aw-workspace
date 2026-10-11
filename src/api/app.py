@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from starlette.datastructures import Headers
 
 if TYPE_CHECKING:
@@ -42,6 +43,7 @@ from src.api.workspace_api_key import (
     regenerate_workspace_api_key,
 )
 from src.api.workspace_url import publish_workspace_api_url
+from src.apps.degradations import health_report_cached
 from src.apps.routes import (attach_on_boot, reconcile_on_boot,
                              register_apps_routes)
 
@@ -497,15 +499,45 @@ def create_app() -> FastAPI:
     )
 
     @app.get("/api/health")
-    async def health():
-        return {
-            "status": "ok",
+    async def health(strict: bool = False):
+        """Is this workspace up — and is anything in it silently off?
+
+        ``status`` was a hardcoded ``"ok"`` until 2026-10-11, when a dead
+        ``proxy:proxy-server`` took every browser-automation MCP family down
+        for ≥27 minutes while this endpoint reported "ok" the whole time. It
+        now answers ``"degraded"`` with a ``degraded[]`` list whenever a
+        component configured to auto-start is not running
+        (``src/apps/degradations.py`` — the same check ``doctor`` trusts, NOT
+        a doctor sweep: that one shells out to system CLIs, probes podman and
+        HTTP-calls every app's self-check route, which would turn every
+        healthcheck poll into seconds of load).
+
+        **A degraded workspace still answers HTTP 200, deliberately.** A 5xx
+        here makes any container-orchestrator healthcheck restart core — the
+        exact restart that caused the outage above — and conflates "serving
+        but degraded" with "down". ``?strict=1`` opts into 503 for callers
+        that genuinely want gate semantics.
+
+        Breaking change for anyone string-matching ``status == "ok"``: a
+        degraded workspace now fails that comparison. That alarm is the
+        feature.
+        """
+        report = await asyncio.to_thread(
+            health_report_cached, getattr(app.state, "app_runtime", None))
+        payload = {
+            "status": report["status"],
             "workspace": os.environ.get("AW_WORKSPACE", ""),
             "version": os.environ.get("AW_WORKSPACE_VERSION", ""),
             "boot_id": boot_info.boot_id(),
             "git_head": boot_info.git_head(),
             "started_at": boot_info.started_at(),
+            "degraded": report["degraded"],
         }
+        if report.get("health_scope"):
+            payload["health_scope"] = report["health_scope"]
+        if strict and report["degraded"]:
+            return JSONResponse(payload, status_code=503)
+        return payload
 
     @app.get("/api/auth/status")
     async def auth_status(request: Request, authorization: str = Header(default="")):

@@ -80,6 +80,21 @@ TTL. The ``asyncio.Lock`` stays in front of it as the in-process layer
 
 The Redis dependency that remains in this module is the ``apps:changed``
 broadcast below — a fan-out, not a mutex, and harmless when it is missing.
+
+### What a restart does to what this module loaded
+
+Required reading before you reason about recovery here:
+**``docs/standards/core-restart-blast-radius.md``**. The short version, and
+it is not the intuitive one — a restart of the workspace *container* kills
+core, every Tier-1 managed service and every Tier-2 app container (podman
+lives inside it), while a restart of the core *process* or a single uvicorn
+worker kills **none** of them: Tier-1 services are spawned with
+``start_new_session=True`` and survive as orphans with their ports still
+bound, which the next ``start()`` has to reap. And because the PROVISION
+half above is a per-boot one-shot, the boot leader's ``activate()`` pass is
+the only code path in the system that ever starts an autostart service: an
+activation missed on boot stays missed, and no later attach or convergence
+pass will fix it.
 """
 from __future__ import annotations
 

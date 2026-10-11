@@ -124,7 +124,7 @@ def test_an_auto_start_service_that_is_off_is_reported():
     )
     assert _autostart_not_running(rt) == [{
         "app": "proxy", "tier": "inprocess", "component": "proxy:proxy-server",
-        "last_exit_code": 0, "last_error": None,
+        "state": "off", "last_exit_code": 0, "last_error": None,
     }]
 
 
@@ -134,7 +134,8 @@ def test_an_auto_start_container_that_is_off_is_reported():
         containers=_Containers({"browser": {"running": False}}),
     )
     assert _autostart_not_running(rt) == [
-        {"app": "browser", "tier": "container", "component": "browser"},
+        {"app": "browser", "tier": "container", "component": "browser",
+         "state": "off"},
     ]
 
 
@@ -147,7 +148,8 @@ def test_a_container_status_error_counts_as_not_running():
         containers=_Containers(errors={"browser"}),
     )
     assert _autostart_not_running(rt) == [
-        {"app": "browser", "tier": "container", "component": "browser"},
+        {"app": "browser", "tier": "container", "component": "browser",
+         "state": "off"},
     ]
 
 
