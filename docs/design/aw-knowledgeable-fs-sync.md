@@ -16,6 +16,16 @@ accordingly. Frederico's decision, verbatim: *"I believe anchor is the thing
 but I like the collection idea too, folders can be collections and we can
 also anchor it right? If so, let's do both."*
 
+**Addendum 2026-10-11, card `3f65bf3b-9510-81ce-9fb7-ff2e67a10035`:** §16
+adds the **git backend** (commit/push the synced tree to a user-named repo
+on each tick) and its hard prerequisite, the **leading-dot exclusion rule**
+(no dot-folder or dot-file ever enters the scan — `.git` above all).
+Frederico's ask, verbatim: *"user will specify the git repo that he wants to
+use to commit the knowledge base artifacts, so on sync we wil also
+commit/push git changes to that backend, any folder starting with '.' on the
+knowledge_base folder should be ignored. I'm saying this specially because
+of .git, I don't want to add it to the knowledge graph."*
+
 Assumes Postgres as the identity store's destination (the SQLite exit is
 card `3f55bf3b-9510-8124-ae31-d67ea0cc96dd`, same target) — nothing here
 adds new SQLite state on the aw-knowledgeable side. **Amended 2026-10-10 by
@@ -1079,3 +1089,422 @@ descriptions must state the two-concept model in one line each: *collection
    documents come from MENTIONS/ASSERTS visibility, not from any folder.
    Don't "optimize" the expansion by pushing the collection predicate into
    it; §15.5's keep-vs-walk rule is the contract.
+
+---
+
+## 16. Addendum (2026-10-11): the git backend, and the leading-dot rule that must land first
+
+Card `3f65bf3b-9510-81ce-9fb7-ff2e67a10035`. Two features, one hard
+ordering: the user names a git repo; each sync tick, after the graph work,
+also commits and pushes the synced tree there — and **no path with a
+leading-dot component may ever enter the scan**, because the git backend's
+very first act is to put a `.git/` inside the tree the scanner walks.
+
+Verified for this addendum, beyond the header list:
+
+- `repos/aw-app-knowledgeable/knowledgeable_app/bulk_ingest.py:248-262` —
+  `scan()` walks only the six `SUBTREE_ORDER` subtrees with
+  `rglob("*.md")`; `is_skipped` (`:130`) is a bare prefix check.
+- `repos/aw-app-kb/kb_app/kb_ops.py:162` —
+  `dirs[:] = [d for d in dirs if not d.startswith(".")]`: the sibling
+  consumer of the **same tree** already prunes dot-dirs at the walk;
+  `kb_app/routes.py:78` skips dot-files; tested at
+  `tests/test_kb_ops_pipeline.py:165-172` (`.hidden/inner.md` → zero
+  upserts). The rule below is this idiom adopted, not invented.
+- `repos/aw-app-knowledgeable/knowledgeable_app/routes.py:1-45` — the
+  credential pattern this app already uses: secrets go to `ctx.secrets` via
+  `POST /settings`, **never** through plain app config; the manifest's
+  `x-secret` flag only makes the UI render a password field.
+- `src/apps/secret_store.py:1-19` — `ctx.secrets`' backing store: Fernet-
+  encrypted, one file per app at `<home>/secrets/<slug>.json`, no app can
+  address another app's namespace.
+- `repos/aw-app-knowledgeable/knowledgeable_app/playground_key_push.py` —
+  the shared-vault (aw-app-secrets REST + `auto_approve_for`) read pattern;
+  considered and not chosen (§16.8-5).
+- `repos/aw-app-knowledgeable/aw-app.json` — `config_schema` with
+  `service_secret` (`x-secret`), the contributed `agentic_output` task whose
+  prompt enumerates failure cases, `notify_exit_codes: [1]`.
+- `/opt/aw-workspace/.aw-workspace/knowledge_base/` — contains today
+  exactly the six subtrees, **no dot-entries and no `.git`**: the rule can
+  land with zero cleanup migration.
+
+### 16.1 The leading-dot rule — prerequisite, shipped first
+
+**Rule: any path whose KB-relative form contains a component starting with
+`.` — directory *or file*, at any depth — is excluded from the scan.**
+Directories are pruned **at the walk** (the `kb_ops.py:162` idiom:
+`os.walk` with `dirs[:] = [...]`, never descended), files are skipped by
+the same leading-dot test. It is a general rule, never a `.git` denylist —
+`.github`, `.obsidian`, `.vscode`, `.venv`, `.DS_Store` are the same class,
+and a one-name denylist is wrong the first time any other tool writes into
+the tree.
+
+Why this cannot wait for, or ride behind, the git backend — stated
+honestly, because the current code half-shields us by accident:
+
+- Today `scan()` never reaches a root-level `.git` at all (it walks only
+  `SUBTREE_ORDER`, `bulk_ingest.py:248`) and matches only `*.md` (`.git`'s
+  object store contains none). **Neither shield is load-bearing**: §3.1
+  roots the sync engine's scan at `kb_root()`, which removes the subtree
+  shield, and the `*.md` filter is an ingest-format choice that this very
+  addendum's git scope already steps around (§16.3) — correctness must not
+  hinge on it. And the shields already leak today: `rglob` descends hidden
+  directories, so a `.github/` or `.obsidian/` dropped inside `notion/` or
+  `authored/` ingests its `.md` content right now.
+- **Dot-files are excluded too — decided, not left open.** Frederico's ask
+  says "folder", but the file half is the severity driver: a `.env` in a
+  synced tree becoming a searchable, vector-indexed graph document is a
+  secrets exposure, not a tidiness bug. The `*.md` extension filter does
+  not durably protect it (`.credentials.md`, a notes-app's `.trash.md`,
+  and any future format widening all pass), the sibling kb app already
+  skips dot-files (`routes.py:78`), and no legitimate corpus content is
+  hidden-by-convention. Cost: zero — the tree has no dot-entries today.
+- Reading of the verbatim `". "` (dot-space): leading dot. Nothing in the
+  tree or the generators produces a literal dot-space name; the kb app's
+  existing rule is leading-dot; `.git` itself — the stated motivation —
+  is leading-dot.
+
+Where it lands:
+
+- `knowledgeable_app/bulk_ingest.py` — the rule goes into `scan()`'s walk
+  **now** (a small, standalone change to today's code: replace the
+  `rglob` with the pruned `os.walk`, extend `is_skipped` with the
+  component test), and is inherited by the §3 shared scan helper when
+  `fs_sync.py` extracts it. Enforced in the WALK, same reasoning as the
+  existing `SKIP_PREFIXES` comment (`bulk_ingest.py:255-258`): a pruned
+  path is never hashed, never journalled, can never win a canonical slot.
+- `repos/aw-knowledgeable/backend/app/api/documents.py` — defense in
+  depth at the §1.2 seam: `PUT /by-path` 400s any `source_path` with a
+  leading-dot component, next to the `..`/absolute-path normalization
+  §15.2 already specifies. A future buggy client cannot push `.git`
+  content past a correct server.
+- Journal/graph cleanup: none needed (verified above — no dot-entries
+  exist, so no rows, no documents). If one ever existed, the §7
+  pending-delete path handles it as an ordinary vanished file; no special
+  case.
+
+Verification (the card's own bar): a test tree containing `.git/` with a
+planted `objects/x.md`, a `.github/README.md`, a nested `notion/.obsidian/
+cache.md`, and a root `.env` produces **zero journal rows and zero
+documents** — proven by the test mirroring
+`aw-app-kb/tests/test_kb_ops_pipeline.py:165`, not by inspection.
+
+### 16.2 The git backend: where the repo lives, what a commit contains (question B)
+
+**`knowledge_base/` itself is the git worktree** — `git init` at
+`kb_root()`, `.git/` living inside the tree (which is exactly why §16.1 is
+a prerequisite). The commit is the **synced source tree, not a graph
+export**: human-readable markdown in the same folder structure the
+collections (§15) expose, so `git log -p memory/foo.md` answers "what
+changed in this document and when" — the point of using git. The graph is
+a projection of this tree (§0) and is rebuildable from it; committing a
+graph dump would add churn with no provenance (rejected, §16.8-7).
+
+Commit scope = the tree minus two subtractions, each enforced by the layer
+that owns it:
+
+- **Dot-entries** are excluded from the *scan* by §16.1 but handled by
+  *git* natively (git never commits `.git/`; other dot-files follow
+  `.gitignore`). Two deliberate dot-named files ARE committed —
+  `.gitignore` and `.aw-kb-sync.json` (§16.5) — and §16.1 keeps both out
+  of the graph automatically. The asymmetry is intentional: the scanner's
+  dot rule protects the corpus, git's scope protects the repo.
+- **`SKIP_PREFIXES`** (`mapped_folders/repos/`, `mapped_folders/
+  aw-workspace/` — code maps, ~79% of the tree) are excluded from the repo
+  via a **generated `.gitignore`** written from the same constant
+  (`bulk_ingest.py:124`), asserted equal in a test so the two can never
+  drift. Without it the repo swallows thousands of regenerable code-map
+  files per sync.
+
+Deliberate divergence from the ingest scope, stated: git commits non-`.md`
+files and >10MB files that the scanner skips. Those filters are *ingest*
+choices (format support, chunking cost); a PNG or a dataset in `authored/`
+is still a KB artifact worth versioning. "What's in the repo" ⊇ "what's in
+the graph", and the delta is exactly the two ingest filters — auditable.
+
+### 16.3 Credentials (question A)
+
+**Storage: `ctx.secrets`, key `git_token`, written only via the connector's
+`POST /settings` — the exact `service_secret` pattern** (`routes.py:19-45`).
+The manifest's `config_schema` gains `git_remote_url` (plain config — HTTPS
+URL, **rejected if it carries userinfo** (`https://user:token@...` is a
+credential in a config file), `git_branch` (default `main`), and
+`git_token` marked `x-secret` — which, per this app's own docstring, is
+only the UI password-field hint; the value itself never lands in plain
+cloud-syncable config. It is read fresh on every tick, like `service_secret`
+is per-call, so rotation needs no restart.
+
+**Credential type: a fine-grained GitHub PAT scoped to the one named repo,
+Contents read/write only.** This estate has already paid for the
+alternative once — the aw-knowledgeable cross-repo PAT that turned out to
+be a full-admin token. A repo-scoped PAT bounds the blast radius of a leak
+to the mirror repo itself, whose entire content the credential holder could
+already read from the tree.
+
+**Injection: per-invocation, environment-only.** The subprocess git call
+gets `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=http.<host>.extraheader`,
+`GIT_CONFIG_VALUE_0=Authorization: Basic <b64(x-access-token:PAT)>`, plus
+`GIT_TERMINAL_PROMPT=0`. The token is never in argv (`/proc/<pid>/cmdline`
+is world-readable; environ is not), never in the remote URL, never in
+`.git/config`, never in a credential-helper file, never on disk anywhere —
+the standing rule, kept mechanically.
+
+**Absent or revoked secret fails visibly, in three places at once:**
+
+1. The tick's git step records a declared status in the journal —
+   `git_state ∈ {ok, no_secret, auth_failed, diverged, push_failed}` with
+   `since` and detail — and `knowledgeable-sync run`/`status` surface it.
+2. `no_secret`/`auth_failed`/`diverged` make the CLI exit **non-zero**,
+   which the contributed `agentic_output` task (aw-app.json, `notify_exit_
+   codes: [1]`) already escalates to an agent; its prompt gains the git
+   cases next to the §7 valve case.
+3. The connector's `/status` (what the window's `auth_status` widget binds
+   to) gains the git backend state, so the settings panel shows "push
+   blocked: credential revoked" instead of nothing.
+
+A 401/403 from the remote is `auth_failed` from the first failing tick —
+never retried silently into oblivion. The graph half of the tick is
+untouched by any of this (§16.6).
+
+### 16.4 Direction: push-only, and why the asymmetry is correct (question C)
+
+Frederico's "on sync we will also commit/push" reads one-way, and **one-way
+(workspace → git) is the design — deliberately, not by omission.** The
+existing fs-sync is bidirectional between *tree and graph* with exactly one
+conflict authority: LWW arbitrated through the journal's three-way base
+(§3.3). The tree is the corpus's primary home (§3.3-3). Pulling from git
+would add a **third writer** to that same tree with its own, different
+conflict semantics (merge/rebase), and two overlapping conflict mechanisms
+over one tree is how an edit gets silently lost — the exact failure §3.3
+was designed to exclude. Git's role here is what S3 was rejected *as
+authority* for in §11.1 but is genuinely useful *as mirror* for: versioned,
+human-readable, offsite history. It asserts no authority: filesystem stays
+truth (§16.6).
+
+**Divergence policy: fast-forward-only, refuse loudly.** Before pushing,
+the lease holder fetches; if the remote branch has commits the local
+history lacks (a human edited on GitHub, another writer pushed, a
+force-push happened), the git step does **not** merge, rebase, or
+force-push — it sets `git_state: diverged` and escalates per §16.3. A
+mirror that silently force-pushes destroys the one thing git adds
+(history); one that auto-merges silently resolves conflicts in generated
+content — both worse than stopping. Mechanically, a plain `git push`
+already fails on non-fast-forward; the step classifies that failure rather
+than fighting it.
+
+**The door to phase-2 pull stays open, and cheaply, because scan-is-truth:**
+a future `git pull --ff-only` executed before the scan makes remote edits
+indistinguishable from local edits — the existing upsync propagates them to
+the graph with zero new mechanism. What that phase must design (and this
+one deliberately does not) is *scope*: an unrestricted pull would let a
+GitHub edit to `notion/` overwrite generator-owned content until the next
+notion-sync run; a pull restricted to `authored/` (sparse checkout or a
+path-filtered merge) matches §4's write-direction contract. Named here so
+the next card doesn't rediscover it.
+
+### 16.5 Per-tenant / per-repo scoping (question F)
+
+**Scope: one remote repo per workspace-install of the connector.** The
+remote URL lives in this install's app config next to `bucket`; the tree
+being committed is this workspace's `knowledge_base/` and nothing else; the
+one synced bucket `main` belongs to one tenant (rule 7, §2). The chain is
+airtight for a structural reason worth stating plainly: **the git backend
+never consults the graph** — it commits a local directory tree — so no
+query bug, no visibility-predicate gap, no cross-tenant Neo4j row can ever
+leak another tenant's document into a commit. The two residual risks are
+config-level, and each gets a mechanism:
+
+1. **Two workspaces pointed at one repo** (copy-pasted config, cloned
+   workspace): first push writes **`.aw-kb-sync.json`** at the repo root —
+   `{workspace_slug, bucket, initialized_at}` — and every subsequent tick
+   verifies it against `workspace_env("AW_WORKSPACE")` (§6, which already
+   refuses to run when the slug is empty) before pushing. Mismatch →
+   `git_state: diverged`-class refusal naming the claiming workspace.
+   Dot-named deliberately: §16.1 keeps the marker out of the graph for
+   free. The marker is advisory (someone can delete it remotely), but the
+   failure it prevents is accident, not attack — the attack surface is the
+   credential, bounded by §16.3's repo-scoped PAT.
+2. **Pointing at a wrong, non-empty repo** (burying an existing project):
+   a remote that is non-empty *and* has no marker refuses with a declared
+   reason; adopting an existing repo requires placing the marker manually
+   — one deliberate human act, same spirit as §7's delete approval.
+
+Not per-bucket (there is exactly one synced bucket by design, §3.1), not
+per-collection (collections are retrieval scope, not storage boundaries —
+§15.8-9's folders-are-not-buckets rule applies unchanged).
+
+### 16.6 Granularity, identity, failure isolation (questions D, E)
+
+**One commit per tick that changed anything** — subject line
+`kb-sync: +<created> ~<updated> -<deleted> [<workspace_slug> <tick-iso>]`,
+body listing changed paths (bounded, first ~50 + count). Per-file commits
+were rejected: the notion-sync burst (§3.3-4) would mint 1,564 commits of
+pure noise and the 30s debounce already defines the natural batch. Author
+and committer are fixed: `aw-kb-sync (<workspace_slug>) <kb-sync@
+<workspace_slug>.invalid>`. The sync cannot know who edited a file (the
+generators don't record authorship), so it must not fabricate attribution —
+an agent-driven `force` reorg and a human edit both arrive as the bot, with
+the *message* carrying what the tick knew. A future per-author story needs
+authorship captured at write time, out of scope here.
+
+**Failure isolation — the tick's order is scan → graph upsync/pull → git
+commit+push, and the boundary is one-way both ways:**
+
+- A git failure (`no_secret`, `auth_failed`, `diverged`, network) never
+  rolls back or blocks the graph write that already happened, and never
+  aborts the next tick's graph work. It sets `git_state`, exits non-zero,
+  escalates (§16.3).
+- A graph failure never blocks the commit: git mirrors the **tree**, not
+  the graph, and the tree is truth for both (§3.3-3). When they disagree,
+  the filesystem wins — graph and repo are both projections of it.
+- **No retry bookkeeping exists, by construction:** a commit is a
+  full-tree snapshot, not a per-file queue. Whatever a failed tick didn't
+  push is still in the worktree; the next successful tick's commit
+  contains it. `git_state` is the only persistent git-side state.
+- One visible consequence, stated so nobody files it as a bug: the repo
+  records a file deletion on the tick after the file vanishes, while the
+  graph holds it in `pending_delete` awaiting §7 approval. The repo is a
+  tree mirror, the approval gate is a graph gate — and git history is
+  itself the recovery path for a wrongly-deleted file.
+
+### 16.7 Multi-writer safety (question G)
+
+**The git step runs strictly inside the §5 lease holder's tick — same
+`ctx.state.lease.claim("fs-sync")`, no second coordination mechanism.**
+Commit and push are stages of the one serialized sync tick, never a
+separate task, schedule, or loop; the CLI door already funnels through the
+same lease (§5). git's own `index.lock` remains as a backstop against
+something outside the connector touching the repo, but it is not the
+design's concurrency story — the lease is. Two workspaces are not two
+writers to one remote because §16.5 forbids sharing a remote at all.
+
+### 16.8 Rejected alternatives (addendum)
+
+1. **A `.git` denylist** (or any name-list). The card itself rules it out;
+   `.github`/`.obsidian`/`.venv` are the same class, and the list is wrong
+   on the first unlisted name. The general rule costs the same line.
+2. **Dot-folders only, dot-files still scanned.** The `.env` secrets class
+   decides it (§16.1); the extension filter is not a durable shield, and
+   the sibling kb app already skips both.
+3. **A shadow clone** (commit from a copy under `data/knowledgeable/`
+   instead of `.git` inside `knowledge_base/`). Avoids placing `.git` in
+   the shared tree — but doubles disk, adds a copy pass that is a second
+   scan, drifts from the tree it mirrors, and the dot rule is needed
+   anyway (`.github` et al. arrive without git's help). Runner-up: revisit
+   only if another consumer of `knowledge_base/` proves unable to tolerate
+   `.git` (the known consumers are covered: kb app prunes dots, bulk
+   ingest gains §16.1, bind-mounts don't care).
+4. **`gh auth` / credential-helper auth** (the agent-side repos-push
+   pattern). That path stores a broad user token in a plain file
+   (`~/.config/gh/hosts.yml`) under a human identity — three rule
+   violations for an unattended app loop. Apps hold their own narrow
+   credentials in `ctx.secrets`.
+5. **The shared vault (aw-app-secrets) with `auto_approve_for`** — the
+   `playground_key_push.py` pattern. Works, but that pattern exists for
+   secrets that *cross an app boundary*; this credential is consumed only
+   by this app, which is exactly what `ctx.secrets` is for, and the
+   approval-gated store would add a human interrupt (or a standing
+   auto-approve entry) for no isolation gain. Runner-up if the repo
+   credential ever needs to be shared across apps — it should not be.
+6. **SSH deploy key.** Narrower than a PAT in theory, but the private key
+   must exist as a file (or an agent daemon we don't run) for
+   `GIT_SSH_COMMAND` to use — violating never-on-disk for real, today, to
+   avoid a hypothetical. HTTPS + env-injected fine-grained PAT keeps the
+   secret memory-only.
+7. **Committing a graph export** (JSON/Cypher dump) alongside or instead
+   of the tree. Opaque diffs, churn every tick, second source of truth —
+   and the graph is rebuildable from the tree, so it versions nothing the
+   tree doesn't.
+8. **Merge or rebase on divergence.** Auto-merge silently resolves
+   conflicts in generated files (the exact class §3.3 refuses to resolve
+   silently); rebase rewrites published history; force-push destroys it.
+   Fast-forward-or-stop is the only policy where the repo never lies.
+
+### 16.9 What this makes harder later
+
+1. **Push-only bakes in "the repo is read-only for humans."** People *will*
+   eventually edit the mirror on GitHub; every such edit becomes a
+   `diverged` stop until phase-2 pull (scoped to `authored/`, §16.4) is
+   designed. The ff-only policy is also what makes that phase safe to add.
+2. **`.git` inside the shared tree obligates every future consumer** of
+   `knowledge_base/` to honor the leading-dot convention forever. Today's
+   consumers all do or will; the convention must ride in the tree's
+   documentation (`native-skills/aw-workspace/SKILL.md` per house rule).
+3. **Repo growth is unbounded.** Full-history snapshots of a churning
+   corpus (notion regenerates constantly) grow the pack store
+   monotonically; an eventual shallow/squash/gc story is deferred — and
+   history rewriting will then collide with the ff-only rule and need a
+   deliberate re-initialization protocol.
+4. **The marker scheme assumes repo-per-workspace.** A future "one repo,
+   branch per workspace" consolidation redoes §16.5's guard (marker per
+   branch, not per repo root).
+5. **Env-injected HTTPS auth assumes an HTTPS remote.** An SSH-only
+   self-hosted remote reopens the deploy-key question §16.8-6 closed.
+
+### 16.10 Risks for the coders (addendum)
+
+1. **Prune at the walk, not post-filter.** Replacing `rglob` matters:
+   filtering `.git` paths *after* globbing still descends tens of
+   thousands of object-store entries every 5-minute tick. Use the
+   `kb_ops.py:162` `os.walk`/`dirs[:]` idiom so pruned trees are never
+   entered.
+2. **A hung git subprocess holds the fs-sync lease forever.** The lease
+   releases on process exit (§5), not on tick timeout — a push to a
+   blackholed remote with no subprocess timeout wedges every future tick
+   on every worker. Hard timeout on every git call, `GIT_TERMINAL_
+   PROMPT=0` so auth failure can never block on a prompt.
+3. **Never enable `GIT_TRACE`/`GIT_CURL_VERBOSE` in this path** — both
+   print the Authorization header, and the task-escalation flow would then
+   mail the token to an agent transcript.
+4. **The generated `.gitignore` must be asserted against `SKIP_PREFIXES`
+   in a test.** If they drift, the repo silently swallows the ~79%
+   code-map tree on the next tick — the failure is a huge slow push, not
+   an error.
+5. **Re-verify the marker on every config change, not just first push.**
+   A user editing `git_remote_url` in settings must hit the §16.5
+   non-empty-remote check again; caching "already initialized" on the
+   install defeats the guard exactly when it's needed.
+6. **Exit codes are the escalation channel.** The task contract fires on
+   non-zero (`notify_exit_codes: [1]`); a git step that catches its own
+   failure, logs it, and returns success has silently disabled §16.3's
+   entire visibility story. Classify, record `git_state`, *then* exit
+   non-zero.
+7. **The dot rule changes `is_skipped()`'s contract** from prefix-only to
+   component-aware; the §3 helper extraction must carry the test tree from
+   §16.1's verification with it, or the fs_sync rewrite quietly reverts to
+   prefix-only.
+8. **Commit after the upsync, inside the same tick.** The §3.3 debounce
+   already guarantees ≥30s of quiet before the tick acts; committing in a
+   separate loop reintroduces the half-written-burst snapshot the debounce
+   exists to prevent.
+
+### 16.11 Sequencing — recommended card breakdown
+
+The dot rule is deliberately **not** bundled into the git-backend card: it
+is a two-function change to *today's* `bulk_ingest.py` plus a test, with no
+dependency on `fs_sync.py`, the lease, or `restart core` — and it must be
+live before any `.git` ever appears in the tree.
+
+1. **Card 1 — leading-dot exclusion (ship immediately, no dependencies).**
+   `bulk_ingest.scan()` walk prune + `is_skipped` component test + the
+   §16.1 test tree. Optionally in the same card: the server-side
+   dot-component 400 lands with §1.2's PUT seam whenever that card runs
+   (it has no standalone seam to land in before then — note it on that
+   card, don't block this one).
+2. **Card 2 — git backend** (depends on card 1 and on the §14 step-5
+   connector work: the tick, the lease, `fs_sync.py`). New module
+   `knowledgeable_app/git_backend.py` (subprocess git, env credential
+   injection, marker check, failure classification, `.gitignore`
+   generation); `routes.py` settings + `/status` additions; `aw-app.json`
+   config keys + task-prompt cases + version bump; the §16.3/16.4/16.5
+   failure-path tests.
+
+Within §14's numbering, card 1 can run **today**, in parallel with step 2b
+— it touches only the connector's existing scan and needs no restart. Card
+2 joins step 5.
+
+QA gates (addendum): the §16.1 zero-rows test tree; marker-mismatch
+refusal; revoked-PAT tick → `auth_failed` + non-zero exit + graph write
+intact; diverged remote → no force-push, declared stop; dead remote →
+tick completes graph work and the *next* tick still runs (lease not
+wedged); `.gitignore` ≡ `SKIP_PREFIXES` assertion.
