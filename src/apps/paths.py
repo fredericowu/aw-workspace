@@ -180,6 +180,27 @@ def workspace_root() -> str:
     )
 
 
+def knowledge_base_dir() -> str:
+    """``<home>/knowledge_base`` — the same shared, non-namespaced tree
+    ``$AW_KB_DIR`` bind-mounts into the kb app's container (see
+    ``apps/runtime.py``'s ``$AW_KB_DIR`` volume resolution)."""
+    d = os.path.join(workspace_home(), "knowledge_base")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def knowledge_apps_dir() -> str:
+    """``knowledge_base/apps/`` — the namespaced root every
+    ``contributes.knowledge`` mirror (``apps/<id>/docs/``) and the
+    ``kb-reference`` generator's app-owned captures (``apps/<id>/cli_reference/``)
+    write under, one subdirectory per app id. Ownership is the directory
+    name itself, not a marker file — each app only ever writes inside its
+    own ``apps/<id>/``."""
+    d = os.path.join(knowledge_base_dir(), "apps")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def repos_dir() -> str:
     """Top-level ``repos/`` at the workspace root — where a user/agent working
     from a workspace terminal clones repos for general dev work (the git

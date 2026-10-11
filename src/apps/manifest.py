@@ -218,6 +218,13 @@ class Manifest:
         return list(self.contributes.get("skills", []))
 
     @property
+    def knowledge(self) -> dict[str, Any] | None:
+        """``contributes.knowledge`` — the app's one docs dir, mirrored into
+        ``knowledge_base/apps/<app-id>/docs/``. ``None`` when the app
+        declares none."""
+        return self.contributes.get("knowledge")
+
+    @property
     def tasks(self) -> list[dict[str, Any]]:
         """``contributes.tasks`` — scheduled tasks the app seeds on install.
 
@@ -1163,6 +1170,11 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
     for skill in contributes.get("skills", []):
         if not isinstance(skill, dict) or not skill.get("id") or not skill.get("path"):
             raise ManifestError("each contributes.skills entry needs an 'id' and a 'path'")
+
+    knowledge = contributes.get("knowledge")
+    if knowledge is not None:
+        if not isinstance(knowledge, dict) or not str(knowledge.get("path") or "").strip():
+            raise ManifestError("contributes.knowledge must be an object with a non-empty 'path'")
 
     tasks = contributes.get("tasks", [])
     if tasks and "tasks:contribute" not in permissions:

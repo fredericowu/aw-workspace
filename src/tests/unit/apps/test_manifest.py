@@ -259,6 +259,30 @@ def test_skills_entry_requires_id_and_path():
         validate_manifest(bad2)
 
 
+def test_knowledge_property_reads_contributes_knowledge():
+    m = validate_manifest(_m(contributes={"knowledge": {"path": "docs"}}, permissions=[]))
+    assert m.knowledge == {"path": "docs"}
+
+
+def test_knowledge_property_none_when_not_declared():
+    m = validate_manifest(_m(contributes={}, permissions=[]))
+    assert m.knowledge is None
+
+
+def test_knowledge_entry_requires_a_path():
+    bad = _m(contributes={"knowledge": {}}, permissions=[])
+    with pytest.raises(ManifestError, match="contributes.knowledge"):
+        validate_manifest(bad)
+
+    bad2 = _m(contributes={"knowledge": {"path": "  "}}, permissions=[])
+    with pytest.raises(ManifestError, match="contributes.knowledge"):
+        validate_manifest(bad2)
+
+    bad3 = _m(contributes={"knowledge": "docs"}, permissions=[])
+    with pytest.raises(ManifestError, match="contributes.knowledge"):
+        validate_manifest(bad3)
+
+
 def test_reload_mcp_gateway_on_save_true_when_declared():
     m = validate_manifest(_m(contributes={"mcp": {"reload_on_save": True}}, permissions=[]))
     assert m.reload_mcp_gateway_on_save is True

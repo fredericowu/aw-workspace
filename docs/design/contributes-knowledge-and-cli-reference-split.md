@@ -38,7 +38,7 @@ before being cited.
 
    | Owner | Commands |
    |---|---|
-   | **core** (15 built-ins, → 26 of the 35 files incl. subcommand pages + `root.md`) | `agent`, `apps`, `doctor`, `folders`, `help`, `kb-reference`, `logs`, `marketplace`, `restart`, `sideload`, `start`, `status`, `stop`, `test`, `update` |
+   | **core** (15 built-ins, → 25 of the 35 files incl. subcommand pages + `root.md`) | `agent`, `apps`, `doctor`, `folders`, `help`, `kb-reference`, `logs`, `marketplace`, `restart`, `sideload`, `start`, `status`, `stop`, `test`, `update` |
    | `agents-platform-runners` | `agents-platform` |
    | `architecture` | `architecture` |
    | `aw-app-uc-phd` | `uc-phd-index` |

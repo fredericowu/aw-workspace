@@ -50,6 +50,7 @@ from src.apps import mcp_template
 from src.apps import repos as repos_mod
 from src.apps import tasks as tasks_mod
 from src.apps.agents import AgentsRegistry
+from src.apps.knowledge import KnowledgeError, KnowledgeRegistry
 from src.apps.repos import RepoError, ReposRegistry
 from src.apps.skills import SkillError, SkillsRegistry
 from src.apps.tasks import TasksRegistry
@@ -642,6 +643,7 @@ class AppRuntime:
         self.watchdog = WatchdogSupervisor()
         self.secret_store = SecretStore()
         self.skills = SkillsRegistry()
+        self.knowledge = KnowledgeRegistry()
         self.tasks = TasksRegistry()
         self.agents = AgentsRegistry()
         self.repos = ReposRegistry()
@@ -1007,6 +1009,27 @@ class AppRuntime:
                 continue
             self.journal.record(slug, "skill:register", skill_id, {"dest_path": dest_path})
 
+    def _register_knowledge(self, loaded: LoadedApp) -> None:
+        """Mirror this app's ``contributes.knowledge`` dir into the shared KB tree.
+
+        No-op for an app that declares none. A bad entry (missing dir, path
+        escaping the package dir) is logged and skipped rather than failing
+        the whole install — same non-fatal posture as ``_register_skills``.
+        """
+        slug = loaded.manifest.id
+        knowledge = loaded.manifest.knowledge
+        if not knowledge:
+            return
+        path = knowledge.get("path")
+        if not path:
+            return
+        try:
+            dest_path = self.knowledge.register(slug, loaded.package_dir, path)
+        except KnowledgeError:
+            log.exception("apps: failed to register knowledge dir for %s", slug)
+            return
+        self.journal.record(slug, "knowledge:register", "docs", {"dest_path": dest_path})
+
     def _register_tasks(self, loaded: LoadedApp) -> None:
         """Seed this app's ``contributes.tasks`` (create-if-absent, by name).
 
@@ -1208,6 +1231,7 @@ class AppRuntime:
             # here, where the plugin is live, because `agent sync` also runs from
             # the CLI with no apps loaded and must reach the same skills/.
             await skill_sources.refresh(slug, plugin, ctx)
+            self._register_knowledge(loaded)
             self._register_tasks(loaded)
             self._register_agents(loaded)
             await self._register_repos(manifest)
@@ -1332,6 +1356,24 @@ class AppRuntime:
             except Exception:
                 log.exception("apps: forgetting skill sources for %s failed", slug)
 
+        # Unconditional, journal-independent purge of the whole knowledge
+        # namespace (design §C) — NOT gated on purge_secrets like the two
+        # blocks above. Unlike a credential or a user's hand-edited skill,
+        # the knowledge mirror is nothing but a re-derivable copy of the
+        # app's own package, so losing it across an upgrade's uninstall-half
+        # costs nothing: the install() half that immediately follows
+        # re-mirrors it from the new version. This is what guarantees
+        # removal even when this worker's in-memory journal has no
+        # knowledge:register entry to reverse (AW_WORKSPACE_WORKERS>1) —
+        # the reconciler's roster sweep is the third, independent backstop.
+        # PROVISION-only: the mirror lives in the one shared knowledge_base/
+        # tree that every worker shares.
+        if provision:
+            try:
+                self.knowledge.purge_app(slug)
+            except Exception:
+                log.exception("apps: purging knowledge namespace for %s failed", slug)
+
         # An uninstalled app's CLI is gone on purpose — stop the healer from
         # trying to resurrect it (system_cli:revert-hook already ran above).
         # Per-process registry, so every worker drops it, provisioning or not:
@@ -1401,6 +1443,14 @@ class AppRuntime:
             # read-only) — deleting an entry is a provisioning act.
             if provision:
                 self.skills.unregister(entry.payload.get("dest_path", ""))
+        elif kind == "knowledge:register":
+            # Same shared-tree reasoning as skill:register. This is only one
+            # of three uninstall layers (design §C) — the unconditional
+            # purge_app below and the reconciler's roster sweep are the
+            # other two, and they are what actually guarantee removal under
+            # AW_WORKSPACE_WORKERS>1, not this journal reverse.
+            if provision:
+                self.knowledge.unregister(entry.payload.get("dest_path", ""))
         # route:mount (already unmounted), system_cli:install (audit-only),
         # secret:write (namespace purged above), capability:denied → no-op.
 
@@ -1632,6 +1682,7 @@ class AppRuntime:
             self._render_mcp_template(loaded)
             self._render_gateway_profiles(loaded)
             self._register_skills(loaded)
+            self._register_knowledge(loaded)
             self._register_tasks(loaded)
             self._register_agents(loaded)
             # (repos were cloned before the volume resolution above)

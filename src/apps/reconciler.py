@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from src.apps import config_store
 from src.apps import fetch as fetch_mod
 from src.apps import gateway_profiles
+from src.apps import knowledge as knowledge_mod
 from src.apps import mcp_template
 from src.apps.capabilities import filter_grants
 from src.apps.manifest import load_manifest
@@ -1408,6 +1409,18 @@ class Reconciler:
         self._pending_broadcast = None
         if wanted_broadcast:
             await self._trigger_broadcast("reconcile")
+
+        # Roster sweep (design §B/§C): the backstop for every path where a
+        # journal-only uninstall teardown could silently no-op (journal is
+        # in-memory PER WORKER — AW_WORKSPACE_WORKERS>1 means an uninstall
+        # can land on a worker that never provisioned the app). Runs here,
+        # after this pass's final actual-loaded set is known, not against
+        # `desired_active` — a failed install must not have its knowledge
+        # dir swept out from under an app that is, in fact, still loaded
+        # from a previous pass.
+        swept = knowledge_mod.sweep(set(self.runtime.loaded_slugs()))
+        if swept:
+            log.info("apps: knowledge sweep removed orphaned namespace(s): %s", swept)
 
         duration_s = round(time.monotonic() - pass_started, 1)
         concurrency = _reconcile_concurrency()
