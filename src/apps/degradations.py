@@ -50,8 +50,13 @@ _CACHE_TTL_S = 5.0
 
 #: Keys only ``doctor`` wants — ``/api/health`` is a status surface, not a
 #: debugging one, and a process's last stderr lines have no business in a
-#: payload an uptime monitor scrapes.
-_DOCTOR_ONLY_KEYS = ("last_exit_code", "last_error", "component", "tier")
+#: payload an uptime monitor scrapes. ``desired`` is deliberately NOT in here:
+#: "this component is off and nobody meant it to be" is exactly what a monitor
+#: needs to tell apart from a component somebody switched off.
+#: ``supervised_here`` is, though — it only qualifies how much the answering
+#: worker's ``desired`` can be trusted, which is a debugging detail.
+_DOCTOR_ONLY_KEYS = ("last_exit_code", "last_error", "component", "tier",
+                     "supervised_here")
 
 _cache_lock = threading.Lock()
 _cache: dict | None = None
@@ -89,7 +94,8 @@ def _collect(runtime) -> tuple[list[dict], bool]:
 
         {"kind": "service", "app": "proxy", "tier": "inprocess",
          "service": "proxy-server", "component": "proxy:proxy-server",
-         "state": "gave_up", "autostart": True, "reason": "crash-loop",
+         "state": "gave_up", "desired": "running", "supervised_here": True,
+         "autostart": True, "reason": "crash-loop",
          "last_exit_code": 1, "last_error": "..."}
 
     ``state`` is the supervisor's own, and ``off`` when it has none to offer
@@ -97,6 +103,11 @@ def _collect(runtime) -> tuple[list[dict], bool]:
     ``gave_up`` | ``stopped``. ``backing_off`` means the restart loop is
     already on it; ``gave_up`` means it is not, and will not be, without a
     human (``src/apps/services.py``).
+
+    ``desired`` is the other half of that, and the half a consumer must not
+    skip: ``state == "stopped"`` with ``desired == "running"`` is a service
+    nobody stopped and nothing is bringing back — broken, not switched off.
+    Services only; a container row has no supervisor intent to report.
     """
     rows: list[dict] = []
     for slug, loaded in _autostart_apps(runtime):
@@ -111,6 +122,13 @@ def _collect(runtime) -> tuple[list[dict], bool]:
                 "kind": "service", "app": slug, "tier": tier,
                 "service": service_id, "component": f"{app_id}:{service_id}",
                 "state": status.get("state") or "off", "autostart": True,
+                # The supervisor's INTENT, which is what separates "someone
+                # switched this off" from "this is broken" — never the absence
+                # of a crash, which is what doctor used to read it from and
+                # which says nothing at all (see the label in
+                # ``src/cli/commands/doctor.py``).
+                "desired": status.get("desired"),
+                "supervised_here": bool(status.get("supervised_here")),
                 "last_exit_code": status.get("last_exit_code"),
                 "last_error": status.get("last_error"),
             }

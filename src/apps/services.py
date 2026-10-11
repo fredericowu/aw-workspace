@@ -25,6 +25,15 @@ new outage, and both are tested:
   ``src/tests/integration/apps/test_services.py``); without the identity
   check that late ``finally`` spawns a third copy.
 
+A third rule, added 2026-10-11 after the first version of the restart loop
+shipped with it missing: **a start the ownership gate declines is deferred,
+not lost**. ``start()`` refuses to spawn while a peer worker's lease is live,
+which is right — two copies collide on the port — but the lease is a 30s TTL
+kept alive by a heartbeat, so a worker that died leaves a *ghost*: a key that
+outlives its owner and then expires with nothing running anywhere. Refusing
+once and forgetting left ``desired = running``, no process, and nothing ever
+looking again. See :meth:`ServiceSupervisor._arm_lease_retry`.
+
 What this module deliberately does NOT do is notice a service that was never
 started, or one whose owning worker died — the supervisor's knowledge dies
 with its worker. That is the activation audit (§A of the same design), which
@@ -72,6 +81,16 @@ _EXIT_REAP_S = 5.0
 #: durations) is where respawning stops being recovery and starts being a
 #: tighter loop than the bug it is fixing: port flapping, CPU burn, log spam.
 _GIVE_UP_AFTER = 5
+
+#: A start DECLINED by the cross-worker ownership gate is re-tried on this
+#: fixed interval, with its own budget — see
+#: :meth:`ServiceSupervisor._arm_lease_retry`. Flat rather than exponential
+#: because what it waits for has a known horizon (the lease's 30s TTL) rather
+#: than an unknown one, and twelve attempts covers twice that TTL: a ghost
+#: lease is always outlasted, while a peer still renewing after a full minute
+#: is taken at its word.
+_LEASE_RETRY_S = 5.0
+_LEASE_RETRY_ATTEMPTS = 12
 
 #: Substrings that identify the one crash class a respawn can never win:
 #: something else already holds the port. After a core-process-only restart
@@ -133,6 +152,12 @@ class _Service:
         # never described by this worker's local policy state.
         self.state = STATE_STOPPED
         self.consecutive_fast_exits = 0
+        # Declined starts (a peer worker's lease was live), counted SEPARATELY
+        # from crashes: being declined is not a crash, and spending the crash
+        # budget on it would hand a perfectly healthy service a `gave_up` for
+        # the sin of having a peer. Reset by any successful acquire and by
+        # every deliberate start.
+        self.lease_waits = 0
         self.last_spawn_monotonic: float | None = None
         self.give_up_reason: str | None = None
         # Guards the fields above only. Never held across Popen() (fork+exec
@@ -190,6 +215,7 @@ class ServiceSupervisor:
             svc.desired = DESIRED_RUNNING
             if manual:
                 svc.consecutive_fast_exits = 0
+                svc.lease_waits = 0
                 svc.give_up_reason = None
                 if svc.state == STATE_GAVE_UP:
                     log.info("apps: service %s/%s was in gave_up — a manual start "
@@ -213,7 +239,14 @@ class ServiceSupervisor:
                 "apps: service %s/%s is already owned by another worker — refusing to "
                 "spawn a duplicate subprocess that would collide on its port",
                 app_id, service_id)
+            # The refusal is right; dropping the start on the floor was not.
+            self._arm_lease_retry(svc)
             return self.status(app_id, service_id)
+        with svc.lock:
+            # Won it, so whatever was holding it is gone: the wait is over and
+            # the next decline (after a future restart, say) starts from a
+            # full budget rather than an exhausted one.
+            svc.lease_waits = 0
 
         # We hold the lease, so no live worker owns this service — anything
         # on this host still running its exact command line is an orphan
@@ -380,6 +413,70 @@ class ServiceSupervisor:
                 svc.app_id, svc.service_id, exit_code, delay,
                 svc.consecutive_fast_exits)
             self._schedule_respawn(svc, delay)
+
+    def _arm_lease_retry(self, svc: _Service) -> None:
+        """Re-ask for ownership later, after a start the gate declined.
+
+        The gate itself is correct and stays: spawning a second copy while a
+        peer worker runs the first is the port collision the lease exists to
+        prevent. What was wrong was treating the refusal as the END of the
+        start. The lease is a 30s TTL renewed by a heartbeat thread, so a
+        worker that *died* leaves a **ghost lease**: the key outlives its
+        owner by up to the TTL and then expires with nothing running anywhere.
+        A refusal inside that window used to be final — ``desired`` stayed
+        ``running``, no process existed, and nothing ever looked again, so one
+        unlucky boot stranded the service until a human restarted it by hand
+        (reproduced on card 3f65bf3b, 2026-10-11; that is how
+        ``proxy:proxy-server`` — and with it all four browser-MCP families —
+        came up dead after a core restart).
+
+        So the declined start sleeps and re-enters ``start(manual=False)``,
+        through :meth:`_schedule_respawn` so a deliberate ``stop()`` still
+        disarms it the same way it disarms a crash backoff. Flat
+        :data:`_LEASE_RETRY_S` rather than the crash backoff, and a budget of
+        its own: a decline is not a crash, and a service that crashes on
+        startup must still reach the sticky ``gave_up`` on ITS five, which
+        this path never touches.
+
+        **Bounded, deliberately.** A peer that keeps renewing for the whole
+        window is alive and running the service — that is not a ghost, and
+        ``status()`` already reports it running fleet-wide — so this stands
+        down instead of polling forever. The bound also caps how long a worker
+        can carry a ``desired = running`` it will never act on: the relay's
+        timeout fallback (rule 4, ``src/apps/service_relay.py``) can leave one
+        on a non-owning worker, and a stale ``desired`` that outlived its
+        reason is how a later deliberate stop elsewhere gets undone. If the
+        peer dies *after* the window, nothing here starts the service: that is
+        the activation audit (design §A, not built), and ``doctor`` now says so
+        loudly instead of calling it deliberately stopped.
+        """
+        with svc.lock:
+            if svc.desired != DESIRED_RUNNING or svc.state == STATE_GAVE_UP:
+                return
+            exhausted = svc.lease_waits >= _LEASE_RETRY_ATTEMPTS
+            if exhausted:
+                # Not `gave_up`: nothing crashed and nothing is broken as far
+                # as this worker can tell. `stopped` + `desired == running` is
+                # the honest pair, and the one doctor reports loudly.
+                svc.state = STATE_STOPPED
+            else:
+                svc.lease_waits += 1
+                svc.state = STATE_BACKING_OFF
+            attempt = svc.lease_waits
+        if exhausted:
+            log.error(
+                "apps: another worker has held service %s/%s's lease for the whole "
+                "%.0fs window — standing down, on the assumption it really is "
+                "running there. If it is NOT, nothing on this worker will start it: "
+                "see docs/standards/core-restart-blast-radius.md",
+                svc.app_id, svc.service_id, _LEASE_RETRY_ATTEMPTS * _LEASE_RETRY_S)
+            return
+        log.info(
+            "apps: service %s/%s stays wanted (desired=running) — re-checking its "
+            "ownership in %.0fs (attempt %s/%s), in case that lease belongs to a "
+            "worker that is already gone",
+            svc.app_id, svc.service_id, _LEASE_RETRY_S, attempt, _LEASE_RETRY_ATTEMPTS)
+        self._schedule_respawn(svc, _LEASE_RETRY_S)
 
     def _looks_like_port_collision(self, svc: _Service) -> bool:
         """Did this exit say "something else already holds my port"?
@@ -574,6 +671,7 @@ class ServiceSupervisor:
             svc.desired = DESIRED_STOPPED
             svc.state = STATE_STOPPED
             svc.consecutive_fast_exits = 0
+            svc.lease_waits = 0
             self._cancel_respawn(svc)
         proc = svc.proc
         if proc is not None and proc.poll() is None:
@@ -620,6 +718,15 @@ class ServiceSupervisor:
             # vs "gave up" vs "deliberately stopped".
             "state": (STATE_RUNNING if (running or remote) else svc.state),
             "desired": svc.desired,
+            # Has THIS worker ever spawned the process? `desired`/`state` are
+            # per-worker memory, so on a worker that never ran the service
+            # they are untouched defaults, not a record of anything — and
+            # "stopped" there must not be read as "someone stopped it on
+            # purpose". Only a worker that actually ran it can say that, and
+            # at AW_WORKSPACE_WORKERS=5 four out of five answers come from one
+            # that did not. Never reset: a deliberate stop always follows a
+            # run, so once true this stays true for the life of the process.
+            "supervised_here": svc.last_spawn_monotonic is not None,
         }
         if svc.give_up_reason and not (running or remote):
             result["give_up_reason"] = svc.give_up_reason

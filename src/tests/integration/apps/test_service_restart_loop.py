@@ -18,6 +18,16 @@ second outage:
 4. a bind collision gives up immediately and names the orphan it suspects,
    because no amount of backoff wins against a port someone else holds.
 
+The last group covers what the first version of this loop got wrong: a start
+the cross-worker ownership gate DECLINED was dropped on the floor. The gate is
+right to refuse while a peer worker's lease is live, but that lease is a 30s
+TTL kept alive by a heartbeat, so a worker that died leaves a **ghost** — a
+key that outlives its owner and then expires with nothing running anywhere.
+Reproduced on card 3f65bf3b (2026-10-11): ``desired = running``, no process,
+no retry, and ``doctor`` announcing it as "deliberately stopped". The three
+tests pin the refusal, the eventual takeover, and the thing a retry path must
+never break — that a deliberate stop mid-wait still wins.
+
 Timings are shrunk via the module's own constants so the suite stays fast;
 the arithmetic under test is the same.
 """
@@ -32,8 +42,46 @@ import uuid
 import pytest
 
 from src.apps import services as services_mod
-from src.apps.service_lease import gave_up_markers, is_lease_held_anywhere
-from src.apps.services import (STATE_BACKING_OFF, STATE_GAVE_UP, ServiceSupervisor)
+from src.apps.service_lease import (ServiceLease, gave_up_markers,
+                                    is_lease_held_anywhere)
+from src.apps.services import (STATE_BACKING_OFF, STATE_GAVE_UP,
+                               STATE_STOPPED, ServiceSupervisor)
+
+
+@pytest.fixture()
+def fast_lease_retry(monkeypatch):
+    """5s × 12 attempts is the shipped schedule for a declined start; 100ms ×
+    12 is the same shape, 50x faster. ``_LEASE_RETRY_ATTEMPTS`` is left alone
+    except where a test is specifically about the budget running out — the
+    count is part of the contract, not a timing detail."""
+    monkeypatch.setattr(services_mod, "_LEASE_RETRY_S", 0.1)
+
+
+@pytest.fixture()
+def ghost_lease():
+    """A lease nobody is renewing — the exact artefact a worker leaves behind
+    when it dies, as opposed to one it released on its way out.
+
+    Needs real Redis: ``ServiceLease.acquire`` deliberately degrades OPEN, so
+    with Redis away the "ghost" is never recorded and the supervisor's own
+    acquire succeeds too. That is correct single-worker behaviour and there is
+    nothing to test, hence the skip rather than a fake client — the whole
+    point of these three is the real expiry arithmetic.
+    """
+    leases: list[ServiceLease] = []
+
+    def _make(app_id: str, service_id: str, *, ttl: float) -> ServiceLease:
+        lease = ServiceLease(app_id, service_id, ttl=ttl)
+        assert lease.acquire() is True
+        leases.append(lease)
+        if not is_lease_held_anywhere(app_id, service_id):
+            pytest.skip("Redis is unreachable, so ServiceLease.acquire degraded "
+                        "open and there is no lease to be a ghost of")
+        return lease
+
+    yield _make
+    for lease in leases:
+        lease.release()
 
 
 @pytest.fixture()
@@ -376,3 +424,132 @@ def test_backoff_grows_and_is_reported_as_backing_off(supervisor, monkeypatch, t
     time.sleep(3.0)
     assert supervisor.status(app_id, service_id)["running"] is False
     assert svc.state == "stopped"
+
+
+# ---------------------------------------------------------------------------
+# The declined start (card 3f65bf3b) — see the module docstring
+# ---------------------------------------------------------------------------
+
+
+def test_a_live_peer_lease_still_refuses_the_spawn(
+        supervisor, ghost_lease, fast_lease_retry, tmp_path):
+    """The anti-collision gate is not what gets relaxed to fix the ghost.
+
+    A lease held for longer than the whole retry window stands in for a peer
+    worker that really is running the service. Every retry has to keep
+    refusing: spawning here would put a second copy on the first one's port,
+    which is the bug the lease exists for.
+    """
+    app_id, service_id = _ids()
+    ghost_lease(app_id, service_id, ttl=30.0)
+
+    supervisor.register(app_id, service_id, "sleep 60", str(tmp_path), autostart=True)
+    svc = supervisor._require(app_id, service_id)
+
+    assert _wait(lambda: svc.lease_waits >= 3, timeout=10), \
+        f"the declined start was not retried at all (lease_waits={svc.lease_waits})"
+    assert svc.proc is None, "it spawned a duplicate next to the lease holder"
+    assert svc.consecutive_fast_exits == 0, \
+        "a declined start spent the CRASH budget, which would eventually " \
+        "hand a healthy service a gave_up for the sin of having a peer"
+    assert svc.state != STATE_GAVE_UP
+    # Reported honestly meanwhile: somebody's lease is live, so the service
+    # IS running fleet-wide, just not here.
+    status = supervisor.status(app_id, service_id)
+    assert status["running"] is True
+    assert status["remote_worker"] is True
+    assert status["pid"] is None
+
+
+def test_a_ghost_lease_defers_the_start_instead_of_losing_it(
+        supervisor, ghost_lease, fast_lease_retry, tmp_path):
+    """The reproduction from the card, as a regression test.
+
+    A dead worker's lease is still in Redis with its TTL counting down from
+    the last heartbeat it managed to send. ``register(autostart=True)`` is
+    declined — correctly — and then the lease expires with no owner. Nothing
+    external ever calls ``start()`` again in this test: the service coming up
+    is the supervisor re-asking on its own, which is the whole fix.
+    """
+    app_id, service_id = _ids()
+    ghost_lease(app_id, service_id, ttl=0.5)
+
+    supervisor.register(app_id, service_id, "sleep 60", str(tmp_path), autostart=True)
+    svc = supervisor._require(app_id, service_id)
+
+    assert svc.desired == "running", "nothing stopped it"
+    assert svc.lease_waits >= 1, \
+        "the declined start was forgotten rather than deferred — this is the bug"
+
+    assert _wait(lambda: svc.proc is not None and svc.proc.poll() is None,
+                 timeout=15), (
+        "the service never came up after the ghost lease expired "
+        f"(state={svc.state}, lease_waits={svc.lease_waits}) — permanently "
+        "stranded with desired=running, exactly as reported")
+    status = supervisor.status(app_id, service_id)
+    assert status["running"] is True
+    assert status["pid"]
+    assert status["state"] == "running"
+    assert status["supervised_here"] is True
+
+
+def test_a_stop_during_a_lease_wait_is_not_undone_when_the_lease_frees(
+        supervisor, ghost_lease, fast_lease_retry, tmp_path):
+    """The rule the retry path must not break.
+
+    A pending retry is as dangerous as a pending crash backoff: if the
+    operator stops the service while it waits, the lease freeing a moment
+    later must not resurrect it. ``stop()`` sets ``desired = stopped`` and
+    cancels the armed timer in the same locked instant — the same discipline
+    the crash loop already follows.
+    """
+    app_id, service_id = _ids()
+    ghost_lease(app_id, service_id, ttl=0.5)
+
+    supervisor.register(app_id, service_id, "sleep 60", str(tmp_path), autostart=True)
+    svc = supervisor._require(app_id, service_id)
+    assert svc.lease_waits >= 1
+
+    supervisor.stop(app_id, service_id)
+    assert svc.desired == "stopped"
+
+    # Well past the ghost's expiry and ~20 shrunk retry intervals.
+    time.sleep(2.0)
+    assert is_lease_held_anywhere(app_id, service_id) is False, \
+        "the ghost never expired — this test cannot reach what it exists for"
+    assert svc.proc is None, "a deliberate stop was undone by the lease retry"
+    status = supervisor.status(app_id, service_id)
+    assert status["running"] is False
+    assert status["state"] == STATE_STOPPED
+    assert status["desired"] == "stopped"
+
+
+def test_a_peer_that_never_lets_go_is_eventually_taken_at_its_word(
+        supervisor, ghost_lease, monkeypatch, tmp_path):
+    """The retry is bounded, and what it leaves behind is honest.
+
+    A lease renewed for the entire window belongs to a worker that is alive
+    and running the service, so polling it forever buys nothing — and a
+    ``desired = running`` carried indefinitely on a worker that will never act
+    on it is how a later deliberate stop elsewhere gets undone. Standing down
+    must not look like a give-up (nothing crashed) nor like a deliberate stop
+    (nobody stopped it): ``state = stopped`` with ``desired = running`` is the
+    pair, and it is the pair ``doctor`` reports as broken.
+    """
+    monkeypatch.setattr(services_mod, "_LEASE_RETRY_S", 0.05)
+    monkeypatch.setattr(services_mod, "_LEASE_RETRY_ATTEMPTS", 3)
+    app_id, service_id = _ids()
+    ghost_lease(app_id, service_id, ttl=30.0)
+
+    supervisor.register(app_id, service_id, "sleep 60", str(tmp_path), autostart=True)
+    svc = supervisor._require(app_id, service_id)
+
+    assert _wait(lambda: svc.state == STATE_STOPPED and svc.lease_waits == 3,
+                 timeout=10), \
+        f"never stood down (state={svc.state}, lease_waits={svc.lease_waits})"
+    assert svc.proc is None
+    assert svc.desired == "running"
+    assert svc.state != STATE_GAVE_UP
+    assert svc.give_up_reason is None
+    time.sleep(0.5)  # 10x the shrunk interval — a 4th attempt would have landed
+    assert svc.lease_waits == 3, "the budget was not respected"

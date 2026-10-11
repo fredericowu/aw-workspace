@@ -119,12 +119,18 @@ def test_an_auto_start_service_that_is_off_is_reported():
         services=_Services({
             ("proxy", "proxy-server"): {
                 "running": False, "last_exit_code": 0, "last_error": None,
+                # Left stopped by a human on the worker that ran it, which is
+                # what makes this one genuinely deliberate — the row has to
+                # carry that intent, because the absence of a crash does not
+                # tell doctor anything (see test_doctor_autostart_label.py).
+                "desired": "stopped", "supervised_here": True,
             },
         }),
     )
     assert _autostart_not_running(rt) == [{
         "app": "proxy", "tier": "inprocess", "component": "proxy:proxy-server",
         "state": "off", "last_exit_code": 0, "last_error": None,
+        "desired": "stopped", "supervised_here": True,
     }]
 
 

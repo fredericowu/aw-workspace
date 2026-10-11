@@ -98,18 +98,23 @@ def test_a_dead_autostart_service_makes_the_workspace_degraded(monkeypatch):
         {"proxy": _app("proxy", config={"auto_start": True}, tier="inprocess")},
         services=_Services({
             ("proxy", "proxy-server"): {"running": False, "state": "off",
-                                        "last_exit_code": 1, "last_error": "boom"},
+                                        "last_exit_code": 1, "last_error": "boom",
+                                        "desired": "running",
+                                        "supervised_here": True},
         }),
     )
     report = health_report(rt)
     assert report["status"] == "degraded"
     assert report["degraded"] == [{
         "kind": "service", "app": "proxy", "service": "proxy-server",
-        "state": "off", "autostart": True,
+        "state": "off", "autostart": True, "desired": "running",
     }]
     # A process's last stderr lines are a debugging detail doctor wants and a
-    # scraped status payload does not.
+    # scraped status payload does not. `desired` is the opposite call: "off and
+    # nobody meant it to be" is exactly what a monitor needs to tell apart
+    # from a component somebody switched off, so it stays.
     assert "last_error" not in report["degraded"][0]
+    assert "supervised_here" not in report["degraded"][0]
 
 
 def test_the_supervisors_own_state_reaches_the_payload(monkeypatch):

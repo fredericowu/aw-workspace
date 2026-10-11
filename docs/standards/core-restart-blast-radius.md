@@ -142,6 +142,25 @@ workspace container (case 1), because podman itself is inside it.
   `stop()` returns; set that flag afterwards and the pump reads a stale
   `running` and respawns the service the operator just killed.
   Test: `test_a_deliberate_stop_is_not_respawned`.
+- **A start the ownership gate declines is deferred, not lost** (added
+  2026-10-11, after the first version of this shipped without it). `start()`
+  refuses to spawn while another worker's lease is live — that refusal is
+  right, it is the port collision the lease exists for — but the lease is a
+  30s TTL kept alive by a heartbeat, so a worker that *died* leaves a **ghost
+  lease**: a key that outlives its owner and then expires with nothing
+  running anywhere. The refusal therefore re-asks for ownership every 5s for
+  up to a minute (twice the TTL) instead of ending the start, with its own
+  budget: a decline is not a crash and must not spend the give-up budget.
+  Tests: `test_a_ghost_lease_defers_the_start_instead_of_losing_it`,
+  `test_a_live_peer_lease_still_refuses_the_spawn`,
+  `test_a_stop_during_a_lease_wait_is_not_undone_when_the_lease_frees`.
+- **`doctor` reads "deliberate or not" off `desired`, never off the absence
+  of a crash.** `desired = stopped` is a decision; `desired = running` while
+  nothing runs is a fault, and is reported as one, loudly. The ghost-lease
+  bug above was first mistaken for an intentional stop *because* the label
+  came from `state == "stopped"`, which says nothing about intent — in the
+  one tool this workspace has for catching silent degradation.
+  Test: `src/tests/unit/cli/test_doctor_autostart_label.py`.
 
 ### The operator consequence: `kill -9` stops working as a tool
 
@@ -161,6 +180,15 @@ message.
 - **The supervisor's knowledge dies with its worker.** It covers "the
   service died"; it does not cover "the service was never started" or "the
   worker that owned it is gone". That is §1's missing audit.
+- **`desired` is per-worker memory too**, which bounds both of the
+  declined-start rules above. A peer still renewing its lease after the full
+  retry window is taken at its word and this worker stands down; if that peer
+  dies *afterwards*, nothing here starts the service (again §1). And a worker
+  that never ran a service has an untouched `desired = stopped` that is not a
+  record of anything — so `doctor` only calls a stop deliberate when the
+  worker answering actually ran the process (`supervised_here` in
+  `ServiceSupervisor.status()`), and says "off and unexplained" otherwise.
+  At `AW_WORKSPACE_WORKERS=5` that is four answers in five.
 - **`/api/health` gained a soft Redis dependency.** With Redis away it falls
   back to this worker's own process table and says so
   (`health_scope: "local-worker"`); it never fails. See §5.
@@ -191,7 +219,8 @@ What can be promised today, in one sentence:
 > service whose activation runs, within seconds of any later death; and a
 > service that is *not* running while its config says it should be is named
 > in three places a human or an agent actually looks — `doctor`,
-> `/api/health`, and the service's own `state`. What is **not** yet
+> `/api/health`, and the service's own `state` — with the one somebody
+> switched off told apart from the one that is broken. What is **not** yet
 > guaranteed is the activation itself: a service whose `activate()` is
 > skipped on boot still stays down, and the activation audit that would
 > close that is deferred (§1).

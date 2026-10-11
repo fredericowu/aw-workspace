@@ -165,14 +165,40 @@ def _autostart_not_running(rows: list) -> int:
         # "backing_off" means recovery is already in flight and this line will
         # clear itself; "gave_up" means it will NOT, and no amount of waiting
         # changes that — only a restart, a reinstall or a config save does.
+        #
+        # Below those two, the question is whether this is DELIBERATE, and the
+        # only field that answers it is `desired` — the supervisor's intent.
+        # This used to read it off `state == "stopped"`, i.e. off the mere
+        # absence of a crash, and so announced "deliberately stopped" for a
+        # service whose start had been silently lost (2026-10-11, a dead
+        # `proxy:proxy-server` after a core restart — the one tool that catches
+        # silent degradation here, telling the operator the outage was on
+        # purpose). A `desired == "running"` service that is not running was
+        # stopped by nobody. Say that, loudly.
         state = row.get("state")
+        desired = row.get("desired")
         if state == "backing_off":
             print("      the supervisor is retrying this with backoff — recheck in a minute")
         elif state == "gave_up":
             print(f"      the supervisor GAVE UP on it ({row.get('reason') or 'unknown'}) "
                   f"— it will not retry until you restart it")
-        elif state == "stopped":
+        elif desired == "running":
+            print("      ✗ BROKEN, NOT deliberate: the supervisor still wants this "
+                  "RUNNING (desired=running) and nobody stopped it")
+            print("        its start was lost, or whatever was running it died with "
+                  "no worker left to notice — restart it and read the logs")
+        elif desired == "stopped" and row.get("supervised_here"):
             print("      deliberately stopped (not a crash) — nothing will restart it")
+        elif desired == "stopped":
+            # `desired` lives in the memory of whichever worker ran the
+            # process, and at AW_WORKSPACE_WORKERS=5 this answer came from one
+            # of the four that did not (see `supervised_here` in
+            # src/apps/services.py's status()). Its "stopped" is an untouched
+            # default, not a record — so do not dress it up as intent.
+            print("      not running on ANY worker, and the worker that answered has "
+                  "never run it, so it cannot say whether that was deliberate")
+            print("        treat it as off-and-unexplained, not as switched off "
+                  "(desired-state is per-worker today — design §A)")
         if row.get("last_error"):
             print(f"      exit {row.get('last_exit_code')}: {row['last_error']}")
     print("      restart it: aw-workspace-cli restart <app>, then find out why it stopped")
