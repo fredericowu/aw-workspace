@@ -1148,9 +1148,15 @@ honestly, because the current code half-shields us by accident:
   roots the sync engine's scan at `kb_root()`, which removes the subtree
   shield, and the `*.md` filter is an ingest-format choice that this very
   addendum's git scope already steps around (§16.3) — correctness must not
-  hinge on it. And the shields already leak today: `rglob` descends hidden
+  hinge on it. The structural hole is real: `rglob` descends hidden
   directories, so a `.github/` or `.obsidian/` dropped inside `notion/` or
-  `authored/` ingests its `.md` content right now.
+  `authored/` would ingest its `.md` content. **Verified against the live
+  tree for this addendum: this is prevention, not remediation** — zero
+  `.md` files under any dot-component path and zero dot directories exist
+  in `knowledge_base/` today, so nothing is currently leaking and there is
+  no cleanup to perform. The urgency is that the git backend's own `.git/`
+  (§16.2) is what turns this structural hole into a live one, the moment
+  that feature lands.
 - **Dot-files are excluded too — decided, not left open.** Frederico's ask
   says "folder", but the file half is the severity driver: a `.env` in a
   synced tree becoming a searchable, vector-indexed graph document is a
