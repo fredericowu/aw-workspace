@@ -20,15 +20,23 @@ cost no LLM tokens to capture:
   ``search_skills`` surface — never as content an ordinary knowledge search
   would ever surface.
 
-Both write straight into ``<AW_WORKSPACE_HOME>/knowledge_base/<prefix>/*.md``
-— the exact tree ``kb_app.kb_ops._build`` walks for the pgvector store (any
-``.md`` anywhere under ``KB_DIR``, see ``src/apps/runtime.py``'s
-``$AW_KB_DIR`` mount comment), so a plain
-``aw-workspace-cli knowledge-base --build`` after this picks them up with no
-further change on that side. The aw-knowledgeable graph side additionally
-needs its own bucket declared (``BUCKET_ORDER`` in aw-app-knowledgeable's
-``bulk_ingest.py``), since that driver only scans a fixed allowlist of
-top-level subtrees — that edit lives in that app's own repo, not here.
+A CLI command's ``--help`` capture is split by owner, read off
+``discover_commands()``'s ``__aw_app_id__`` stamp (``src/cli/discovery.py``):
+a built-in lands in this repo's own committed ``docs/cli/`` (checksum-gated
+writes, so a regeneration with no real ``--help`` change produces no git
+diff), an app-contributed command lands in
+``<AW_WORKSPACE_HOME>/knowledge_base/apps/<app-id>/cli_reference/`` — the
+exact tree ``kb_app.kb_ops._build`` walks for the pgvector store (any ``.md``
+anywhere under ``KB_DIR``, see ``src/apps/runtime.py``'s ``$AW_KB_DIR`` mount
+comment), so a plain ``aw-workspace-cli knowledge-base --build`` after this
+picks them up with no further change on that side. Both halves delete a
+capture whose command disappeared — an uninstalled app's old ``--help`` page
+must not outlive the app. ``skills/`` (below) keeps writing straight into
+``<AW_WORKSPACE_HOME>/knowledge_base/skills/*.md`` as before. The
+aw-knowledgeable graph side additionally needs its own bucket declared
+(``BUCKET_ORDER`` in aw-app-knowledgeable's ``bulk_ingest.py``), since that
+driver only scans a fixed allowlist of top-level subtrees — that edit lives
+in that app's own repo, not here.
 
 Wired to a scheduled task (see ``aw-workspace-cli kb-reference``) rather than
 into ``agent_sync.sync_all()`` / the boot path: capturing ``--help`` for
@@ -43,6 +51,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from datetime import date
@@ -63,6 +72,13 @@ def kb_dir() -> Path:
     indexes and aw-knowledgeable's bulk-ingest driver reads (its own
     ``kb_root()``)."""
     return Path(paths.workspace_home()) / "knowledge_base"
+
+
+def docs_cli_dir() -> Path:
+    """``<workspace root>/docs/cli`` — committed, core-owned half of the
+    ``cli_reference`` split (the app-owned half is ``kb_dir() / "apps" /
+    <id> / "cli_reference"``, written by ``_write_doc`` below)."""
+    return Path(paths.workspace_root()) / "docs" / "cli"
 
 
 @dataclass
@@ -198,37 +214,133 @@ def _capture_help(command_path: list[str]) -> str | None:
     return proc.stdout or proc.stderr
 
 
+def _read_checksum(path: Path) -> str | None:
+    """The ``checksum: sha256:...`` frontmatter line of an existing doc, or
+    ``None`` if it has none / doesn't exist — the checksum-gate's read side."""
+    if not path.is_file():
+        return None
+    try:
+        with path.open(encoding="utf-8") as f:
+            for _ in range(10):  # frontmatter is always near the top
+                line = f.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if line.startswith("checksum:"):
+                    return line[len("checksum:"):].strip()
+    except OSError:
+        return None
+    return None
+
+
+def _write_core_doc(filename: str, source_label: str, body: str, captured: str) -> bool:
+    """Checksum-gated write into the committed ``docs/cli/`` tree: a
+    regeneration whose ``--help`` text is byte-identical to what's already
+    committed must not touch the file (no spurious diff/commit), and a real
+    interface change must still land. Returns whether a write happened."""
+    checksum = f"sha256:{hashlib.sha256(body.encode()).hexdigest()}"
+    out_path = docs_cli_dir() / filename
+    if _read_checksum(out_path) == checksum:
+        return False
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    frontmatter = (
+        "---\n"
+        f"source: {source_label}\n"
+        "type: cli-reference\n"
+        f"checksum: {checksum}\n"
+        f"captured: {captured}\n"
+        "edited: false\n"
+        "---\n\n"
+    )
+    out_path.write_text(frontmatter + body, encoding="utf-8")
+    return True
+
+
+def _prune_stale(dir_path: Path, expected: set[str]) -> None:
+    """Exact-mirror delete pass: a ``.md`` in ``dir_path`` whose command no
+    longer exists (removed, or — for an app's own dir — the app got
+    uninstalled) does not get to outlive it. The missing half of the
+    generator before this split."""
+    if not dir_path.is_dir():
+        return
+    for existing in sorted(dir_path.iterdir()):
+        if existing.is_file() and existing.suffix == ".md" and existing.name not in expected:
+            existing.unlink()
+
+
+def _prune_app_stale(expected: dict[str, set[str]]) -> None:
+    """Same delete pass as ``_prune_stale``, one level up: an app with no
+    discovered commands this run (typically: uninstalled) loses its whole
+    ``cli_reference/`` subdir. ``apps/<id>/docs/`` — the separate
+    ``contributes.knowledge`` mirror — lives beside it and is never touched
+    here; that tree belongs to a different registry."""
+    apps_dir = kb_dir() / "apps"
+    if not apps_dir.is_dir():
+        return
+    for app_dir in sorted(apps_dir.iterdir()):
+        if not app_dir.is_dir():
+            continue
+        cli_dir = app_dir / "cli_reference"
+        if not cli_dir.is_dir():
+            continue
+        if app_dir.name not in expected:
+            shutil.rmtree(cli_dir)
+            continue
+        _prune_stale(cli_dir, expected[app_dir.name])
+
+
 def sync_cli_reference() -> ReferenceSyncResult:
     """Capture ``--help`` for the root command, every discovered command,
-    and every subcommand it declares, and write one document per capture
-    under ``cli_reference/``."""
+    and every subcommand it declares, and write one document per capture —
+    split by owner (``discover_commands()``'s ``__aw_app_id__`` stamp): a
+    built-in goes to the committed ``docs/cli/``, an app-contributed command
+    goes to ``kb_dir()/apps/<id>/cli_reference/``. Both targets are
+    exact-mirrored (stale captures for a removed command/uninstalled app are
+    deleted), which this generator didn't do before this split."""
     result = ReferenceSyncResult()
     captured = date.today().isoformat()
 
-    # (command_path, one-sentence description) — the description is this
-    # repo's own cost-free source for the intent surface's prose line: a
-    # top-level command's own ``DESCRIPTION``, or a subcommand's
-    # ``add_parser(..., help=...)`` text when it declared one.
-    entries: list[tuple[list[str], str]] = [([], "List and run every aw-workspace-cli command.")]
+    # (command_path, one-sentence description, owning app id or None for a
+    # built-in) — the description is this repo's own cost-free source for
+    # the intent surface's prose line: a top-level command's own
+    # ``DESCRIPTION``, or a subcommand's ``add_parser(..., help=...)`` text
+    # when it declared one.
+    entries: list[tuple[list[str], str, str | None]] = [
+        ([], "List and run every aw-workspace-cli command.", None)
+    ]
     for name, module in sorted(discover_commands().items()):
-        entries.append(([name], getattr(module, "DESCRIPTION", "") or ""))
+        owner = getattr(module, "__aw_app_id__", None)
+        entries.append(([name], getattr(module, "DESCRIPTION", "") or "", owner))
         for sub, sub_description in _subcommands(module):
-            entries.append(([name, sub], sub_description))
+            entries.append(([name, sub], sub_description, owner))
 
-    for command_path, description in entries:
+    core_expected: set[str] = set()
+    app_expected: dict[str, set[str]] = {}
+
+    for command_path, description, owner in entries:
         label = (CLI_BIN + " " + " ".join(command_path)).strip()
         text = _capture_help(command_path)
         if text is None:
             result.failed.append(label)
             continue
         slug = "-".join(command_path) or "root"
+        filename = f"{slug}.md"
         pt_question, en_question = _intent_questions(command_path)
         intent = f"**{pt_question}** / **{en_question}**\n\n"
         if description:
             intent += f"{description}\n\n"
         body = f"# {label} --help\n\n{intent}`{label}`\n\n```\n{text.rstrip()}\n```\n"
-        _write_doc(Path("cli_reference") / f"{slug}.md", label, "cli-reference", body, captured)
+
+        if owner is None:
+            core_expected.add(filename)
+            _write_core_doc(filename, label, body, captured)
+        else:
+            app_expected.setdefault(owner, set()).add(filename)
+            _write_doc(Path("apps") / owner / "cli_reference" / filename, label, "cli-reference", body, captured)
         result.written += 1
+
+    _prune_stale(docs_cli_dir(), core_expected)
+    _prune_app_stale(app_expected)
 
     return result
 

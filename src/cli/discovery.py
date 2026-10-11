@@ -11,6 +11,11 @@ Both locations use the identical file contract: a plain module exposing
 ``COMMAND`` (str), ``DESCRIPTION`` (str), and ``run(args: list[str]) -> int``.
 Shared here so both ``aw-workspace-cli`` (the entrypoint) and the ``help``
 command list the exact same set.
+
+An app-contributed module is stamped ``module.__aw_app_id__ = slug`` after a
+successful load; a built-in carries no such attribute. ``src/libs/cli_reference.py``
+reads that stamp to route a command's generated ``--help`` capture to the
+right owner's tree.
 """
 from __future__ import annotations
 
@@ -35,6 +40,7 @@ def _load_app_command(slug: str, path: str):
         print(f"aw-workspace-cli: failed loading {slug}'s command "
               f"{os.path.basename(path)}: {exc}")
         return None
+    module.__aw_app_id__ = slug
     return module
 
 
