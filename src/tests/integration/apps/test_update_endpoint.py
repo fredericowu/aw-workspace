@@ -9,6 +9,9 @@ so no PG/network is needed.
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+from pathlib import Path
 
 import httpx
 import pytest
@@ -16,11 +19,13 @@ from fastapi import FastAPI
 
 from src.api.identity import require_identity
 from src.apps import catalog as catalog_mod
+from src.apps import paths
 from src.apps import routes as routes_mod
 from src.apps.reconciler import AppSpec
 from src.apps.routes import register_apps_routes
 
 from .test_reconciler import FakeCloud, FakeMirror, _fake_fetch, _make_app_repo
+from .test_reconciler_knowledge_sweep import _make_app_repo_with_knowledge
 
 
 def _async(coro):
@@ -116,6 +121,46 @@ def test_update_already_at_catalog_version_is_a_noop(tmp_path, monkeypatch):
         s = await _get(app, "/api/apps/widget/install-status")
         assert s.json()["status"] == "installed"
         assert s.json()["summary"] == {"app_id": "widget", "status": "no-op", "version": "1.0.0"}
+
+    _async(run())
+
+
+def test_update_noop_still_syncs_a_missing_knowledge_mirror(tmp_path, monkeypatch):
+    """A version/trust no-op must not mean "nothing to do" for the knowledge
+    mirror (bug:contributes-knowledge-mirror-not-running-on-install). Before
+    the fix, `--update` on an app already at the catalog version returned
+    before ever reaching reconcile()/runtime.load() — the only place that
+    otherwise calls `_register_knowledge` — so a mirror that never ran (e.g.
+    it only ran on a later boot's activation pass) stayed missing until a
+    core restart. Reproduces the gap directly: delete the mirror the initial
+    install created, then confirm `--update` on the SAME version restores it.
+    """
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    repo = _make_app_repo_with_knowledge(tmp_path, "notes")
+    cloud = FakeCloud()
+    app, runtime, reconciler = _app(tmp_path, monkeypatch, cloud)
+
+    async def run():
+        await reconciler.install(AppSpec(app_id="notes", repo=repo, ref="main"))
+        docs_dir = os.path.join(paths.knowledge_apps_dir(), "notes", "docs")
+        assert os.path.isdir(docs_dir)
+        shutil.rmtree(docs_dir)  # simulate a mirror that never ran
+        assert not os.path.isdir(docs_dir)
+
+        _set_catalog(monkeypatch, [{"id": "notes", "version": "1.0.0",
+                                    "repo": repo, "ref": "main"}])
+
+        r = await _post(app, "/api/apps/notes/update")
+        assert r.status_code == 202
+
+        job = app.state.app_install_jobs.get("notes")
+        assert job is not None and job.task is not None
+        await job.task
+
+        s = await _get(app, "/api/apps/notes/install-status")
+        assert s.json()["summary"] == {"app_id": "notes", "status": "no-op", "version": "1.0.0"}
+        assert os.path.isdir(docs_dir), "update's no-op path must still sync the knowledge mirror"
+        assert (Path(docs_dir) / "intro.md").read_text() == "# notes\n"
 
     _async(run())
 

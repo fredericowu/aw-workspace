@@ -1329,6 +1329,14 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                 trust_is_stale = loaded.signed != is_marketplace_app(slug, catalog_repo)
                 if catalog_version and catalog_version == loaded.manifest.version \
                         and not trust_is_stale:
+                    # This no-op return skips reconcile()/runtime.load() entirely, the
+                    # only place that otherwise calls _register_knowledge — so an app
+                    # whose contributes.knowledge mirror never ran (e.g. it only
+                    # started existing on the boot activation pass, not here) stays
+                    # unmirrored forever if it's already at the catalog version.
+                    # Hash-gated, so re-running it here on an already-synced app is a
+                    # free no-op.
+                    runtime._register_knowledge(loaded)
                     jobs.mark_installed(
                         slug,
                         {"app_id": slug, "status": "no-op", "version": loaded.manifest.version},
