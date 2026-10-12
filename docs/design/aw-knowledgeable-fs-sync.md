@@ -35,6 +35,39 @@ SQLite-exit card names `bulk_ingest.py`'s journal as its second store, and
 it moves to the workspace Postgres via `ctx.db` (`db:own-tables`). Nothing
 in this design depends on the journal's storage engine.
 
+**Amendment 2026-10-12 — as-built status (card
+`3f75bf3b-9510-81eb-9c4c-f63d3a4a8f52`, delta inventory; corrects claims
+below that were true on 2026-10-10/11 and are no longer):**
+
+- **The §5 restart-core gate has CLEARED.** `ctx.state` is live in the
+  running core (`AW_WORKSPACE_WORKERS=10`): the connector's `run_tick`
+  already claims `ctx.state.lease` on every scheduled tick
+  (`bulk_ingest.py:431-477`, `routes.py:200`) and `state:own` ships in
+  `aw-app.json` v0.27.0. §14 step 3 is done; the "not live
+  (`bb23bd8`)" note below is historical.
+- **§15 (collections + anchors) is shipped AND deployed** — verified live
+  2026-10-12 via `search_graph` (`scope.collection` honored;
+  `strategy: "anchored"` with `anchor="path:memory/"` resolves). The
+  Library collection facet and `GET /api/collections` also shipped
+  (commit `2e86caa`).
+- **§16.1 (leading-dot rule) and §16.2–16.7 (git backend) are shipped**
+  (`bulk_ingest.py:162-172`, `_iter_markdown_files`' walk-prune,
+  `git_backend.py`, `_run_git_step` inside the lease-held tick; tests in
+  `tests/test_git_backend.py`). The git backend is **dormant**: live
+  config has `git_remote_url` empty and no `git_token` — enabling it is
+  operator config, not code.
+- **§9 (owner allowlist) is shipped and configured live**
+  (`config.py:59,352-383`, `identity.py:256`; `KNOWLEDGEABLE_OWNER_SUBS`
+  set on the production container).
+- **The journal moved to the workspace Postgres**
+  (`app__knowledgeable__bulk_ingest_files` via `ctx.db`) per the
+  SQLite-exit amendment — already reflected above.
+- **Still unbuilt:** §1 (path-identity templates, `PUT /by-path`,
+  `GET /changes`, mark-delete/restore), §2 (global bucket-slug check),
+  §3.2 journal columns, §3.3 sync tick / `fs_sync.py`, §4's 403 seam,
+  §6 refusal, §7 delete pipeline + UI, §8 step-1 backfill. `scan()` is
+  still create-only (frozen `uploaded` rows, `bulk_ingest.py:327-369`).
+
 Verified against the working tree this session:
 
 - `repos/aw-knowledgeable/backend/app/core/graph.py:505` — `create_document`
