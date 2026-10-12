@@ -48,7 +48,7 @@ permissions:
 jobs:
   build:
     name: Build + push multi-arch image
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     # workflow_dispatch has no workflow_run event, so no conclusion to
     # gate on — a manual run is its own explicit go-ahead. A workflow_run
@@ -66,7 +66,7 @@ jobs:
       # that commit already — see the top-of-file comment). Falls through
       # to the default ref on a workflow_dispatch run, where there is no
       # workflow_run event to read a sha from.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ github.event.workflow_run.head_sha || github.ref }}
