@@ -67,6 +67,16 @@ below that were true on 2026-10-10/11 and are no longer):**
   §3.2 journal columns, §3.3 sync tick / `fs_sync.py`, §4's 403 seam,
   §6 refusal, §7 delete pipeline + UI, §8 step-1 backfill. `scan()` is
   still create-only (frozen `uploaded` rows, `bulk_ingest.py:327-369`).
+  *(Later that day: cards A/B/D shipped §1/§2/§3.2/§3.3-upsync/§4/§6/§7
+  and are live; see each card. Card C downsync and §16 enablement remain.)*
+
+**Amendment 2026-10-12 (evening), card
+`3f75bf3b-9510-8155-a345-c9b812686f9d`:** §17 — delete detection as built
+is journal-row-driven and therefore blind to any graph document with no
+journal row pointing at it (35 live instances at the dead `cli_reference/`
+paths). §17 redefines delete marking to key on the **path** (a new
+service-only `mark-delete-by-path` fan-out seam) and adopts
+server-claimed paths the journal lacks, under the same §7 valve, widened.
 
 Verified against the working tree this session:
 
@@ -1547,3 +1557,247 @@ refusal; revoked-PAT tick → `auth_failed` + non-zero exit + graph write
 intact; diverged remote → no force-push, declared stop; dead remote →
 tick completes graph work and the *next* tick still runs (lease not
 wedged); `.gitignore` ≡ `SKIP_PREFIXES` assertion.
+
+---
+
+## 17. Amendment (2026-10-12): journal-blind documents — delete detection must key on the path, not the journal row
+
+Written against card `3f75bf3b-9510-8155-a345-c9b812686f9d`, after cards
+A/B/D shipped and went live. **Design, not code** — the implementation is
+two cards, §17.7.
+
+### 17.1 The defect, measured
+
+§3.3/§7 as built (card B, `fs_sync._mark_missing_as_deleted`) iterates
+**journal rows** and marks by each row's `external_id`
+(`aw-app-knowledgeable/knowledgeable_app/fs_sync.py:382-418`). The journal
+is one-row-per-path (`relpath` is the PK — `bulk_ingest.py`'s schema); the
+graph can hold **several documents per path** (duplicate uploads through
+the old content-hash MERGE, before §1's path-keyed identity existed —
+today's 35 `workspace_slug IS NULL` losers from card A's backfill, but the
+class is open: any client that ever PUTs by-path or POSTs with a
+`source_path` outside the connector creates more).
+
+So a document with no journal row pointing at it is **permanently
+unreachable by delete detection** — not stale, not racy; no code path ever
+visits it. Live on production 2026-10-12: top-level `cli_reference/` is
+gone from disk, 70 documents still claim those 35 paths, exactly 35 got
+marked (the journaled winners) and 35 structurally never can be (the
+losers). They still answer `knowledge_search` — the precise failure this
+whole design exists to end.
+
+Two aggravating facts any fix must respect:
+
+- **The journal's document and the surviving graph document are not
+  reliably the same one.** Card A's backfill picked duplicate-group
+  winners by Cypher visit order during a crashed deploy (QA verified a
+  live group where the *older* upload won). Dereferencing `external_id`
+  to decide anything about "the" document at a path is unsound.
+- **Already-marked rows are skipped forever.** The engine's
+  `not row["pending_delete"]` guard means a path marked once is never
+  revisited — correct for the per-id mechanism, but it means the live 35
+  cannot be healed by the structural fix alone; they need an explicit
+  catch-up (§17.4).
+
+### 17.2 The decision: mark by path, adopt paths (not documents) into the journal
+
+The journal's unit is the **file**; the graph's unit is the **document**.
+The bug is the 1:1 cast between them at the marking step. Fix the cast,
+keep everything else:
+
+1. **Marking fans out server-side.** A new service-only seam,
+   `POST /api/documents/mark-delete-by-path`, marks **every** document
+   claiming `{tenant, bucket, source_path}` with
+   `workspace_slug = $slug OR workspace_slug IS NULL` — winners, losers,
+   and anything a future client minted. The connector stops dereferencing
+   `external_id` for deletes entirely; `_mark_missing_as_deleted` calls
+   by-path instead of by-id. Pending-delete only — **no `force` variant
+   exists on this seam**, by design.
+2. **Paths the journal has never heard of get adopted — as paths.** A new
+   enumeration seam, `GET /api/documents/sync-paths` (paged; distinct
+   `source_path` + claimant count, same slug-or-NULL filter), lets the
+   tick insert a journal row (`origin='adopted'`, `external_id` NULL) for
+   any server-claimed path the journal lacks. From then on the **existing**
+   machinery covers it: the same ≥2-consecutive-scans clock, the same
+   valve, the same by-path mark. Adoption never marks anything — it only
+   starts observation.
+3. **One mechanism, one tick.** Both changes live inside
+   `fs_sync.run_tick`'s existing pass, strictly **after** the §7 valve
+   check. No second engine, no second schedule, no second source of truth
+   for missing-ness: the journal remains the only holder of per-path scan
+   state.
+
+A pleasant consequence of adopting paths rather than documents: an adopted
+path whose file **does** exist on disk converges into a normal synced row
+on its own — the scan sees the row, debounces, PUTs by-path, and journals
+the winner's `external_id` from the response. Adoption heals live paths
+and watches dead ones with the same rows.
+
+### 17.3 Adoption exclusions (each one is a correctness rule, not tidiness)
+
+- **`is_skipped()` paths** (the `SKIP_PREFIXES`): a document claiming a
+  skipped path mirrors a file the scan deliberately never looks at — its
+  file may exist. "Missing from source tree" would be a lie; those
+  documents stay outside sync's contract, like the 73 pathless ad-hoc
+  uploads (explicitly out of scope, unchanged).
+- **`authored/` paths, until card C lands**: pre-downsync, a
+  human-authored document legitimately exists server-side with no file on
+  disk yet. Adopting it would mark card C's future downsync payload for
+  deletion. Card C removes this exclusion deliberately (its journal-first
+  echo-breaker rows make it moot).
+- **Paths claimed only by other `workspace_slug`s**: not this connector's
+  documents. NULL-slug claims are adopted by this (single) workspace's
+  connector — see §17.6-3 for what that bakes in.
+- **Dot-paths**: already impossible on both sides (§16.1 walk-prune +
+  server 400); the enumeration must still never return one.
+
+### 17.4 The one-time catch-up for the live 35
+
+For every journal row already `pending_delete=1`, re-issue
+`mark-delete-by-path(relpath)` once — idempotent on the server (`SET` on
+an already-marked document is a no-op), and it sweeps the unmarked
+siblings at those 126 paths, which includes all 35 `cli_reference/`
+losers. This runs inside a valve-cleared tick like everything else (gated
+by a journal flag so it runs once per upgrade, not per tick). After it,
+the structural fix keeps the invariant: **a marked path means every
+claimant at that path is marked.** Approving the `cli_reference/` backlog
+afterwards remains a human act in card D's UI — nothing here deletes.
+
+### 17.5 Valve coverage — designed in, not bolted on
+
+Everything new runs strictly after `_check_mass_delete_valve`, and the
+valve's arithmetic widens to see the new rows:
+
+- **Guard 1 (zero-file / unreadable root) is unchanged and still covers
+  everything**: adoption, catch-up and marking all sit behind it. A
+  transiently-unmounted tree aborts the whole tick before any row's state
+  moves — same as today.
+- **Guard 2's tracked set widens** from `status='uploaded'` rows to *rows
+  participating in missing-tracking*: `external_id IS NOT NULL OR
+  origin='adopted'` — numerator (missing-now count) **and** denominator
+  (threshold base) both. Without this, a mass disappearance of adopted
+  paths would be invisible to the valve, which is the exact failure mode
+  §7 exists for.
+- **A second, in-pass ceiling on documents**: by-path marking fans out
+  (one path can mark N documents), and guard 2 counts paths. The marking
+  pass therefore also sums the per-call `marked` counts the server
+  returns and **stops marking** when the tick's document total would
+  exceed the same `max(25, 10%)` threshold — sets the valve flag, exits
+  non-zero, defers the remainder. Marking is idempotent and two-phase, so
+  deferral is free.
+- **Adoption cannot amplify a wipe past the valve**: adoption itself never
+  marks, and the paths it adds are inside guard 2's tracked set from the
+  next tick on. First-tick-after-wipe: guard 1 or guard 2 aborts before
+  adoption runs at all.
+- **Two-phase with human approval is untouched.** Both new seams mark;
+  only card D's live UI deletes. No `force` on the by-path seam, no new
+  deletion path of any kind.
+
+Behavior on a transiently-unmounted tree: guard 1 aborts, nothing moves.
+On a half-written tree (e.g. `agent sync` caught mid-write): the ≥2-scan
+clock absorbs anything shorter than one scan interval; a wider gap trips
+guard 2 (the missing count exceeds the threshold) and the tick marks
+nothing. A path that reappears resets `missing_scans`, which now shields
+*every* claimant at that path, journaled or not.
+
+### 17.6 Rejected alternatives, and what this makes harder later
+
+Rejected:
+
+1. **Pure server-side reconciliation** (enumerate documents whose file is
+   missing, server-driven): the server cannot see the filesystem — it
+   runs on bare-metal aw-stack; the tree lives in the workspace
+   container. Any server-resident "missing file" notion would be a second,
+   blind source of truth needing its own 2-scan state. The connector owns
+   the tree; the journal already is the state store.
+2. **Adopting documents (one journal row per document)**: breaks the
+   `relpath` PK, fabricates rows whose `sha256`/`last_synced_hash` mean
+   nothing, and makes `bulk_ingest`'s own queries see phantom files.
+   Paths are what the journal models; adopt paths.
+3. **A separate operator-triggered sweep**: a second code path that
+   drifts from the first, covers nothing continuously (the duplicate
+   class is open, §17.1), and would need its own valve from scratch. The
+   §17.4 catch-up delivers the sweep's one legitimate job inside the
+   existing engine.
+4. **Connector enumerates per-path document ids and marks each by id**
+   (no new server write seam): more round trips, pushes "which document
+   is which" back into the connector — the exact unsound dereference
+   §17.1 forbids — and leaves the winner/loser distinction load-bearing.
+   By-path marks the set atomically without ever naming a winner.
+
+Harder later:
+
+1. **Journal rows stop meaning "a file this connector uploaded."**
+   `origin='adopted'` rows have no upload history and a NULL
+   `external_id`; any future code that assumes `external_id IS NOT NULL`
+   on tracked rows (or that `sha256` reflects a local read) must filter
+   by origin. This is the price of one state store instead of two.
+2. **`mark-delete-by-path` is a fan-out write seam.** Service-only and
+   two-phase, but the server cannot know tree state, so the valve
+   protecting it lives client-side in the connector. A future non-connector
+   service caller inherits no valve. Mitigation accepted as-is: the seam
+   marks (reversible), never deletes.
+3. **NULL-slug documents are adopted by whichever workspace's connector
+   syncs the bucket.** Correct while `aw` is the only workspace writing
+   `main`; a second workspace on the same bucket would need the NULL-slug
+   claim rule revisited before it syncs.
+4. **The `authored/` exclusion is a tripwire for card C.** It must be
+   removed deliberately when downsync lands; forgetting it means
+   human-authored documents whose files were deleted on disk are again
+   invisible to delete detection — a smaller re-instance of this very bug,
+   confined to one subtree. Card C's card must name it.
+5. **Decline/restore does not reset the journal.** A human declining a
+   mark leaves `pending_delete=1` journal-side, so the engine will not
+   re-mark that path if it goes missing again later (pre-existing
+   behavior, now slightly wider since marks cover more documents). The
+   clean fix is card C's changes feed (`sync_status` is already in it);
+   until then a declined path that dies again needs the catch-up flag
+   cleared by an operator. Named, not solved here.
+
+### 17.7 Implementation cards (dependency order) and acceptance gates
+
+**Card G1 — server: the two path-level seams (`repos/aw-knowledgeable`).**
+`POST /api/documents/mark-delete-by-path` (service-only, marks all
+claimants at `{tenant, bucket, source_path}` with slug-or-NULL, returns
+the marked ids/count, no `force`) and `GET /api/documents/sync-paths`
+(paged distinct path-claims, same filter, includes paths of
+already-marked documents). Both reuse `validate_source_path`. Gates:
+- Marks the NULL-slug sibling in a real duplicate group, and the call is
+  idempotent (re-run marks 0 new).
+- Human caller → 403 with a reason body; dot-path → 400.
+- `sync-paths` returns a path whose only claimant is already
+  pending-delete (catch-up idempotence depends on this).
+- K3/K5 green — both templates tenant+bucket scoped; the slug-or-NULL
+  `WHERE` needs a K5-shaped test, not an exemption.
+- Live (throwaway data, then cleaned): create a duplicate group on
+  production via `POST` with `source_path` (legacy shape) + `PUT by-path`
+  (migrated shape) at one path; by-path mark → both marked; `force`
+  cleanup; graph back to pre-test state.
+
+**Card G2 — connector: path-keyed marking, adoption, catch-up, valve
+widening (`repos/aw-app-knowledgeable`).** Depends on G1 deployed and
+verified live. Gates:
+- `_mark_missing_as_deleted` marks via by-path; the `external_id`
+  dereference for deletes is gone.
+- Adopted row (no `external_id`) is NOT marked on first miss, IS marked
+  via by-path on the second — i.e. the old `not row["external_id"]` guard
+  demonstrably no longer excludes adopted rows.
+- Adoption excludes `is_skipped()` paths, `authored/`, and foreign-slug
+  claims (three tests).
+- Adopted path whose file exists converges to a normal synced row
+  (upload happens, `external_id` lands from the PUT response).
+- Valve: guard 2 counts adopted rows in numerator and denominator;
+  the in-pass document ceiling stops marking, sets the flag, exits
+  non-zero (simulated fan-out group exceeding the threshold).
+- Catch-up: runs once (flag-gated), re-issues by-path for
+  `pending_delete=1` rows, idempotent across restarts.
+- Zero-file tree: still aborts before adoption or catch-up touch anything.
+- Live (coordinator-driven, post-release): after two ticks, production's
+  marked count rises from 126 paths' worth to include the 35
+  `cli_reference/` losers (graph query: 0 documents with
+  `source_path STARTS WITH 'cli_reference/'` and no `sync_status`);
+  valve untripped; card D's UI lists them with reason. **Nothing
+  deleted** — approving the backlog stays a human act in card D's UI.
+
+Out of scope, unchanged by this amendment: the 73 pathless documents,
+card C (downsync), card F (soak), entity extraction (off), Redis.
