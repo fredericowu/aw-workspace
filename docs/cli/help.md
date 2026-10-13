@@ -1,8 +1,8 @@
 ---
 source: aw-workspace-cli help
 type: cli-reference
-checksum: sha256:bdc1f830014348149c3191d7e637f770f0f532f7598cf0c4f4a647746f42cd71
-captured: 2026-10-11
+checksum: sha256:adedb52908847897dc3070a5b7c978fe3ac517dc544c3b6677d7fd37cf4528a5
+captured: 2026-10-13
 edited: false
 ---
 
@@ -34,6 +34,7 @@ Commands:
   kb-reference           Regenerate CLI --help and skills/ content under the knowledge-base tree
   knowledge-base         Manage the knowledge base (build, search, map) — runs inside the kb app
   knowledgeable-ingest   KB bulk-ingest driver (§13) — scan/run/status/report
+  knowledgeable-sync     fs-sync upsync engine (§3/§7) — run/status/report
   logs                   Show (or follow) a component's logs
   marketplace            Install or update apps from the marketplace catalog
   notion-sync            Mirror Notion notes + Kanban cards into the knowledge base
