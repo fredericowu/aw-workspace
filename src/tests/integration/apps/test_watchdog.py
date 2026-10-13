@@ -331,3 +331,91 @@ def test_resume_after_pause_reticks_run_immediately_task_but_not_a_deferred_one(
         wd.cancel_all_for("app")
 
     _async(run())
+
+
+def test_failed_activate_leaves_no_watchdog_residue(tmp_path):
+    """A load that raises AFTER registering a watchdog must not keep the
+    registration — otherwise the app can never be loaded again.
+
+    ``register`` raises on a duplicate key, so a leftover entry makes every
+    LATER attach fail on the stale registration rather than on whatever is
+    actually wrong. It wedges permanently and it hides the real cause.
+
+    Live on 2026-10-13: agents-platform-runners failed one activate after
+    registering 'skills-sync-delta'; every retry afterwards died on the
+    duplicate, the app never re-mounted its routes, and every run Agents
+    Platform dispatched to it came back ``/execute 404 Not Found``.
+    """
+    plugin_src = """
+        FAIL = __import__("os").environ.get("WD_TEST_FAIL") == "1"
+
+        class AppPlugin:
+            async def activate(self, ctx):
+                async def tick():
+                    pass
+                ctx.watchdog.register("poll", tick, 0.01)
+                if FAIL:
+                    raise RuntimeError("boom, after registering")
+            async def deactivate(self):
+                return None
+    """
+    pkg = _write_app(tmp_path, "wdfail", plugin_src, '["watchdog:tasks"]')
+
+    async def run(monkey_fail: bool):
+        import os
+        os.environ["WD_TEST_FAIL"] = "1" if monkey_fail else "0"
+        rt = AppRuntime(FastAPI(), journal=ActionJournal())
+        if monkey_fail:
+            raised = False
+            try:
+                await rt.load(pkg, granted_permissions=["watchdog:tasks"])
+            except RuntimeError:
+                raised = True
+            assert raised, "the plugin was supposed to fail its activate"
+            assert not rt.is_loaded("wdfail")
+            # The assertion that matters: no residue to wedge the next attach.
+            assert rt.watchdog.task_ids_for("wdfail") == []
+        return rt
+
+    _async(run(True))
+
+
+def test_an_app_can_attach_again_after_a_failed_activate(tmp_path):
+    """The consequence of the above, stated as the behaviour users feel:
+    a transient activate failure must not cost the app every future attach."""
+    plugin_src = """
+        import os
+
+        class AppPlugin:
+            async def activate(self, ctx):
+                async def tick():
+                    pass
+                ctx.watchdog.register("poll", tick, 0.01)
+                if os.environ.get("WD_TEST_FAIL") == "1":
+                    raise RuntimeError("transient: a dependency was briefly down")
+            async def deactivate(self):
+                return None
+    """
+    pkg = _write_app(tmp_path, "wdretry", plugin_src, '["watchdog:tasks"]')
+
+    async def run():
+        import os
+        rt = AppRuntime(FastAPI(), journal=ActionJournal())
+
+        os.environ["WD_TEST_FAIL"] = "1"
+        try:
+            await rt.load(pkg, granted_permissions=["watchdog:tasks"])
+        except RuntimeError:
+            pass
+        assert not rt.is_loaded("wdretry")
+
+        # The transient cause is gone; the retry must now succeed.
+        os.environ["WD_TEST_FAIL"] = "0"
+        try:
+            await rt.load(pkg, granted_permissions=["watchdog:tasks"])
+        finally:
+            os.environ.pop("WD_TEST_FAIL", None)
+        assert rt.is_loaded("wdretry"), "second attach was wedged by the first failure"
+        assert rt.watchdog.task_ids_for("wdretry") == ["poll"]
+
+    _async(run())

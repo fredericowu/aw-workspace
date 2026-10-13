@@ -1208,6 +1208,22 @@ class AppRuntime:
                 if loaded.host_mount is not None and loaded.host_mount in self.host.router.routes:
                     self.host.router.routes.remove(loaded.host_mount)
                 self.journal.clear_app(slug)
+                # Watchdog tasks the plugin registered BEFORE it failed. This
+                # line is what makes the claim above true: without it a failed
+                # activate is not residue-free at all, and because
+                # WatchdogRegistry.register raises on a duplicate key, the
+                # leftover entry makes every LATER attach of that app fail on
+                # the stale registration instead of on whatever is actually
+                # wrong — permanently, in that process.
+                #
+                # That wedge took the "aw" workspace's runners offline on
+                # 2026-10-13: agents-platform-runners failed one activate
+                # after registering 'skills-sync-delta', so every retry
+                # afterwards died on the duplicate, the app never mounted its
+                # routes again, and every run Agents Platform dispatched to it
+                # came back `/execute 404 Not Found`. The original cause was
+                # four layers down and invisible behind the duplicate.
+                self.watchdog.cancel_all_for(slug)
                 self._unimport(module_prefix)
                 raise
             self._loading = None
