@@ -708,9 +708,12 @@ corpus **today**, buckets still `kb-*`, before any migration.
    Chunk `source_path` denormalization + backfill, `(:Collection)` spine +
    backfill, the retrieval pre-filter, the anchor expansion, API/MCP params.
    No dependency on anything else in this doc; immediate user value
-   (`collection=notion/kanban/done/` against `bucket=kb-notion` works the
-   day it deploys). Deploy is manual (service's own build first, then stack
-   re-pull).
+   (`collection=notion/kanban/` against `bucket=kb-notion` works the day it
+   deploys — `notion/kanban/done/` was this example's original illustration
+   but §19 flattens that status directory out of existence, so a
+   status-scoped collection on the Kanban mirror is no longer expressible
+   as a path prefix after that lands). Deploy is manual (service's own
+   build first, then stack re-pull).
 2. **Step 2a: sync server seams (§1, §2, §9)** — templates, endpoints,
    constraint, allowlist, backfill. Deployable alone; nothing calls the new
    seams yet. 2a and 2b touch the same files (`graph.py`, `documents.py`,
@@ -751,9 +754,12 @@ the data already carries but retrieval cannot use: **where it came from** —
 the source tree. Two named concepts, both delivered:
 
 - A **collection** is a source-path prefix inside one bucket
-  (`notion/`, `notion/kanban/done/`, `memory/`, `skills/`), used as a
-  **hard scope filter** on retrieval. Deterministic, human-legible, full
-  depth — what six flat buckets never gave.
+  (`notion/`, `notion/kanban/`, `memory/`, `skills/`), used as a **hard
+  scope filter** on retrieval. Deterministic, human-legible, full depth —
+  what six flat buckets never gave. (`notion/kanban/<status>/` was a valid
+  prefix at the time this was written; §19 removes the status directory,
+  so a collection can scope to the whole Kanban mirror but no longer to
+  one status within it.)
 - An **anchor** is a node a traversal **starts from** — "answer this query,
   but start at this Notion card / this entity / this folder and follow the
   edges."
