@@ -1801,3 +1801,242 @@ verified live. Gates:
 
 Out of scope, unchanged by this amendment: the 73 pathless documents,
 card C (downsync), card F (soak), entity extraction (off), Redis.
+
+## 18. Amendment (2026-10-13): mark/restore are invisible to the changes feed — status transitions must move `updated_at`, approvals must be inferred from `sync-paths`
+
+Supersedes §17.6 point 5's claim that "the clean fix is card C's changes
+feed (`sync_status` is already in it)". QA on card C
+(`3f85bf3b-9510-8105-85b3-f85101fcbdb0`, 2026-10-13) proved that claim
+half-true in a way that makes it false: the feed's **payload** does carry
+`sync_status` (`document_changes`,
+`repos/aw-knowledgeable/backend/app/core/graph.py:707-718`) but its
+**key** — the `WHERE`/`ORDER BY` on `(updated_at, external_id)` — never
+moves on a mark or a restore. `mark_document_pending_delete`
+(graph.py:722) and `restore_document` (graph.py:729) SET/REMOVE only the
+three `sync_status`/`pending_delete_*` properties; the only template that
+bumps `updated_at` is `upsert_document_by_path` (graph.py:683), and only
+on a real content change. So card C's restore branch
+(`repos/aw-app-knowledgeable/knowledgeable_app/fs_sync.py:400-408`) is
+correct code that can never run: the transition it listens for is
+structurally absent from the one stream the pull pass consumes. Measured
+live: the 18 documents Frederico restored through card D's UI on
+2026-10-12 all still show `rev: 1` and `updated_at` from 2026-10-03/08.
+
+Three decisions, one per QA question.
+
+### 18.1 Decision 1: marks and restores bump `updated_at`; `rev` stays content-only
+
+**The feed is the connector's single source of remote mutations; a feed
+that omits a mutation class is a trap for every consumer. Fix the feed,
+not the consumer.** `SET d.updated_at = datetime()` is added to all three
+status-writing templates in graph.py:
+
+- `mark_document_pending_delete` (graph.py:722) — card D's per-document
+  mark, and decision 5's agent path (the `force` branch deletes the node
+  and needs nothing).
+- `restore_document` (graph.py:729) — the decline path. The `REMOVE`
+  stays; one `SET` is added alongside it.
+- `mark_documents_pending_delete_by_path` (graph.py:747) — the §17.2
+  fan-out. Its existing `WHERE ... <> 'pending_delete'` idempotency gate
+  means a re-run matches 0 rows and re-stamps nothing, so no feed churn.
+
+**`rev` is NOT bumped, and this is a load-bearing invariant, not a
+stylistic preference.** The pull pass's `rev <= remote_rev` gate
+(fs_sync.py:412-415) sits *after* the restore branch and *before* the
+`authored/` conflict resolution. A status-only transition therefore
+surfaces on the feed, fires the journal reset, and then short-circuits at
+the rev gate — no content pull, no conflict comparison, no file write.
+Bump `rev` on a restore and that shield breaks: an unchanged-content
+restore of an `authored/` document would flow into §3.3 step 3's
+last-change-wins comparison with a freshly-minted remote timestamp and
+overwrite local edits with identical-but-"newer" remote content. The
+semantics after this amendment, to be stated at §1.2: **`rev` = content
+version (bumped only with `content_hash`); `updated_at` = feed cursor key
+(any sync-visible mutation: content, mark, restore).** Any future status
+transition added to the graph must follow the same split.
+
+Idempotency note for the single-id mark (graph.py:722): unlike the
+by-path template it has no already-marked guard, so a re-mark re-bumps
+`updated_at` and the document re-surfaces on the feed once. The
+connector's handling is a no-op either way (journal already
+`pending_delete=1`, feed `sync_status='pending_delete'` fails the
+fs_sync.py:400 condition). Adding the same guard for symmetry is
+harmless and optional.
+
+### 18.2 Decision 2: restore semantics — re-arm on file reappearance, not immediate re-detection
+
+Card C's reset (`pending_delete = 0, missing_scans = 0`,
+fs_sync.py:400-408) is amended, because once restores actually arrive
+(18.1) it creates a human-vs-engine loop: the 18 declined documents'
+files are *still missing from disk* — that is why they were marked — so a
+bare reset re-enters them into delete detection and
+`_mark_missing_as_deleted` (fs_sync.py:895) re-marks them two ticks
+later. The operator declines again, the engine marks again, forever. A
+decline means "keep this document even though its file is gone", and the
+journal must encode that.
+
+**On an observed restore (feed or catch-up), the row is cleared AND
+suppressed: `pending_delete = 0`, `missing_scans = 0`, plus a new journal
+column `restore_suppressed INTEGER DEFAULT 0` set to 1** (idempotent
+hand-rolled ALTER in `bulk_ingest._ensure_table`, this repo's
+convention). While suppressed:
+
+- `_mark_missing_as_deleted` skips the row (alongside its existing
+  `pending_delete` skip at fs_sync.py:915).
+- The scan/upload loop clears the flag the first time it sees the file
+  present at that path. From then on detection is fully re-armed — a file
+  that comes back and later disappears again is re-marked normally, which
+  closes §17.6-5's original gap *without* the nag loop.
+
+### 18.3 Decision 3: approvals never reach the feed — GC journal rows whose claimants are gone, and narrow the valve's numerator to mark-eligible rows
+
+A hard delete removes the node; `document_changes` MATCHes live nodes, so
+an approval is structurally invisible to the feed *even after 18.1* — no
+tombstone exists (rejected, §11-8) and none is added. The ~107
+approved-and-deleted journal rows (and every future approval) need a
+different signal, and the connector already has one for free: the
+adoption pass pages `GET /api/documents/sync-paths` **every tick**
+(fs_sync.py:567; server seam documents.py:495, `list_sync_paths`
+graph.py:3336), and that enumeration deliberately includes
+already-marked claimants (§17.7 G1 gate). Absence from it is therefore
+server-truth that the last claimant at a path is gone.
+
+**Steady-state GC, every tick, after the adoption pass:** delete every
+journal row with `pending_delete = 1` whose relpath is absent from the
+just-fetched sync-paths set. Guards, zero-trust like §7 guard 1: GC runs
+only when the enumeration completed fully (every page, no error) and
+returned a nonzero path set while the journal is nonempty; GC touches
+only `pending_delete = 1` rows — a *live* row whose claimant vanished is
+the §17 journal-blind family, not deletion evidence, and is never GC'd.
+Dropping the row is safe: if a file later reappears at that path, the
+scan treats it as new and re-uploads, which is the filesystem-is-primary
+answer.
+
+**Valve numerator (§7 guard 2, fs_sync.py:203-244):** the numerator
+`missing_now = tracked_paths - found` currently counts rows that cannot
+produce a new mark. The valve protects one thing — the number of *new*
+marks a tick could initiate — so the numerator query is narrowed to
+mark-eligible rows: `_TRACKED_ROWS_WHERE` plus `pending_delete = 0 AND
+restore_suppressed = 0`. The denominator (`_tracked_row_count`,
+fs_sync.py:196) stays the full tracked set — the threshold remains "10%
+of the corpus the journal tracks". With GC removing the ~107 dead rows
+from both sides and suppression removing the 18 from the numerator, the
+132-of-206 permanently-consumed headroom QA measured returns to ~0.
+
+### 18.4 One-time catch-up for the already-stuck rows
+
+The feed cannot retroactively surface the 18 restores — the cursor is
+past their stale `updated_at`, and 18.1 does not rewrite history. A
+flag-gated one-time pass (same shape and table as §17.4's
+`CATCHUP_FLAG`, fs_sync.py:104/297-304; new flag
+`restore_reconcile_catchup_v1`): fetch the server's currently-marked set
+via `GET /api/documents?pending_delete=1` (documents.py:69-85), then for
+every journal row `pending_delete = 1`:
+
+- path has a live claimant in sync-paths but is NOT in the marked set →
+  it was restored → apply 18.2 (clear + suppress);
+- path IS in the marked set → genuinely awaiting approval → untouched;
+- path has no claimant in sync-paths → 18.3's steady-state GC already
+  collects it; the catch-up does nothing extra.
+
+Flag set only when the pass completed without errors; the operations are
+idempotent, so a crash mid-pass re-runs clean. This absorbs the open
+backlog card "Pre-card-C declines left 18 journal rows stuck at
+pending_delete" (FindingKey
+`knowledgeable:fs-sync-stale-journal-pending-rows-after-decline`) — its
+one-time reconciliation is this section.
+
+### 18.5 Rejected alternatives
+
+1. **Connector-only fix: reconcile restores by polling
+   `?pending_delete=1` every tick, never touch the server.** Works, no
+   deploy coupling — and leaves the changes feed permanently lying about
+   the mutation class its own payload advertises (`sync_status` is IN the
+   response shape). The next feed consumer inherits the trap QA just
+   paid to find. One `SET` per template is cheaper than a second
+   standing consistency mechanism.
+2. **Bump `rev` as well, "a transition is a revision".** Breaks the rev
+   gate's shield exactly as 18.1 describes — status-only restores of
+   `authored/` paths would overwrite local edits. `rev` drives content
+   decisions (pull, conflict, `base_hash`); polluting it buys nothing
+   the `updated_at` bump doesn't already deliver.
+3. **Tombstones for approvals** (`sync_status: 'deleted'` kept on the
+   node) so deletes ride the feed too. Re-rejection of §11-8: dead nodes
+   keep matching searches, collections, and §15 member counts unless
+   every reader learns to exclude them. The sync-paths absence rule
+   gets the same information from a seam that already exists.
+4. **Server-side one-time backfill** (bump `updated_at` on restored
+   docs so the feed replays them). Impossible as specified: `restore_
+   document` REMOVEs all three status properties, so restored documents
+   are indistinguishable from never-marked ones server-side. The
+   connector's journal is the only place that remembers the 18.
+5. **Exclude stuck rows from the valve's denominator too.** Shrinking
+   the denominator shrinks the threshold — it makes the valve *more*
+   trigger-happy as rows get suppressed, punishing exactly the corpus
+   state the operator just blessed. Numerator-only narrowing keeps the
+   threshold stable at 10% of tracked reality.
+
+### 18.6 What this makes harder later
+
+1. **`updated_at` stops meaning "content last changed".** Any future
+   consumer wanting content recency must read `rev`/`content_hash`. The
+   §3.3 conflict rule keeps using `change["updated_at"]` as remote
+   mtime and stays correct only because the rev gate filters
+   status-only changes before the comparison — bump `rev` in any future
+   status transition and that correctness silently ends. Stated as an
+   invariant in 18.1; it is the one rule a future editor most needs.
+2. **GC bakes in §17.6-3's single-workspace assumption.** Absence from
+   sync-paths means "deleted" only while the slug-or-NULL filter
+   enumerates everything that could claim a path. A second workspace
+   syncing the same bucket revisits the NULL-slug rule (§17.6-3) and
+   must revisit 18.3 in the same breath.
+3. **A third journal row regime.** Tracked, adopted (§17.2), and now
+   suppressed. Every future pass over the journal must decide how it
+   treats `restore_suppressed = 1`.
+4. **Feed replays after mass operations.** A 161-document mark/restore
+   event now lands on the feed and forces the connector through full
+   pages of status-only rows. Bounded by `CHANGES_PAGE_LIMIT` paging
+   and cheap no-op handling, but a future mass-status tool should know
+   it is writing to the feed.
+
+### 18.7 Implementation cards (dependency order) and acceptance gates
+
+**Card H1 — server (`repos/aw-knowledgeable`): `updated_at` on the three
+status templates.** Tiny diff, graph.py only, plus tests. Gates:
+- Mark → the document surfaces on `GET /api/documents/changes` past the
+  old cursor with `sync_status: 'pending_delete'` and unchanged `rev`;
+  restore → surfaces again with `sync_status: null`, `rev` still
+  unchanged. Both as template-level tests starting from the *deployed*
+  node shape (the schema-test blindness lesson: fixtures must not wipe
+  only what the test creates).
+- By-path mark re-run matches 0 rows and moves no `updated_at` (feed
+  idempotency).
+- K3/K5 template-scoping tests still green for all three templates.
+- Live (throwaway doc, then force-cleaned): mark → poll changes →
+  present; restore → poll → present; `rev` unchanged throughout.
+  Verified in the running container, not by green CI (deploy lesson:
+  a green release can ship old code).
+
+**Card H2 — connector (`repos/aw-app-knowledgeable`): suppression, GC,
+valve numerator, catch-up.** Depends on H1 deployed and verified live
+(its feed-path gates cannot pass against a pre-H1 server). Gates:
+- Restore on the feed → row cleared AND `restore_suppressed = 1`; two
+  subsequent ticks with the file still missing → NOT re-marked.
+- File reappears → flag cleared; file disappears again → marked after
+  the normal 2 scans (§17.6-5 closed, loop-free).
+- GC: `pending_delete=1` row whose path is absent from a fully-fetched
+  sync-paths set → row deleted; same row with an errored or empty
+  enumeration → untouched; live (`pending_delete=0`) row with absent
+  claimant → untouched.
+- Valve: suppressed and pending rows out of the numerator, denominator
+  unchanged; a simulated 18-suppressed/107-dead corpus shows headroom
+  restored.
+- Catch-up: flag-gated, runs once, crash-idempotent; the three-way
+  split of 18.4 each covered by a test.
+- Live, post-deploy (coordinator-driven): journal `pending_delete`
+  count drops from 132 to match the graph's (6 at last measure); the
+  18 restored paths show `restore_suppressed = 1`; guard-2 numerator
+  measured near 0 on a quiet tree.
+
+Out of scope, unchanged: pathless documents, tombstones, the §17.6-3
+multi-workspace claim rule, card F (soak).
