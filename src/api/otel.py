@@ -77,6 +77,14 @@ _state_lock = threading.Lock()
 _target: dict[str, Any] | None = None
 _initialized = False
 
+#: The last :class:`src.apps.runtime.AppRuntime` core handed to
+#: :func:`ensure_export_state`. Recorded only so
+#: :func:`export_target_for_sibling_container` can answer with no argument —
+#: its caller is an installed app's plugin, which core hands a
+#: capability-gated ``AppContext`` and which therefore has no runtime of its
+#: own to pass. Not a cache: the target itself is always re-resolved.
+_runtime_seen: Any = None
+
 
 def current_target() -> dict[str, Any] | None:
     """``{"endpoint": ..., "headers": {...}}`` the dynamic exporters should
@@ -101,11 +109,18 @@ def _set_target(new_target: dict[str, Any] | None) -> None:
         log.info("otel: export disabled (no observability target)")
 
 
-def ensure_export_state(runtime: Any = None) -> dict[str, Any] | None:
-    """Recompute the effective OTLP target and publish it for the dynamic
-    exporters to pick up on their next export. Idempotent and cheap (one
-    settings-table read via :func:`src.api.observability.resolve`) — safe to
-    call as often as needed. Never raises.
+def _resolve_export_target(runtime: Any) -> dict[str, Any] | None:
+    """The one copy of "where should OTLP go right now, for a process on this
+    workspace's own container network" — ``{"endpoint", "headers"}`` or
+    ``None`` for "export nothing".
+
+    Two callers, deliberately not folded into either of them:
+    :func:`ensure_export_state` (this process's own dynamic exporters) and
+    :func:`export_target_for_sibling_container` (a sibling process that has to
+    be told, e.g. an MCP stdio child the gateway spawns in its own container).
+    Unlike both of those this one RAISES, because what a failure means
+    differs: a publisher keeps its last known target, a one-shot reader just
+    gets ``None``.
 
     ``runtime`` is a :class:`src.apps.runtime.AppRuntime` (or ``None``,
     which reads as "aw-app-signoz not installed", same convention as
@@ -142,83 +157,136 @@ def ensure_export_state(runtime: Any = None) -> dict[str, Any] | None:
     If that internal lookup itself raises (malformed ``runtime.containers``,
     ``is_loaded()`` lying about liveness — Architect finding #7), the public
     endpoint was NEVER this consumer's intended target and is known to hang
-    (finding #2 above) — so this publishes ``None`` (export nothing) rather
+    (finding #2 above) — so this answers ``None`` (export nothing) rather
     than falling back to it. Confirmed live 2026-09-03: exactly this path is
     what stalled CI 25+ minutes when pytest ran with no real ``AppRuntime``.
     """
-    try:
-        from src.api.observability import (
-            SIGNOZ_APP_ID,
-            SIGNOZ_CONNECTOR_APP_ID,
-            connector_installed,
-            resolve,
-        )
-        from src.api.workspace_api_key import HEADER_NAME
+    from src.api.observability import (
+        SIGNOZ_APP_ID,
+        SIGNOZ_CONNECTOR_APP_ID,
+        connector_installed,
+        resolve,
+    )
+    from src.api.workspace_api_key import HEADER_NAME
 
-        result = resolve(runtime)
-        resolved = result.get("resolved")
-        target = None
-        if resolved and resolved.get("endpoint"):
-            endpoint = str(resolved["endpoint"]).rstrip("/")
-            if connector_installed(runtime):
-                # aw-app-signoz-connector is installed, so it — not the final
-                # destination — is this process's next hop. Exactly the same
-                # swap the auto/local branch below does for the local signoz
-                # app, for the same reason (an internal container URL instead
-                # of the public edge), with two differences:
-                #
-                #  * It applies whatever the resolved SOURCE is, including
-                #    `custom`. That is the point of a forwarder: the
-                #    connector holds the real destination (pushed into its
-                #    config by observability.py's PUT handler) and owns the
-                #    retry/queue behaviour, so core hands it everything and
-                #    stops caring where it ends up.
-                #  * NO auth header. The resolved api_key is a credential for
-                #    the FINAL destination, and the connector is the one that
-                #    presents it upstream. Its own OTLP receiver is
-                #    internal-only with no gate (the app exposes nothing
-                #    publicly), so forwarding the key here would be noise at
-                #    best and a credential on a hop that does not check it.
-                #
-                # Still gated on something having resolved at all: an
-                # unconfigured workspace exports NOTHING rather than filling
-                # the connector's (bounded, in-memory) queue with telemetry
-                # that has nowhere to drain to.
-                try:
-                    endpoint = runtime.containers.base_url(
-                        SIGNOZ_CONNECTOR_APP_ID).rstrip("/")
-                except Exception:
-                    log.warning(
-                        "otel: could not resolve aw-app-signoz-connector's internal "
-                        "container URL — exporting nothing rather than falling back "
-                        "to the public endpoint, which is known to hang (Architect "
-                        "finding #2)",
-                        exc_info=True)
-                    _set_target(None)
-                    return None
-                target = {"endpoint": endpoint, "headers": {}}
-                _set_target(target)
-                return target
-            if resolved.get("source") in ("auto", "local") and runtime is not None:
-                try:
-                    endpoint = runtime.containers.base_url(SIGNOZ_APP_ID).rstrip("/")
-                except Exception:
-                    log.warning(
-                        "otel: could not resolve aw-app-signoz's internal container "
-                        "URL — exporting nothing rather than falling back to the "
-                        "public endpoint, which is known to hang (Architect finding #2)",
-                        exc_info=True)
-                    _set_target(None)
-                    return None
-            headers = {}
-            api_key = resolved.get("api_key")
-            if api_key:
-                headers[HEADER_NAME] = api_key
-            target = {"endpoint": endpoint, "headers": headers}
-        _set_target(target)
-        return target
+    result = resolve(runtime)
+    resolved = result.get("resolved")
+    if not (resolved and resolved.get("endpoint")):
+        return None
+    endpoint = str(resolved["endpoint"]).rstrip("/")
+    if connector_installed(runtime):
+        # aw-app-signoz-connector is installed, so it — not the final
+        # destination — is this process's next hop. Exactly the same
+        # swap the auto/local branch below does for the local signoz
+        # app, for the same reason (an internal container URL instead
+        # of the public edge), with two differences:
+        #
+        #  * It applies whatever the resolved SOURCE is, including
+        #    `custom`. That is the point of a forwarder: the
+        #    connector holds the real destination (pushed into its
+        #    config by observability.py's PUT handler) and owns the
+        #    retry/queue behaviour, so core hands it everything and
+        #    stops caring where it ends up.
+        #  * NO auth header. The resolved api_key is a credential for
+        #    the FINAL destination, and the connector is the one that
+        #    presents it upstream. Its own OTLP receiver is
+        #    internal-only with no gate (the app exposes nothing
+        #    publicly), so forwarding the key here would be noise at
+        #    best and a credential on a hop that does not check it.
+        #
+        # Still gated on something having resolved at all: an
+        # unconfigured workspace exports NOTHING rather than filling
+        # the connector's (bounded, in-memory) queue with telemetry
+        # that has nowhere to drain to.
+        try:
+            endpoint = runtime.containers.base_url(
+                SIGNOZ_CONNECTOR_APP_ID).rstrip("/")
+        except Exception:
+            log.warning(
+                "otel: could not resolve aw-app-signoz-connector's internal "
+                "container URL — exporting nothing rather than falling back "
+                "to the public endpoint, which is known to hang (Architect "
+                "finding #2)",
+                exc_info=True)
+            return None
+        return {"endpoint": endpoint, "headers": {}}
+    if resolved.get("source") in ("auto", "local") and runtime is not None:
+        try:
+            endpoint = runtime.containers.base_url(SIGNOZ_APP_ID).rstrip("/")
+        except Exception:
+            log.warning(
+                "otel: could not resolve aw-app-signoz's internal container "
+                "URL — exporting nothing rather than falling back to the "
+                "public endpoint, which is known to hang (Architect finding #2)",
+                exc_info=True)
+            return None
+    headers = {}
+    api_key = resolved.get("api_key")
+    if api_key:
+        headers[HEADER_NAME] = api_key
+    return {"endpoint": endpoint, "headers": headers}
+
+
+def ensure_export_state(runtime: Any = None) -> dict[str, Any] | None:
+    """Recompute the effective OTLP target and publish it for the dynamic
+    exporters to pick up on their next export. Idempotent and cheap (one
+    settings-table read via :func:`src.api.observability.resolve`) — safe to
+    call as often as needed. Never raises; a resolution failure leaves the
+    previously published target alone rather than blanking it.
+
+    See :func:`_resolve_export_target` for what "the effective target" means
+    and why it is not simply ``resolve()``'s endpoint.
+    """
+    global _runtime_seen
+    if runtime is not None:
+        _runtime_seen = runtime
+    try:
+        target = _resolve_export_target(runtime)
     except Exception:
         log.exception("otel: ensure_export_state failed")
+        return None
+    _set_target(target)
+    return target
+
+
+def export_target_for_sibling_container(
+        runtime: Any = None) -> dict[str, Any] | None:
+    """Where a process on this workspace's container network — but NOT this
+    one — should send OTLP right now: ``{"endpoint", "headers"}`` or ``None``
+    for "there is no target, don't export".
+
+    Same answer :func:`ensure_export_state` publishes for this process's own
+    exporters, exposed as a one-shot read for the one case core cannot
+    instrument itself: a child process spawned in ANOTHER container, which
+    has to be handed the endpoint as env at spawn time. Today's caller is
+    aw-app-agents-platform-runners' ``build_mcp_servers``, building the env of
+    the stdio MCP server aw-mcp-gateway spawns inside the gateway's own
+    container (Kanban ``observability:runners-app-no-otel-instrumentation``).
+
+    ``runtime`` defaults to the last one core handed
+    :func:`ensure_export_state` — an in-process app's plugin is handed a
+    capability-gated ``AppContext``, not the :class:`~src.apps.runtime.
+    AppRuntime`, so it has no legitimate way to pass one.
+
+    With no runtime from either source this answers ``None`` rather than
+    resolve()'s endpoint, which in ``auto``/``local`` mode is the PUBLIC
+    tunnel edge — never a container-network consumer's target, and known to
+    hang on it (see :func:`_resolve_export_target`). The practical
+    consequence, stated out loud because it is load-bearing for callers: core
+    runs its first ``ensure_export_state`` at the END of the boot reconcile,
+    i.e. AFTER every app's ``activate()``, so a caller that asks once at
+    activation gets nothing on a cold boot and must ask again later.
+
+    Never raises: a caller using this to build an env dict must still build
+    the rest of it.
+    """
+    runtime = runtime if runtime is not None else _runtime_seen
+    if runtime is None:
+        return None
+    try:
+        return _resolve_export_target(runtime)
+    except Exception:
+        log.exception("otel: sibling-container export target resolution failed")
         return None
 
 

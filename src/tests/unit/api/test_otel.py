@@ -37,6 +37,7 @@ def _none_resolved():
 
 def setup_function(_):
     otel._set_target(None)
+    otel._runtime_seen = None
 
 
 # --- ensure_export_state -----------------------------------------------------
@@ -107,6 +108,57 @@ def test_no_runtime_falls_back_to_the_public_endpoint():
         target = otel.ensure_export_state(None)
 
     assert target["endpoint"] == "https://signoz.app.ws.example.com"
+
+
+# --- export_target_for_sibling_container ------------------------------------
+# The read an installed app uses to tell a child process it spawns in ANOTHER
+# container where to export (Kanban observability:runners-app-no-otel-
+# instrumentation). Same resolution as ensure_export_state above — these pin
+# the two things that differ: it must NOT publish, and it must answer with no
+# runtime argument.
+
+
+def test_sibling_target_is_the_same_internal_url_without_publishing_it():
+    with patch("src.api.observability.resolve",
+               return_value=_resolved("auto", "https://signoz.app.ws.example.com")):
+        target = otel.export_target_for_sibling_container(_runtime())
+
+    assert target == {"endpoint": "http://aw-app-signoz:8080", "headers": {"X-Api-Key": "k"}}
+    # A one-shot read must not touch what THIS process's exporters send to.
+    assert otel.current_target() is None
+
+
+def test_sibling_target_reuses_the_runtime_core_last_published_with():
+    """The caller is an app plugin, which is handed a capability-gated
+    AppContext and has no AppRuntime to pass."""
+    with patch("src.api.observability.resolve",
+               return_value=_resolved("auto", "https://signoz.app.ws.example.com")):
+        otel.ensure_export_state(_runtime())
+        target = otel.export_target_for_sibling_container()
+
+    assert target["endpoint"] == "http://aw-app-signoz:8080"
+
+
+def test_sibling_target_is_none_before_core_has_ever_resolved():
+    """Boot ordering: app activation runs BEFORE the boot reconcile's
+    ensure_export_state, so a caller at activate() time has no runtime to
+    resolve through. It must get nothing — NOT resolve()'s public tunnel
+    endpoint, which is never a container-network consumer's target."""
+    with patch("src.api.observability.resolve",
+               return_value=_resolved("auto", "https://signoz.app.ws.example.com")):
+        target = otel.export_target_for_sibling_container()
+
+    assert target is None
+
+
+def test_sibling_target_never_raises():
+    with patch("src.api.observability.resolve", side_effect=RuntimeError("db is down")):
+        assert otel.export_target_for_sibling_container(_runtime()) is None
+
+
+def test_sibling_target_is_none_when_nothing_is_configured():
+    with patch("src.api.observability.resolve", return_value=_none_resolved()):
+        assert otel.export_target_for_sibling_container(_runtime()) is None
 
 
 # --- _build_resource -----------------------------------------------------
