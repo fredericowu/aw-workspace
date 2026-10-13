@@ -2040,3 +2040,241 @@ valve numerator, catch-up.** Depends on H1 deployed and verified live
 
 Out of scope, unchanged: pathless documents, tombstones, the §17.6-3
 multi-workspace claim rule, card F (soak).
+
+## 19. Amendment (2026-10-13): the Kanban mirror's status directory turns every card move into delete+create — fix the writer, not the sync
+
+Written against card `3f85bf3b-9510-8196-9799-c11a50fbd85e`, after H1/H2
+landed and their live gates passed. **Design, not code** — the
+implementation is one card, §19.7, and it lands in a repo this document
+has not touched before: `repos/aw-app-notion`. fs-sync itself — server,
+connector, valve, feed — changes **nothing** under this amendment.
+
+### 19.1 The finding, confirmed
+
+The Kanban mirror encodes a card's status as a directory:
+`notion/kanban/<status>/<slug>.md`. Moving a card between columns is
+therefore a rename on disk. fs-sync has no rename concept — correctly, see
+§19.5-1 — so the scan sees the old path vanish (→ two-phase mark, human
+approval queue) and the new path appear (→ fresh document, fresh
+identity). Every component behaves as specified; the composition is the
+bug: **routine card movement fills the one queue in the system that
+deliberately demands a human, and silently re-keys the card's document
+identity (links, embeddings, annotations do not follow) on every column
+change.** Five moves in one evening produced 6 pending approvals; the
+other 6 pending are the same cause from the night before.
+
+Confirmed live 2026-10-13 (aw-stack Neo4j, `aw-stack-aw-neo4j-1`):
+
+    MATCH (d:Document) WHERE d.sync_status = 'pending_delete'
+    RETURN count(d) AS pending,
+           count(CASE WHEN d.source_path STARTS WITH 'notion/kanban/'
+                 THEN 1 END) AS kanban_pending
+    → pending 12, kanban_pending 12          (100% of the queue)
+
+    MATCH (d:Document)
+    RETURN count(d) AS all_docs, count(d.source_path) AS with_path,
+           count(CASE WHEN d.source_path STARTS WITH 'notion/kanban/'
+                 THEN 1 END) AS kanban_docs
+    → all_docs 2046, with_path 1973, kanban_docs 1649
+
+(`count(d.source_path)` counts documents **with a path** — the 73-document
+gap to `all_docs` is the known pathless ad-hoc uploads, out of scope since
+§17, not drift.) On disk the mirror holds 1,619 files across 13 status
+directories. The kanban mirror is **84% of all pathed documents**: this
+subtree's churn is not marginal noise, it is most of what delete
+detection watches.
+
+Two aggravating facts:
+
+- **The churn is not only human-driven.** The board's 7-day auto-archival
+  routine (Done/Self-closed → archived dirs) moves cards with no human in
+  the loop — the queue refills even on a week nobody touches the board.
+- **The layout already has a demonstrated failure class.** Backlog card
+  `bug:notion-sync-stale-status-folder-not-removed-for-12-cards`
+  documents 12 cards whose *old* status file was left behind — and the
+  live tree shows exactly 12 duplicate basenames across status dirs
+  today. A layout where one logical document can occupy two paths is
+  fragile in precisely the way §1's path-keyed identity cannot absorb.
+
+### 19.2 Who owns the path shape
+
+The mirror is written by `sync_kanban` in
+`repos/aw-app-notion/notion_app/sync.py:435` — **not** by the KB app and
+not by fs-sync; both are downstream consumers of whatever tree the writer
+lays out. The status directory is entirely the writer's choice:
+`_render_card` builds `rel_path = f"{KANBAN_SUBDIR}/{status_key}/{slug}.md"`
+(sync.py:382). Decisive detail: the writer already *knows* a move is a
+move — it tracks every card by `page_id` in its state file and removes the
+old file itself when the status changes (sync.py:501, counted as
+`moved`). The rename information exists at the source and is destroyed by
+the act of encoding status into the path; fs-sync downstream is then asked
+to reconstruct it from two unlabeled filesystem events. The fix belongs
+where the information is.
+
+### 19.3 The decision: status out of the path (option 2), in `aw-app-notion`
+
+`sync_kanban` mirrors every card to **`notion/kanban/<slug>.md`** — one
+flat directory, no status component. Status is not lost: it is already in
+the file twice, as frontmatter (`status:` and `status_key:`,
+sync.py:403-404) and in the rendered "Propriedades" section, so search
+and grep keep working; only the directory layout changes. Slug-collision
+disambiguation (`_card_slugs`, sync.py:331) keys on the slug alone
+instead of `status/slug` — the 12 current cross-status basename
+duplicates (all one stale-file bug) plus any genuine title twins get the
+existing `-<id8>` suffix treatment, board-wide.
+
+After this, a column move is a **content update at a stable path**:
+fs-sync's happy path. The connector sees the same `source_path` with a
+new hash, PUTs by-path, the server bumps `rev` and `updated_at`, the
+document re-embeds once — no mark, no approval, no identity re-key. The
+approval queue returns to carrying only genuine disappearances.
+
+Stated as an invariant, to live beside §1's identity rule and §18.1's
+rev/updated_at split: **path is document identity, so a mirror writer
+must never encode mutable state in a path.** Status today, assignee or
+priority tomorrow — anything that changes over a document's life belongs
+in content or metadata. The notes mirror (`notion/notes/<slug>.md`)
+already complies; any future mirror must.
+
+Known, accepted residual: the **title** is still in the path, so a card
+retitled in Notion still re-keys once. Titles change rarely and
+deliberately where status changes constantly and automatically; buying
+full stability with `notion_id`-named files would cost every human and
+agent a readable tree. Named, not solved.
+
+### 19.4 Migration — staged under the valve, using only existing machinery
+
+The flatten re-keys all 1,649 kanban documents once. Done in one shot,
+1,619 old paths go missing in one scan — guard 2's threshold is
+`max(25, 10% of tracked rows)` ≈ ~200, so a bulk flatten **trips the
+valve by design and the migration wedges** (the valve marks none and
+exits non-zero, every tick, forever). There is no sanctioned mass-rename
+override, and this amendment deliberately does not add one. Instead the
+**writer throttles**: each `sync_kanban` run flattens at most ~100 cards
+(move the file, update tracked state), paced so no single fs-sync scan
+sees more missing-advances than ~half the guard-2 threshold — writer-side
+pacing, zero connector changes. Each batch then flows through the normal
+machinery: ≥2-scan debounce → by-path mark (§17) → card D's UI, where the
+operator clears it with one `notion/kanban/` **prefix multi-select
+approve** per batch; §18.3's GC then collects the journal rows. Total
+one-time operator cost: a handful of prefix-approve clicks over a day or
+two. The migration also deletes the 12 stale dual-folder files, absorbing
+backlog card `bug:notion-sync-stale-status-folder-not-removed-for-12-cards`.
+
+Window costs, named: until a batch's old paths are approved, both copies
+of those cards answer `knowledge_search` (duplicate results, bounded by
+batch size and operator promptness), and the one-time re-key loses
+whatever was attached to the old nodes — acceptable once, since today it
+happens on *every move forever*, and entity extraction is still off so
+attachments on kanban mirrors are minimal.
+
+The 12 documents currently pending are untouched by this amendment; they
+are the operator's call in card D's UI, and they are genuinely stale
+old-status copies that the migration's own batches would otherwise have
+produced anyway.
+
+### 19.5 Rejected alternatives
+
+1. **Rename detection in fs-sync (content-hash pairing of a vanished and
+   a created path).** Structurally cannot catch the case that motivates
+   it: the mirror file's content *changes* on a move — frontmatter
+   `status:`, `status_key:`, `checksum:` all differ (sync.py:397-412) —
+   so the old and new files never share a hash. Three further strikes,
+   each sufficient alone: the pair never coexists in one pass (a new file
+   ingests on first sight; the old path needs ≥2 scans to count as
+   missing), so pairing needs a cross-tick holding pen for unmatched
+   creations; §17 made a path mean *N claimant documents*, so "which
+   document follows the rename" is exactly the winner-picking §17.1
+   forbids as unsound; and identical-content files (empty stubs,
+   templates) pair wrongly. Byte-identical rename detection might someday
+   earn its keep for human reorganizations of mapped folders — it would
+   still not have fixed this card.
+2. **Exempt `notion/kanban/` from approval (auto-approve deletes
+   there).** Cheapest and worst, and the measured numbers make it worse
+   than the card assumed: this subtree is 100% of current delete traffic
+   and 84% of pathed documents, so the exemption doesn't trim an edge —
+   it unplugs the human gate from essentially the whole corpus the gate
+   watches. The writer has a demonstrated stale-and-missing-file bug
+   class (§19.1); auto-approve converts the next writer bug directly
+   into silent hard deletes with no tombstone and no feed signal (§18.3:
+   approvals are structurally invisible). It also sets the precedent of
+   per-subtree trust carve-outs, which is how §7 dies by a thousand
+   exemptions.
+3. **Document-and-accept.** The rate scales with exactly the things we
+   want more of (Dev Team flow activity) plus one thing no human even
+   does (auto-archival), the re-keying silently severs card-document
+   continuity on every move, and a queue that trains the operator to
+   bulk-approve mirror churn erodes the gate for the subtrees that
+   still need it. Writing it down doesn't change any of that.
+4. **Teach fs-sync the mirror's semantics** (parse `notion_id`
+   frontmatter to track identity, or a writer→connector rename hint
+   channel). Couples the generic sync engine to one producer's file
+   format / adds a second mutation channel beside the filesystem,
+   which §17.6-1 already rejected in another form: the tree is the
+   interface. The writer owns its layout; fixing the layout needs no
+   new interface at all.
+
+### 19.6 What this makes harder later
+
+1. **Browsable-by-column dies.** The on-disk tree and the §16 git-backend
+   repo stop showing status at a glance; "what's in backlog" becomes a
+   frontmatter grep or a board question, not an `ls`. Anything that
+   globs `notion/kanban/<status>/*.md` breaks — known live consumers:
+   old Kanban cards' CheckHints (at least
+   `bug:notion-sync-stale-status-folder-not-removed-for-12-cards`, whose
+   card this migration absorbs anyway), and the writer's own
+   empty-dir semantics (sync.py:259-268), which are deleted with the
+   layout. §19.7 gates include a consumer sweep.
+2. **One flat directory of ~1,650 files.** GitHub's web UI truncates
+   directory listings at 1,000 entries, so the §16 repo's kanban dir is
+   only fully listable via clone/raw; directory scans get marginally
+   slower. Sharding (e.g. by initial) was considered and skipped —
+   it reintroduces a path component that must never change, for a
+   cosmetic win.
+3. **A one-time identity re-key of every kanban document**, with a
+   migration window of duplicate search results per batch (§19.4). After
+   it, kanban document identity is stable for the first time — but any
+   external reference captured against an old path (none known today)
+   dangles once.
+4. **Title edits still churn** (§19.3's residual): the path still encodes
+   one mutable thing. If title-edit churn ever becomes measurable, the
+   next step is id-suffixed-always filenames, not another layout
+   migration — note it here so that option isn't re-derived.
+5. **The invariant binds future mirrors.** "No mutable state in paths"
+   constrains every future tree-producing writer (and is the reason this
+   amendment exists); a writer that can't comply (e.g. one mirroring a
+   system whose native keys are mutable) needs its own design pass
+   before it may feed a synced tree.
+
+### 19.7 Implementation card and acceptance gates
+
+**Card I1 — writer: flatten the Kanban mirror + staged migration
+(`repos/aw-app-notion`).** No fs-sync, server, or connector change; no
+other card. Gates:
+
+- A new card lands at `notion/kanban/<slug>.md`; a column move rewrites
+  the **same** path (state-file diff shows `updated`, not
+  `moved`+`removed`) and the archived statuses land flat too.
+- Slug collisions disambiguate board-wide with the existing `-<id8>`
+  suffix; the suffix applies to *all* colliders, preserving
+  sync.py:331's order-independence property.
+- Migration: flag/state-gated, ≤100 cards per run, idempotent across
+  crashes (a half-moved batch re-runs clean); the old file is removed
+  and the new one written in the same run; stale dual-folder leftovers
+  are removed; after convergence no `notion/kanban/*/` subdirectory
+  remains on disk.
+- Consumer sweep: grep this workspace's skills, scheduled tasks,
+  CheckHints and docs for `notion/kanban/<status>` path patterns;
+  update or retire each hit in the same card.
+- Live, coordinator-driven, against production fs-sync: across the whole
+  migration the valve never trips (`blocked: false` on every tick);
+  pending approvals arrive only in operator-sized batches and the
+  operator clears each with a prefix approve; after convergence and
+  approvals, the graph shows zero live status-dir documents —
+  `MATCH (d:Document) WHERE d.source_path =~ 'notion/kanban/[^/]+/.+'
+  RETURN count(d)` → 0 — and a deliberate test-card column move
+  produces `deleted_marked: 0` on the following two ticks.
+
+Out of scope, unchanged: the 12 currently-pending approvals (operator's
+decision), the 73 pathless documents, rename detection for mapped
+folders, card F (soak), everything in §17/§18 as built.
