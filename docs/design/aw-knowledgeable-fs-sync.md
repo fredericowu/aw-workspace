@@ -2284,3 +2284,267 @@ other card. Gates:
 Out of scope, unchanged: the 12 currently-pending approvals (operator's
 decision), the 73 pathless documents, rename detection for mapped
 folders, card F (soak), everything in §17/§18 as built.
+
+---
+
+## 20. Amendment (2026-10-15): per-prefix quiet period before upsync — hold a changed file until it has been still for N (`notion/` = 3h)
+
+Written against card `3f85bf3b-9510-814e-917d-e93357322ddd`. Frederico's
+request, verbatim intent: *stop syncing a card while it is still being
+modified* — hold every detected change until the file has been unmodified
+for 3 hours, as a **generic** setting in the connector config, applied to
+`notion/`. Lands entirely in `repos/aw-app-knowledgeable` (the
+connector); server, valve semantics, feed, and `aw-app-notion` are
+untouched.
+
+The earlier cost justification is retired: the mapping agents moved to
+`openai-gpt-4o-mini` (162 labeller runs ≈ $0.04 vs ≈ $5.56 before, ~145×
+cheaper), so "repeated LLM rebuilds are expensive" no longer carries the
+card. What stands is the correctness/behaviour argument: the topic tree
+rebuilt 4× in the last 24h, three of them inside 90 minutes (05:21,
+06:22, 06:52), each a full ~7-minute rebuild producing an essentially
+identical tree — syncing a card mid-edit embeds transient states and
+re-derives the same graph over and over. Every agent comment on a card
+bumps Notion's `last_edited_time` and re-renders that card's mirror file
+(comments are rendered into the body — the churn source confirmed on the
+card), so a card under active work churns continuously.
+
+### 20.1 The mechanism already exists — this generalizes it
+
+The upload pass already holds a changed file until it has been still:
+`DEBOUNCE_SECONDS = 30` (`knowledgeable_app/fs_sync.py:127`), enforced
+hash-anchored in the found-loop (fs_sync.py:981-992) — a new hash restarts
+the window, upload happens only once the same hash has been observed
+stable past the window. **This amendment is that mechanism with a
+per-prefix window and a starvation cap, not a new subsystem.** Creates are
+held exactly like edits, as today (fs_sync.py:931-934 — a brand-new card
+that is immediately commented on is the same churn).
+
+### 20.2 The decision
+
+**Per-prefix quiet rules, hash-anchored stillness, journal-persisted
+clocks in fs-sync-owned columns, with a max-hold cap.**
+
+- **Stillness signal: content hash as observed by the scan, not mtime**
+  (card decision 2). Three reasons, each sufficient: the scan already
+  hashes every file every tick (`_walk_sync_tree`, fs_sync.py:177) so the
+  signal is free; a re-clone or restore of the tree rewrites every mtime
+  wholesale — under mtime a recovery re-clone of the §16 mirror would
+  freeze ALL syncing for the full window (git's own `checkout -B` on the
+  in-place repo, git_backend.py:165, touches nothing, but the recovery
+  path is exactly when you least want a silent 3h global hold); and the
+  existing debounce is already hash-anchored — same idiom, no second
+  timing concept.
+
+- **The clock must live in columns only fs_sync writes.** This is the
+  non-obvious load-bearing constraint: `bulk_ingest.scan()` runs inside
+  every bulk-ingest tick (bulk_ingest.py:544) — **every 15 minutes in
+  production** (the "KB bulk-ingest — tick" scheduled task, enabled, last
+  run ok 2026-10-15) — and its upsert stomps `sha256` and
+  `scanned_at = now` on every row not status `uploaded`/`skipped`
+  (bulk_ingest.py:400-408). A never-yet-uploaded row's quiet clock
+  anchored on `scanned_at` would be reset every 15 minutes and **never
+  elapse**. Three new journal columns, idempotent ALTERs in
+  `bulk_ingest._ensure_table` beside the §3.2 set (house style, no
+  alembic): `pending_hash TEXT` (the candidate content awaiting
+  stillness), `pending_since DOUBLE PRECISION` (when that hash was first
+  observed — restarts on every hash change), `dirty_since DOUBLE
+  PRECISION` (when the row first diverged from `last_synced_hash` — does
+  NOT restart on further changes; the starvation cap's anchor).
+
+- **Found-loop contract** (replaces the `sha256`/`scanned_at` debounce
+  branch at fs_sync.py:981-992; `sha256`/`scanned_at` keep their values
+  for reporting but are never again trusted for timing):
+  1. `digest == last_synced_hash` → clear `pending_hash`/`pending_since`/
+     `dirty_since` if set (an edit that reverted cancels its own hold);
+     unchanged.
+  2. `digest != pending_hash` → `pending_hash = digest`,
+     `pending_since = now`, `dirty_since = COALESCE(dirty_since, now)`;
+     no upload — the window restarts.
+  3. stable pending hash → upload iff
+     `now - pending_since >= quiet(relpath)` **or**
+     `cap(relpath) > 0 and now - dirty_since >= cap(relpath)`.
+     On confirmed upload, clear all three columns.
+  A successful downsync write clears the hold naturally (it sets
+  `last_synced_hash` to the new content → rule 1 next scan).
+
+- **Starvation cap: required** (card decision 1, the coordinator's view
+  confirmed). A pure quiet period never fires on a file that keeps
+  changing, and that is the common case here: several fs-sync cards went
+  12h+ without a 3h-still window because agents kept commenting. Without
+  a cap, a card is invisible to `search_knowledge_base` for exactly as
+  long as it is interesting. Default `cap = 4 × quiet` (12h for
+  `notion/`): a hot card syncs a consistent snapshot at most twice a day,
+  and the final state lands 3h after the activity ends. `cap = 0`
+  disables it per rule, for a future subtree where "never while dirty" is
+  genuinely wanted. A cap-fire uploads whatever bytes the scan read —
+  atomic per file, possibly mid-burst per card; the next still-window
+  supersedes it, which is the normal churn path, not a new hazard.
+
+- **Post-deploy transient, named:** existing dirty rows have NULL
+  `pending_hash`, so the first tick after deploy starts their window
+  fresh — already-pending `notion/` edits wait one full quiet period
+  from the restart, once.
+
+### 20.3 The delete side is NOT gated (card decision 3)
+
+The quiet period is an **upload gate only**. Delete marking keeps its
+existing independent damping unchanged: ≥2-consecutive-scans (§3.3), the
+§7 valve, human approval (card D). Reasons: an absent file is not "being
+modified" — the request's rule has no referent on the delete path, which
+already has three dampers and a human gate; and gating deletes on a quiet
+period is what would convert the §19.4 migration's 17 paced batches into
+one super-burst (§20.4). The race the card names — a delete "racing
+ahead" of a held content update — is moot by construction: when a path
+vanishes mid-hold there is nothing left to upload; the mark proposes
+deleting the last-*synced* content, subject to approval as always, and if
+the file reappears `missing_scans` resets (fs_sync.py:961-968) and the
+hold resumes. Rows mid-hold that were never synced (`external_id` NULL,
+not adopted) stay outside delete tracking and the valve's numerator
+exactly as today (`_TRACKED_ROWS_WHERE`, fs_sync.py:192) — no valve
+change of any kind.
+
+### 20.4 Interaction with the §19 I1 flatten migration (card decision 5)
+
+Because deletes are not quiet-gated, **the migration keeps exactly
+§19.4's cadence**: writer-paced ≤100 old-path removals per batch, each
+batch marking ≈ half of guard 2's threshold (`max(25, 10% of ~2,008
+journal rows) ≈ 200` today). The feared single ~1,700-removal burst
+cannot occur under this design; the valve is never approached. No
+migration bypass exists or is added.
+
+The residual interaction is on the **create** side: each batch's ~100 new
+flat paths are new files and wait out the 3h window before first upload.
+If the operator prefix-approves a batch's old paths before its new paths
+ingest, that batch's cards are absent from search for up to ~3h — a gap
+window replacing §19.4's duplicate window.
+
+**Required landing order: I1 completes first — through its §19.7
+convergence gate (zero `notion/kanban/*/` directories on disk, zero
+status-dir documents in the graph) — then this card deploys.** The order
+is free: I1 is `ready_to_deploy` with no dependency on this card, while
+this card still needs implementation, release, and the Tier-1 core
+restart. Stated fallback so nobody panics mid-flight: if the order
+inverts anyway, nothing trips and nothing wedges — the migration merely
+acquires the 3h ingest lag and the gap window above. Degraded UX, not a
+correctness failure. Post-I1 the two changes compose: I1 makes a column
+move a content update at a stable path; this card coalesces those
+updates.
+
+### 20.5 Config shape (card decision 4)
+
+One new `config_schema` key in `aw-app.json` — existing keys, notably
+`service_secret` and `git_token`, are byte-for-byte untouched:
+
+    "sync_quiet_rules": {
+      "type": "string",
+      "default": "notion/=10800",
+      "title": "Sync quiet periods",
+      "description": "Comma- or newline-separated rules
+        `prefix=quiet_seconds[:max_hold_seconds]`. A changed file under
+        `prefix` uploads only once its content has been unchanged for
+        quiet_seconds; max_hold (default 4× quiet, 0 = unlimited) syncs
+        it anyway if it has been continuously changing that long.
+        Longest matching prefix wins. Paths matching no rule keep the
+        built-in 30s debounce."
+
+Threading: the `/fs-sync/run` route (routes.py:234-247) reads
+`ctx.config.get("sync_quiet_rules")`, parses, and passes a `quiet_rules=`
+kwarg into `fs_sync.run_tick` — the CLI door POSTs that route
+(commands/knowledgeable_sync.py:29), so the route stays the single config
+seam. With the kwarg absent, behaviour is byte-identical to today (30s
+everywhere), so every existing test keeps its meaning. The parser is a
+pure function with its own unit tests including malformed input; an
+invalid rule is skipped with a logged warning AND surfaced as
+`quiet_rules_invalid` in `status()` — a typo must not silently disable
+the feature (the optional-config-gated-paths lesson: the default value
+must exercise the real code path in tests, not a bypass).
+
+A second contributed scheduled task (`knowledgeable-sync run`, cron
+`*/15 * * * *`, `enabled: false` like the bulk-ingest task, operator
+enables) ships in the same manifest change: a held file only uploads on a
+LATER tick, so without a periodic fs-sync tick a quiet period never
+releases. Today no schedule drives fs-sync (verified against the live
+tasks list 2026-10-15) — ticks are coordinator-driven — which the I1
+migration gates already implicitly require fixing; this makes it
+explicit.
+
+Rejected shapes: dedicated per-prefix keys (`notion_quiet_seconds` — not
+generic, next prefix needs a schema change, which is what Frederico
+explicitly asked to avoid); a JSON-object field (every existing key is a
+flat scalar the declarative settings UI renders as a plain input —
+hand-typed JSON in a text box is the error-prone version of the same
+string); separate quiet-map and cap-map fields (two lists to keep
+aligned by hand).
+
+### 20.6 Supersession (card decision 6): yes — closes the topic-rebuild debounce card
+
+This supersedes card `3f85bf3b-9510-81f2-ace9-f029266fd424` (raise
+`TOPIC_BUILD_DEBOUNCE_SECONDS` in `repos/aw-knowledgeable`); the
+coordinator should close it rather than ship both. Judged on correctness
+alone (its cost case evaporated with the 4o-mini move too): the quiet
+period removes the rebuild trigger at the source — mirror churn never
+reaches the graph, so there is no burst for the debounce to damp — while
+the debounce knob damps the symptom downstream, in a repo with live work
+in it, and would still let every intermediate state ingest and re-embed.
+Falsifiable reopen condition: if a week after this deploys the tree still
+rebuilds >2×/day producing essentially identical trees, reopen that card
+with the measurement — the quiet period will have been shown insufficient
+at the source.
+
+### 20.7 Observability
+
+`status()` gains `holding` (rows with `pending_hash` set, not yet
+eligible), `quiet_rules` (the parsed, effective rules) and
+`quiet_rules_invalid`; `report()` gains per-subtree `holding`. Without
+these, "held for 3h" and "silently broken" are indistinguishable from the
+operator's seat — this workspace's named failure mode.
+
+### 20.8 What this makes harder later
+
+1. **KB freshness for `notion/` becomes ≥3h stale by design** (≤12h for
+   continuously-active cards). Agents reading board state through
+   `search_knowledge_base` see old data; the `aw-kanban` MCP tools (live
+   Notion) are the fresh path. This is the requested trade — named, not
+   hidden.
+2. **The two-engines-one-table asymmetry deepens**: bulk-ingest may stomp
+   `sha256`/`scanned_at` at will; fs-sync must never again derive timing
+   from them. Anyone merging the engines later unwinds three more
+   columns.
+3. **A mini-DSL in config** — a new silent-degradation surface, mitigated
+   by §20.7, not eliminated.
+4. **E2E flows that drop a file and expect prompt ingestion** must use a
+   non-`notion/` path or override the rules; a future "sync now" action
+   needs an explicit hold-bypass flag on the route (reserved, not built).
+5. The built-in 30s default for unmatched paths stays hardcoded; if it
+   ever needs configuring, extend the same rules string with a `*` or
+   empty prefix — noted so it isn't re-derived as a new field.
+
+### 20.9 Implementation card and gates (one card, the connector)
+
+Everything above is one coder card in `repos/aw-app-knowledgeable`:
+columns in `bulk_ingest._ensure_table`, found-loop + rule resolution in
+`fs_sync.py`, config threading in `routes.py`, `sync_quiet_rules` + the
+scheduled task + version bump in `aw-app.json`, `status()`/`report()`
+fields, tests. Gates:
+
+- **The stomp test, failing pre-change** (stash/run/restore proof): a
+  `notion/` row mid-hold, `bulk_ingest.scan()` runs (overwriting
+  `sha256`/`scanned_at`), the quiet window must still elapse on
+  schedule. Pre-change this fails because timing lives in `scanned_at`.
+- Window restart on content change; upload at quiet elapse; cap-fire at
+  `dirty_since + cap` despite continuous changes; revert-to-synced
+  clears the hold; downsync clears the hold.
+- Longest-prefix: `notion/` vs `notion/kanban/` rules, both orders.
+- Unmatched prefix keeps 30s; absent kwarg keeps today's behaviour
+  (existing suite green unmodified, specifically the valve tests —
+  `test_valve_*`, tests/test_fs_sync.py:191-290,739-809 — untouched).
+- Parser: malformed rule → skipped + `quiet_rules_invalid` surfaced,
+  valid rules still applied.
+- Live after deploy (Tier-1: needs the core restart; verify the
+  INSTALLED copy, not CI): `status()` shows the default rule active and
+  `holding > 0` while the board churns; a deliberately-commented test
+  card does NOT re-ingest within the window and DOES ingest after 3h of
+  stillness; `deleted_marked` behaviour on a deleted file is unchanged
+  (2 scans, no 3h wait).
+- Deploy blocked on I1's convergence gate (§20.4's landing order).
