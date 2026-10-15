@@ -2548,3 +2548,290 @@ fields, tests. Gates:
   stillness; `deleted_marked` behaviour on a deleted file is unchanged
   (2 scans, no 3h wait).
 - Deploy blocked on I1's convergence gate (§20.4's landing order).
+
+---
+
+## 21. Amendment (2026-10-15): per-prefix `delete_policy` — unattended approval for routine deletions
+
+Written against card `3fa5bf3b-9510-81f5-9992-d977b17726ad`. Frederico,
+verbatim: *"I deleted the random* folder, so I want everything working e2e
+without manual intervention."* Verified live that day: `random/` and
+`random2/` deleted ~21:08Z, journal reached `missing_scans=5,
+pending_delete=1` on its own, and both documents kept answering searches
+until a hand approval at 22:06Z. §7's two-phase delete has no unattended
+path: creates and edits converge alone, deletes stop dead. This amendment
+adds the unattended path for the routine case while keeping every §7
+safeguard for the anomaly.
+
+### 21.1 The decision
+
+**A `delete_policy` config string in §20.5's DSL family, resolved per
+path; an in-tick auto-approve pass that reuses the card-D approve
+machinery verbatim; and the §7 valve latch promoted from reporting-only
+to a hard gate on that pass.**
+
+Rules: comma- or newline-separated `prefix=auto[:min_missing_scans]` or
+`prefix=manual`, longest prefix wins, paths matching no rule are
+`manual`. Default `""` — ships inert, today's behaviour byte-for-byte,
+exactly how §20 itself shipped safely mid-migration. Two deliberate
+parser restrictions beyond §20's:
+
+- **An empty prefix is invalid** (skipped + surfaced in
+  `delete_policy_invalid`). §20.8-5 reserves `*`/empty for a global
+  default; for deletions a global `auto` is precisely the blanket
+  approve the 2026-10-15 queue proved catastrophic (4
+  `apps/knowledgeable/cli_reference/` marks were live documentation
+  whose files a daily task restores — a blanket approve deletes them).
+  Scope stays explicit, always.
+- **`authored/` cannot carry an `auto` rule** (same invalid-surface
+  path). §4's downsync is still unexercised; until it is, "the file
+  vanished" is weak evidence about a document a human authored in the
+  graph. Lift this restriction consciously, in an amendment, when §4 is
+  exercised — not by discovering the parser allows it.
+
+`min_missing_scans` defaults to **2** — the same tick the mark lands
+(see 21.3). The knob exists per rule (`notion/=auto:4`) for operators
+who want to buy extra confidence with latency.
+
+### 21.2 Where it lands
+
+All in `repos/aw-app-knowledgeable` (the connector) plus this doc; the
+server, the feed, the valve thresholds, and `tests/test_fs_sync.py`'s
+frozen valve ranges (:191-290, :739-809) are untouched.
+
+- **`knowledgeable_app/fs_sync.py`** — `parse_delete_policy` /
+  `_resolve_delete_policy`, mirroring `parse_quiet_rules`
+  (fs_sync.py:150) and `_resolve_quiet_rule` (:197): same splitting,
+  same longest-prefix sort, same skip-and-surface on malformed entries.
+  A new pass `_auto_approve_pending`, called immediately after
+  `_mark_missing_as_deleted` (:1171) so a mark and its approval land in
+  one tick. The pass:
+  1. **No-ops entirely** if guard 2's pre-pass check tripped this tick
+     (`_check_mass_delete_valve`, :301 — the tick already aborted), if
+     the mid-pass `_MarkBudget` tripped (:1196-1209), **or if the
+     sticky valve latch is set** (threaded in, below). Skips are
+     counted, never silent: `auto_approve_suspended: <reason>` in the
+     tick result.
+  2. Selects journal rows `pending_delete = 1 AND missing_scans >=
+     rule.min AND policy(relpath) == auto`. `missing_scans` keeps
+     advancing on pending rows (the harmless `else` branch,
+     :1273-1278), so thresholds above 2 work; a file that reappears
+     resets the counter (:1067) and the approval never fires.
+  3. Fetches the server's pending list (fresh, after this tick's
+     marks) and, per matched rule, calls
+     `pending_deletions.approve_pending_deletions` with
+     `node_ids = [every pending doc whose source_path equals an
+     eligible relpath]` and `expected_count = len(node_ids)`, actor
+     `"fs-sync:delete_policy rule=<prefix>"`. One approve path, one
+     audit shape, one journal-reconcile (`_reconcile_journal_for_
+     succeeded`), for human, agent and policy alike. Matching on
+     `source_path` means co-claimant duplicates at an approved path go
+     together — §17's by-path semantics, unchanged.
+- **`knowledgeable_app/routes.py`** — `/fs-sync/run` (:252-270) threads
+  two more kwargs: `delete_policy=ctx.config.get("delete_policy")` and
+  `valve_latched=bool(await ctx.state.kv.get(FS_SYNC_VALVE_KV_NAME))`.
+  `run_tick`'s `valve_latched` parameter defaults to `None` = unknown =
+  **auto-approve disabled** — a caller that doesn't prove the latch is
+  clear gets marking-only behaviour (fail closed; existing tests keep
+  their meaning for free). New route `POST /fs-sync/valve/clear`
+  (identity-gated like its siblings): deletes the KV entry and writes a
+  `valve_clear` row to the card-D audit table via `_caller_actor`
+  (:72). The latch's TTL changes from 30 days to **none**: a latch that
+  silently expires would silently re-arm unattended deletion, which is
+  this workspace's named failure mode. The auto pass itself NEVER
+  clears the latch — constraint 2 holds: a trip always waits for an
+  explicit, audited, out-of-tick decision.
+- **`aw-app.json`** — `delete_policy` config_schema key beside
+  `sync_quiet_rules` (:153), default `""`; the fs-sync escalation
+  prompt (:97) gains one line: a latched valve also suspends
+  auto-approval until `/fs-sync/valve/clear`. Version bump belongs to
+  the release bot, not the diff.
+- **`knowledgeable_app/pending_deletions.py`** — no behaviour change;
+  at most a thin internal entry point if the dict-args surface is
+  awkward to call from the tick. The audit premise on the card is
+  stale: this module takes `db` explicitly and `run_tick` already
+  holds `ctx.db` (routes.py:263), so the auto path reuses the same
+  audit table with zero new plumbing.
+- **`status()`/`report()`** (fs_sync.py:1282/:1318) — `delete_policy`
+  (parsed effective rules), `delete_policy_invalid`,
+  `auto_approve_suspended`; tick result gains `auto_approved`,
+  `auto_approve_failed`. §20.7's rule: without these, "working" and
+  "silently off" are indistinguishable.
+- **Tests in a NEW file** (`tests/test_delete_policy.py`), not appended
+  to `test_fs_sync.py` — the valve contract is pinned to line ranges;
+  inserting tests above them renumbers the contract.
+
+### 21.3 The card's open questions, answered
+
+**Prefix, not provenance.** Measured 2026-10-15: all 2,079 tracked
+journal rows carry `origin` NULL/empty (1,107) or `scan` (975 incl.
+pending) — zero `feed`, `adopted`, `downsync`. The column records how
+the JOURNAL ROW came to exist, not who writes the FILES; a Kanban
+mirror file and a human's hand-written note both arrive as `scan`. The
+risk classes Frederico distinguishes — machine mirror vs generated docs
+vs human-authored — are encoded only in the tree layout (`notion/`,
+`apps/`, `authored/`, `mapped_folders/`), so in this tree **prefix IS
+the provenance axis**, and it is the axis every adjacent mechanism
+already uses (§20 quiet rules, card D's `path_prefix` scoping, the
+UI's prefix breakdown).
+
+**Latency buys almost nothing here; default `min_missing_scans=2`.**
+The protective window a higher threshold adds runs from the mark to the
+approval — and the one measured false-positive class (cli_reference,
+restored by a *daily* task) has a restore horizon of hours-to-a-day:
+~96 fifteen-minute scans to cover it, at which point the path isn't
+"auto" in any meaningful sense. That class is why `apps/` stays
+`manual`, not a reason to slow every auto delete. Meanwhile the
+acceptance contract is "delete under an auto prefix, two ticks,
+gone" — which is exactly mark-at-2 + same-tick approval. The real
+protections are structural: the 2-scan rule, guard 1's zero-files
+abort, guard 2 + the mark budget, the latch gate, explicit scope, and
+reappearance resetting `missing_scans`. The per-rule knob preserves
+the option without imposing the cost.
+
+**The valve denominator keeps auto prefixes in.** Re-rejection of
+§18.5-5: excluding them shrinks the threshold and makes the valve
+MORE trigger-happy for everyone else. Auto-approval already
+self-adjusts it honestly — each approval's journal-reconcile deletes
+rows, so the denominator tracks the corpus as it genuinely shrinks.
+Measured with the code's own query (`_TRACKED_ROWS_WHERE`): 2,079 →
+threshold 207. (The narrower pending/suppressed-excluded query reads
+1,975 — both were measured, per the twice-burned measure-never-infer
+rule; the code uses the wider one.)
+
+**`authored/`** — parser-rejected for `auto` until §4 is exercised
+(21.1). A local file deletion proposing removal of a graph-authored
+document is a conflict question, not a convergence question.
+
+### 21.4 Interactions in flight
+
+- **I1 flatten migration (paused, ~750 cards left).** This ships inert,
+  so there is no landing-order constraint. When I1 resumes AND the
+  operator enables `notion/=auto` (or `notion/kanban/=auto`), each
+  batch's ≤100 legacy-path marks auto-approve in the same tick —
+  replacing precisely the per-batch manual prefix-approvals the
+  coordinator performed by hand on 2026-10-15, at 100 marks against a
+  measured threshold of 207, with the `_MarkBudget` ceiling still
+  pacing mid-tick. The policy accelerates the §19.7 convergence gate;
+  it cannot fight the migration. Recommended ramp: enable after
+  watching one resumed batch tick.
+- **The 544 orphaned duplicates** (card
+  `3fa5bf3b-9510-812c-a439-d7fcc773f2bd`, debugger in flight). A
+  policy keyed on journal rows cannot reap a document no journal row
+  references; this design does not claim to. One helpful edge it does
+  cover: because approval matches on `source_path`, an orphan twin
+  co-claiming a path whose tracked row is auto-approved is deleted
+  with it (by-path semantics). Orphans at live or never-journaled
+  paths remain that card's problem — coordinate, don't duplicate.
+
+### 21.5 Rejected alternatives
+
+1. **Provenance (`origin`) as the policy axis.** Measured zero
+   discriminating power (21.3), and file-writer provenance is recorded
+   nowhere else — adopting this axis would first require building the
+   very metadata it presumes.
+2. **A scheduled agent as the approver** (cron → agent run → MCP
+   approve tools). Replaces human-in-the-loop with LLM-in-the-loop:
+   non-deterministic, token-cost per routine delete, and the
+   run-reliability record (watchdog kills, duplicate QA fan-outs,
+   wakeup races) makes it the least dependable component in the
+   chain the policy is supposed to make dependable. The deterministic
+   20-line pass is the honest version.
+3. **`force` hard-delete for auto prefixes** (decision 5's existing
+   path, skipping the pending state). Loses the pending window and the
+   reappearance cancel, bypasses the queue UI mid-flight, and forks a
+   second delete path whose valve interactions must be maintained
+   separately. The two-phase shape stays; phase 2 gains a machine
+   approver — strictly smaller change.
+4. **Auto-DECLINE for known-churn prefixes** (e.g. cli_reference).
+   Inherits §18's permanence trap in automated form: `restore_
+   suppressed=1` rows silently exempt paths from deletion forever —
+   18 such rows made §19.7's gate unreachable while every batch
+   "succeeded". The policy enum is `auto|manual` only; nothing
+   auto-declines, ever.
+5. **Age-based blanket approve** ("approve anything pending > 7
+   days"). Scope by time instead of place violates constraint 3 in
+   the exact way the cli_reference marks demonstrate: they would have
+   quietly aged into deletion overnight.
+6. **An out-of-tick approver** (second scheduled task calling the MCP
+   approve tools with computed counts). Adds a scheduler racing the
+   tick (TOCTOU between its list and its approve), duplicates the
+   eligibility logic outside the journal's custody, and gains nothing
+   the in-tick pass — already serialized by the §5 lease — doesn't
+   have.
+
+### 21.6 What this makes harder later
+
+1. **Unattended destructive writes now exist at all.** A *valid* but
+   wrong rule (`mapped_folders/=auto`) is operator rope the parser
+   cannot take away. Mitigations are audit + status surfacing + the
+   latch, not prevention.
+2. **A second config mini-DSL** beside `sync_quiet_rules`, with
+   different value semantics (enum vs numbers). Share the
+   split/longest-prefix helper so they cannot drift apart
+   structurally; the silent-degradation surface §20.8-3 named now has
+   two tenants.
+3. **The valve latch becomes load-bearing.** Today it is cosmetic;
+   after this, its presence suppresses auto-approval and its absence
+   permits it. The TTL removal is part of the design, not an
+   optimization — and anyone touching the KV layer must know a lost
+   latch re-arms unattended deletion.
+4. **Every future `run_tick` caller must thread latch state** or
+   silently get marking-only behaviour. Fail-closed is the right
+   default, but it means "auto-approve mysteriously off" is the
+   failure mode to document (hence `auto_approve_suspended` in
+   status).
+5. **The `authored/` parser rejection must be consciously lifted**
+   when §4 is exercised — a future coder who finds it will be tempted
+   to just delete the check.
+6. **§17.6-3's single-workspace assumption deepens**: auto-approval
+   trusts that absence from this tree means absence everywhere. A
+   second workspace syncing the bucket revisits this amendment
+   alongside §17.6-3 and §18.3.
+
+### 21.7 Risks for the coders
+
+- **Ordering inside the tick is load-bearing**: the auto pass must run
+  after `_mark_missing_as_deleted` (:1171) and must fetch the server
+  pending list AFTER those marks, or same-tick approval (the default)
+  never sees them.
+- **Check both trip signals**: guard 2's pre-pass abort exits the tick
+  before the pass; the mid-pass `_MarkBudget` trip (:1196) does not —
+  the pass must test `mark_budget.tripped` itself.
+- **A TOCTOU count mismatch is a feature**: if the queue moved between
+  selection and approve, `expected_count` rejects, the rejection is
+  audited, and the next tick retries. Do not retry in-pass.
+- **Adopted rows** (`external_id` NULL) won't match
+  `_reconcile_journal_for_succeeded`'s `(relpath, external_id)` key;
+  their journal rows are collected by the existing §18.3 GC a tick
+  later. Expected, not a leak.
+- **Deploy is Tier-1**: config + code land only after a core restart;
+  verify the INSTALLED copy. Enable via `POST
+  /api/apps/knowledgeable/config` — never via `/settings`, which
+  clobbers `service_secret`.
+- **Verification ticks**: drive `POST .../fs-sync/run` directly with a
+  long timeout; the CLI's 30s HTTP timeout tracebacks while the tick
+  keeps running.
+
+### 21.8 Acceptance (the card's falsifiable contract)
+
+With `delete_policy = "random/=auto"` set and the latch clear:
+
+1. Sync a file under `random/`, delete the directory, run two ticks →
+   tick 2 marks AND approves; the document is gone from the graph and
+   from search; the audit table shows `action=approve,
+   actor=fs-sync:delete_policy rule=random/` with matching counts; the
+   journal row is gone. No agent, no human.
+2. Same deletion under a `manual` (or unmatched) prefix → marked,
+   stays pending, queue visible in UI and MCP list. Unchanged from
+   today.
+3. A deletion large enough to trip guard 2 → tick aborts, latch set,
+   nothing marked or approved; a subsequent small delete under the
+   auto prefix is marked but NOT approved while latched
+   (`auto_approve_suspended` says why); after `POST
+   /fs-sync/valve/clear` (audited), the next tick approves it.
+4. With `random/=auto:5`: file deleted, restored at `missing_scans=3`
+   → counter resets, nothing approved, document intact.
+5. `delete_policy=""` → tick result and status byte-identical to
+   today; the full existing suite green unmodified, the frozen valve
+   ranges untouched.
