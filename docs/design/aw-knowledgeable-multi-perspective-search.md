@@ -163,15 +163,27 @@ that is the door the entity layer opens, noted, not assumed).
   the workflow calls `http://aw-knowledgeable:8090` with its **own scoped
   read-only API key** (the scoped-api-keys mechanism already exists), scope
   = read on bucket `main`. New credential, named in §8.
-- **Reaching codegraph:** codegraph lives inside the workspace (Tier-1 app,
-  index next to the source, served via aw-mcp-gateway). The workflow calls
-  the gateway's scoped HTTP endpoint for `aw__codegraph__*` over the
-  workspace edge. **This is the design's one unverified assumption** — that
-  an ap-mt-held gateway token can reach a scoped endpoint through the tunnel
-  (30s edge cut applies; codegraph calls are local-SQLite fast, so they fit).
-  If it doesn't hold, P6 degrades exactly as designed: the code section
-  reports `unavailable`, the knowledge answer still returns. Verify before
-  implementation starts.
+- **Reaching codegraph: SUPERSEDED 2026-10-16 —** see
+  `docs/design/knowledgeable-connector-tool-forwarder.md` (commit `91a3b73`).
+  P6's transport is no longer ap-mt's problem: the Knowledgeable Connector
+  forwards to codegraph from *inside* the workspace process, so a future
+  LangGraph workflow calls that forwarder surface rather than opening a
+  second codegraph transport of its own. **Do not implement the paragraph
+  below.** It is kept only to record what changed and why.
+
+  ~~The workflow calls the gateway's scoped HTTP endpoint for
+  `aw__codegraph__*` over the workspace edge. **This is the design's one
+  unverified assumption** — that an ap-mt-held gateway token can reach a
+  scoped endpoint through the tunnel (30s edge cut applies). Verify before
+  implementation starts.~~
+
+  That assumption was never verified because Frederico's forwarder proposal
+  removed the need for it: the Connector already runs next to codegraph's
+  index and the gateway, so there is no tunnel, no edge cut, and no
+  ap-mt-held gateway token on the path. The "verify ap-mt reachability"
+  sequencing step is therefore **dropped, not inherited**. P6's degraded
+  contract is unchanged — the code section reports `unavailable`, the
+  knowledge answer still returns.
 
 **Composes (never replaces):**
 
