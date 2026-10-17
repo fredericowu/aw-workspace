@@ -80,13 +80,17 @@ The destination (live-inspected 2026-10-17):
 
 - Container `aw-remote-host-postgres`, image `pgvector/pgvector` (digest-
   pinned), **PostgreSQL 16.14** — note: *older major* than kb's bundled PG 17.
-- Published on `127.0.0.1:5432` of the workspace container (the podman host);
-  attached only to the `aw-remote-host` network — **not** on
-  `AW_CONTAINER_NETWORK`, so Tier-2 app containers cannot reach it. uc-phd
-  states this exact constraint:
+- Published on `127.0.0.1:5432` of the workspace container (the podman host)
+  and attached to the `aw-remote-host` network — which on this deployment
+  **is the shared app-container network**: measured 2026-10-17, `aw-app-kb`
+  (10.89.0.213) sits on the same network and `psql` from inside it to
+  `aw-remote-host-postgres:5432` completes TCP + protocol handshake (fails
+  only on the password, a server-side error). So **Tier-2 app containers can
+  reach it by container name**. What cannot reach it is an *agent runner*
+  container — a separate network namespace, per
   `repos/aw-app-uc-phd/estudo_geral_extractor/pgvector_index.py:34-37`
-  ("an agent runner container is a different network namespace and cannot
-  reach aw-remote-host-postgres:5432").
+  (that comment is about runner containers only; an earlier draft of this
+  doc over-generalized it to Tier-2 apps — corrected after measuring).
 - Already hosts per-concern databases: `aw_workspace` (core journal),
   `ux_proto`, `awserv`. A new `execution_index` database follows that
   precedent (and the ap_notion_kb db-per-concern precedent on aw-stack's
@@ -123,10 +127,11 @@ Why a supervised subprocess and not in-process: workspace core runs WORKERS=N
 subprocess holds it once, owned by one worker via the existing service lease
 (`src/apps/services.py` — the F4 supervisor with respawn, lease ownership,
 stop-on-uninstall; already used by aw-app-codegraphcontext, aw-app-proxy,
-aw-app-google-workspace-mcp). The subprocess also trivially reaches both
-sides: the producer (core, same container) and the Postgres
-(127.0.0.1:5432, same container) — the exact reachability that a Tier-2
-container owner would lack.
+aw-app-google-workspace-mcp). The subprocess reaches both sides over
+loopback: the producer (core, same container) and the Postgres
+(127.0.0.1:5432). A Tier-2 container owner could also reach the Postgres
+(measured — §2), so reachability is *not* what decides against it; cost and
+ownership are (§4).
 
 The service's code is substantially a lift of `exec_pg.py` plus the embedding
 helpers of `kb_pg.py` (`_get_model`/`_embed_docs`/`_embed_query`/`_vec_str`)
@@ -245,17 +250,20 @@ Rollback is trivial at every step before 6: the old path is never touched.
   design deliberately leaves that door open by not touching knowledgeable
   at all.
 - **B-as-stated — new Tier-2 container app owning the index.** Rejected as
-  the *service* shape (the data half of B is adopted). Two reasons. First,
-  reachability: `aw-remote-host-postgres` publishes only to the workspace
-  container's loopback and sits on the `aw-remote-host` network — a Tier-2
-  app container on `AW_CONTAINER_NETWORK` cannot reach it
-  (`pgvector_index.py:34-37`); bridging via `podman network connect` does not
-  survive a container recreation, which is exactly the kind of quiet breakage
-  this workspace collects. Second, cost: a new app means a new repo, release
-  pipeline, marketplace onboarding (two separate GitHub allowlists, release-
-  bot ownership of versioning — all documented traps), to host ~400 lines.
-  Runner-up: if the runners-app service route proves unworkable in practice,
-  this is the fallback, with the network question solved first.
+  the *service* shape (the data half of B is adopted) — but narrowly, and it
+  is the clear runner-up. It is technically viable: Tier-2 containers reach
+  `aw-remote-host-postgres` by name on the shared network (measured, §2 —
+  an earlier draft wrongly claimed they couldn't). What decides against it
+  is cost and ownership: a new app means a new repo, release pipeline, and
+  marketplace onboarding (two separate GitHub allowlists, release-bot
+  ownership of versioning — all documented traps) to host ~400 lines; it
+  stands up a second ~1 GB container whose only job is holding a model the
+  runners app's workload already orbits; and it splits the index across two
+  owners (producer + doctor in runners, reader + embedder in the new app)
+  where the subprocess design has one. If the runners-app service route
+  proves unworkable in practice — e.g. the workspace container's memory
+  headroom can't take the resident model — fall back to this, with no other
+  part of the design changing: same database, same data move, same cutover.
 - **C — into AP-MT itself.** Rejected. Cleanest conceptual ownership, but
   AP-MT has no pgvector in its own DB and no embedding path; it lives on the
   bare-metal aw-stack host across a boundary agent containers don't reliably
@@ -365,11 +373,13 @@ index's lifetime decouples from the kb app, unify-with-knowledgeable stays a
 later decision" — is **right on the data and adopted**. Where it was
 incomplete: (1) it had no answer for who runs the embedder and serves the
 tool, which is most of what aw-app-kb *is* to this index — this design
-answers runners-app-owned supervised service; (2) "the shared
-aw-remote-host-postgres" hides a reachability cliff — it is loopback-only on
-the workspace container and off the apps network, so the obvious
-implementation of B (a new container app pointing at it) does not actually
-connect; (3) the PG 17 → PG 16 version skew rules out the obvious
-pg_dump/pg_restore. None of these overturn B; all three would have been
-discovered mid-implementation and improvised. That is what this document is
-for.
+answers runners-app-owned supervised service, on cost and ownership grounds —
+a new Tier-2 app *can* reach the shared Postgres (measured; an earlier
+draft of this doc claimed otherwise and was corrected), it just isn't worth
+a repo and a second model container for ~400 lines; (2) the PG 17 → PG 16
+version skew rules out the obvious pg_dump/pg_restore — the move must be
+COPY with `vector::text`; (3) the index is a 30-day digest with a working
+rebuild path from AP-MT, which caps the downside of every ordering mistake
+and is worth knowing before anyone treats this as irreplaceable data. None
+of these overturn B; each would have been discovered mid-implementation and
+improvised. That is what this document is for.
