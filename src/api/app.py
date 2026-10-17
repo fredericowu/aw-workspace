@@ -118,6 +118,112 @@ class _ScopedCORSMiddleware(CORSMiddleware):
         await super().__call__(scope, receive, send)
 
 
+#: Scope of the config-generation floor below. Every measured read path for an
+#: app's config is under this prefix: the app's own mounted routes
+#: (``Mount("/api/apps/<id>")``, ``src/apps/runtime.py``), ``GET
+#: /api/apps/{slug}/config``, ``leaf_tool_call``, and the Tier-1 MCP endpoints
+#: the gateway dials — which is the path the ``knowledge_search`` failure that
+#: opened card 3fc5bf3b actually took. A future core route OUTSIDE it that
+#: reads ``ctx.config`` is covered by the broadcast but not by this floor.
+_CONFIG_FLOOR_PREFIX = "/api/apps/"
+
+
+class _ConfigGenerationMiddleware:
+    """Re-read app config at the request boundary when another worker saved it.
+
+    The deterministic floor under the ``apps:changed`` broadcast (design doc
+    ``docs/design/app-config-cross-worker-propagation.md``). ``POST
+    /api/apps/<slug>/config`` lands on one of ``AW_WORKSPACE_WORKERS``
+    processes and only that one updates its ``ctx.config``; the broadcast is
+    what tells the other four, and when the broadcast dies — two ways it has,
+    both now fixed — they answer from the old config indefinitely. Measured
+    1-in-5 correct on 2026-10-17.
+
+    So: one ``os.stat`` of ``<workspace_home>/app-config/.generation`` per
+    request under :data:`_CONFIG_FLOOR_PREFIX` (µs), and only when that mtime
+    has moved since this worker last looked does it pay anything more — read
+    the token, and if the token really changed, ``await
+    reconciler.refresh_configs_in_process()`` BEFORE dispatching. Config only:
+    never an attach, never a detach, so no mounting work can ever land inside
+    a request.
+
+    **Pure ASGI, not ``BaseHTTPMiddleware``**, deliberately: that one runs the
+    downstream app in a separate task, which breaks contextvars — this
+    workspace has already been bitten by a contextvar lost across an
+    async-boundary wrapper (``fastapi-sync-dependency-breaks-contextvars``),
+    and there is nothing here that needs a ``Request`` object.
+
+    Costs worth knowing, both named in the design doc: the first ``/api/apps/*``
+    request after a save pays the mirror read plus every changed app's
+    ``on_config_reloaded`` inline, so a slow hook now shows up as one slow
+    unrelated request; and the whole mechanism assumes all workers share one
+    filesystem, which is true of one container and false of a future
+    multi-host core.
+    """
+
+    def __init__(self, app, *, host_app: FastAPI) -> None:
+        self.app = app
+        # The FastAPI instance, for app.state — NOT module globals: a test
+        # building two apps in one process must not share this worker state.
+        self.host_app = host_app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and (scope.get("path") or "").startswith(
+                _CONFIG_FLOOR_PREFIX):
+            try:
+                await self._converge_if_generation_moved()
+            except Exception:  # noqa: BLE001
+                # A floor that can 500 a request is worse than no floor: the
+                # broadcast is still the primary path and the next request
+                # retries this one.
+                log.exception("apps: the config-generation check raised — serving "
+                              "this request without it")
+        await self.app(scope, receive, send)
+
+    async def _converge_if_generation_moved(self) -> None:
+        from src.apps import config_store
+
+        state = self.host_app.state
+        mtime = await asyncio.to_thread(config_store.generation_mtime_ns)
+        if mtime is None:
+            return  # no config has ever been saved here — nothing to converge to
+        # `!=`, never `>`: a restore or a copy can move an mtime backwards, and
+        # "different from what I last saw" is the question being asked.
+        if mtime == state.config_generation_mtime_ns:
+            return
+        # One worker, one convergence per save: a burst of requests arriving
+        # right after a save all see the moved mtime, and the lock (held across
+        # the re-check AND the refresh) means the first one does the work while
+        # the rest wait for it and then find nothing left to do.
+        async with state.config_generation_lock:
+            current = await asyncio.to_thread(config_store.read_generation)
+            if current is None:
+                return
+            mtime, token = current
+            if token == state.config_generation_token:
+                # mtime moved, content did not (a restore, a re-write of the
+                # same token). Record the new mtime so this costs one read, not
+                # one per request from here on.
+                state.config_generation_mtime_ns = mtime
+                return
+            reconciler = getattr(state, "app_reconciler", None)
+            if reconciler is None:
+                return  # deliberately WITHOUT recording: a later request converges
+            # The first observation after a boot counts as "moved" on purpose,
+            # even though this worker loaded its config from the same mirror
+            # moments ago: a save landing between this worker's attach and its
+            # first request would otherwise be the one case the floor misses.
+            # It is a no-op refresh (`_refresh_config` compares normalized
+            # configs — see its docstring), paid once per worker lifetime.
+            await reconciler.refresh_configs_in_process()
+            # Recorded only AFTER a successful refresh. A refresh that raised
+            # leaves the token unrecorded on purpose, so the next request
+            # retries — the alternative is this worker quietly serving the
+            # pre-save config forever, which is the bug class this exists for.
+            state.config_generation_mtime_ns = mtime
+            state.config_generation_token = token
+
+
 def _read_setting(key: str) -> dict:
     """Blocking read of one generic settings row. Never call from the event
     loop directly — see ``_write_setting``."""
@@ -485,6 +591,19 @@ def create_app() -> FastAPI:
     # (aw-app-signoz) is actually installed. See src/api/otel.py.
     from src.api.otel import init_otel
     init_otel(app)
+
+    # The config-generation floor (card 3fc5bf3b). Per-worker state lives on
+    # app.state so two apps in one test process cannot share it; the lock is
+    # created here rather than lazily because Starlette may run concurrent
+    # requests through this middleware from the first one onward.
+    app.state.config_generation_mtime_ns = None
+    app.state.config_generation_token = None
+    app.state.config_generation_lock = asyncio.Lock()
+    # Added BEFORE the CORS middleware below, which makes CORS the OUTER layer
+    # (add_middleware inserts at position 0 and the stack is built outermost-
+    # first): a preflight OPTIONS is then answered by CORS and never reaches
+    # this check at all.
+    app.add_middleware(_ConfigGenerationMiddleware, host_app=app)
 
     # SPA→API is cross-origin (same apex) and credentialed — allow the SPA
     # origin with credentials so the apex aw_id_jwt cookie is accepted and

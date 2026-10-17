@@ -35,6 +35,7 @@ dependency blinked.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 
@@ -85,6 +86,55 @@ def _autostart_apps(runtime) -> list[tuple[str, object]]:
             continue
         out.append((slug, loaded))
     return out
+
+
+def broadcast_rows(runtime) -> list[dict]:
+    """``apps:changed`` fan-out that is down on THIS worker — at >1 workers.
+
+    Reported per-worker, which is the only honest scope available: whether
+    this process can hear a broadcast is a fact about this process, and
+    ``/api/health`` is answered by whichever worker got the request. So a
+    fleet with one deaf worker shows the row roughly 1-in-N polls. That reads
+    as flaky until you know why, and it is still strictly better than the
+    status quo this replaces, which was zero signal anywhere: a worker whose
+    relay died kept answering ``200 ok`` while serving app config from before
+    the last save (card 3fc5bf3b, measured 1-in-5 fresh).
+
+    Silent at ``AW_WORKSPACE_WORKERS<=1``: with one worker there is nobody to
+    converge with, the inline hook in ``save_app_config`` is the whole of
+    correctness, and a dead broadcast costs nothing — exactly the posture
+    ``src/apps/lifecycle.py`` documents.
+    """
+    if int(os.environ.get("AW_WORKSPACE_WORKERS", "1") or "1") <= 1:
+        return []
+    # Reached through the runtime's own FastAPI app (``AppRuntime.host``)
+    # rather than taken as an argument, so every existing caller of
+    # ``degradations()``/``health_report()`` — including the unit tests' fake
+    # runtimes, which have no ``host`` — keeps working unchanged.
+    state = getattr(getattr(runtime, "host", None), "state", None)
+    lifecycle = getattr(state, "app_lifecycle", None)
+    health = getattr(lifecycle, "broadcast_health", None)
+    if not callable(health):
+        return []
+    report = health()
+    if report.get("started") and report.get("relay_alive"):
+        return []
+    reason = ("never subscribed — Redis was unreachable when this worker booted"
+              if not report.get("started")
+              else "the relay task is down and reconnecting")
+    # Shaped like a service row on purpose: ``app``/``service``/``reason``
+    # survive health's projection (``_DOCTOR_ONLY_KEYS`` drops ``component``
+    # and ``last_error``), so a monitor reading /api/health still gets a
+    # self-describing row, while doctor gets the pid-level detail.
+    return [{
+        "kind": "broadcast", "app": "core", "tier": "core",
+        "service": "apps:changed", "component": "core:apps:changed",
+        "state": "off", "desired": "running", "autostart": True,
+        "reason": reason,
+        "last_error": (f"this worker (pid {os.getpid()}) will not be told when "
+                       f"another worker installs, removes or reconfigures an app; "
+                       f"relay reconnects so far: {report.get('relay_failures', 0)}"),
+    }]
 
 
 def _collect(runtime) -> tuple[list[dict], bool]:
@@ -170,6 +220,10 @@ def _collect(runtime) -> tuple[list[dict], bool]:
             row["last_exit_code"] = marker["exit_code"]
         if not row.get("last_error") and marker.get("detail"):
             row["last_error"] = marker["detail"]
+
+    # Appended after the give-up pass above, which keys on (app, service) and
+    # has nothing to say about a broadcast row.
+    rows.extend(broadcast_rows(runtime))
     return rows, redis_ok
 
 

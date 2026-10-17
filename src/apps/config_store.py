@@ -54,11 +54,17 @@ import json
 import logging
 import os
 import tempfile
+import uuid
 from typing import Any
 
 from src.apps import paths
 
 log = logging.getLogger(__name__)
+
+#: The config-generation token (see :func:`bump_generation`). A dotfile so
+#: :func:`list_saved`'s ``not f.startswith(".")`` already excludes it, and it
+#: carries no ``.json`` suffix either — it is not an app's snapshot.
+GENERATION_NAME = ".generation"
 
 
 def config_dir() -> str:
@@ -115,6 +121,89 @@ def purge(app_id: str) -> bool:
         return True
     except FileNotFoundError:
         return False
+
+
+# ---- the config-generation token (the cross-worker propagation floor) -------
+#
+# Why a file next to the snapshots. A config save has to reach every one of
+# AW_WORKSPACE_WORKERS uvicorn processes, and the push that does that
+# (``apps:changed`` over Redis — ``src/apps/lifecycle.py``) has two ways to
+# die silently, both of which have actually happened: a wedged pending-
+# broadcast flag and a relay task killed by a Redis blip. Both are fixed, and
+# a fix for the push is still a fix for *a* push.
+#
+# So this is the floor underneath it: one token, bumped at the save site, read
+# at the request boundary (``src/api/app.py``'s generation middleware). Every
+# worker is a process in ONE container sharing ONE filesystem, so the file is
+# visible to all of them with no transport at all — which is the point: with
+# Redis dead, propagation degrades to "slightly later, on the next
+# /api/apps/* request this worker serves", never to "wrong answers until a
+# restart". See docs/design/app-config-cross-worker-propagation.md.
+
+
+def generation_path() -> str:
+    """The token's path, resolved WITHOUT :func:`config_dir`'s ``makedirs``.
+
+    This is read on (almost) every ``/api/apps/*`` request, and a ``mkdir``
+    syscall per request to create a directory that exists is exactly the kind
+    of cost a floor is not allowed to have."""
+    return os.path.join(paths.workspace_home_path(), "app-config", GENERATION_NAME)
+
+
+def bump_generation() -> str | None:
+    """Write a fresh token, atomically. Returns it, or ``None`` on failure.
+
+    Called from ``routes.save_app_config`` only, deliberately **not** from
+    :func:`save` — that one also runs on the uninstall-snapshot path, where
+    there is no new config for anyone to converge to.
+
+    Same ``mkstemp`` + ``os.replace`` as :func:`save` for the same reason: a
+    reader must see either the old token or the new one, never a half-written
+    file. Never raises — a save must not fail because its floor could not be
+    stamped (the broadcast is still the primary path).
+    """
+    token = uuid.uuid4().hex
+    try:
+        fd, tmp = tempfile.mkstemp(dir=config_dir(), prefix=f"{GENERATION_NAME}.",
+                                   suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            f.write(token)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, generation_path())
+        return token
+    except Exception:  # noqa: BLE001 — never fail a config save over this
+        log.exception("apps: could not bump the config generation token")
+        return None
+
+
+def generation_mtime_ns() -> int | None:
+    """``st_mtime_ns`` of the token, or ``None`` when there is no token.
+
+    One ``os.stat`` — the per-request half of the floor. ``None`` means no
+    config has ever been saved in this workspace (a fresh install), which is
+    nothing to converge to, so callers skip.
+    """
+    try:
+        return os.stat(generation_path()).st_mtime_ns
+    except OSError:
+        return None
+
+
+def read_generation() -> tuple[int, str] | None:
+    """``(st_mtime_ns, token)``, or ``None`` when there is no readable token.
+
+    Paid only when :func:`generation_mtime_ns` says the mtime moved. The token
+    is what callers must compare on — ``st_mtime_ns`` is the cheap *hint* that
+    something may have happened, and it can move without the content changing
+    (a restore, a copy) or move backwards (which is why its consumers compare
+    with ``!=``, never ``>``).
+    """
+    try:
+        st = os.stat(generation_path())
+        with open(generation_path()) as f:
+            return st.st_mtime_ns, f.read().strip()
+    except OSError:
+        return None
 
 
 def list_saved() -> list[str]:

@@ -91,6 +91,15 @@ DEFAULT_WORKSPACE = "default"
 
 POLL_STREAM_MAXLEN = 200
 
+#: Relay reconnect backoff — doubling from the first to the second, so a
+#: momentary blip (a Redis restart, the 2026-10-12 auth rollout) costs one
+#: second of missed fan-out rather than the rest of the process's life, while a
+#: genuinely dead Redis settles into one attempt every half minute instead of a
+#: hot loop. Deliberately NOT an attempt ceiling: a relay that gives up is the
+#: exact silent death this backoff exists to end.
+RELAY_BACKOFF_START_S = 1.0
+RELAY_BACKOFF_MAX_S = 30.0
+
 BroadcastHandler = Callable[[str, dict], Awaitable[None]]
 
 
@@ -171,6 +180,16 @@ class RedisBroadcaster:
     own PSUBSCRIBE relay task started by `start_relay()`. That's the only
     way a handler ever runs, so there's no separate "local" vs "remote"
     branch to keep in sync.
+
+    That single path is also a single point of silent failure, which is why
+    `_relay_loop` reconnects: until 2026-10-17 it caught only
+    `asyncio.CancelledError`, so any `ConnectionError` out of
+    `pubsub.listen()` (a Redis restart, an auth change) killed the relay task
+    outright — and with it every cross-worker effect that rides this
+    broadcaster, for the rest of that process's life, with nothing in any log
+    but an unretrieved task exception. See `relay_alive`/`relay_failures` and
+    `src/apps/degradations.py` for the other half of that fix: a dead relay is
+    a reported degradation now, not an invisible one.
     """
 
     def __init__(self, redis_url: Optional[str] = None):
@@ -178,6 +197,7 @@ class RedisBroadcaster:
         self._client: Optional[aioredis.Redis] = None
         self._pubsub: Optional[aioredis.client.PubSub] = None
         self._relay_task: Optional[asyncio.Task] = None
+        self._relay_failures = 0
 
     def _get_client(self) -> aioredis.Redis:
         if self._client is None:
@@ -194,7 +214,13 @@ class RedisBroadcaster:
         return await client.publish(f"{_bcast_prefix()}{topic}", json.dumps(payload))
 
     async def start_relay(self, handler: BroadcastHandler) -> None:
-        """Start the PSUBSCRIBE relay that delivers every broadcast to `handler(topic, payload)`."""
+        """Start the PSUBSCRIBE relay that delivers every broadcast to `handler(topic, payload)`.
+
+        Still raises if the FIRST subscribe cannot be made — the caller
+        (`AppLifecycle.start`) reports that honestly as "this worker has no
+        cross-worker convergence" rather than pretending to be subscribed.
+        Once the relay is up, every LATER failure is the loop's to retry.
+        """
         if self._relay_task is not None:
             raise RuntimeError("relay already started")
         client = self._get_client()
@@ -202,23 +228,78 @@ class RedisBroadcaster:
         await self._pubsub.psubscribe(f"{_bcast_prefix()}*")
         self._relay_task = asyncio.create_task(self._relay_loop(handler))
 
+    @property
+    def relay_alive(self) -> bool:
+        """True while this process's relay task exists and has not finished.
+
+        The one fact a health check needs and could not previously get: a
+        broadcaster whose relay has died looks exactly like a healthy one from
+        the outside — `publish()` keeps working (it only writes), it is
+        *delivery* that stopped."""
+        return self._relay_task is not None and not self._relay_task.done()
+
+    @property
+    def relay_failures(self) -> int:
+        """How many times the relay has had to reconnect. Non-zero is not
+        itself a problem (one blip, recovered); a number that keeps climbing
+        is a Redis the reconnect loop is politely hiding — see
+        ``src/apps/degradations.py``."""
+        return self._relay_failures
+
     async def _relay_loop(self, handler: BroadcastHandler) -> None:
-        assert self._pubsub is not None
-        prefix = _bcast_prefix()
+        pattern = f"{_bcast_prefix()}*"
+        backoff = RELAY_BACKOFF_START_S
         try:
-            async for message in self._pubsub.listen():
-                if message["type"] != "pmessage":
-                    continue
-                topic = message["channel"][len(prefix):]
+            while True:
                 try:
-                    payload = json.loads(message["data"])
-                except (TypeError, ValueError):
-                    logger.warning("redis_coord: dropping malformed broadcast on %s", message["channel"])
-                    continue
-                try:
-                    await handler(topic, payload)
+                    if self._pubsub is None:
+                        client = self._get_client()
+                        self._pubsub = client.pubsub()
+                        await self._pubsub.psubscribe(pattern)
+                        logger.warning("redis_coord: relay re-subscribed to %s after "
+                                       "%d failure(s)", pattern, self._relay_failures)
+                    prefix = _bcast_prefix()
+                    async for message in self._pubsub.listen():
+                        # A delivered message is proof the connection works, so
+                        # the next blip starts its backoff from the bottom again
+                        # rather than inheriting a long-dead incident's delay.
+                        backoff = RELAY_BACKOFF_START_S
+                        if message["type"] != "pmessage":
+                            continue
+                        topic = message["channel"][len(prefix):]
+                        try:
+                            payload = json.loads(message["data"])
+                        except (TypeError, ValueError):
+                            logger.warning("redis_coord: dropping malformed broadcast on %s", message["channel"])
+                            continue
+                        try:
+                            await handler(topic, payload)
+                        except Exception:
+                            logger.exception("redis_coord: broadcast handler raised for topic=%s", topic)
+                    # listen() is an infinite generator over a live
+                    # subscription; it returning at all means the subscription
+                    # is gone (connection closed under us). Treated as the
+                    # failure it is, not as a clean exit — a `return` here is
+                    # how the relay used to die silently.
+                    raise ConnectionError("pubsub.listen() ended — subscription lost")
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
-                    logger.exception("redis_coord: broadcast handler raised for topic=%s", topic)
+                    self._relay_failures += 1
+                    logger.exception(
+                        "redis_coord: relay on %s dropped (failure #%d) — "
+                        "reconnecting in %.0fs. Every broadcast is MISSED until it "
+                        "is back (no replay): this worker will not be told about "
+                        "app installs or config saves served elsewhere.",
+                        pattern, self._relay_failures, backoff)
+                    pubsub, self._pubsub = self._pubsub, None
+                    if pubsub is not None:
+                        try:
+                            await pubsub.aclose()
+                        except Exception:  # noqa: BLE001 — it is already broken
+                            pass
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, RELAY_BACKOFF_MAX_S)
         except asyncio.CancelledError:
             pass
 

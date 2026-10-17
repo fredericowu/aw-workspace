@@ -290,11 +290,35 @@ def _redis(section: dict) -> int:
         print("Redis (redis_coord) — no report from the server")
         return 0
     url = section.get("url", "?")
+    problems = _apps_changed_broadcast(section.get("broadcast"))
     if section.get("reachable"):
         print(f"Redis (redis_coord) — reachable at {url}")
-        return 0
+        return problems
     print(f"Redis (redis_coord) — ✗ unreachable at {url}")
     print(f"      {section.get('note', '')}")
+    return problems + 1
+
+
+def _apps_changed_broadcast(row: dict | None) -> int:
+    """The ``apps:changed`` fan-out, as seen by the worker that answered.
+
+    A real problem, unlike the ``reachable`` line above it: this is the
+    transport every app install, removal and config save uses to reach the
+    other workers, and when it is down that worker serves app config from
+    before the last save — the 1-in-5 stale reads of card 3fc5bf3b. PING
+    answering proves the server is up, not that this process is subscribed to
+    it, which is why the two are reported separately."""
+    if not row:
+        return 0
+    print(f"  ✗ apps:changed fan-out DOWN on the answering worker "
+          f"— {row.get('reason', 'unknown')}")
+    if row.get("last_error"):
+        print(f"      {row['last_error']}")
+    print("      the floor still holds: /api/apps/* re-reads config off the")
+    print("      .generation token, so saved config is not served stale — but")
+    print("      an idle worker (e.g. the watchdog leader) stays behind until")
+    print("      it serves a request. Check this Redis and restart core if it")
+    print("      does not clear itself.")
     return 1
 
 

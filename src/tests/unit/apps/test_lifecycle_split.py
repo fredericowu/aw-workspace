@@ -14,6 +14,7 @@ Two real processes over one Redis + one Postgres is
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 
 import pytest
@@ -472,6 +473,261 @@ def test_converge_survives_an_app_whose_config_hook_raises(runtime, tmp_path, mo
                                  "error": "app hook blew up"}]
     # the refresh itself still landed — only the app's reaction to it failed
     assert runtime.get("badcfg").ctx.config["interval"] == 9
+
+
+# --- the pending-broadcast wedge (card 3fc5bf3b) -----------------------------
+
+
+class _RecordingLifecycle:
+    """Just enough ``AppLifecycle`` to see whether a publish happened.
+
+    Not the real class and deliberately not Redis-backed: the suite shares the
+    LIVE Redis keyspace of this very container, so nothing here may publish
+    for real."""
+
+    def __init__(self) -> None:
+        self.published: list[tuple[str, str | None]] = []
+
+    async def publish(self, reason: str, app_id: str | None = None) -> None:
+        self.published.append((reason, app_id))
+
+    @contextlib.asynccontextmanager
+    async def provision_lock(self, name: str = "apps"):
+        yield True
+
+    @contextlib.asynccontextmanager
+    async def in_process_exclusive(self):
+        yield
+
+
+def _wedge_reconciler(monkeypatch):
+    from src.apps.reconciler import Reconciler
+
+    lifecycle = _RecordingLifecycle()
+    reconciler = Reconciler(AppRuntime(FastAPI()), lifecycle=lifecycle)
+    monkeypatch.setattr(type(reconciler.cloud), "configured",
+                        property(lambda self: False))
+    return reconciler, lifecycle
+
+
+def test_a_reconcile_pass_that_raises_leaves_the_flags_disarmed(monkeypatch):
+    """The wedge, as a regression test (card 3fc5bf3b).
+
+    ``_pending_broadcast = False`` does not mean "nothing pending" — it means
+    "``_trigger_broadcast``, you are inside a pass, defer". Left behind by a
+    pass that blew up mid-way, it silently disabled EVERY later broadcast on
+    that worker, including the one at the end of every config save it served:
+    measured live as 1-in-5 workers holding fresh config, with no log line.
+    """
+    reconciler, lifecycle = _wedge_reconciler(monkeypatch)
+
+    async def _boom(desired=None):
+        # An app installed earlier in the pass asked for a broadcast...
+        await reconciler._trigger_broadcast("install", "someapp")
+        assert reconciler._pending_broadcast is True  # ...and it was deferred
+        raise RuntimeError("the pass blew up halfway")
+
+    monkeypatch.setattr(reconciler, "_reconcile_pass", _boom)
+
+    with pytest.raises(RuntimeError, match="halfway"):
+        asyncio.run(reconciler.reconcile())
+
+    assert reconciler._pending_broadcast is None
+    assert reconciler._pending_gateway_reload is None
+    # A failed pass still owed the fleet a broadcast, and flushed it.
+    assert lifecycle.published == [("reconcile", None)]
+
+    # The part that actually bit: the NEXT broadcast must publish immediately
+    # instead of being deferred into a pass that is long over.
+    asyncio.run(reconciler._trigger_broadcast("config", "knowledgeable"))
+    assert lifecycle.published[-1] == ("config", "knowledgeable")
+
+
+def test_a_cancelled_reconcile_pass_leaves_the_flags_disarmed(monkeypatch):
+    """The likelier trigger of the two: ``reconcile_on_boot`` bounds the boot
+    pass with ``asyncio.wait_for(..., 1200)`` and a manual reconcile can be cut
+    by the tunnel edge at 30s — both CANCEL the coroutine mid-pass.
+
+    Cancelled for real (a task, cancelled from outside) rather than by raising
+    ``CancelledError`` by hand, because the property under test is specifically
+    that the ``finally`` does not ``await`` on this path: an ``await`` in a
+    cancelled task re-raises at once, which would skip whatever came after it.
+    """
+    reconciler, lifecycle = _wedge_reconciler(monkeypatch)
+    started = asyncio.Event()
+
+    async def _hangs(desired=None):
+        await reconciler._trigger_broadcast("install", "someapp")
+        started.set()
+        await asyncio.sleep(30)  # cancelled here, like a wait_for timeout
+
+    monkeypatch.setattr(reconciler, "_reconcile_pass", _hangs)
+
+    async def run():
+        task = asyncio.ensure_future(reconciler.reconcile())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10))
+
+    assert reconciler._pending_broadcast is None
+    assert reconciler._pending_gateway_reload is None
+    # No publish attempted: the flush is skipped under cancellation on purpose
+    # (the convergence watchdog owns a cancelled pass's convergence).
+    assert lifecycle.published == []
+
+    asyncio.run(reconciler._trigger_broadcast("config", "knowledgeable"))
+    assert lifecycle.published == [("config", "knowledgeable")]
+
+
+def test_a_clean_reconcile_pass_still_publishes_exactly_once(monkeypatch):
+    """Control case for the two above: the finally must not DOUBLE-publish the
+    broadcast the pass already flushed itself."""
+    reconciler, lifecycle = _wedge_reconciler(monkeypatch)
+
+    asyncio.run(reconciler.reconcile(desired=[]))
+
+    assert reconciler._pending_broadcast is None
+    assert reconciler._pending_gateway_reload is None
+    assert lifecycle.published == []  # nothing changed, so nothing to announce
+
+    async def _changes_something(desired=None):
+        await reconciler._trigger_broadcast("install", "someapp")
+        return {"installed": ["someapp"]}
+
+    monkeypatch.setattr(reconciler, "_reconcile_pass", _changes_something)
+    asyncio.run(reconciler.reconcile())
+    assert lifecycle.published == [("reconcile", None)]
+
+
+# --- the generation floor: the two-hook contract, pinned ---------------------
+
+
+def _shared_mirror(rows):
+    """One mirror two 'workers' read, the way two real workers share one
+    Postgres. ``update_config`` is what ``save_app_config`` writes through."""
+
+    class _Mirror:
+        def list(self):
+            return [dict(r) for r in rows]
+
+        def update_config(self, app_id, config):
+            for r in rows:
+                if r.get("app_id") == app_id:
+                    r["config"] = dict(config)
+
+    return _Mirror()
+
+
+def test_on_config_saved_runs_once_in_total_across_both_converge_paths(
+        tmp_path, monkeypatch):
+    """The contract that distinguishes the two hooks, over all three paths a
+    worker can learn about a save — and the asymmetry most likely to break
+    when adding a fourth.
+
+    * ``on_config_saved`` is the PROVISION half: **exactly once in total**,
+      only on the worker that served the POST. Running it per worker would
+      restart a managed service in every one of them (the measured reason the
+      hooks were split at all).
+    * ``on_config_reloaded`` is the ATTACH half: once **per worker** — inline
+      on the request worker, via ``apps:changed`` on the others, and via the
+      generation floor on any worker the broadcast missed.
+
+    Three workers here: A serves the real route, B hears the broadcast, C
+    hears nothing and is reached only by ``refresh_configs_in_process`` —
+    which is the floor's whole claim, so it is asserted rather than assumed.
+    """
+    from src.apps import config_store
+    from src.apps.routes import register_apps_routes
+
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    pkg = _cfg_pkg(tmp_path)
+    rows = [{"app_id": "cfgapp", "version": "1.0.0", "package_dir": pkg,
+             "granted_permissions": [], "config": {}, "signed": False}]
+
+    # Worker A — serves POST /api/apps/cfgapp/config through the real route.
+    host_a = FastAPI()
+    runtime_a = register_apps_routes(host_a)
+    _Effects().wire(runtime_a, monkeypatch)
+    reconciler_a = host_a.state.app_reconciler
+    reconciler_a.local = _shared_mirror(rows)
+    monkeypatch.setattr(type(reconciler_a.cloud), "configured",
+                        property(lambda self: False))
+    asyncio.run(runtime_a.load(pkg, provision=False))
+    loaded_a = runtime_a.get("cfgapp")
+
+    # Workers B and C — never see the request. Both attach first, as they
+    # would at boot, so the save below is a genuine config CHANGE for them.
+    workers = []
+    for _ in range(2):
+        rt = AppRuntime(FastAPI(), guard_identity=False)
+        _Effects().wire(rt, monkeypatch)
+        rec = _cfg_reconciler(rt, rows, monkeypatch)
+        asyncio.run(rec.converge_in_process())
+        workers.append((rt, rec))
+    (runtime_b, reconciler_b), (runtime_c, reconciler_c) = workers
+
+    save = next(r.endpoint for r in host_a.routes
+                if getattr(r, "path", "") == "/api/apps/{slug}/config"
+                and "POST" in (getattr(r, "methods", None) or set()))
+    asyncio.run(save("cfgapp", {"config": {"sweep_enabled": True}}, identity={}))
+
+    # A: both halves, each once.
+    assert loaded_a.ctx.saved == [{"sweep_enabled": True, "interval": 30}]
+    assert loaded_a.ctx.reloaded == [{"sweep_enabled": True, "interval": 30}]
+    # ...and the save stamped the floor's token, next to the snapshot it wrote.
+    assert config_store.read_generation() is not None
+
+    # B: the broadcast path. One reload, and then the floor finds nothing left.
+    asyncio.run(reconciler_b.converge_in_process())
+    loaded_b = runtime_b.get("cfgapp")
+    assert loaded_b.ctx.reloaded == [{"sweep_enabled": True, "interval": 30}]
+    assert asyncio.run(reconciler_b.refresh_configs_in_process()) == []
+    assert loaded_b.ctx.reloaded == [{"sweep_enabled": True, "interval": 30}]
+
+    # C: the floor path ALONE — no broadcast ever reached this worker.
+    assert asyncio.run(reconciler_c.refresh_configs_in_process()) == ["cfgapp"]
+    loaded_c = runtime_c.get("cfgapp")
+    assert loaded_c.ctx.config["sweep_enabled"] is True
+    assert loaded_c.ctx.reloaded == [{"sweep_enabled": True, "interval": 30}]
+    # A second refresh with nothing new must call nothing — the normalization
+    # in _refresh_config is load-bearing here (see its own docstring).
+    assert asyncio.run(reconciler_c.refresh_configs_in_process()) == []
+    assert loaded_c.ctx.reloaded == [{"sweep_enabled": True, "interval": 30}]
+
+    # The whole point: one save, one on_config_saved, fleet-wide.
+    assert loaded_b.ctx.saved == []
+    assert loaded_c.ctx.saved == []
+
+
+def test_refresh_configs_in_process_never_attaches_or_detaches(runtime, tmp_path,
+                                                               monkeypatch):
+    """It runs INLINE in a request (``src/api/app.py``'s generation
+    middleware), so it must not be able to do mounting work: an attach imports
+    a plugin and runs ``activate()``, a detach unmounts routes. A package that
+    appeared or vanished is the broadcast's and the watchdog's business."""
+    fx = _Effects()
+    fx.wire(runtime, monkeypatch)
+    pkg = _cfg_pkg(tmp_path)
+    rows = [{"app_id": "cfgapp", "version": "1.0.0", "package_dir": pkg,
+             "granted_permissions": [], "config": {}, "signed": False}]
+    reconciler = _cfg_reconciler(runtime, rows, monkeypatch)
+
+    # An app in the mirror that this worker does not serve must stay unserved.
+    assert asyncio.run(reconciler.refresh_configs_in_process()) == []
+    assert not runtime.is_loaded("cfgapp")
+
+    asyncio.run(reconciler.converge_in_process())
+    assert runtime.is_loaded("cfgapp")
+
+    # ...and an app this worker serves that the mirror no longer lists must
+    # stay served (unlike converge_in_process, which detaches it).
+    rows.clear()
+    assert asyncio.run(reconciler.refresh_configs_in_process()) == []
+    assert runtime.is_loaded("cfgapp")
+    assert fx.shared_total == 0, f"the floor reached a shared side effect: {vars(fx)}"
 
 
 def test_attach_refuses_when_the_package_is_not_on_disk_yet(runtime, tmp_path, monkeypatch):

@@ -215,6 +215,36 @@ class AppLifecycle:
                           "workers will not converge until their next restart",
                           TOPIC_APPS_CHANGED, reason, app_id)
 
+    def broadcast_health(self) -> dict:
+        """Can THIS worker still hear ``apps:changed``? Sync and syscall-free.
+
+        Three states, all of which used to be invisible:
+
+        * ``started: False`` — :meth:`start` never got a subscription (Redis
+          was unreachable at boot). It logs one warning and the worker then
+          serves forever with no cross-worker convergence at all.
+        * ``relay_alive: False`` — it did subscribe, and the relay task has
+          since died. Before 2026-10-17 that was permanent (``_relay_loop``
+          caught only ``CancelledError``); it now reconnects, so this state
+          means the reconnect loop is currently between attempts.
+        * ``relay_failures`` climbing — reconnecting, repeatedly. Healthy
+          from the outside, which is precisely why it is reported: the
+          reconnect loop is capable of hiding a Redis that is simply gone.
+
+        Consumed by ``src/apps/degradations.py`` (``/api/health``) and by
+        ``doctor``'s ``redis`` section. Harmless at
+        ``AW_WORKSPACE_WORKERS=1`` — there is no other worker to hear from —
+        so both consumers gate on the worker count, not on this.
+        """
+        broadcaster = self._broadcaster
+        if broadcaster is None:
+            return {"started": False, "relay_alive": False, "relay_failures": 0}
+        return {
+            "started": True,
+            "relay_alive": bool(getattr(broadcaster, "relay_alive", False)),
+            "relay_failures": int(getattr(broadcaster, "relay_failures", 0) or 0),
+        }
+
     async def stop(self) -> None:
         if self._broadcaster is not None:
             with contextlib.suppress(Exception):

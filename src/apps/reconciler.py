@@ -609,6 +609,56 @@ class Reconciler:
         return {"attached": attached, "detached": detached,
                 "reconfigured": reconfigured, "errors": errors}
 
+    async def refresh_configs_in_process(self) -> list[str]:
+        """Bring this worker's LOADED apps' configs up to the shared mirror —
+        and nothing else. Returns the app_ids that actually moved.
+
+        The narrow sibling of :meth:`converge_in_process`, for the one caller
+        that must never do mounting work: the config-generation middleware
+        (``src/api/app.py``), which runs this INLINE, before dispatching an
+        ``/api/apps/*`` request, whenever the on-disk generation token has
+        moved since this worker last looked.
+
+        So it deliberately has no attach and no detach half. An attach loads a
+        plugin module and runs ``activate()``; a detach unmounts routes — work
+        measured in seconds for some apps, and absolutely not something to put
+        in front of a user's request. A package that appeared or vanished is
+        the broadcast's and the convergence watchdog's business. Config is the
+        one thing cheap enough to make deterministic here, and it is also the
+        thing that was wrong (card 3fc5bf3b).
+
+        Reaches ``on_config_reloaded`` and provably not ``on_config_saved``:
+        the only path through here is the existing :meth:`_refresh_config`,
+        whose docstring enumerates every PROVISION effect it must not touch.
+        The two-hook contract is therefore unchanged — ``on_config_saved``
+        stays exactly-once-in-total, called only from
+        ``routes.save_app_config``.
+        """
+        if self.lifecycle is not None:
+            async with self.lifecycle.in_process_exclusive():
+                return await self._refresh_configs_in_process()
+        return await self._refresh_configs_in_process()
+
+    async def _refresh_configs_in_process(self) -> list[str]:
+        rows = {r["app_id"]: r for r in await asyncio.to_thread(self.local.list)
+                if r.get("app_id")}
+        reconfigured: list[str] = []
+        for app_id, row in rows.items():
+            loaded = self.runtime.get(app_id)
+            if loaded is None:  # not served by this worker — nothing to refresh
+                continue
+            try:
+                if await self._refresh_config(loaded, row.get("config")):
+                    reconfigured.append(app_id)
+            except Exception:  # noqa: BLE001 — one bad app must not block the rest
+                log.exception("apps: config-generation refresh failed for %s", app_id)
+        if reconfigured:
+            # The per-worker evidence that this actually fans out: one line per
+            # worker pid, which is what acceptance #2 of card 3fc5bf3b reads.
+            log.info("apps: reconfigured=%s pid=%d (config generation moved)",
+                     reconfigured, os.getpid())
+        return reconfigured
+
     async def _refresh_config(self, loaded, row_config: dict[str, Any] | None) -> bool:
         """Bring ONE loaded app's in-process config up to the mirror row's.
         True if it actually moved. The ATTACH half of a config save: it
@@ -1183,6 +1233,79 @@ class Reconciler:
 
     async def _reconcile_provisioned(
             self, desired: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Arm this pass's two coalescing flags, run it, and — after ANY exit —
+        leave them disarmed (``None``).
+
+        That invariant is the whole method. It used to hold only on the happy
+        path: :meth:`_reconcile_pass` armed both flags at its top and cleared
+        them at its bottom, with ~140 lines and no ``try``/``finally`` in
+        between. An exception or a **cancellation** escaping the middle left
+        ``_pending_broadcast = False`` — which is not "nothing pending", it is
+        ":meth:`_trigger_broadcast`, you are inside a pass, defer" — on that
+        worker *forever*. From then on every config save that worker served
+        published nothing at all, so only the worker that answered the POST
+        held the new config and the other four answered from the old one until
+        a restart: measured as 1-in-5 fresh reads on 2026-10-17 (card
+        3fc5bf3b), with no log line and a green ``doctor``.
+
+        Cancellation is the likely trigger, not a theoretical one:
+        ``reconcile_on_boot``'s ``asyncio.wait_for(..., 1200)``
+        (``src/apps/routes.py``) cancels the pass mid-flight on a boot-budget
+        overrun (the 2026-10-08 incident), and a manual ``POST
+        /api/apps/reconcile`` cut by the tunnel edge at 30s has Starlette
+        cancel the handler. The leader self-healed — its 900s convergence
+        watchdog re-runs ``reconcile()``, which re-arms and re-flushes — which
+        is exactly why this looked like an app bug: the boot provisioner (a
+        different worker by design) stayed wedged and nothing said so.
+
+        The flush order in the ``finally`` is load-bearing. Reset both flags
+        FIRST, so an exception from the flush itself cannot re-wedge them; and
+        skip the flush entirely under cancellation, because an ``await`` in a
+        cancelled task re-raises immediately — attempting it before the reset
+        would leave the wedge in place. Convergence a cancelled pass owes is
+        the convergence watchdog's job, not this method's.
+        """
+        # Coalesce every gateway reload this pass would trigger into one at
+        # the end (see _pending_gateway_reload). Set even on the error paths
+        # inside the pass — an app that failed halfway may still have written
+        # its mcp.json before failing.
+        self._pending_gateway_reload = False
+        # Same for the W3 apps:changed fan-out: one publish for the pass, not
+        # one per app (see _trigger_broadcast).
+        self._pending_broadcast = False
+        cancelled = False
+        try:
+            return await self._reconcile_pass(desired)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            # None on the happy path (the pass flushed and disarmed them
+            # itself), so this is a no-op there rather than a second publish.
+            wanted_reload = bool(self._pending_gateway_reload)
+            self._pending_gateway_reload = None
+            wanted_broadcast = bool(self._pending_broadcast)
+            self._pending_broadcast = None
+            if not cancelled and (wanted_reload or wanted_broadcast):
+                log.warning("apps: reconcile pass did not finish — flushing its "
+                            "pending effects anyway (gateway_reload=%s broadcast=%s)",
+                            wanted_reload, wanted_broadcast)
+                if wanted_reload:
+                    try:
+                        await self._trigger_gateway_reload()
+                    except Exception:  # noqa: BLE001 — must not mask the real error
+                        log.exception("apps: the post-failure gateway reload raised")
+                if wanted_broadcast:
+                    try:
+                        await self._trigger_broadcast("reconcile")
+                    except Exception:  # noqa: BLE001 — same
+                        log.exception("apps: the post-failure apps:changed publish raised")
+
+    async def _reconcile_pass(
+            self, desired: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """One reconcile pass. Only ever called by :meth:`_reconcile_provisioned`,
+        which owns arming and disarming the two coalescing flags this body
+        relies on — do not call it directly, and do not arm them here."""
         source = "provided"
         if desired is None:
             if self.cloud.configured:
@@ -1254,15 +1377,6 @@ class Reconciler:
         # and in the log line rather than an impression. Covers installs,
         # upgrades and removals — whatever this pass actually did to each app.
         durations: dict[str, float] = {}
-
-        # Coalesce every gateway reload this pass would trigger into one at
-        # the end (see _pending_gateway_reload). Set even on the error paths
-        # below — an app that failed halfway may still have written its
-        # mcp.json before failing.
-        self._pending_gateway_reload = False
-        # Same for the W3 apps:changed fan-out: one publish for the pass, not
-        # one per app (see _trigger_broadcast).
-        self._pending_broadcast = False
 
         # Partition the desired set ONCE, up front, instead of asking
         # is_loaded() per app as the loop reaches it: the missing half is what

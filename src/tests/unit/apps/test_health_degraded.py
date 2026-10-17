@@ -197,6 +197,92 @@ def test_an_app_the_user_switched_off_is_not_degraded(monkeypatch):
     assert health_report(rt)["status"] == "ok"
 
 
+# --- the apps:changed fan-out, reported per worker (card 3fc5bf3b) -----------
+
+
+def _runtime_with_lifecycle(health, apps=None):
+    """A runtime whose FastAPI app carries an ``app_lifecycle``, the way
+    ``register_apps_routes`` wires the real one."""
+    rt = _Runtime(apps or {})
+    rt.host = SimpleNamespace(
+        state=SimpleNamespace(app_lifecycle=SimpleNamespace(
+            broadcast_health=lambda: health)))
+    return rt
+
+
+def test_a_dead_relay_is_reported_at_more_than_one_worker(monkeypatch):
+    """What had NO signal anywhere: a worker whose relay died kept answering
+    200 ok while serving app config from before the last save."""
+    _no_redis(monkeypatch)
+    monkeypatch.setenv("AW_WORKSPACE_WORKERS", "5")
+    rt = _runtime_with_lifecycle(
+        {"started": True, "relay_alive": False, "relay_failures": 3})
+
+    report = health_report(rt)
+    assert report["status"] == "degraded"
+    row = report["degraded"][0]
+    # Health's projection drops `component`/`last_error`, so the row has to be
+    # self-describing without them — a monitor gets kind+app+service+reason.
+    assert row["kind"] == "broadcast"
+    assert (row["app"], row["service"]) == ("core", "apps:changed")
+    assert row["state"] == "off" and row["desired"] == "running"
+    assert "reconnecting" in row["reason"]
+    # ...and doctor's projection keeps the per-worker detail.
+    assert "pid" in degradations(rt)[0]["last_error"]
+
+
+def test_a_relay_that_never_subscribed_is_reported_too(monkeypatch):
+    """``AppLifecycle.start`` returning False used to be a lone log.warning —
+    a worker that boots with Redis briefly away then runs forever without any
+    cross-worker convergence at all."""
+    _no_redis(monkeypatch)
+    monkeypatch.setenv("AW_WORKSPACE_WORKERS", "5")
+    rt = _runtime_with_lifecycle(
+        {"started": False, "relay_alive": False, "relay_failures": 0})
+    assert "never subscribed" in health_report(rt)["degraded"][0]["reason"]
+
+
+def test_a_healthy_relay_reports_nothing(monkeypatch):
+    _no_redis(monkeypatch)
+    monkeypatch.setenv("AW_WORKSPACE_WORKERS", "5")
+    rt = _runtime_with_lifecycle(
+        {"started": True, "relay_alive": True, "relay_failures": 2})
+    assert health_report(rt) == {"status": "ok", "degraded": []}
+
+
+def test_a_single_worker_never_reports_the_fan_out(monkeypatch):
+    """The single-worker golden rule: with one worker there is nobody to
+    converge with, the inline hook in ``save_app_config`` is the whole of
+    correctness, and a dead broadcast costs nothing."""
+    _no_redis(monkeypatch)
+    monkeypatch.setenv("AW_WORKSPACE_WORKERS", "1")
+    rt = _runtime_with_lifecycle(
+        {"started": False, "relay_alive": False, "relay_failures": 0})
+    assert health_report(rt) == {"status": "ok", "degraded": []}
+
+
+def test_a_runtime_with_no_lifecycle_wired_reports_nothing(monkeypatch):
+    """Every CLI/unit-test runtime is built without one (``AppRuntime`` alone,
+    no ``register_apps_routes``), and must not become degraded by omission."""
+    _no_redis(monkeypatch)
+    monkeypatch.setenv("AW_WORKSPACE_WORKERS", "5")
+    assert health_report(_Runtime({})) == {"status": "ok", "degraded": []}
+
+
+def test_the_fan_out_row_stays_out_of_doctors_autostart_section(monkeypatch):
+    """``_autostart_not_running`` is printed by a service-shaped formatter
+    ("auto_start is on but X is off"); the fan-out row would read as an app
+    nobody has. It is printed from doctor's ``redis`` section instead."""
+    from src.apps.routes import _autostart_not_running
+
+    _no_redis(monkeypatch)
+    monkeypatch.setenv("AW_WORKSPACE_WORKERS", "5")
+    rt = _runtime_with_lifecycle(
+        {"started": True, "relay_alive": False, "relay_failures": 1})
+    assert len(degradations(rt)) == 1
+    assert _autostart_not_running(rt) == []
+
+
 def test_no_runtime_yet_is_ok():
     """``/api/health`` answers before the apps framework has attached
     anything — and must, since that is when a boot is watched most closely."""

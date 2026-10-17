@@ -119,9 +119,14 @@ def _autostart_not_running(runtime) -> list[dict]:
     here is the doctor-side projection of that shared primitive: every key it
     produces except the ones only health wants.
     """
+    # Services and containers only. ``degradations()`` also reports the
+    # ``apps:changed`` fan-out being down on this worker (card 3fc5bf3b), and
+    # that is not an auto-start app — the CLI prints it from the ``redis``
+    # section below, where its wording fits.
     return [{k: v for k, v in row.items()
              if k not in ("kind", "service", "autostart")}
-            for row in degradations(runtime)]
+            for row in degradations(runtime)
+            if row.get("kind") in ("service", "container")]
 
 
 def _referenced_gateway_profiles(runtime) -> dict[str, str]:
@@ -712,7 +717,7 @@ async def _mcp_gateway_status(runtime: AppRuntime, *, expect_tools: bool,
     }
 
 
-async def _redis_coord_status() -> dict:
+async def _redis_coord_status(runtime=None) -> dict:
     """Whether `src/libs/redis_coord.py` can actually reach a Redis right
     now (W0). That module (F5b: RedisBroadcaster/RedisPollQueue — the
     leadership primitives moved to ``flock`` on 2026-10-03, see
@@ -723,21 +728,33 @@ async def _redis_coord_status() -> dict:
     a real `AW_WORKSPACE_REDIS_URL` (F5a) is blocked in Need Human. This
     exists so that dead-end is visible in ``doctor`` instead of only
     surfacing the day a consumer is finally wired in and breaks silently.
+
+    It has a consumer now, and the most load-bearing one in the file: the
+    ``apps:changed`` fan-out that carries every app install, removal and
+    config save to the other workers. ``broadcast`` below reports whether
+    THIS worker can still hear it — PING answering says the server is up, not
+    that this process is still subscribed to it (card 3fc5bf3b: a relay that
+    died on a Redis blip left a worker serving config from before the last
+    save, with PING green throughout).
     """
     import redis.asyncio as aioredis
+    from src.apps.degradations import broadcast_rows
     from src.libs.redis_coord import get_workspace_redis_url
 
     url = get_workspace_redis_url()
     safe_url = re.sub(r"://[^@/]+@", "://***@", url)
+    # Empty at AW_WORKSPACE_WORKERS<=1 and when the fan-out is healthy — see
+    # broadcast_rows() for why this is a per-worker answer.
+    broadcast = (broadcast_rows(runtime) or [None])[0]
     client = aioredis.from_url(url, socket_connect_timeout=3)
     try:
         await asyncio.wait_for(client.ping(), timeout=3.0)
     except Exception as e:  # noqa: BLE001 — the failure itself IS the finding
-        return {"reachable": False, "url": safe_url,
+        return {"reachable": False, "url": safe_url, "broadcast": broadcast,
                 "note": f"redis_coord cannot reach {safe_url}: {e}"}
     finally:
         await client.aclose()
-    return {"reachable": True, "url": safe_url,
+    return {"reachable": True, "url": safe_url, "broadcast": broadcast,
             "note": "redis_coord's resolved Redis answers PING"}
 
 
@@ -1177,6 +1194,17 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         # (or workers=1) → no delivery and no error: the inline
         # on_config_reloaded above already did this worker's half, which is the
         # whole of the single-worker case.
+        #
+        # The generation token is bumped HERE, at the broadcast site and under
+        # the same ordering argument, because it is the same statement made
+        # twice over two channels: push (below, instant, reaches even an idle
+        # worker) and floor (the token, read at the request boundary by
+        # src/api/app.py's middleware, and immune to Redis). A worker acting on
+        # either one must find a mirror row that is already final — which is
+        # why both come after every shared write above, and why the bump is
+        # not inside config_store.save() (that also runs on the uninstall
+        # snapshot path, where nothing has changed for anyone to converge to).
+        config_store.bump_generation()
         await reconciler._trigger_broadcast("config", slug)
 
         return _app_config_payload(loaded)
@@ -1651,7 +1679,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             runtime, expect_tools=bool(mcp_apps), expected=mcp_expected,
             expected_profiles=_referenced_gateway_profiles(runtime),
             expected_versions=mcp_expected_versions)
-        redis_status = await _redis_coord_status()
+        redis_status = await _redis_coord_status(runtime)
         vault_status = await _vault_status()
         state_facade_status = _state_facade_status(runtime)
 
