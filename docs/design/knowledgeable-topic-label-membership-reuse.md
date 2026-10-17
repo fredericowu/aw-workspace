@@ -367,3 +367,161 @@ has the same members AND a close centroid), so it is inert rather than wrong,
 and `document_ids` + `labels.reused_by` are the instrumentation the next
 iteration needs to measure anything at all. Reverting it is a one-line change
 if the Architect prefers that; the decision is theirs, not the coder's.
+
+---
+
+## ARCHITECT DECISION after the falsification (2026-10-17)
+
+### Decision 1 — the membership arm STAYS deployed
+
+It is inert, not wrong: it can only admit a pair that already shares members
+AND a close centroid, and the live build confirms it admits ~1/156. Reverting
+would churn 11 mutation-checked tests to remove a no-op, and `document_ids` +
+`labels.reused_by` are the only measurement surface any further iteration has
+— including the one below, whose acceptance is read off `reused_by`. Under a
+warm-started clustering the arm also stops being dead weight: a same-partition
+build has jaccard ≈ 1.0, so membership corroborates the cosine key instead of
+failing beside it. This holds even if decision 2's gate fails: storage cost is
+measured and trivial (32,876 ids tree-wide, biggest set 2,395, overflow 0).
+
+### Decision 2 — one more attempt, through the clustering INIT, gated by a
+### measurement before any production code
+
+**The approach, falsifiably:** warm-start `StreamingLeafClustering` from the
+stored tree's level-0 centroids instead of the reservoir k-means, keeping all
+three full passes; spend leftover labeller budget upgrading reused
+keyword-source labels; bound entrenchment with a cold-build clock. The
+measured basis: the diag table above shows the clustering is *deterministic
+given its init* — same init ⇒ 145/145 at cosine ≥ 0.98, and the entire
+production reuse failure reproduces from a reseed alone. Pinning the init is
+therefore the one lever that makes the already-shipped 0.98 key hold. The
+premise this stands on, and the thing that can falsify it, is step 0 below.
+
+**Why this is NOT rejected alternative 1(d).** 1(d) rejected incremental
+*assignment*: new chunks bolted onto frozen clusters, no re-clustering, drift
+unbounded, `leaf_k` frozen. Warm start keeps every pass: pass 2 still refines
+over the FULL corpus every build (`build.py:560-565`), pass 3 still reassigns
+every chunk, `leaf_k` still follows corpus size, empty clusters are still
+dropped at `finish()`. The only change is where Lloyd starts. The residual —
+real — risk is local-optimum *entrenchment*: a warm init exploits history
+instead of exploring, so a corpus that genuinely reorganises keeps the old
+partition shape until something forces a fresh look. That is what the cold
+clock bounds, rather than the design denying the risk.
+
+### Where it lands
+
+1. **`backend/app/topics/cluster.py`** — new `seed_centroids_from(prior, k)`
+   beside `seed_centroids(k)` (`:402`). `prior` = the stored level-0
+   centroids. `k > len(prior)`: top up with k-means++ farthest-point picks
+   from the reservoir (pass 1 is unchanged — the reservoir is still sampled,
+   it just stops being the *init*). `k < len(prior)`: keep the `k` largest by
+   stored `chunk_count`. **Weights contract:** assign the reservoir to the
+   warm centroids and seed `_weights` from those counts — same semantics as
+   the cold path; the invariant at `:356-359` ("the first refined page cannot
+   erase the seed") is the thing a wrong weights-init silently breaks.
+2. **`backend/app/topics/build.py`** — move the `read_bucket_topic_labels()`
+   call (`:691`) above the init (`:556`); ONE read serves both warm start and
+   the reuse pass. Warm path when a stored tree exists, the embedding
+   dimension matches (same guard `_reuse_labels` already has, `:401-403`),
+   and the cold clock hasn't expired; cold otherwise. The build report stamps
+   `init: "warm" | "cold"` — without it the next measurement can't tell which
+   path ran.
+3. **Budget upgrade pass** (`build.py:716-737`) — today a topic whose reused
+   label has `source == "keywords"` is skipped by the budget loop forever
+   (`:735`), which is why `keywords == 0` is unreachable even with perfect
+   reuse. After `wanted` is filled with non-reused topics, spend the
+   LEFTOVER budget on reused-but-keyword-source topics, same order (highest
+   level first, largest first). This is also what re-absorbs each cold
+   build's relabel debt over the following builds instead of in one storm.
+4. **Cold clock** — `TOPIC_BUILD_COLD_INTERVAL_SECONDS` (default 604800, 7
+   days), checked and stamped (`topic_build_last_cold_at` on `(:Bucket)`)
+   inside `build_bucket_topic_tree`, NOT inside `claim_dirty_bucket` — the
+   claim's lock-then-recheck duplication hazard (see "What this makes harder
+   later" above) is not getting a third condition. Plus an explicit
+   `init=cold` override on `POST /api/topics/build` for the operator.
+5. **Untouched:** the floor (works, stays at 3600 — its measured side effect,
+   worse per-build reuse from bigger deltas, dissolves under warm start
+   because reuse no longer depends on delta size through the init), the
+   connector, the extractor, `max_llm_calls`, the delete-then-replace
+   invariant, the membership arm.
+
+### Step 0 — THE GATE, before any production change
+
+Extend `/tmp/diag.py` (bare-metal-privileged / inside the container,
+read-only, ~2 min): warm-start from the stored level-0 centroids, run
+refine + assign over the live corpus, compare against the stored tree.
+**Proceed only if cosine ≥ 0.98 matches ≥ 135/145 leaves.** If the gate
+fails, STOP and report back — and the fallback is pre-decided, no third
+design round: the card closes `partial` on the floor's measured saving,
+decision 1 unchanged. This is the same discipline that caught the membership
+premise, applied *before* the build cost this time.
+
+### Acceptance criteria (replacing the falsified 1/2/4; 3 already passes)
+
+1. **Gate:** warm re-cluster of live `main` matches ≥ 135/145 leaves at
+   cosine ≥ 0.98 before any code ships.
+2. **`labels.reused ≥ 140`** of 156 on a warm single-document rebuild.
+3. **`labels.keywords == 0` within 4 warm builds of deploy** (the upgrade
+   pass drains the standing ~56-topic keyword debt at ≤ 48/build while also
+   covering genuinely-new topics).
+4. **`llm_attempted ≤ 10` once the keyword debt is drained.**
+5. Report carries `init: warm|cold`; at most one `cold` build per
+   `TOPIC_BUILD_COLD_INTERVAL_SECONDS` per bucket.
+
+### Rejected alternatives (this round)
+
+- **Max-label-age relabelling over a loosened cosine threshold** (the
+  runner-up). It concedes topic-identity instability and papers over it: at
+  seed+1 the median best cosine is 0.975, so even a 0.95 bar leaves ~half
+  the tree unreused, and every label it does carry lands on a partition
+  sharing a median 34% of its members — the exact defect
+  `label_reuse_cosine()`'s docstring exists to prevent, now at scale.
+  `reused ≥ 140` is unreachable through it, and the build-to-build identity
+  churn (bad for `mode=tree` users, fatal for any future incremental
+  feature) stays. Becomes relevant again only if the gate fails AND someone
+  later decides the floor-only saving isn't enough.
+- **Smaller `leaf_k`.** Pays the labelling bill by coarsening retrieval
+  granularity tree-wide — a quality cost on an orthogonal axis — and the
+  identity instability survives at any k.
+- **Close at `partial` now, floor-only.** The floor's ~−23% (vs the card's
+  measured 1.30 builds/h) is real but leaves the tree simultaneously
+  expensive AND half keyword-degraded forever, with its identity reshuffling
+  every build. Taken only if the gate fails.
+
+### What THIS makes harder later
+
+- **The tree becomes path-dependent.** What you have depends on build
+  history, not just the corpus; reproducing a tree for debugging needs the
+  lineage or a forced cold build. The `init` stamp and
+  `topic_build_last_cold_at` are the breadcrumbs.
+- **Entrenchment is bounded, not eliminated.** A genuine corpus
+  reorganisation waits up to the cold interval for the tree to notice its
+  shape (searchability is unaffected — only the partition's *quality* lags).
+- **Cold builds periodically re-degrade labels** for the 1-2 builds it takes
+  the upgrade pass to drain the debt — a scheduled, visible storm instead of
+  today's permanent one.
+- **A third clock on `(:Bucket)`** (`dirty_at`, `last_built_at`, now
+  `last_cold_at`) — though this one deliberately lives outside the claim's
+  duplicated WHERE clauses.
+- `seed` on `build_bucket_topic_tree` loses most of its meaning on warm
+  builds (only the top-up picks consume RNG) — tests that relied on seed
+  variation to produce different trees must force `init=cold`.
+
+### Risks for the coder
+
+- **The weights init is the silent killer**: seed `_weights` wrong and the
+  first refined page erases the warm centroids — the build "works", the gate
+  numbers just quietly don't reproduce in production. Mirror the cold path's
+  semantics exactly (reservoir-assignment counts).
+- Leaves are level 0 (`flat_levels` construction, `build.py:695`) — filter
+  `previous` to `level == 0` for the warm init; upper levels are rebuilt
+  from leaf centroids as today (cheap, deterministic given leaves).
+- ONE `read_bucket_topic_labels()` call, moved earlier — not a second read
+  (the single-worker claim makes it race-free, keep it that way).
+- A re-embed (dimension change) must fall back to cold, same as the reuse
+  pass already does.
+- The test fixture must wipe `(:Bucket)` *properties*, not just nodes
+  (memory `schema-migration-tests-are-blind-when-the-fixture-only-wipes-nodes`
+  — it bit the floor tests' design too).
+- Don't let the upgrade pass relabel topics the budget already covered — the
+  `wanted` set is one pool, upgrades fill the remainder only.
