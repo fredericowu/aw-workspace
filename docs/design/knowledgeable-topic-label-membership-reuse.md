@@ -281,3 +281,89 @@ hourly.
   the `processed_at` overwrite-on-resync observability gap; the connector's
   tick; `collapse_to_main.py`'s own `mark_bucket_dirty` calls (one-shot
   script).
+
+---
+
+## MEASURED AFTER IMPLEMENTATION — the membership premise is FALSIFIED
+
+Implemented and deployed 2026-10-17 by `coder-opus`
+(`aw-knowledgeable@119cb44`, deploy run 38986099888, green). Both changes are
+live. Measured on bucket `main` the same night, and **§"Where it lands"
+change 1 does not deliver its acceptance criteria.** Change 2 does.
+
+### What the live builds say
+
+```
+00:39:40  42287 chunks  labels {reused: 61, reused_by: {cosine: 61, membership: 0},
+                                llm: 48, keywords: 47, llm_attempted: 48}   <- first build, expected: old tree has no document_ids
+01:39:46  42314 chunks  labels {reused: 52, reused_by: {cosine: 51, membership: 1},
+                                llm: 48, keywords: 56, llm_attempted: 48}   <- STEADY STATE. target was <=10 / >=140 / 0
+```
+
+Acceptance: 1 ✗ (48 calls, not ≤10), 2 ✗ (56 keyword labels, not 0),
+3 ✓ (60 min apart, see below), 4 ✗ (the floor alone caps the rate at 1
+build/h — against the card's measured 1.30 builds/h that is ~−23%, not −85%;
+in the hour actually observed it suppressed 2 of 3 builds, ~−67%).
+
+### Why — the root cause, measured two ways
+
+A read-only re-cluster of the live bucket, compared against the stored tree
+(`/tmp/diag.py`, no writes, no LLM):
+
+| input | best centroid cosine (median) | best doc jaccard (median) | cosine≥0.98 | jaccard≥0.9 |
+|---|---|---|---|---|
+| same corpus, same seed (0) | **1.000** | **1.000** | 145/145 | 145/145 |
+| same corpus, seed 1 | 0.975 | **0.340** | 62/145 | **4**/145 |
+
+The second row reproduces production's own profile (49-68 cosine matches per
+build) from a *reseed alone*, with the corpus byte-identical. So:
+
+1. **The clustering is perfectly deterministic** given identical input — when
+   it lands in the same local optimum, cosine already reuses *everything*
+   (145/145) and the membership key adds nothing.
+2. **When it lands in a different local optimum, membership collapses far
+   harder than the centroid** — 0.340 median jaccard against 0.975 median
+   cosine. §"What the live system actually does today" asserted the opposite
+   ("their *membership* is byte-identical even when the centroid wobbles");
+   that is false on this corpus. Leaves hold a median of 105-124 documents,
+   so a boundary shift reassigns tens of them, and jaccard ≥ 0.9 over 124
+   documents tolerates only ~12 moving.
+3. Therefore **no threshold choice rescues the design**: jaccard ≥ 0.7 ∧
+   cosine ≥ 0.90 is 9/145, jaccard ≥ 0.5 is 35/145. "reused ≥ 140" is
+   unreachable by tuning.
+4. The actual variable is the clustering's **initialisation**: the reservoir
+   sample depends on how many rows have been seen, so +27 chunks reseeds the
+   seed centroids and lands k-means in a different partition. A corpus delta
+   behaves exactly like a reseed. The lever that would make *either* key work
+   is a warm start from the previous tree's centroids — which this spec put
+   explicitly out of scope ("the clustering itself ... untouched"), so it is
+   a new design decision, not a coder fix.
+
+### What change 2 (the floor) actually did — verified live
+
+```
+00:36:28Z  claim stamps topic_build_last_built_at   -> build at 00:39:40
+00:36:54Z  real document arrival, bucket dirty
+01:00:22Z  second real document arrival (dirty_at overwritten)
+01:24:33Z  read-only replica of the claim's WHERE:
+             floor=3600s -> claimable: []          <- deferred, pending stays true
+             floor=0s    -> claimable: ['main']    <- what today's code would have done
+01:36:28Z  floor expires -> claim                  -> build at 01:39:46
+```
+Two arrivals that would each have paid a full tree (~00:42 and ~01:05)
+collapsed into one build 60 min after the previous one. Nothing was lost:
+`pending_topic_build` stayed true throughout.
+
+### Consequence the floor introduces, now visible
+
+Builds an hour apart accumulate a bigger delta than builds 15 min apart, so
+per-build reuse gets *worse* (52 vs the 49-68 band) even as total spend falls.
+Cost is clearly better; per-build label quality is slightly worse.
+
+### Left deployed deliberately
+
+The membership arm is strictly additive (it can only admit a pair that already
+has the same members AND a close centroid), so it is inert rather than wrong,
+and `document_ids` + `labels.reused_by` are the instrumentation the next
+iteration needs to measure anything at all. Reverting it is a one-line change
+if the Architect prefers that; the decision is theirs, not the coder's.
