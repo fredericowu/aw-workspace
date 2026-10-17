@@ -525,3 +525,54 @@ premise, applied *before* the build cost this time.
   — it bit the floor tests' design too).
 - Don't let the upgrade pass relabel topics the budget already covered — the
   `wanted` set is one pool, upgrades fill the remainder only.
+
+---
+
+## ROUND 2 — the gate passed, and what shipped behind it (2026-10-17)
+
+`aw-knowledgeable@14f8220`, deploy run 38996139111 green (796 pytest, 11 new).
+
+### The gate, run twice
+
+The first gate pass was **vacuous and discarded**: compared on a corpus
+byte-identical to the stored tree's, the cold init reproduces itself
+(145/145), so warm's 138 said nothing. The 2×2 below adds the delta
+(withholding every 1000th chunk from all three passes, ~42 chunks — the same
+order as the +27 that broke reuse between 00:39 and 01:39):
+
+| init | corpus unchanged | ~42 chunks changed |
+|---|---|---|
+| cold (reservoir) | 145/145 | **57/145** — reproduces production's 51/156 |
+| **warm (previous tree)** | 138/145 | **135/145** — threshold was 135 |
+
+Warm loses 3 matches to the delta; cold loses 88.
+
+### Live, bucket `main`
+
+```
+03:00:33  init=cold  reused 108, upgraded 48, llm 48, keywords 0, llm_attempted 48
+03:05:23  warm       reused 129, upgraded 17, llm 27, keywords 0, llm_attempted 27
+03:11:33  warm       reused 148, upgraded  0, llm  8, keywords 0, llm_attempted  8
+```
+
+Warm confirmed from state rather than inference: `topic_build_last_cold_at`
+is still `02:57:55` after both later builds, and a cold build would have
+re-stamped it. The stricter, node-level degradation measure: **all 156 topics
+now carry `label_source: "llm"`** — zero keyword-degraded topics tree-wide,
+from ~56.
+
+Acceptance 1-5 all pass (gate 135; reused 148; keywords 0; llm_attempted 8;
+`init` in the report with one cold stamp and two warm builds after it).
+
+### Two caveats, recorded rather than buried
+
+1. **All three production builds ran on an unchanged corpus** (42 337 chunks
+   each), and the two warm ones were manual `POST /api/topics/build` calls
+   that bypassed the claim and the floor. They prove the upgrade pass and
+   that warm start reuses 148/156; the warm-vs-cold **delta** robustness
+   still rests on the gate above, not on a scheduler-claimed build with real
+   churn. The first of those is the one number left to confirm.
+2. **`init` is in the report but not in the log line.** Warm vs cold is
+   therefore not readable from `docker logs` — it was verified through
+   `topic_build_last_cold_at`. A one-line follow-up to the log format would
+   make acceptance 5 checkable the same way everything else here is.
