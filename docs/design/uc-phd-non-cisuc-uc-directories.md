@@ -386,14 +386,20 @@ name→slug pairs anywhere in it).
 
 ## 6. Sequencing, verification, deployment — binding on the Coder
 
-0. **Do not start until sibling run `38e7563f…` has ended**, then
-   `git log`/`git status` the repo and resolve the corpus gap first: the
-   2509 untracked `estudo_geral/*.md` + the 2690-entry manifest MUST be
-   committed (by the sibling if its card covers it — check before
-   duplicating; otherwise as this card's step 0) so that
-   `git ls-files estudo_geral` count == manifest count == seed thesis
-   count. Until that holds, the mandated rebuild-equals-committed-seed
-   check is unsatisfiable and every downstream claim is unverifiable.
+0. **Do not start until sibling run `38e7563f…` has ended** (it has —
+   landed in `8074c7c`+`8c82189`, v0.21.0, 2026-10-18). The corpus gap
+   stands, amended now that its size is known: the untracked
+   `estudo_geral/*.md` total **~1.5 GB** (sibling's measurement), so
+   committing them is NOT a step a Coder takes as a side-effect — it
+   would balloon the repo and the marketplace packaging pipeline, and the
+   sibling's report assigns the call to the harvesting card. Instead:
+   **copy the untracked corpus (`estudo_geral/*.md` + `manifest.json`)
+   from the shared tree into the isolated worktree before any rebuild**,
+   and assert the build report says `theses == 2690` before trusting any
+   number. The rebuild-equals-committed-seed check runs against that
+   copied corpus; the fact that a fresh clone cannot reproduce the seed
+   remains true, is NOT fixed by this card, and must be restated in the
+   final report so the PO/harvesting card owns it explicitly.
 1. **Work in an isolated git worktree**
    (`aw-autoskill-concurrent-coder-worktree-isolation`); never edit the
    shared tree. The seed is a committed binary — merge conflicts on it are
