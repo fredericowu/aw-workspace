@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime, timezone
 
 import anyio
 import httpx
@@ -858,6 +859,70 @@ async def _vault_status() -> dict:
             "note": f"secret store answers — {len(secrets)} secret(s) listed"}
 
 
+# The dead-man's-switch threshold from
+# docs/design/aw-remote-host-postgres-backup.md §6 step 7: a red GHA run
+# already shows up on its own; this exists for the mode a red run can't —
+# the job silently stopped being SCHEDULED at all (GitHub disables a cron
+# workflow after 60 days of repo inactivity, and a dead runner looks
+# identical from here).
+REMOTE_HOST_POSTGRES_BACKUP_MAX_AGE_HOURS = 26.0
+
+
+def _remote_host_postgres_backup_status() -> dict:
+    """Whether the nightly aw-remote-host-postgres backup actually ran and
+    restore-verified recently.
+
+    ``aw-stack``'s ``backup-remote-host-postgres.sh`` (the
+    ``backup-remote-host`` job in ``backup-postgres.yml``) writes
+    ``{slot, verified_at, ...counts, sha256}`` to this exact path ONLY after
+    a full restore-verify passes and the artifact uploads — never on a
+    failed verify, never on a ``SKIP_UPLOAD`` dry run. It does so via
+    ``docker exec aw-remote-host mkdir ...`` + ``docker cp`` from the
+    bare-metal GHA runner: "aw-remote-host" is only this very container's
+    name as seen from THAT docker, and ``/opt/aw-workspace/.aw-workspace``
+    is host-mounted, so the file this process reads below (on ITS OWN
+    filesystem, no exec needed) is the exact same file that job wrote and
+    survives this container being recreated.
+
+    This is an implicit cross-repo contract (aw-stack script <-> this
+    check) that neither CI can see the other break — if the status file's
+    shape ever changes, this function and that script's manifest-writing
+    section both need updating together.
+    """
+    path = os.path.join(workspace_home_path(), "data", "backup-status",
+                         "remote-host-postgres.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {"present": False, "stale": True,
+                "reason": "no verified aw-remote-host-postgres backup has ever run"}
+    except (OSError, ValueError) as exc:
+        return {"present": True, "stale": True,
+                "reason": f"status file unreadable: {exc}"}
+
+    verified_at = data.get("verified_at")
+    try:
+        verified_dt = datetime.fromisoformat(str(verified_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return {"present": True, "stale": True,
+                "reason": f"verified_at missing or unparseable: {verified_at!r}"}
+
+    age_hours = (datetime.now(timezone.utc) - verified_dt).total_seconds() / 3600
+    stale = age_hours > REMOTE_HOST_POSTGRES_BACKUP_MAX_AGE_HOURS
+    return {
+        "present": True,
+        "stale": stale,
+        "verified_at": verified_at,
+        "age_hours": round(age_hours, 1),
+        "slot": data.get("slot"),
+        "reason": None if not stale else
+        (f"last verified backup is {age_hours:.1f}h old "
+         f"(> {REMOTE_HOST_POSTGRES_BACKUP_MAX_AGE_HOURS}h) — "
+         "the nightly job may have stopped running"),
+    }
+
+
 def register_apps_routes(app: FastAPI) -> AppRuntime:
     """Wire the plugin runtime + management routes onto ``app``.
 
@@ -1617,6 +1682,14 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
           ``ok``: every credential anything here reaches for comes through
           it, and on 2026-10-03 it was dead workspace-wide for hours with
           nothing anywhere saying so.
+        * ``remote_host_postgres_backup`` — dead-man's switch for the nightly
+          aw-remote-host-postgres backup (see
+          ``_remote_host_postgres_backup_status``): red when the last
+          restore-VERIFIED artifact is older than
+          ``REMOTE_HOST_POSTGRES_BACKUP_MAX_AGE_HOURS``. Folded into ``ok``
+          on purpose — this is the one failure mode a red GHA run can never
+          show, because it's what catches the job no longer being scheduled
+          at all.
         """
         clis = runtime.commands.system_cli_report()
 
@@ -1682,6 +1755,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         redis_status = await _redis_coord_status(runtime)
         vault_status = await _vault_status()
         state_facade_status = _state_facade_status(runtime)
+        remote_host_postgres_backup = _remote_host_postgres_backup_status()
 
         host_offers = hostpower.host_grants()
         host_apps = []
@@ -1715,9 +1789,15 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             # than `not reachable` on purpose — an unlinked BYOD workspace
             # reports None (no store to check), which must not read as
             # broken.
+            # remote_host_postgres_backup IS folded in: this is the
+            # dead-man's switch for "the nightly backup job stopped being
+            # scheduled at all" (design doc §6 step 7) — a red GHA run
+            # already shows up on its own, so silence here is itself the
+            # failure this exists to catch.
             "ok": (not unhealthy and not permissions and not failing_app_checks
                    and not mcp_status["degraded"] and not autostart_not_running
-                   and vault_status.get("reachable") is not False),
+                   and vault_status.get("reachable") is not False
+                   and not remote_host_postgres_backup["stale"]),
             "app_checks": app_checks,
             "system_clis": {
                 "total": len(clis),
@@ -1740,6 +1820,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             "redis": redis_status,
             "vault": vault_status,
             "state_facade": state_facade_status,
+            "remote_host_postgres_backup": remote_host_postgres_backup,
         }
 
     @app.get("/api/apps/-/catalog")
