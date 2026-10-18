@@ -228,7 +228,21 @@ def test_doctor_reports_a_present_but_broken_cli():
     assert unhealthy[0]["path"]
 
 
-def test_doctor_is_ok_when_nothing_is_degraded():
+def test_doctor_is_ok_when_nothing_is_degraded(tmp_path, monkeypatch):
+    # Includes a fresh aw-remote-host-postgres backup status file: that
+    # check is a real, folded-into-ok degradation (no backup has ever run
+    # yet reports exactly as stale) — "nothing is degraded" has to mean the
+    # backup is verified-recent too, not that this test is silently exempt
+    # from the one check it would otherwise always fail.
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    status_dir = tmp_path / "home" / "data" / "backup-status"
+    status_dir.mkdir(parents=True)
+    import json as _json
+    from datetime import datetime, timezone
+    with open(status_dir / "remote-host-postgres.json", "w", encoding="utf-8") as f:
+        _json.dump({"slot": "sunday",
+                    "verified_at": datetime.now(timezone.utc).isoformat()}, f)
+
     _runtime, client = _doctor_client()
     assert client.get("/api/apps/-/doctor").json()["ok"] is True
 

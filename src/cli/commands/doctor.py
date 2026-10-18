@@ -50,6 +50,7 @@ def run(args: list[str]) -> int:
     problems += _redis(report.get("redis") or {})
     problems += _vault(report.get("vault") or {})
     problems += _state_facade(report.get("state_facade") or {})
+    problems += _remote_host_postgres_backup(report.get("remote_host_postgres_backup") or {})
 
     print()
     if problems:
@@ -373,3 +374,30 @@ def _vault(section: dict) -> int:
     print("      every credential an agent, app or scheduled task reads comes")
     print("      through here; the key-push self-heal loops fail silently")
     return 1
+
+
+def _remote_host_postgres_backup(section: dict) -> int:
+    """Dead-man's switch for the nightly aw-remote-host-postgres backup
+    (docs/design/aw-remote-host-postgres-backup.md §6 step 7).
+
+    aw-stack's ``backup-remote-host`` GHA job writes the status file this
+    reads ONLY after a full restore-verify passes and the artifact uploads.
+    A red GHA run already shows up on its own; this exists for the mode a
+    red run can't — the job silently stopped being scheduled at all.
+    """
+    print()
+    if not section:
+        print("Backup (aw-remote-host-postgres) — no report from the server")
+        return 0
+    if not section.get("present"):
+        print("Backup (aw-remote-host-postgres) — ✗ NO VERIFIED BACKUP HAS EVER RUN")
+        print(f"      {section.get('reason', '')}")
+        return 1
+    if section.get("stale"):
+        print(f"Backup (aw-remote-host-postgres) — ✗ STALE "
+              f"(last verified {section.get('age_hours', '?')}h ago, slot={section.get('slot')})")
+        print(f"      {section.get('reason', '')}")
+        return 1
+    print(f"Backup (aw-remote-host-postgres) — verified {section.get('age_hours', '?')}h ago "
+          f"(slot={section.get('slot')})")
+    return 0
