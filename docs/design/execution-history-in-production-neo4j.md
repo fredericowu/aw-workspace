@@ -1,7 +1,23 @@
 # Execution history in the production Neo4j — tenant isolation design
 
-Status: **design, approved scope — no implementation on this card.**
-Card `3fd5bf3b-9510-814c-be85-c2f9723dca01` (Architect, 2026-10-18).
+Status: **implemented, flag-off (2026-10-18).** Steps 1 and 2 of §9's
+migration have landed on master; step 3 (flag on, backfill, reconcile green)
+and step 4 (agent-facing MCP tools) are deliberately operator decisions and
+have NOT been taken. Nothing is written to the production graph until
+`exec_sync_enabled` is set true.
+
+Where it landed, against §4: `repos/aw-knowledgeable/backend/app/core/graph.py`
+(constraints, two fulltext indexes, the `exec_*` templates, `EXEC_BUCKET`),
+`backend/app/core/exec_history.py` + `backend/app/api/exec_history.py` (the
+service-caller-only router), `backend/tests/test_exec_isolation.py` (K7 — the
+route-level reachability proof, §3 point 5), the exec guards in
+`backend/tests/test_tenant_isolation.py` (§12 risk 1), and in the connector
+`repos/aw-app-knowledgeable`: `knowledgeable_app/exec_scrub.py` (§6),
+`knowledgeable_app/exec_sync.py` (§4/§8) and the
+`knowledgeable-exec-sync` CLI + two flag-off scheduled tasks.
+`scripts/load_exec_retrieval_neo4j.py` grew the §4 refusal guard.
+
+Design card `3fd5bf3b-9510-814c-be85-c2f9723dca01` (Architect, 2026-10-18).
 Predecessors: `docs/design/execution-history-retrieval-test-plan.md` (the
 measurement), `.tmp/exec-retrieval-test/RESULTS.md` (the results),
 `scripts/load_exec_retrieval_neo4j.py` (the throwaway v2 loader — reused for
@@ -76,13 +92,25 @@ the **build** if that stops being true. Three distinct guards:
 complete but whose grants are trivial today.** Since §7bis
 (docs/design/aw-knowledgeable-buckets.md, amended 2026-09-28) bucket is a
 permission boundary between co-tenant tokens, enforced by `_bucket_denied()`
-(`core/identity.py:356-377` — the 404/403/200 table). But the T2-less
-resolver (`resolve_bucket_scopes`, identity.py:321-353) grants **every
-registered bucket in the tenant, read+write, to every authenticated caller of
-that tenant** — humans and the service caller alike. So today, bucket
-separates nothing between co-tenant callers in practice. Any design that
+(`core/identity.py:356-377` — the 404/403/200 table). The T2-less resolver
+(`resolve_bucket_scopes`, identity.py:321-353) then grants **every registered
+bucket in the caller's OWN tenant, read+write, to every authenticated caller
+of that tenant** — humans and the service caller alike. So today, bucket
+separates nothing *between co-tenant callers* in practice. Any design that
 says "the exec data is safe because it's in its own bucket" is wrong until
 T2 per-token scopes land. This design does not say that (§3, §6).
+
+**Correction, verified 2026-10-18 (Frederico), against an earlier draft of
+this section that overstated it.** This is a **within-tenant** gap, not a
+cross-tenant leak. `resolve_bucket_scopes` calls
+`list_buckets_for_tenant(tenant_id)` (`core/graph.py:3982-4007`), which
+passes `tenant_id` into the catalog query — it *is* tenant-filtered, and a
+caller never sees another tenant's bucket slugs through it. Do not propagate
+"every registered bucket to every tenant caller" as if it crossed tenants:
+it does not. The design's conclusion is unchanged either way, because it
+never rested on the stronger claim — an unregistered `_exec-history` bucket
+can never enter any caller's `$bucket_ids`, whatever the grant rule is, so
+the exec subgraph stays invisible to every bucket-scoped generic template.
 
 **Neo4j Community has one user database, no RBAC — confirmed and designed
 around.** `SHOW DATABASES` on the production image (`neo4j:5.26.4-community`)

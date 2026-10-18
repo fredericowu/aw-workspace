@@ -7,6 +7,21 @@ harness loaded a **metadata-only** graph and scored 5/10; three of its losses
 were caused by the absence of run text and nothing else. This script rebuilds
 the v1 vocabulary unchanged and adds the text layer on top.
 
+**DEAD AS A PRODUCTION PATH.** This is the throwaway measurement harness and
+nothing more. It wipes the entire target graph before loading and writes raw
+Cypher over the HTTP tx endpoint, so pointed at the production
+``aw-stack-aw-neo4j-1`` it would erase aw-knowledgeable's knowledge corpus
+AND bypass the template catalogue that is the whole tenant-isolation
+enforcement mechanism. ``refuse_if_knowledge_corpus`` below aborts before the
+wipe if the target holds any ``(:Document)`` node, for exactly that reason.
+
+The production path is the Knowledgeable Connector's incremental
+MERGE-upsert through aw-knowledgeable's service-authed ingest route —
+``aw-workspace-cli knowledgeable-exec-sync run``, see
+``docs/design/execution-history-in-production-neo4j.md`` §4. Do not adapt
+anything here for it; reuse the SQL and the shape knowledge only (which is
+what ``knowledgeable_app/exec_sync.py`` did).
+
 What it builds (full rebuild — it WIPES the target graph first, so re-running
 it is the supported way to refresh):
 
@@ -317,6 +332,48 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def refuse_if_knowledge_corpus(neo: Neo4j) -> None:
+    """Abort if the target holds any `(:Document)` node.
+
+    **This script is dead as a production path** (docs/design/execution-
+    history-in-production-neo4j.md §4). It wipes the entire graph before
+    loading, and it writes raw Cypher over the HTTP tx endpoint — so pointed
+    at `aw-stack-aw-neo4j-1` it would erase the knowledge corpus AND bypass
+    the template catalogue that is the whole tenant-isolation enforcement
+    mechanism. The production path is the connector's incremental
+    MERGE-upsert through aw-knowledgeable's service-authed ingest route
+    (`aw-workspace-cli knowledgeable-exec-sync`); nothing here should ever be
+    adapted for it.
+
+    The script stays for the throwaway measurement harness, which is why this
+    is a guard rather than a deletion. A `(:Document)` node is the cheapest
+    unambiguous signature of the knowledge corpus: the throwaway instance has
+    none by construction (it only ever held `Run`/`Session`/`Card`/`Tool`/
+    `ToolCall`), and production has thousands. Checked BEFORE the wipe, not
+    after — the whole point is that there is no "after" worth having.
+
+    `AW_EXEC_ALLOW_DOCUMENTS=1` overrides, for the one legitimate case of a
+    throwaway instance that someone has deliberately put a Document into. It
+    is an env var rather than a flag so it cannot be in a shell history as a
+    convenient-looking argument next to `--verify-only`.
+    """
+    if os.environ.get("AW_EXEC_ALLOW_DOCUMENTS") == "1":
+        log("WARNING: AW_EXEC_ALLOW_DOCUMENTS=1 — skipping the knowledge-corpus guard")
+        return
+    found = neo.scalar("MATCH (d:Document) RETURN count(d)")
+    if found:
+        raise SystemExit(
+            f"REFUSING TO RUN: the target graph holds {found} (:Document) node(s), "
+            "which means it is a knowledge corpus and not the throwaway measurement "
+            "instance. This script WIPES its target before loading and bypasses "
+            "aw-knowledgeable's template catalogue (the tenant-isolation enforcement "
+            "point), so it must never be pointed at aw-stack-aw-neo4j-1.\n"
+            "The production path is the Knowledgeable Connector's incremental sync: "
+            "`aw-workspace-cli knowledgeable-exec-sync run` "
+            "(docs/design/execution-history-in-production-neo4j.md §4)."
+        )
+
+
 def wipe(neo: Neo4j) -> None:
     """Delete everything in batches — a single DETACH DELETE over 300k+ nodes
     does not fit the heap."""
@@ -393,6 +450,7 @@ CREATE (r)-[:MADE_CALL]->(:ToolCall {
 def load(neo: Neo4j, conn) -> None:
     params = {"tenant": TENANT, "t0": T0}
 
+    refuse_if_knowledge_corpus(neo)
     log("wiping graph")
     wipe(neo)
     for stmt in SCHEMA:
