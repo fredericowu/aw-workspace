@@ -1248,6 +1248,101 @@ with a QA run id, per the flow contract.
     run resets off-hours, and remember the lease means a long backfill tick
     delays, not corrupts, the scheduled tick.
 
+### 13.13 Slice 1 shipped — what was measured (2026-10-19)
+
+`aw-knowledgeable` 3ac371f (schema + templates + service + K7), connector
+`aw-app-knowledgeable` v0.57.0. The schema commit deployed and was verified
+on the **empty** label before the first backfill tick ran, as §13.12 point 4
+requires: `exec_event_tenant_id` and `exec_event_text` both `ONLINE` at 100 %
+with `MATCH (e:ExecEvent) RETURN count(e)` = 0.
+
+**Counts, graph vs SQL, per kind — 13/13 exact, zero drift:**
+
+| kind | SQL | graph |
+|---|---|---|
+| `node_start` | 28,017 | 28,017 |
+| `finalizing` | 27,146 | 27,146 |
+| `cli.first_byte` | 24,173 | 24,173 |
+| `system.init` | 22,536 | 22,536 |
+| `done` | 3,958 | 3,958 |
+| `cli.error` | 1,606 | 1,606 |
+| `error` | 661 | 661 |
+| `auto_compact.ineffective` | 165 | 165 |
+| `auto_compact.blind` | 155 | 155 |
+| `connector.timing` | 36 | 36 |
+| `container.started` | 28 | 28 |
+| `log` | 4 | 4 |
+| `cli.timeout` | 2 | 2 |
+| **total** | **108,487** | **108,487** |
+
+`EMITTED` = 108,487 = `ExecEvent`, so every event hangs off its run and none
+landed edgeless. 14 bounded ticks of 2,000 runs drained 28,147 runs in ~6
+minutes; `event_fields_dropped` was 0 on every tick and
+`event_kinds_unreviewed` empty on every tick.
+
+**The gap against this section's own ~113k estimate is fully accounted for
+and is not loss.** 113,172 is the count across ALL tenants; the sync is
+scoped to one `exec_sync_source_tenant` (§2's two namespaces), and the
+remaining **4,689** events belong to tenant
+`0f27bbf396f545ba94a2d115ff4a6a25` (1,131 runs), which is correctly not
+projected. Checked for the two ways that argument could be wrong: events
+whose `run_id` matches no row in `runs` = **0**, and events whose own
+`tenant_id` disagrees with their run's = **0**. So 108,483 + 4,689 = 113,172,
+and the figures above are the same measurement taken a few minutes later
+with live traffic included.
+
+**Two behaviours found while verifying, neither a defect of this slice:**
+
+* **`exec_counts` omits a label that has never existed**, rather than
+  returning 0 for it. Neo4j returns ZERO ROWS for an aggregation over a
+  label absent from the token store — verified directly — so before the
+  first event landed, `graph_counts` carried no `ExecEvent`/`EMITTED` key at
+  all. Harmless because the reconcile reads `graph_counts.get(label, 0)`,
+  which is why a pre-backfill reconcile correctly reports drift rather than
+  a match; worth knowing before someone reads a missing key as a broken
+  template.
+* **`reconcile` reads the graph counts and the SQL counts at different
+  instants**, so a few rows of live traffic between them read as drift:
+  this run showed `ExecToolCall` 291,280 SQL vs 291,269 graph (11 rows) with
+  every other arm exact, including both new ones. Pre-existing, and the
+  reason the report is a table rather than a verdict.
+
+**The timeline reconstructs, on the §13 worked example** (run
+`4a95e46bd4e4460aaf2d1533e11e9a63`). Its 14 events over 9 kinds split as:
+2 `llm_token` (never projected), 3 `tool_call` (already `ExecToolCall`),
+3 `tool_result` (slice 3), 1 `node_end` (slice 2), and **5 `ExecEvent`** —
+`node_start` → `cli.first_byte` → `system.init` → `finalizing` → `done`,
+`ORDER BY ts`, interleaved with the 3 tool calls at 12:00:21/24/24. So the
+card's "12 non-tool-call timeline events" was the timeline total (14 − 2
+`llm_token`) INCLUDING tool calls, not the ExecEvent count. The typed
+properties landed as designed: `system.init` carries
+`tools_count` 30 / `cwd` / `permission_mode` / `session_id` and `model`
+`claude-sonnet-5` (the CLI's own string, distinct from the run's
+`claude-runner-sonnet` `model_slug`), and `finalizing` carries
+273,128 / 960 tokens and `cost_usd` 0.5179808.
+
+**The §13.6 alarm was proven to fire AND clear in production**, to the same
+standard the vault-coverage check was held to: a sentinel stamped with a
+fabricated `event_kinds_unreviewed: ["probe.unreviewed.kind"]` turned
+`GET /exec-sync/status` `degraded: true` and the CLI's exit code 1; the next
+real tick cleared both. `vault_names_uncovered` stayed empty throughout and
+`exec_sync` reports `exact_values` 10 / `pattern_families` 16.
+
+**One piece of surface added beyond the slice list:** `POST
+/exec-sync/reset-watermark` + `aw-workspace-cli knowledgeable-exec-sync
+reset-watermark`. §13.8 calls for one watermark-reset backfill per slice, so
+slices 2 and 3 need the same trigger; unwired, the next coder hand-rolls an
+HTTP call to a service-authed route carrying the internal secret.
+
+**Known, pre-existing, and not worth chasing:** the watermark oscillates
+between two values once the history is drained (ticks 15+ alternated
+16:36:30 / 16:51:20), because `_watermark_of` takes the max over the LANDED
+rows with no floor at the previous watermark, and the 48 h re-sweep keeps
+re-selecting the non-terminal runs in flight. It can only move backward,
+never past unread rows, and re-reading is free — but it does mean "run until
+`runs` is 0" never terminates while any run is live. Drain on the watermark
+reaching the present instead.
+
 
 ### 13.13 Slice 1 shipped — measured outcome (2026-10-19)
 
