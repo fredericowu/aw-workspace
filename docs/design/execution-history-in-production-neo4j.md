@@ -7,7 +7,10 @@ card `3fe5bf3b-9510-81d0-a0de-ea04b0e9cd46`) with a per-kind verdict table,
 and §13.2 records a live scrubbing hole found during that design — the
 secret-tool args drop never fired for gateway-prefixed tool names.
 **Slice 0 (§13.2's fix + purge) shipped 2026-10-19**; the measured exposure
-was 34 `write_secret` rows, not the three §13.2 first named.** Measured
+was 34 `write_secret` rows, not the three §13.2 first named. **Slice 1 (the
+`ExecEvent` mechanism + the 13 structured/low-risk kinds) shipped
+2026-10-19** — 108,487 events projected, graph == SQL per kind, measured
+outcome in §13.13.** Measured
 2026-10-19: `exec_sync_enabled` true, ~27,970 `ExecRun` / ~288,013
 `ExecToolCall`, sentinel fresh, degraded false. The MCP tools
 (`search_execution_graph`, `exec_run_detail`, card
@@ -1127,7 +1130,8 @@ selected RAW, parsed client-side by psycopg, NUL-stripped (`_clean`) —
   tests pinning the three measured spellings; purge template for landed
   secret-tool `args_text`; live verification that the named rows are gone;
   rotation card filed. Blocked on: nothing.
-- **Slice 1 — mechanism + the 13 structured/low-risk kinds:** ExecEvent
+- **Slice 1 — SHIPPED 2026-10-19** (see §13.13 for the measured outcome):
+  mechanism + the 13 structured/low-risk kinds. ExecEvent
   label, constraint, `exec_event_text` index (created empty), EMITTED edge,
   upsert/detail/search/counts/wipe templates + K5 list additions + K7
   extension (ExecEvent invisible through every generic surface), the
@@ -1243,3 +1247,89 @@ with a QA run id, per the flow contract.
     and the 10-minute sync: keep `MAX_RUNS_PER_TICK`/`BATCH_BYTES` bounds,
     run resets off-hours, and remember the lease means a long backfill tick
     delays, not corrupts, the scheduled tick.
+
+
+### 13.13 Slice 1 shipped — measured outcome (2026-10-19)
+
+Delivered: `aw-knowledgeable` commit `3ac371f`, connector `aw-app-knowledgeable`
+v0.57.0 (`5b18b8a` + `1885573`) and v0.58.0 (`7f4a743`).
+
+**Counts, graph vs SQL, per kind.** Measured after the watermark-reset
+backfill drained, with `kind = ANY(...)` bound from the registry on both
+sides:
+
+| kind | SQL | graph | match |
+|---|---|---|---|
+| `node_start` | 28,017 | 28,017 | ✓ |
+| `finalizing` | 27,146 | 27,146 | ✓ |
+| `cli.first_byte` | 24,173 | 24,173 | ✓ |
+| `system.init` | 22,536 | 22,536 | ✓ |
+| `done` | 3,958 | 3,958 | ✓ |
+| `cli.error` | 1,606 | 1,606 | ✓ |
+| `error` | 661 | 661 | ✓ |
+| `auto_compact.ineffective` | 165 | 165 | ✓ |
+| `auto_compact.blind` | 155 | 155 | ✓ |
+| `connector.timing` | 36 | 36 | ✓ |
+| `container.started` | 28 | 28 | ✓ |
+| `log` | 4 | 4 | ✓ |
+| `cli.timeout` | 2 | 2 | ✓ |
+| **total** | **108,487** | **108,487** | ✓ |
+
+`EMITTED` = 108,487 = `ExecEvent`, so every event hangs off its run; the
+weekly reconcile's two new arms both match. §13.1's table predicted ~113k
+from figures taken earlier the same day against a DIFFERENT scope — those
+were tenant-wide `run_events` rows, and the projection is scoped to one
+source tenant (`tenant-bootstrap`); 108,487 is the right number for what is
+actually loaded, not a 4 % shortfall. The reconcile's only mismatch was
+`ExecToolCall` 291,268 SQL vs 291,262 graph — six tool calls that arrived
+between the SQL read and the graph read, in a live estate that was
+generating them throughout (this very delivery's own session included). The
+event arms matched in that same read.
+
+**Text and the cap.** 661 `error` + 4 `log` events carry text; 107,822 are
+structured-only. Longest stored text 1,026 chars, zero truncations — §13.4's
+16,384 cap has not fired on this slice's kinds, which is what the measured
+p95s predicted. The distinct property set actually present on `ExecEvent` in
+production is exactly the allowlist plus bookkeeping: no `payload`, no
+`payload_json`, no `tools`, no `env`. §13.3's field allowlist held.
+
+**The worked example.** Run `4a95e46bd4e4460aaf2d1533e11e9a63` has 14
+`run_events` rows over 9 kinds, and the split is worth recording because the
+card's own estimate ("12 non-tool-call timeline events") was wrong: 3
+`tool_call` + 3 `tool_result` (the `ExecToolCall` layer — `tool_result` is
+slice 3), 2 `llm_token` (never), 1 `node_end` (slice 2), and **5 slice-1
+`ExecEvent`** — `node_start`, `cli.first_byte`, `system.init`, `finalizing`,
+`done`. `exec_run_detail` returns those 5 with their typed properties
+(`system.init` → `tools_count: 30`, `cwd`, `permission_mode`, `session_id`,
+`model`; `finalizing` → 273,128/960 tokens and $0.5179808) interleaved with
+the 3 tool calls by `ts` — the page-equivalent timeline, from the graph
+alone.
+
+**Found and fixed during the delivery, both in the mechanism rather than the
+projection:**
+
+1. `build_event_row` honoured an unshipped registry row's `text_field`, so
+   the SQL's `kind = ANY(...)` was the ONLY thing between `node_end`'s final
+   output text and the graph — one predicate, for exactly the kind §13.12
+   point 3 names as the trap. Caught by the registry's own unit test before
+   it ever ran against production; `shipped` is now part of the build-path
+   condition, not only of the query.
+2. A 2,000-run tick outlives `local_client.request`'s 30 s default read
+   timeout once events are in it. The route finishes server-side and the
+   CLIENT reports failure — which made the first backfill attempt
+   unobservable and makes the contributed scheduled task dispatch an agent
+   to diagnose a tick that worked. Fixed in v0.58.0 (30 min on the mutating
+   subcommands, `status` unchanged).
+
+**Observed, not fixed, and deliberately so:** in steady state the watermark
+oscillates between two timestamps a few minutes apart (measured: 16:36:30
+and 16:51:20, alternating, 2 and 4 runs re-read per tick). The 48 h
+re-sweep re-selects a non-terminal run whose `started_at` is below the
+frontier the previous complete pass set from `ended_at`, so the frontier
+steps back, then forward again. It re-reads a handful of runs forever and
+can never skip one — `_watermark_of`'s stated preference ("re-reading a run
+is free; skipping one is permanent") working as designed. Worth knowing
+before reading a backfill loop that waits for `runs == 0`: with any
+non-terminal run in the window, that condition never arrives, and "no runs
+due" is not the signal a backfill has drained. The watermark reaching
+today's timestamp is.
