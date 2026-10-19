@@ -1,11 +1,16 @@
 # Execution history in the production Neo4j — tenant isolation design
 
-Status: **implemented, flag ON. Step 4 (agent-facing MCP tools) shipped in
-v0.48.0, 2026-10-19.** All four steps of §9's migration have landed:
-`exec_sync_enabled` is `true` in production (independently measured by two
-agents — 27,887 `ExecRun` nodes, a fresh sentinel), and the agent-facing MCP
-tools (`search_execution_graph`, `exec_run_detail`) shipped in v0.48.0 (card
-`3fd5bf3b-9510-819f-8370-e80d964590d3`).
+Status: **implemented, flag ON; all four §9 steps live. The human-facing
+surface is decided (§10 exec-view, 2026-10-19) and build-pending.** Measured
+2026-10-19: `exec_sync_enabled` true, ~27,970 `ExecRun` / ~288,013
+`ExecToolCall`, sentinel fresh, degraded false. The MCP tools
+(`search_execution_graph`, `exec_run_detail`, card
+`3fd5bf3b-9510-819f-8370-e80d964590d3`) are at v0.52.0 with
+`search_in=name|args|both` and `matched_field` on every row
+(`knowledgeable_app/mcp/client.py:602`). The §6 vault coverage registry maps
+all 21 vault names to tested families (`vault_names_uncovered` empty), its
+`contributes.doctor` check is live and was proven to fire and clear, and the
+`VAULT_REVIEWED_NOT_CREDENTIAL` third state exists and is empty.
 
 Where it landed, against §4: `repos/aw-knowledgeable/backend/app/core/graph.py`
 (constraints, two fulltext indexes, the `exec_*` templates, `EXEC_BUCKET`),
@@ -234,9 +239,11 @@ requires the **service caller** (`require_service`, identity.py:213-225) for
 *both* ingest and search in v1. Rationale: the only consumers are agents via
 the connector's MCP tools, which already reach richer versions of this exact
 data in Postgres (`search_execution_history`, `get_run_detail`, raw SQL
-arms) — exposing exec search to service callers widens nothing. Human/browser
-tokens get no exec surface at all until T2 token scopes make bucket grants
-real; that single dependency swap is the future "expose to humans" change.
+arms) — exposing exec search to service callers widens nothing. Human
+exposure was settled 2026-10-19 (§10 exec-view decision): a separate
+owner-allowlisted router, not a dependency swap on these routes —
+`/api/exec/*` stays `require_service` permanently, and the bucket stays
+unregistered under every planned future.
 
 **`repos/aw-app-knowledgeable` (the Knowledgeable Connector, workspace
 side)** — the worker, matching Frederico's 2026-10-12 direction that the
@@ -337,8 +344,9 @@ today — every tenant caller gets every registered bucket. So:
    every vault secret on every 10-minute sync tick is impossible through
    that gate and wrong around it — see §10 for the two rejected
    alternatives. The containment for a vault-credential miss is §6 point 2's
-   population-equivalence argument, which holds in v1 regardless of which
-   store a secret lives in.
+   population-equivalence argument, which holds under the pinned reader
+   population (service callers, plus §10 exec-view's owner-allowlisted
+   operators) regardless of which store a secret lives in.
 
    **What replaces the lost guarantee — a tested, monitored requirement,
    not a coincidence:**
@@ -365,15 +373,26 @@ today — every tenant caller gets every registered bucket. So:
      `exact_match_unavailable` in `exec_sync.py`.)
 2. **Residual risk stated plainly:** pattern scrubbing is best-effort; a
    pasted credential with no recognisable shape survives it. The layers that
-   contain that miss: the reserved unregistered bucket (no human-reachable
-   read path, §4), service-caller-only routes (v1), disjoint labels and
-   zero cross edges (§7), and no published Neo4j port. A scrubber miss is
-   then exposed only to callers who already have the service secret — the
-   same population that can already read the unscrubbed original in
-   Postgres. That equivalence is the actual safety argument; scrubbing is
-   what keeps it from degrading when T2 later widens the audience, and what
-   keeps backups/dumps (which leave the box for S3) from carrying live
-   tokens.
+   contain that miss: the reserved unregistered bucket (generic surfaces can
+   never return an exec node, §4), a pinned reader population (service
+   callers, plus — once §10's exec-view ships — owner-allowlisted humans
+   only), disjoint labels and zero cross edges (§7), and no published Neo4j
+   port. The population-equivalence argument, in its general form: **every
+   authorized reader of exec text can already read the unscrubbed original
+   in Postgres** — service callers because they hold the service secret,
+   exec-view humans because the allowlist admits only operators who hold
+   host root, vault approval authority and the service secret in their own
+   config. A scrubber miss therefore grants nothing to anyone who didn't
+   already have it. "Service callers only" was the v1 *instance* of that
+   invariant, never the invariant itself. That equivalence is the actual
+   safety argument; scrubbing is what keeps it from degrading if the
+   audience ever widens beyond that set (§11), and what keeps backups/dumps
+   (which leave the box for S3) from carrying live tokens. What the human
+   surface does change, stated rather than waved away: membership in the
+   reader set becomes stealable as a browser session (`aw_id_jwt`, on a
+   publicly reachable origin) rather than only as a server-side secret —
+   contained by §10 exec-view point 4's rendering shape, which bounds what
+   a stolen session exfiltrates casually.
 3. **Tool-call hygiene:** `args_text` for secret-handling tools
    (`read_secret`, `collect_secret`, `write_secret`) is dropped wholesale,
    not scrubbed — name and timestamp load, arguments never do.
@@ -492,7 +511,104 @@ recoverable forward: wipe-and-backfill, since the graph is a projection.
 
 ---
 
-## 10. Rejected alternatives
+## 10. Decisions and rejected alternatives
+
+### Decision 2026-10-19 — the human surface ships as **exec-view**: owner-allowlisted, no bucket registration, digests stay shelved
+
+Card `3fd5bf3b-9510-818d-8801-ce4061140cfa` (the UI card) is §11's reopen
+trigger #1 fired, and this section settles it (Architect run
+`eb44177852ba4e068a8cba6fca8beebc`). The finding that settles it: **§6
+point 2's argument was never "service callers only" — it is "every
+authorized reader can already read the unscrubbed original."** Service-only
+was the v1 instance of that invariant. The UI ships by preserving the
+invariant under a new instance, not by weakening it:
+
+1. **A dedicated human-facing router** (working name `exec-view`) in
+   `backend/app/api/`, joining the shared gate list like every router
+   (`api/__init__.py`), plus its own dependency: an authenticated identity
+   whose `sub` is on a new `KNOWLEDGEABLE_EXEC_VIEWER_SUBS` allowlist. A
+   boot-time validator (same home and shape as `config.py:382`'s owner-subs
+   validator) refuses to start unless exec-viewer subs ⊆
+   `KNOWLEDGEABLE_OWNER_SUBS`. The subset relation IS the equivalence
+   argument made machine-checkable: an exec viewer must be an operator who
+   already resolves to the service tenant (`resolve_tenant_id`,
+   `core/identity.py:256-257`) and already holds the estate. An
+   authenticated non-allowlisted human gets **404** (existence hidden, the
+   `_bucket_denied` convention), covered by a K7 extension.
+2. **The backend is the proxy.** The router calls `core/exec_history.py` /
+   the `exec_*` catalog templates directly under the request's own
+   `tenant_scope()`. No service secret in the browser — and none needed
+   server-side either, so there is nothing for the frontend to hold.
+   `/api/exec/*` stays `require_service`, untouched.
+3. **The bucket is never registered — including for this.** T2 token scopes
+   are not a prerequisite, and bucket registration is not the exposure
+   mechanism (rejected below). K7's underscore-rejection guard and its
+   zero-exec-through-generic-surfaces proofs stay exactly as they are; the
+   new router is *added to* K7, it does not renegotiate K7.
+4. **What the UI renders:** search/list views render metadata plus the
+   matched-field snippet (`matched_field` is already on every row,
+   `mcp/client.py:602-606`; default `search_in='both'`, with the toggle
+   exposed because the name/args distinction changes answers). Full
+   scrubbed `input_text`/`output_text` renders only on an explicit per-run
+   detail view (the `exec_run_detail` mirror). No bulk-text list mode, no
+   export endpoint. This bounds what a stolen owner session exfiltrates
+   casually — exposure shaping layered on the allowlist boundary, not a
+   substitute for it. The UI also carries the MCP tools' two honesty
+   constraints: `CHILD_OF` understates lineage across wakeups (4 shown
+   where 11 are real), and "how many runs called tool X" must show its
+   predicate or the breakdown, never one confident number.
+5. **The door that stays closed:** any reader who cannot already read
+   unscrubbed Postgres breaks the equivalence. Widening the audience past
+   the operator allowlist therefore requires reviving the digest runner-up
+   *first* — that is now the §11 trigger, and the subset validator turns an
+   attempted quiet widening into a refused boot.
+
+Rejected alternatives, 2026-10-19 (this decision):
+
+- **Option A — reviving the digest runner-up before the UI ships.** The
+  21/21 coverage registry does not cure the digest approach's recorded
+  objections: digests still must be computed where plaintext lives (the
+  brute-forceable vault endpoint), and write-time capture still silently
+  misses out-of-band writes — the same silent-divergence family as the bug
+  that created the vault-coverage card. What the registry *does* change is
+  the digests' marginal value, downward: with every vault name mapped to a
+  tested pattern family, uncovered names alarmed through a doctor check
+  proven to fire and clear, and `VAULT_REVIEWED_NOT_CREDENTIAL` empty, the
+  residual gap digests would close is a value whose real shape diverges
+  from its registry-declared family, or a credential living in neither
+  store — and the pinned reader population already contains both cases.
+  Buying the most expensive defence for the thinnest residual slice stays
+  rejected. Still the named runner-up; its revive-trigger is now sharper
+  (§11: audience beyond the operator allowlist).
+- **Option B as framed — "pattern coverage alone is sufficient for a
+  human-facing surface."** Not signed, and deliberately so: pattern
+  scrubbing is best-effort by §6 point 2's own words, and no improvement in
+  coverage makes it sufficient for an audience that couldn't otherwise read
+  the source rows. What makes the surface shippable now is not that the
+  patterns got good enough — it is that the audience can be pinned to a
+  population for which equivalence holds, with coverage gaps degrading
+  visibly instead of silently. Coverage is supporting, never sufficient.
+- **T2 per-token scopes + registering the bucket as the human-exposure path
+  (what §11 originally assumed).** Registration is exposure to the wrong
+  population: it puts exec nodes in reach of the bucket-scoped generic
+  templates for co-tenant callers — exactly what K7 forbids — and forces
+  renegotiating the underscore guard, while also gating Frederico's request
+  on T2, which does not exist. The dedicated router reaches named humans
+  without touching the bucket machinery at all; the unregistered
+  reservation survives its first human surface intact.
+- **"A view plus an auth gate" — any authenticated co-tenant human.**
+  Breaks population equivalence: an authenticated human who is not an
+  operator cannot read unscrubbed Postgres, so a scrubber miss would grant
+  them something new. Rejected regardless of the gate mechanism's strength
+  — the argument is about who may be in the population, not about who
+  holds the password.
+- **Not shipping the UI at all.** A legitimate reading of trigger #1,
+  rejected because it treats the trigger as a veto when it is a design
+  obligation: the equivalence argument survives under the operator
+  allowlist, Frederico asked for the surface explicitly, and deferral buys
+  no safety the subset validator doesn't already enforce.
+
+### Rejected alternatives (2026-10-18, the original design)
 
 - **Separate Neo4j instance per use (the Coordinator's position).** Overruled
   by Frederico; recorded as the named runner-up, and it remains the designed
@@ -554,16 +670,27 @@ recoverable forward: wipe-and-backfill, since the graph is a projection.
   recreates the exact silent-divergence failure the 2026-10-19 card was
   about. The marginal win over tested patterns is only the
   no-recognisable-shape case, which §6 point 2's population-equivalence
-  argument already contains in v1. **Named runner-up:** this is the
-  approach to revive if the equivalence argument breaks — see §11.
+  argument already contains. **Named runner-up:** this is the approach to
+  revive if the reader population ever widens beyond the operator
+  allowlist — see §11, and the 2026-10-19 decision above, which re-examined
+  and kept this rejection when trigger #1 fired.
 
 ## 11. What this makes harder later
 
-- **Exposing exec search to humans** requires T2 per-token bucket scopes
-  first, then registering the bucket — at which point §4's
-  underscore-rejection guard and K7 must be consciously renegotiated. The
-  v1 shape makes accidental exposure hard, which also makes deliberate
-  exposure a real (small) project.
+- **Exposing exec search to humans** was settled 2026-10-19 (§10 exec-view
+  decision): a dedicated owner-allowlisted router, not
+  T2-plus-bucket-registration — the bucket stays unregistered and K7's
+  guards stay unrenegotiated. What stays hard, deliberately: widening the
+  audience beyond the operator allowlist (anyone who cannot already read
+  unscrubbed Postgres) requires reviving the §10 digest runner-up first,
+  and the subset boot validator turns a quiet config widening into a
+  refused boot.
+- **exec-view couples "may see exec runs" to "is an owner":** the subset
+  validator means a future partial grant — a teammate who may browse runs
+  but must not inherit the owner tenant mapping of
+  `KNOWLEDGEABLE_OWNER_SUBS` — is impossible without either widening
+  owner-subs (wrong: it remaps their whole knowledge tenant) or reviving
+  digests and then decoupling the two lists (the designed path).
 - **Linking exec data to knowledge** (e.g. ON_CARD → Kanban-derived docs) is
   structurally forbidden by the zero-cross-edge rule; adding the first such
   edge reopens §7's traversal-containment argument entirely.
@@ -576,16 +703,19 @@ recoverable forward: wipe-and-backfill, since the graph is a projection.
 - **Vault credentials are pattern-scrubbed only (§6 point 1, corrected
   2026-10-19)** — the exact-match guarantee is permanently narrowed to the
   file store. Acceptable while §6 point 2's population-equivalence holds.
-  Three things would reopen it, in order of likelihood: (1) T2 exposes exec
-  search to human/browser tokens — the reader population then exceeds the
-  set who can read unscrubbed Postgres, the equivalence breaks, and the
-  digest approach (§10 runner-up) becomes worth its cost; (2) a vault
-  credential with no recognisable shape is measured transiting run text —
-  the "pattern coverage can be made a requirement" premise fails; (3) the
-  coverage registry rots in practice (unacknowledged vault names sitting in
-  doctor output) — evidence the manual registry doesn't scale, same
-  conclusion. Any of the three: revive the §10 digest runner-up rather than
-  re-arguing bulk vault reads.
+  Three things would reopen it, in order of likelihood: (1) the exec
+  reader population widens beyond the operator allowlist — anyone who
+  cannot already read unscrubbed Postgres. This is the surviving form of
+  the original trigger ("T2 exposes exec search to humans"), which fired
+  2026-10-19 via the UI card and was resolved by pinning the population
+  (§10 exec-view decision) rather than by digests; (2) a vault credential
+  whose real shape diverges from its registry-declared family — or that
+  lives in neither store — is measured transiting run text: the "pattern
+  coverage can be made a requirement" premise fails; (3) the coverage
+  registry rots in practice (unacknowledged vault names sitting in doctor
+  output — the doctor surface now exists and was proven to fire, so this
+  trigger is live rather than aspirational). Any of the three: revive the
+  §10 digest runner-up rather than re-arguing bulk vault reads.
 - **Secret-store consolidation got harder:** this section now documents
   "two stores, two different scrub guarantees" as intended. Anyone merging
   the file store and the vault later must update `exec_scrub`, the coverage
@@ -636,3 +766,29 @@ recoverable forward: wipe-and-backfill, since the graph is a projection.
    and `workspace_secret_values()` docstrings, which still claim "the set
    of known-live secret VALUES is enumerable" unqualified — scope the claim
    to the file store, mirroring this section.
+9. **exec-view (§10 decision) gates in the backend dependency, never the
+   frontend.** The SPA's AuthGate is presentation; the allowlist check is
+   the router dependency. The K7 extensions land in the same commit as the
+   router: a pinned endpoint list for the new router (the
+   test_exec_isolation.py:646 shape — and enumerating the router's own
+   routes, not `app.routes`, per commit 13507ab's lesson), an
+   authenticated-but-not-allowlisted human → 404 with the sentinel absent,
+   cross-tenant → nothing, and the generic surfaces still returning zero
+   exec nodes.
+10. **The subset validator is load-bearing, not decoration.** Exec-viewer
+    subs ⊆ owner subs is §6 point 2's equivalence argument in code; without
+    it, adding a viewer is a silent population widening. Refuse boot, same
+    pattern as config.py:382. It also bakes in a named coupling (§11):
+    granting exec-view requires owner-subs membership, which remaps that
+    person's entire knowledge tenant.
+11. **Single worker is still single.** exec-view search shares the one
+    production worker with sync and knowledge search: bound page sizes, no
+    unbounded run-text list rendering, detail view fetches one run.
+12. **Correct the stale "until T2" claims in the same change, in place.**
+    `api/exec_history.py`'s module docstring and `core/exec_history.py`'s
+    third bullet both still say humans get no exec surface "until T2
+    per-token bucket scopes make bucket grants real". After §10's decision
+    the true statement is: humans get no surface through *these* routes
+    ever; the human surface is the exec-view router, owner-allowlisted.
+    Rewrite the lines — this document has twice been bitten by a correction
+    appended below a stale claim.
