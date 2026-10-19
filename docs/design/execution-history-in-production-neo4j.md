@@ -1928,13 +1928,28 @@ its verdict alongside the cleared watermark.
 1. **`exec_sync_enabled` was flipped to `false` twice mid-backfill** (19:41
    and 19:47), each time stopping both the backfill and the live sync. The
    core did not restart; the writes landed through the normal app-config
-   path. The only candidate still running was the sibling card's slice-4
-   run, and a note is on that card. The backfill was hardened to re-assert
-   the flag before each tick rather than failing 35 times in a row the way
-   the first attempt did. Worth recording as a hazard of the shared estate:
-   **a config flag that gates a long unattended pass needs re-asserting, not
-   just setting**, and a backfill loop that reads `blocked: true` as "keep
-   going" burns 35 ticks in 40 seconds and reports nothing.
+   path.
+
+   **Corrected after the fact (2026-10-19, by the Source who owns this
+   card's sequencing): those flips were deliberate and correct.** A sibling
+   agent stopped the sync to protect a host disk at ~94 % falling ~2 GB/min
+   — an operational fact with no policy content, on a host where ENOSPC has
+   taken unrelated apps down before. It was not carelessness and not a
+   collision, which is what this entry originally assumed.
+
+   That inverts the lesson, so read the next sentence instead of the
+   original one. The honest finding is about the LOOP, not the flag: a
+   driver loop must distinguish `blocked: true` from progress, because one
+   that reads "blocked" as "keep going" burns 35 ticks in 40 seconds and
+   reports nothing — which is what the first attempt did. But **"re-assert
+   the flag before each tick" is NOT a lesson to generalise**: a flag that
+   gates an expensive pass is also the kill switch someone else may be
+   pulling on purpose, and a loop that re-asserts it unconditionally
+   defeats a safety intervention it cannot see. Nothing shipped does this
+   (the re-asserting driver was a throwaway script under `.tmp/slice3/`,
+   never connector code). A loop that must survive a flip should surface
+   the flip and stop, or re-assert only after confirming the reason is
+   gone.
 2. **The `url-userinfo` family's "the host survives" promise does not hold
    for a git remote whose USERNAME contains `token`.**
    `https://x-access-token:SECRET@github.com/o/r` is matched by
