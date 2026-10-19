@@ -1,17 +1,11 @@
 # Execution history in the production Neo4j — tenant isolation design
 
-Status: **implemented, flag-off (2026-10-18).** Steps 1 and 2 of §9's
-migration have landed on master; step 3 (flag on, backfill, reconcile green)
-and step 4 (agent-facing MCP tools) are deliberately operator decisions and
-have NOT been taken. Nothing is written to the production graph until
-`exec_sync_enabled` is set true.
-
-**Correction, 2026-10-19 (card `3fe5bf3b-9510-8119-80e5-ebc2b27c7740`):** the
-line above is stale. §9 step 3 was taken — `exec_sync_enabled` has been
-`true` in production for hours, independently measured by two agents
-(27,887 `ExecRun` nodes, a fresh sentinel). **Status is now: implemented,
-flag ON (2026-10-19).** Step 4 (agent-facing MCP tools) remains a separate,
-not-yet-taken operator decision.
+Status: **implemented, flag ON. Step 4 (agent-facing MCP tools) shipped in
+v0.48.0, 2026-10-19.** All four steps of §9's migration have landed:
+`exec_sync_enabled` is `true` in production (independently measured by two
+agents — 27,887 `ExecRun` nodes, a fresh sentinel), and the agent-facing MCP
+tools (`search_execution_graph`, `exec_run_detail`) shipped in v0.48.0 (card
+`3fd5bf3b-9510-819f-8370-e80d964590d3`).
 
 Where it landed, against §4: `repos/aw-knowledgeable/backend/app/core/graph.py`
 (constraints, two fulltext indexes, the `exec_*` templates, `EXEC_BUCKET`),
