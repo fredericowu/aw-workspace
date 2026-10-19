@@ -6,6 +6,13 @@ and step 4 (agent-facing MCP tools) are deliberately operator decisions and
 have NOT been taken. Nothing is written to the production graph until
 `exec_sync_enabled` is set true.
 
+**Correction, 2026-10-19 (card `3fe5bf3b-9510-8119-80e5-ebc2b27c7740`):** the
+line above is stale. §9 step 3 was taken — `exec_sync_enabled` has been
+`true` in production for hours, independently measured by two agents
+(27,887 `ExecRun` nodes, a fresh sentinel). **Status is now: implemented,
+flag ON (2026-10-19).** Step 4 (agent-facing MCP tools) remains a separate,
+not-yet-taken operator decision.
+
 Where it landed, against §4: `repos/aw-knowledgeable/backend/app/core/graph.py`
 (constraints, two fulltext indexes, the `exec_*` templates, `EXEC_BUCKET`),
 `backend/app/core/exec_history.py` + `backend/app/api/exec_history.py` (the
