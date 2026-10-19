@@ -10,7 +10,11 @@ secret-tool args drop never fired for gateway-prefixed tool names.
 was 34 `write_secret` rows, not the three §13.2 first named. **Slice 1 (the
 `ExecEvent` mechanism + the 13 structured/low-risk kinds) shipped
 2026-10-19** — 108,487 events projected, graph == SQL per kind, measured
-outcome in §13.13.** Measured
+outcome in §13.13. **Slice 2 (`thinking` + `node_end`) shipped 2026-10-19**
+— 144,153 == 144,153, §13.14. **Slice 3 (`tool_result` as
+`ExecToolCall.result_text`) shipped 2026-10-19 — the projection is
+COMPLETE**: 264,967 results projected, 138 secret-tool results dropped,
+reconcile 10/10 exact, §13.15.** Measured
 2026-10-19: `exec_sync_enabled` true, ~27,970 `ExecRun` / ~288,013
 `ExecToolCall`, sentinel fresh, degraded false. The MCP tools
 (`search_execution_graph`, `exec_run_detail`, card
@@ -1780,3 +1784,157 @@ call inside `exec_sync.attach_results`), then ONE
 `marketplace install knowledgeable --update` carrying both, then the
 `reset-watermark` backfill off-hours, then §13.16. Nothing in slice 3 needs
 re-doing to get there.
+
+**The index build cost, measured: 54 ms.** The `CREATE FULLTEXT INDEX
+exec_toolcall_result` statement and the three `IF NOT EXISTS` no-ops around
+it occupied 19:28:28,257 → 19:28:28,311 in the container's own boot log, and
+`exec_toolcall_text` stayed `ONLINE`/100 % throughout. The reason the feared
+build was free is worth writing down rather than filing under luck: the
+index was created over a label whose `result_text` property **did not exist
+on a single one of the 292,310 nodes yet** (Neo4j's own warning said so),
+so Lucene had no text to analyse — the statement was a label scan, not an
+indexing pass. §13.12 point 4's caution was right to demand the baseline and
+the off-hours slot; what it could not know is that index creation and data
+arrival were separable here, and separating them is what made the trap
+cheap. A future index over an already-POPULATED property has no such escape.
+
+**Backfill.** `reset-watermark` (preflight: ok, 30.7 GB free) + bounded
+2,000-run ticks, drained on **watermark-at-present** per §13.13's gotcha,
+never on `runs == 0`. 14 productive ticks over ~21 minutes walked the
+watermark from null → the present, then settled into the documented 2-tick
+oscillation (19:25:07 ↔ 19:45:57 — and the lower bound is literally the
+`started_at` of a concurrent still-running agent run, which is the 48 h
+re-sweep doing exactly what `_watermark_of` says it does).
+
+**Counts after the backfill drained:**
+
+| quantity | measured |
+|---|---|
+| `ExecToolCall` nodes | 292,821 |
+| carrying `result_text` | **264,967** |
+| paired (`result_ts` set) | 265,091 |
+| secret-tool results DROPPED | **138** |
+| results truncated by the cap | **6,969** (2.6 %) |
+| longest result (`result_len`) | **20,966** chars |
+| stored result text | **538.6 M chars** |
+| results carrying a `<REDACTED:…>` marker | **13,698** |
+
+**The reconcile is 10/10 EXACT — better than slices 1 and 2, and the
+difference is an operational finding, not luck.** Both earlier slices
+recorded an `ExecToolCall` off-by-N and filed it as "the two counts are read
+at different instants". Measured properly this time: the gap is
+monotonically *growing* between ticks (12, then 14 a minute later, with the
+graph side unchanged) because SQL accrues tool calls continuously while the
+graph only advances when a tick runs. It is **sync lag, not read skew**, and
+running one tick immediately before the reconcile closes it to zero on every
+row. That is now the documented way to read this reconcile; a non-zero
+`ExecToolCall` row means "a tick is due", and only a gap that survives a
+fresh tick is drift.
+
+**Two measurements that correct this section's own earlier numbers.**
+
+1. **The stored text is ~1.5× the "raw payload" figure, not equal to it.**
+   §13.7 sized slice 3 from `sum(pg_column_size(payload))` = 357 MB, but
+   `pg_column_size` on a `json` column returns the **TOAST-compressed**
+   size. The projected text measures 538.6 M characters. The store estimate
+   (~0.8–1.2 GB with Lucene) still holds — `/data` is the thing to watch and
+   it is in that band — but anyone sizing a future text slice from
+   `pg_column_size` should multiply, not copy.
+2. **The cap fires, and the maximum is exactly where §13.1 measured it.**
+   6,969 results (2.6 %) were truncated and the longest pre-cap result was
+   20,966 chars — against §13.1's measured 20.7 KB maximum. This is the only
+   cap in the whole feature that has ever fired: slices 1 and 2 recorded zero
+   truncations. So §13.4's "exists for the unbounded tail" is, for this one
+   kind, "exists for 2.6 % of rows".
+
+**The secret-tool result drop, verified on production rows rather than in a
+fixture.** 138 secret-tool calls carry `result_dropped: true` and **zero**
+carry any `result_text` — including the 124 of them whose result row DID
+exist in Postgres and was therefore paired and then dropped, which is the
+case that distinguishes a working drop from a call that simply never
+returned. Spot-checked through the real `exec_run_detail` MCP tool on run
+`5376254f7c1d452682bc50dabba75b15` (15 secret-tool calls, every one
+`args_text: null`, `result_text: null`, `result_dropped: true`, `result_ts`
+present) while a neighbouring `Bash` call on the same run carries its result
+normally.
+
+**And the rule did not over-reach**, which matters as much: `list_secrets`
+— 152 calls, name ends in `_secrets`, returns secret NAMES and no values —
+is correctly NOT a secret tool, and 133 of its results are projected. The
+terminal-segment rule is segment EQUALITY against the four names, so a
+near-miss neighbour keeps its retrieval value (the same property the
+`spread_secret`/`misread_secret` tests pin negatively).
+
+**`search_in='result'` works through the real MCP surface.** Queried
+"unsupported Unicode escape sequence" and got scored hits with
+`matched_field='result_text'`, match-centred snippets and `result_len` —
+and what came back was this very design's own `UntranslatableCharacter`
+incident (`payload->>` against a NUL-bearing `json` column) as captured in
+a Bash result from 2026-10-18. The retrieval gap the card opened with ("what
+did that run actually learn" is often only answerable from results) is
+closed on exactly the kind of question it was opened for.
+
+**QA's slice-2 finding is fixed and verified in the serving process**, not
+just in the diff: the app's own `/mcp` `tools/list` no longer contains the
+string "not yet projected" for either tool, `search_in`'s enum is
+`[name, args, result, both]`, and `exec_run_detail`'s description now reads
+"COMPLETE as of §13 slice 3" and documents the three distinct reasons a
+`result_text` can be absent.
+
+**Tests.** Connector 691 passed (31 of them new for this slice: the pairing
+across the two key names, the per-run key scoping, the drop over the bare
+name plus all three measured gateway spellings, the straddle-the-cap
+credential test at `RESULT_TEXT_MAX`, result-shaped scrub fixtures, the
+NUL strip, the "tool_result still gets no text through `build_event_row`"
+gate, and the preflight's four cases). `aw-knowledgeable` backend 908
+passed, 1 pre-existing unrelated failure
+(`test_k1_every_get_route_is_classified` — the SPA-dist `/{full_path:path}`
+route, always red locally and blind in CI; the new exec route IS classified
+in `GET_ROUTE_PLAN`). Frontend 7 vitest passed, `tsc` clean. Two mutations
+run and measured rather than claimed: deleting `result_text = None` from
+`normalize_toolcall`'s secret-tool branch turns 8 K7 tests red while the
+args-only tests stay green; removing `exec_search_toolcall_results` from
+`_EXEC_FULLTEXT_TEMPLATES` fails the KNOWLEDGE ANN guard on the missing
+collection predicate, which is §13.12 point 7's mechanism working as
+designed rather than as a reminder.
+
+**The retention valve and the preflight are proven by test, deliberately,
+and that is the honest scope.** The valve is irreversible in the graph until
+a re-backfill, so its three arms are exercised in K7 against a throwaway
+Neo4j (`test_k7_retention_valve_nulls_old_args_text_and_keeps_the_metadata`
+now asserts `{args_text: 1, result_text: 1, event_text: 1}` with the
+structured-only event correctly NOT counted) and never against the
+production corpus. The preflight likewise: `disk_preflight` takes the
+measurement as an argument so the low-disk and failed-measurement branches
+are tested with invented numbers instead of by filling a host. What IS
+verified live is the passing path — the status surface reports
+`{ok: true, free_gb: 30.1, min_free_gb: 25}` and `reset-watermark` returned
+its verdict alongside the cleared watermark.
+
+**Found during the delivery, and neither is a defect in this slice:**
+
+1. **`exec_sync_enabled` was flipped to `false` twice mid-backfill** (19:41
+   and 19:47), each time stopping both the backfill and the live sync. The
+   core did not restart; the writes landed through the normal app-config
+   path. The only candidate still running was the sibling card's slice-4
+   run, and a note is on that card. The backfill was hardened to re-assert
+   the flag before each tick rather than failing 35 times in a row the way
+   the first attempt did. Worth recording as a hazard of the shared estate:
+   **a config flag that gates a long unattended pass needs re-asserting, not
+   just setting**, and a backfill loop that reads `blocked: true` as "keep
+   going" burns 35 ticks in 40 seconds and reports nothing.
+2. **The `url-userinfo` family's "the host survives" promise does not hold
+   for a git remote whose USERNAME contains `token`.**
+   `https://x-access-token:SECRET@github.com/o/r` is matched by
+   `credential-field` first (it is ordered ahead of `url-userinfo`), which
+   eats the rest of the line including the host. The credential is removed
+   either way; what is lost is the repo name. Pinned as an assertion in
+   `test_exec_sync.py` so a future reordering of `_PATTERNS` surfaces as a
+   test change rather than silently.
+
+**Known gap, stated rather than papered over:** `exec-view`'s own
+`/search/tool-calls` (the human surface) was NOT given a `result` arm. Its
+run-detail view renders `result_text` in full, which is §10 point 4's rule
+working, so an operator can READ results but cannot SEARCH them from the
+UI. Deferred deliberately: a backend arm no frontend calls is dead code, and
+the frontend search control is a UI change this slice was not scoped for.
