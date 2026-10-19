@@ -14,7 +14,7 @@ outcome in §13.13. **Slice 2 (`thinking` + `node_end`) shipped 2026-10-19**
 — 144,153 == 144,153, §13.14. **Slice 3 (`tool_result` as
 `ExecToolCall.result_text`) shipped 2026-10-19 — the projection is
 COMPLETE**: 264,967 results projected, 138 secret-tool results dropped,
-reconcile 10/10 exact, §13.15.** Measured
+reconcile 10/10 exact, §13.15. Measured
 2026-10-19: `exec_sync_enabled` true, ~27,970 `ExecRun` / ~288,013
 `ExecToolCall`, sentinel fresh, degraded false. The MCP tools
 (`search_execution_graph`, `exec_run_detail`, card
@@ -1529,27 +1529,36 @@ Full `aw-knowledgeable` backend suite: 897 passed, 1 pre-existing unrelated
 failure (`test_k1_every_get_route_is_classified`, documented elsewhere as
 always red locally — SPA-dist routing, blind in CI).
 
-### 13.15 Slice 3 built, server live, connector HELD — measured outcome (2026-10-19)
+### 13.15 Slice 3 shipped — measured outcome (2026-10-19)
 
-**Read the status line first: this slice is deliberately not projecting
-anything yet.** Built and pushed in full; the server half is deployed and
-verified live; the connector half is released-but-**not installed**, by an
-explicit hold from `telegram-opus-aw`, the Source that owns this card's
-sequencing. The hold is not a defect in this slice and not a scope cut —
-it is a dependency this slice's own design did not price, found by someone
-reading both designs at once.
+**Final state: shipped and projecting.** Server deployed and verified live,
+connector released AND installed (**v0.62.0**), backfill drained to the
+present, reconcile 10/10 exact — the Event-timeline projection is COMPLETE.
+The measured numbers are in **Counts after the backfill drained** below.
 
-Delivered:
+**Read this section in two passes, because it was written in two.** The
+block immediately following records the state at the moment of the release,
+when the connector was deliberately **HELD** — released but not installed —
+by `telegram-opus-aw`, the Source that owns this card's sequencing. That
+hold was lifted the same day once the sibling card's slice 4 landed, and one
+`marketplace install knowledgeable --update` then carried both halves, as
+planned. The hold block is kept rather than deleted: it is the record of why
+the deploy order paid off twice, and of a dependency this slice's own design
+did not price. Everything in it is past tense as of the install; where it
+says something is "deferred" or "still ahead", the measured tail of this
+same section is where that work was actually done.
+
+Delivered at the release (pre-install):
 
 * `aw-knowledgeable` commit `4ecf63d` — **deployed and live**: the five
   `result_*` properties, the `exec_toolcall_result` index, the
   `search_in='result'` route + template, the valve's two new arms, K5+K7 in
   the same commit. Safe to be live alone, and that is the whole point of the
   deploy order: a service that accepts a field nobody sends is a no-op.
-* `aw-app-knowledgeable` commit `f5fc32e` — **pushed, release cut, NOT
-  installed**: pairing, the result drop, the scrub+cap, the disk preflight,
-  the MCP surface. The installed version in this workspace remains
-  **v0.61.0**, which contains none of it.
+* `aw-app-knowledgeable` commit `f5fc32e` — at that moment **pushed, release
+  cut, NOT installed**: pairing, the result drop, the scrub+cap, the disk
+  preflight, the MCP surface. The installed version in this workspace was
+  still **v0.61.0**, which contained none of it. It is **v0.62.0** now.
 
 **Why the hold, in the Source's own terms.** `result_text` is where a
 tool's OUTPUT lands, and the sibling card's per-tool **output axis**
@@ -1587,16 +1596,16 @@ Both questions have exact answers, and they matter because the two differ:
   historical ones. Those move only under the explicit
   `reset-watermark` backfill.
 
-The operational conclusion: **install is the only clean gate.** Not
-installing is sufficient and is what is in force. But if the connector were
-installed, the gate would have to be the first tick rather than the
-backfill — the contributed scheduled task fires every 10 minutes with no
+The operational conclusion, which is why the hold was expressed as "do not
+install" rather than "do not backfill": **install is the only clean gate.**
+Once the connector is installed the gate becomes the first tick rather than
+the backfill — the contributed scheduled task fires every 10 minutes with no
 further command from anyone, and the only switch short of that is
 `exec_sync_enabled=false`, which stops the entire projection rather than
 just results.
 
-**Evidence that nothing is projecting, measured in the live container
-rather than inferred:** `MATCH (tc:ExecToolCall {bucket:'_exec-history'})
+**Evidence that nothing was projecting at that point, measured in the live
+container rather than inferred:** `MATCH (tc:ExecToolCall {bucket:'_exec-history'})
 WHERE tc.result_text IS NOT NULL RETURN count(tc)` → **0**, against 292,325
 `ExecToolCall` nodes. The live v0.61.0 connector sends no `result_text`, so
 the deployed `normalize_toolcall` writes null over null on every row its
@@ -1606,8 +1615,9 @@ construction, not by luck.
 **The Event-timeline projection is code-complete with this slice**, with one
 permanent exception (`llm_token`, excluded by the timeline's own upstream
 definition) and one relocation (`tool_result` rides `ExecToolCall`, not
-`ExecEvent`). It is not yet *live-complete*, and §13.16 — written after the
-joint install — is where the end-to-end numbers belong.
+`ExecEvent`). It was not *live-complete* at that point; it became so after
+the joint install, and the end-to-end numbers are in this section's tail
+rather than in a separate §13.16.
 
 **Deploy order, proven again — and the hold is why it paid off twice.**
 Server first and alone, connector second via `app-release.yml`, backfill
@@ -1647,8 +1657,8 @@ analyse, so the `CREATE` is a label scan and not a text-indexing job:
 within the deploy's own health gate. So the §13.12 point 4 warning is
 correct about the general case and was defused in this one BY the deploy
 order — the expensive build is not the `CREATE`, it is the first backfill
-that writes ~290k text values into it. That is still ahead, and still
-off-hours work.
+that writes ~290k text values into it. That backfill ran the same evening —
+see **Backfill** below.
 
 It is a NEW index and emphatically not a widening of `exec_toolcall_text`:
 adding `tc.result_text` to that index's `ON EACH` would drop and rebuild
@@ -1755,13 +1765,14 @@ Satisfied now, without needing the connector installed:
   post-filter bucket against $bucket_ids`). That is §12 risk 1 working as
   designed.
 
-**Deferred to the joint install, and deferred rather than skipped** — every
-one of these needs the connector running, so none of them can be faked
-from here: `result_text` populated and paired on a known run via
+**Deferred to the joint install at that point, and deferred rather than
+skipped — all of it verified after the install, in this section's tail.**
+Every one of these needed the connector running, so none could be faked
+from there: `result_text` populated and paired on a known run via
 `exec_run_detail`; a real hit through `search_in='result'`; the spot-check
 that a live `write_secret`/`collect_secret` node has no `result_text`;
 `orphan_results` measured against the 483-call gap; the reconcile after the
-backfill; and the §13.16 end-to-end numbers. The `search_in='result'` arm
+backfill; and the end-to-end numbers. The `search_in='result'` arm
 has been exercised against a seeded graph through the real route (K7's
 positive control), so what is unverified is the live corpus, not the code
 path.
@@ -1778,12 +1789,13 @@ useful half"), so the test asserts the real behaviour and says so, which
 means a future reordering of `_PATTERNS` shows up as a changed assertion
 instead of silently.
 
-**What a reader of this section should do next:** slice 4 of
+**What that block said to do next, and what then happened:** slice 4 of
 `exec-index-per-tool-policy.md` (the output axis, whose wiring point is one
 call inside `exec_sync.attach_results`), then ONE
 `marketplace install knowledgeable --update` carrying both, then the
-`reset-watermark` backfill off-hours, then §13.16. Nothing in slice 3 needs
-re-doing to get there.
+`reset-watermark` backfill off-hours. That is the sequence that ran, in that
+order, with nothing in slice 3 re-done to get there. Everything below is
+post-install measurement.
 
 **The index build cost, measured: 54 ms.** The `CREATE FULLTEXT INDEX
 exec_toolcall_result` statement and the three `IF NOT EXISTS` no-ops around
