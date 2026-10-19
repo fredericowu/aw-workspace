@@ -5,7 +5,9 @@ surface is decided (§10 exec-view, 2026-10-19) and build-pending. The full
 Event-timeline projection (all 17 kinds) is designed in §13 (2026-10-19,
 card `3fe5bf3b-9510-81d0-a0de-ea04b0e9cd46`) with a per-kind verdict table,
 and §13.2 records a live scrubbing hole found during that design — the
-secret-tool args drop never fired for gateway-prefixed tool names.** Measured
+secret-tool args drop never fired for gateway-prefixed tool names.
+**Slice 0 (§13.2's fix + purge) shipped 2026-10-19**; the measured exposure
+was 34 `write_secret` rows, not the three §13.2 first named.** Measured
 2026-10-19: `exec_sync_enabled` true, ~27,970 `ExecRun` / ~288,013
 `ExecToolCall`, sentinel fresh, degraded false. The MCP tools
 (`search_execution_graph`, `exec_run_detail`, card
@@ -410,7 +412,12 @@ today — every tenant caller gets every registered bucket. So:
    never fired for a single real MCP-routed call, and vault-only secret
    values written via `write_secret` landed in the graph in plaintext. The
    fix (suffix-segment matching, both copies, plus a purge of the already
-   landed rows) is §13.2 / slice 0 of the timeline projection.
+   landed rows) is §13.2 / slice 0 of the timeline projection, **shipped
+   2026-10-19**: `exec_scrub.is_secret_tool` / `tool_name_segment` in the
+   connector, the same pair in aw-knowledgeable's `core/exec_history.py`,
+   and `POST /api/exec/purge-secret-args` over the
+   `exec_drop_secret_toolcall_args` template for the rows that had already
+   landed.
 
 ---
 
@@ -875,21 +882,64 @@ plaintext** (secret names: `zadarma_account_password`, `mac_home_vnc_password`,
 here). The triple hole is exactly the class this card's security analysis
 feared, found already live in the narrow tool_call projection.
 
+**Measured exactly when slice 0 shipped (2026-10-19): 34 rows, not three.**
+`search_execution_graph(q='write_secret', search_in='name')` returns 34
+`ExecToolCall` rows with `args_text` present (`possibly_truncated: false`),
+spread over all three prefixes — `mcp__aw-gateway__aw__…` 29,
+`aw-gateway.aw__…` 4, `mcp__workspace-gateway__aw__…` 1. Eleven distinct
+real credential names beyond the three above, several with multiple
+superseded generations; six throwaways with invented values. The names are
+enumerated on the rotation card (`3fe5bf3b-9510-811a-9454-f2eac2acc2b4`),
+never the values. Worth stating plainly because "at least three" read as a
+bounded incident and it was an order of magnitude larger — the sentence that
+was accurate about what had been *seen* was not a count.
+
+The other three names in `SECRET_TOOL_NAMES` are a far smaller exposure by
+shape, and that is an argument for purging them anyway rather than against:
+`read_secret`/`delete_secret` arguments carry a secret NAME, and
+`collect_secret`'s carry a request id. The value lives in the RESULT, which
+slice 3 is what drops.
+
 Containment honesty: §6 point 2's equivalence holds — every authorized graph
 reader could already read these in Postgres — so no NEW population gained
 access. What changed is durability (graph + backups). Remediation:
 
-1. **Fix (slice 0, ships before everything):** match the terminal segment —
-   the substring after the last `__` or `.` — against `SECRET_TOOL_NAMES`,
-   in BOTH copies (connector `exec_scrub.scrub_tool_args` and
-   aw-knowledgeable's server-side refusal in `core/exec_history.py`), with
-   tests pinning all three measured spellings plus the bare name.
-2. **Purge:** a one-off catalog template nulling `args_text` on every
-   ExecToolCall whose name's terminal segment is a secret tool (the
+1. **Fix (slice 0, ships before everything) — SHIPPED 2026-10-19:** match
+   the terminal segment — the substring after the last `__` or `.` —
+   against `SECRET_TOOL_NAMES`, in BOTH copies (connector
+   `exec_scrub.scrub_tool_args` and aw-knowledgeable's server-side refusal
+   in `core/exec_history.py`), with tests pinning all three measured
+   spellings plus the bare name.
+
+   Landed as a `tool_name_segment` + `is_secret_tool` pair in each repo,
+   duplicated rather than shared for the same reason `SECRET_TOOL_NAMES`
+   already is (the connector is a plain HTTP client with no import of the
+   service's code). **Segment EQUALITY, not `endswith`** — the obvious
+   over-correction, and the one the tests in both repos pin negatively: a
+   hypothetical `spread_secret` / `misread_secret` ends with `read_secret`
+   and must keep its arguments. Both wrong rules (the old exact match, and
+   `endswith`) were confirmed to turn the new tests red.
+2. **Purge — SHIPPED 2026-10-19:** a catalog template nulling `args_text` on
+   every ExecToolCall whose name's terminal segment is a secret tool (the
    `exec_trim_toolcall_args` shape, name-predicated); re-verify by searching
    the graph for the affected rows. Postgres keeps the originals (§5);
    the next S3 dump after the purge no longer carries them — older dumps do,
    for their retention life.
+
+   Landed as `exec_drop_secret_toolcall_args` (batched, tenant+bucket in the
+   pattern, one `$bare` per call looped in Python so the segment-safe
+   predicate stays visible to a reader instead of hiding inside an `any()`
+   lambda), stamping `args_dropped_at` rather than the valve's
+   `args_trimmed_at` — a routine retention eviction and a remediated
+   exposure are different events and an operator reading a nulled row needs
+   to know which one it was. Exposed as service-authed
+   `POST /api/exec/purge-secret-args`, with a connector route
+   (`POST /api/apps/knowledgeable/exec-sync/purge-secret-args`) and
+   `aw-workspace-cli knowledgeable-exec-sync purge-secret-args` in front of
+   it. It takes no body on purpose: a caller-supplied name list would turn a
+   remediation into a general "null the args of any tool I name" primitive.
+   Idempotent, so it stays wired rather than being a one-off script — the
+   next addition to `SECRET_TOOL_NAMES` already has its backfill button.
 3. **Rotation is a separate security card** (filed with this design): the
    three named values must be treated as exposed — though their exposure
    population was always "anyone who can read AP-MT Postgres", the backups
