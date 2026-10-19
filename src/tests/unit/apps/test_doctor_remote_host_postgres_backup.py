@@ -9,6 +9,7 @@ would reproduce exactly the kind of silence this card exists to kill.
 """
 import json
 import os
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -29,7 +30,13 @@ def _write(status_dir, **fields):
 
 
 def test_fresh_backup_is_not_stale(status_dir):
-    _write(status_dir, slot="sunday", verified_at="2026-10-18T00:30:00Z",
+    # Must stay fresh (< 26h old) no matter when this test runs, so
+    # verified_at is pinned relative to the real clock at run time rather
+    # than to a literal date — the inverse of test_old_verified_at_is_stale's
+    # fixed-but-always-old literal below.
+    one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)
+                     ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    _write(status_dir, slot="sunday", verified_at=one_hour_ago,
            executions=25063)
     out = routes._remote_host_postgres_backup_status()
     assert out["present"] is True
