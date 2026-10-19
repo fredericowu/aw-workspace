@@ -1139,11 +1139,21 @@ selected RAW, parsed client-side by psycopg, NUL-stripped (`_clean`) —
   refusal, connector fetch/build/scrub for the 13 kinds, `error`/`log`
   planted-credential scrub tests, backfill, live count verification
   (~113k events vs SQL). Blocked on: nothing — this document is the decision.
-- **Slice 2 — the text kinds `thinking` + `node_end`:** registry rows flip
-  to `text`, planted-fake-credential tests per kind (including a
-  vault-style shapeless canary proving the §13.3 decision's stated residual
-  honestly), backfill (~37k events), live verification incl. a real
-  reasoning hit via the new `target='events'` arm. Blocked on: slice 1.
+- **Slice 2 — the text kinds `thinking` + `node_end`:** connector registry
+  rows flip `shipped` to `True` (verdict was already `text`), planted-fake-
+  credential tests per kind (including a vault-style shapeless canary
+  proving the §13.3 decision's stated residual honestly), backfill (~37k
+  events), live verification incl. a real reasoning hit via the new
+  `target='events'` arm. **Also requires the server-side mirror flip**
+  (`aw-knowledgeable`'s `SHIPPED_EVENT_KINDS`, §13.6 "Server-side mirror") —
+  found live during slice 2's build (2026-10-19) that an earlier dispatch
+  summary had wrongly called this "no server-side change needed"; the two
+  copies are deliberately symmetric (same pattern as `SECRET_TOOL_NAMES`),
+  and shipping the connector flip without it 400s every batch that reaches
+  a `thinking`/`node_end` row, hard-stalling the live sync watermark at that
+  point. Deploy order is load-bearing: server first (forward-compatible
+  no-op if the connector isn't live yet), connector second, backfill third.
+  Blocked on: slice 1.
 - **Slice 3 — `tool_result`:** result pairing in the connector, suffix-rule
   result DROP (+ server-side refusal of result text on secret-tool names),
   scrub + cap, `exec_toolcall_result` index (off-hours build),
@@ -1428,3 +1438,89 @@ before reading a backfill loop that waits for `runs == 0`: with any
 non-terminal run in the window, that condition never arrives, and "no runs
 due" is not the signal a backfill has drained. The watermark reaching
 today's timestamp is.
+
+### 13.14 Slice 2 shipped — measured outcome (2026-10-19)
+
+Delivered: `aw-knowledgeable` commit `76c2a54` (server-side `SHIPPED_EVENT_KINDS`
+mirror flip), connector `aw-app-knowledgeable` v0.60.0 (`15ad902`).
+
+**The server-side half was not optional, contrary to this document's own
+§13.9 at dispatch time.** Flipping only the connector's registry would have
+shipped `thinking`/`node_end` into every sync batch while
+`aw-knowledgeable`'s `SHIPPED_EVENT_KINDS` (its own §13.6 "server-side
+mirror") still refused both — a hard batch-abort on the first row of either
+kind, stalling the watermark at that point every tick. Caught before any
+code shipped, by reading `exec_history.py`'s own docstring (it already named
+`thinking`/`node_end` as "slice 2") and the pinning test
+`test_k7_the_shipped_kind_list_is_exactly_slice_1` (now
+`..._slice_2`) that existed specifically to force this edit. §13.9 above is
+corrected to say so.
+
+**Deploy order, proven live:** server first (`aw-knowledgeable` 76c2a54,
+deployed and health-gated before the connector shipped — a server that
+admits a kind nobody sends yet is a no-op), connector second
+(`aw-app-knowledgeable` v0.60.0, released through `app-release.yml`'s normal
+bump/tag/marketplace-sync path), backfill third. Verified live in the
+running `aw-knowledgeable` container (not trusted from green CI alone) via
+the `fredericowu/agentic-workspace` "Bare-metal shell (break glass)"
+workflow: `grep -n "thinking\|node_end" .../site-packages/backend/app/core/exec_history.py`
+showed the new lines before the connector was released.
+
+**Backfill, drained on watermark-at-present per §13.13's own documented
+gotcha** (NOT `runs == 0`, which oscillates forever under live traffic):
+`reset-watermark` + 14 bounded 2,000-run ticks (~8 minutes) walked the
+watermark from 2026-08-24 to the present, then settled into the same
+documented 2-tick oscillation (2-4 runs/tick) slice 1 observed.
+
+**Counts, aggregate, before/after backfill** (all 15 now-shipped kinds
+combined — `ExecEvent`/`EMITTED`, SQL vs graph):
+
+| when | SQL | graph | gap |
+|---|---|---|---|
+| after the registry flip landed, before backfill | 144,117 | 108,593 | 35,524 |
+| after the backfill drained | 144,153 | 144,153 | 0 |
+
+The gap before backfill (35,524) is in the right neighbourhood of §13.1's
+~37k estimate for the `thinking`+`node_end` historical backlog — the small
+difference is live traffic between the two measurements, not drift. The
+post-backfill reconcile matched exactly on `ExecEvent`/`EMITTED`; the one
+mismatched row (`ExecToolCall`, off by 1) is §13.13's own documented
+reconcile-timing artefact (the two counts are read at different instants),
+not a new defect.
+
+**No sanctioned tool exists to split that count by `kind`, on either side —
+true for slice 1 too, not a regression here.** `exec_sync.reconcile`'s SQL
+and `/exec-sync/status`'s `graph_counts` are both label-level aggregates;
+getting §13.13's slice-1 per-kind table required an ad-hoc one-off script
+against both stores directly, which this slice did not repeat (reading the
+AP-MT DSN or querying production Neo4j by hand for a verification step felt
+like the wrong trade against the aggregate-plus-content evidence below).
+Flagging this as a real gap in the feature's own observability rather than
+silently asserting a per-kind table that was not actually measured.
+
+**Content-level proof instead, on a real run** (`knowledgeable-labeller`,
+run `bb3c485145234c109a7dc2d4e2c6c34a`, synced during the backfill):
+`exec_run_detail` reconstructs its full timeline — `node_start` →
+`cli.first_byte` → `system.init` → **`thinking`** (2,550 chars of real
+reasoning: "The user wants me to label a cluster of passages...") →
+`finalizing` → **`node_end`** (226 chars, the node's actual final JSON
+output: `{"label": "Case-based design reasoning", "summary": ...}`) — both
+new kinds carrying real, unscrubbed-looking (because nothing in this run
+needed scrubbing) text end to end. Independently, `search_execution_graph`
+with `target='events'` returned real, scored hits for both kinds against
+unrelated queries ("design" → a `thinking` hit; "done" → five `node_end`
+hits, one of them a QA run's own close-out prose) — proving the
+`exec_event_text` fulltext index serves both newly-shipped kinds, not just
+`error`/`log`.
+
+**The planted-credential and residual-honesty tests all pass** (92 tests in
+`test_event_kinds.py`, including the generalised §13.12 point 6 straddle
+test across `error`+`thinking`+`node_end`, the shipped-gate test proving
+`tool_result` still gets no text through the same `build_event_row` path,
+and `test_documented_residual_vault_style_shapeless_secret_survives_in_thinking`
+— which asserts a shapeless, vault-only-style planted secret SURVIVES
+scrubbing in `thinking`, proving §13.3's accepted residual rather than
+claiming coverage that was never built). Full connector suite: 639 passed.
+Full `aw-knowledgeable` backend suite: 897 passed, 1 pre-existing unrelated
+failure (`test_k1_every_get_route_is_classified`, documented elsewhere as
+always red locally — SPA-dist routing, blind in CI).
