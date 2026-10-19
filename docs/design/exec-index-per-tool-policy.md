@@ -282,11 +282,54 @@ output, note}` — rejected for floor names), `DELETE /exec-policy/override`.
   key≠slug join; uninstalled-app → deny; `mcp__` third-party → deny;
   bare-name intersection rule; floor-beats-everything including an
   override row that lies.
+
+  **Shipped 2026-10-19.** `knowledgeable_app/exec_policy.py` (resolution
+  grammar, per-tick table, `Decision`, `apply_call_axis`), consulted from
+  `build_toolcall_row`; `policy_unresolved` / `policy_unresolved_total` /
+  `policy_denied_calls` / `policy_scan_error` ride the sentinel's `counts`
+  and degrade the existing `contributes.doctor` check. 31 tests, every one
+  §9 asks for. Three things measured against the REAL installed tree rather
+  than fixtures (§12 risk 1):
+
+  * **38 of the gateway's 40 live upstream segments resolve**, each to the
+    right app — including every key≠slug case the design predicted
+    (`aw_kanban`→`notion`, `paper_search`→`research-search`,
+    `vscode`→`code-server`, `devctl_browser`→`devctl`,
+    `playwright`→`mcp-tools`, `phd_knowledge_base`→`aw-app-uc-phd`) and the
+    federated `kali`→`kali-linux`.
+  * **The 2 that do not are the linked-workspace federations**
+    (`fredericowu`, `fredericowu_browser` — BYOD `/link`, registered into
+    the gateway's own config, not `apps/<slug>/mcp.json`). They fail closed
+    and will sit on the doctor permanently once a tick observes a call to
+    one. Correct per §3.5 and a known §11 cost, but it is a **standing**
+    unresolved row rather than a transient one, which §7's `unresolved`
+    state was written for and §3.5's counter was not: a doctor line that is
+    always red detects nothing. Slice 3 should give the UI a way to
+    acknowledge a row as "attributable to nothing, on purpose" — the
+    `vault_coverage.py` registry shape — or core should expose the
+    gateway's non-app upstreams so they can be attributed.
+  * Decisions for all three measured spellings of real production names
+    (`write_secret` → `floor`, args `None`; `add_kanban_comment` → app
+    `notion`, `never_declared`, args kept) printed from the live tree.
+
+  Deliberately NOT in this slice: the output axis. `Decision.allow_output`
+  is resolved and carried (the §6 precedence rules govern both axes and
+  §7's UI shows both) and is read by nothing — see the note on slice 4.
 - **Slice 3 — overrides + maintenance UI.** State-facade store, the three
   routes, the `app_iframe` page with five-state source column, floor rows
   locked. No modals.
 - **Slice 4 — output axis + policy-driven retro-purge.** `allow_output`
-  consumed by the §13-slice-3 `result_text` path. Retro-purge: when a new
+  consumed by the §13-slice-3 `result_text` path. **Now a real gap, not a
+  future one (2026-10-19):** §13 slice 3 landed in the connector the same
+  day slice 2 did (`attach_results` / `scrub_tool_result` in
+  `aw-app-knowledgeable`), so `ExecToolCall.result_text` is being projected
+  *today* under the floor alone — an app's `output: false` declaration is
+  resolved, carried on the `Decision`, and consulted by nothing. The
+  no-declarations-exist-yet fact (all ~36 installed apps) is what keeps that
+  from being a live exposure, and it stops being true the moment any app
+  ships the field. Slice 4 is therefore the next one to run, not an
+  optional tail, and its wiring point is one call in
+  `exec_sync.attach_results` beside the floor's. Retro-purge: when a new
   opt-out appears (manifest update or override), existing rows don't
   change; extend the §13.2 purge with a **per-bare-name, service-authed**
   variant the UI exposes per row ("purge existing rows"). This consciously
