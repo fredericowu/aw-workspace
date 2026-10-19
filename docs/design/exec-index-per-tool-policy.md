@@ -436,3 +436,100 @@ output, note}` — rejected for floor names), `DELETE /exec-policy/override`.
    confirm rows only.
 9. **Slice 1 must not reject existing manifests.** ~36 installed apps have
    no `indexing` key; absence is valid forever, not a deprecation.
+   **Corollary, and it bit us** (risk 11): that makes "declared nothing" a
+   legitimate everyday state, which is exactly why "could not read" must not
+   be spelled the same way.
+10. **A test that reads the real `apps/` tree can only be green here.**
+    Paid for on slice 4's own release (2026-10-19). `PolicyTable.
+    from_workspace()` reads `/opt/aw-workspace/apps`, which exists for every
+    human and every agent running the suite inside this workspace and does
+    NOT exist on a GitHub runner — so in CI the table degrades, every routed
+    name fails closed exactly as §3.5 requires, and a test asserting "a
+    never-declared tool's result lands" is false. The release went red on
+    one such test.
+
+    What makes this a risk entry rather than a bug note: the test was
+    verified twice, by two parties, each running the full suite, each
+    getting **715 passed** — and neither verification could see it, because
+    both ran in the one environment that satisfies the dependency. A suite
+    that reads the machine it runs on has no local signal that it is doing
+    so, so "I ran the tests" is not evidence about CI for this module.
+
+    Two things follow, both now in place:
+
+    * `tests/conftest.py` carries an **autouse guard** pointing
+      `exec_policy._apps_root()` at a path that does not exist, so local and
+      CI agree by default and the dependency cannot be acquired by
+      forgetting something. A test that wants a tree declares one
+      (`_policy_tree` / `_estate`); a test that genuinely wants the real one
+      asks for the `real_apps_root` fixture, which **skips** when the tree
+      is absent — the same shape `tests/test_exec_scrub.py:863` already used
+      for "aw-workspace core is not on the path".
+    * Verify this module's suite in a **CI replica** — repo root, no
+      workspace checkout on `PYTHONPATH`, only the deps
+      `aw-marketplace/.github/workflows/app-release.yml` installs
+      (`pytest jsonschema fastapi httpx uvicorn`) — not only in-workspace.
+      The in-workspace run is the one that cannot fail.
+
+    The mirror direction exists too and is NOT fixed: `test_routes.py`'s
+    `reset-watermark` test exercises §13.7's preflight against the **real
+    host disk**, so it is red here whenever free space is under the 25 GB
+    floor (observed failing at 22.2 GB and 24.3 GB, passing at 36.3 GB on a
+    host that sits near 95 % used) and green in CI, where a runner has room.
+    `disk_preflight` is pure specifically so the low-disk case can be tested
+    with an invented number; the route-level test injects nothing. Left as a
+    finding rather than fixed, because it belongs to §13 slice 3 — but any
+    slice touching that route should take the measurement as a parameter.
+11. **Under a blacklist, every read path must fail CLOSED — and they must
+    all agree.** Found by QA on slice 2 (run
+    `ee833426cc074f1ea716d7001497160e`), filed non-blocking, reclassified as
+    blocking and fixed in slice 4.
+
+    `_declared_entries` caught `(OSError, ValueError)` and returned `{}`.
+    Under a blacklist `{}` does not mean "unknown" — it means *this app
+    opted out of nothing*, i.e. every tool of that app is indexable on BOTH
+    axes. So an unreadable or malformed `apps/<slug>/aw-app.json` silently
+    converted every declared opt-out in that app into permission to index.
+
+    Three things made it worse than it looks, and each is a general lesson:
+
+    * **The docstring said the opposite of the code.** It stated "every
+      coercion here tightens rather than widens, because this is a security
+      default", and every coercion *inside* the loop genuinely did. The
+      guard *around* the loop widened. A docstring that describes the body
+      but not the error path is worse than none — a reader who trusts it
+      never looks at the `except`.
+    * **Its siblings failed the other way.** `from_workspace` losing the
+      apps ROOT fails closed, and `_server_keys` losing an `mcp.json` fails
+      closed (the app's upstreams vanish from the map, so its routed names
+      are unattributable). Only this path failed open. Either direction can
+      be defended; **two read paths over the same tree disagreeing cannot**,
+      and the narrower-scoped one being the unsafe one is how it stayed
+      invisible.
+    * **It is the exact failure mode this card exists to fix.** The 138
+      exposed secret-tool calls happened because a policy failed open. The
+      floor covers four tools; `indexing` is the only thing between the
+      other ~658 and the index, and the middle tier — a non-secret tool
+      whose output carries a credential — is what slice 4 was built to
+      protect. A declared `output: false` that evaporates on an `IOError` is
+      that protection failing silently.
+
+    Fixed by returning `(entries, read_error)`: a read failure makes that
+    app's routed tools `unresolved` (both axes denied, name and timestamp
+    kept) and lands in `policy_unresolved_actionable` plus
+    `policy_manifest_unreadable` (`{slug: error_name}` — the pointer to the
+    file to fix). Checked *after* the override lookup, because §6 puts a
+    human override above the manifest and a corrupt manifest does not
+    invalidate what a human said about one tool. Scoped to apps that
+    contribute upstreams: an app serving no tools cannot have its policy
+    widened, and this workspace's `apps/` holds 7 `.<app>.fetch-*`
+    download-staging directories with no manifest and no `mcp.json` that
+    would otherwise be 7 permanent entries in the actionable bucket — the
+    always-on-counter defect `UNRESOLVABLE_UPSTREAMS` exists to prevent.
+    Measured after the fix: `manifest_errors: 0` on the real tree and all 39
+    live upstreams resolving exactly as before, so the fix is a no-op until
+    something is actually broken.
+
+    The general rule for anyone extending this module: **when a function
+    returns a security default, its error path needs the same scrutiny as
+    its happy path, and the docstring must cover both.**
