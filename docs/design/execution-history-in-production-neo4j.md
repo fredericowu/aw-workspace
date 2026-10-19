@@ -1,7 +1,11 @@
 # Execution history in the production Neo4j — tenant isolation design
 
 Status: **implemented, flag ON; all four §9 steps live. The human-facing
-surface is decided (§10 exec-view, 2026-10-19) and build-pending.** Measured
+surface is decided (§10 exec-view, 2026-10-19) and build-pending. The full
+Event-timeline projection (all 17 kinds) is designed in §13 (2026-10-19,
+card `3fe5bf3b-9510-81d0-a0de-ea04b0e9cd46`) with a per-kind verdict table,
+and §13.2 records a live scrubbing hole found during that design — the
+secret-tool args drop never fired for gateway-prefixed tool names.** Measured
 2026-10-19: `exec_sync_enabled` true, ~27,970 `ExecRun` / ~288,013
 `ExecToolCall`, sentinel fresh, degraded false. The MCP tools
 (`search_execution_graph`, `exec_run_detail`, card
@@ -394,8 +398,19 @@ today — every tenant caller gets every registered bucket. So:
    contained by §10 exec-view point 4's rendering shape, which bounds what
    a stolen session exfiltrates casually.
 3. **Tool-call hygiene:** `args_text` for secret-handling tools
-   (`read_secret`, `collect_secret`, `write_secret`) is dropped wholesale,
-   not scrubbed — name and timestamp load, arguments never do.
+   (`read_secret`, `collect_secret`, `write_secret`, `delete_secret`) is
+   dropped wholesale, not scrubbed — name and timestamp load, arguments
+   never do.
+
+   **Correction, 2026-10-19 (§13.2): the drop as shipped matched BARE tool
+   names only, and production names arrive gateway-prefixed in at least
+   three spellings** (`mcp__aw-gateway__aw__aw_secrets__write_secret`,
+   `aw-gateway.aw__aw_secrets__write_secret`,
+   `mcp__workspace-gateway__aw__aw_secrets__write_secret`) — so the drop
+   never fired for a single real MCP-routed call, and vault-only secret
+   values written via `write_secret` landed in the graph in plaintext. The
+   fix (suffix-segment matching, both copies, plus a purge of the already
+   landed rows) is §13.2 / slice 0 of the timeline projection.
 
 ---
 
@@ -792,3 +807,389 @@ Rejected alternatives, 2026-10-19 (this decision):
     ever; the human surface is the exec-view router, owner-allowlisted.
     Rewrite the lines — this document has twice been bitten by a correction
     appended below a stale claim.
+
+---
+
+## 13. The full Event-timeline projection — all 17 kinds (2026-10-19)
+
+Card `3fe5bf3b-9510-81d0-a0de-ea04b0e9cd46`. Frederico's ask, verbatim: "eu
+quero na verdade ver dentro do grafo toda a Event timeline". The definition is
+AP-MT's own run detail page: `repos/agents-platform-multitenant/frontend/src/
+routes/RunDetail.tsx:181` — `events.filter(e => e.kind !== "llm_token")` —
+every kind except `llm_token`, chronological, one row per event. That filter
+is the spec; this section does not invent its own. Supersedes the
+decomposition of two archived cards (`…8170` thinking-only, `…81fd`
+tool_result design); their security analysis is carried forward here, not
+discarded.
+
+**Measured 2026-10-19, live during this design (re-verified, not inherited):**
+`run_events` 1,339,471 rows / 1001 MB; `llm_token` 573,500 → excluded;
+**timeline = 765,971 events across 17 kinds.** Graph today: ExecRun 28,096,
+ExecToolCall 290,447, sync fresh, scrub healthy (10 exact values, 16 pattern
+families, vault coverage clean). Neo4j `/data` 4.0 GB. **Host disk 92 % used,
+36 GB free — AT §8's retention-valve tripwire line already**, before this
+feature adds a byte. `run_events.id` is its own varchar PK, and the table has
+a `node_id` column (workflow node attribution) — both matter for the shape
+below.
+
+### 13.1 Per-kind verdicts — the blocking decision, one row each
+
+Payload shapes were sampled from production (truncated, client-side), not
+guessed. Sizes are `pg_column_size(payload)` avg/max.
+
+| kind | n | payload (measured) | verdict | slice |
+|---|---|---|---|---|
+| `tool_call` | 308,430 | `{id, name, input}` 506 B/9.3 KB | **already projected** (ExecToolCall) | — |
+| `tool_result` | 307,934 | `{tool_use_id, content}` 1.3 KB/20.7 KB | **project, onto ExecToolCall as `result_text`** — scrubbed, capped, secret-tool results DROPPED by suffix match. The one genuinely dangerous kind: results are the channel through which secrets enter a run (a `collect_secret`/`read_secret` return, a `cat .env`, `docker inspect`); the exact-match pass structurally cannot cover a third-party credential that was never in the file store. Shipped last, under the §13.5 restated equivalence. | 3 |
+| `thinking` | 8,367 | `{text}` 2.1 KB/9.2 KB | **project as ExecEvent text, scrubbed.** NOT credential-free (a model can restate a secret it just read — the earlier chat claim to the contrary was wrong and is corrected on the card). §6.3-analogue decided in §13.3: no per-run drop. | 2 |
+| `node_end` | 28,218 | `{text, tokens_in/out, cost_usd, run_id}` 998 B/7 KB | **project as ExecEvent — text is OUTPUT-class, scrubbed**, tokens/cost as structured props. The name lies: this is not lifecycle metadata, the payload carries the node's final text. Classified by measurement, not by name. | 2 |
+| `node_start` | 29,087 | `{label, agent, provider, model, model_slug, run_id, parent_run_id}` 233 B | project, structured fields only | 1 |
+| `finalizing` | 28,210 | `{tokens_in, tokens_out, cost_usd}` 66 B | project, structured | 1 |
+| `cli.first_byte` | 25,210 | `{}` 3 B | project — the ts IS the value (first-byte latency) | 1 |
+| `system.init` | 23,561 | `{session_id, model, cwd, tools[names], permission_mode}` 587 B / **max 787 B** | **project with a FIELD ALLOWLIST** (`model`, `cwd`, `permission_mode`, `tools_count`, `session_id`). Measured: uniformly bounded, tool NAMES only, **no env snapshot today** — but the payload shape is owned by the upstream CLI, which is exactly where an env snapshot would appear later, so only named fields ever cross; an added field is invisible to the graph by construction. | 1 |
+| `done` | 4,195 | `{}` or `{status}` | project, structured | 1 |
+| `cli.error` | 1,615 | `{subtype, is_error}` 45 B/112 B | project, structured | 1 |
+| `error` | 719 | `{error: msg}` 107 B/1.1 KB | project, **text scrubbed** — error strings embed connection strings and DSNs; the `url-userinfo`/`env-assignment` families cover the measured shapes | 1 |
+| `auto_compact.blind` | 179 | `{session_id, threshold, completed_runs}` | project, structured | 1 |
+| `auto_compact.ineffective` | 165 | token/cooldown numbers | project, structured | 1 |
+| `connector.timing` | 42 | `{phase, epochs, duration_s}` | project, structured | 1 |
+| `container.started` | 31 | `{}` | project (ts-only) | 1 |
+| `log` | 4 | `{msg}` | project, text scrubbed | 1 |
+| `cli.timeout` | 2 | `{timeout_s}` | project, structured | 1 |
+| `llm_token` | 573,500 | `{delta}` streamed chunks | **never.** Matches the page's own definition; deltas reassemble into assistant text that is already projected scrubbed as `output_text`; 573k rows of pure cost with zero retrieval value per row. If reassembled per-node assistant text for workflow runs is ever wanted, that is a new ask, not "the timeline". | — |
+| *(any future kind)* | — | unknown | **excluded by default, visibly** — §13.6 registry | — |
+
+### 13.2 Found live during this design: the secret-tool drop never fired for prefixed names
+
+§6 point 3's drop is `if name in SECRET_TOOL_NAMES`
+(`exec_scrub.py:scrub_tool_args`) — exact match on the BARE name. Production
+tool names arrive gateway-prefixed in at least three spellings (measured via
+`search_execution_graph(search_in='name')`):
+`mcp__aw-gateway__aw__…`, `aw-gateway.aw__…`, `mcp__workspace-gateway__aw__…`.
+Consequence, verified in the live graph: prefixed `write_secret` calls landed
+with `args_text` intact, and because `write_secret` writes to the VAULT, the
+values were vault-only (no exact match) and shapeless (no pattern fired) —
+**at least three real secret values are in the graph and in its S3 dumps in
+plaintext** (secret names: `zadarma_account_password`, `mac_home_vnc_password`,
+`knowledgeable-explorer-apmt-key`; the values are deliberately not repeated
+here). The triple hole is exactly the class this card's security analysis
+feared, found already live in the narrow tool_call projection.
+
+Containment honesty: §6 point 2's equivalence holds — every authorized graph
+reader could already read these in Postgres — so no NEW population gained
+access. What changed is durability (graph + backups). Remediation:
+
+1. **Fix (slice 0, ships before everything):** match the terminal segment —
+   the substring after the last `__` or `.` — against `SECRET_TOOL_NAMES`,
+   in BOTH copies (connector `exec_scrub.scrub_tool_args` and
+   aw-knowledgeable's server-side refusal in `core/exec_history.py`), with
+   tests pinning all three measured spellings plus the bare name.
+2. **Purge:** a one-off catalog template nulling `args_text` on every
+   ExecToolCall whose name's terminal segment is a secret tool (the
+   `exec_trim_toolcall_args` shape, name-predicated); re-verify by searching
+   the graph for the affected rows. Postgres keeps the originals (§5);
+   the next S3 dump after the purge no longer carries them — older dumps do,
+   for their retention life.
+3. **Rotation is a separate security card** (filed with this design): the
+   three named values must be treated as exposed — though their exposure
+   population was always "anyone who can read AP-MT Postgres", the backups
+   widen the blast radius of an S3 compromise.
+
+The design lesson folded into everything below: **never exact-match a tool
+name; a tool's identity is its terminal segment.** The result-drop list in
+slice 3 uses the same suffix rule from day one.
+
+### 13.3 Node shape — one `ExecEvent` label; `tool_result` rides `ExecToolCall`
+
+**One `ExecEvent` label with a `kind` property, not a label per kind.**
+Label-per-kind fights the house machinery everywhere at once: the catalog is
+static (`exec_counts`' UNION arms, the per-label wipe templates, constraints
+and K5 guard lists are all enumerated per label — 17 kinds would multiply
+each), fulltext indexes are per-label (17 indexes), and §13.6's open-set fact
+means a new kind would be a schema change. With one label, a new kind is one
+registry row.
+
+- **Identity:** `(tenant, id)` unique, `id` = `run_events.id` — the table has
+  its own PK; no synthetic `run_id+seq` needed (unlike ExecToolCall, which
+  predates this observation and keeps its shape).
+- **Properties:** `id, run_id, kind, ts, node_id`, `text` (nullable, scrubbed,
+  capped — §13.4), plus flat per-kind allowlisted props (`agent`, `label`,
+  `provider`, `model_slug`, `tokens_in/out`, `cost_usd`, `status`, `subtype`,
+  `cwd`, `permission_mode`, `tools_count`, `threshold`, `duration_s`, …) set
+  from the §13.6 registry's field lists. **No `payload_json` catch-all** —
+  a passthrough would smuggle every future unreviewed field (the system.init
+  env-snapshot scenario) past the review this section exists to force.
+- **Edge:** `(r:ExecRun)-[:EMITTED {tenant}]->(e:ExecEvent)`, both endpoints
+  MATCHed on tenant (the K3 shape). No edge to any non-Exec node (§7).
+- **`tool_call` stays ExecToolCall** — already projected; duplicating 308k
+  calls as events would double-store them.
+- **`tool_result` lands ON the existing ExecToolCall node** as `result_text`
+  (scrubbed, capped), `result_ts`, `result_len`, `result_truncated`,
+  `result_dropped` — paired client-side inside the sync batch via
+  `tool_result.payload.tool_use_id` ↔ `tool_call.payload.id` (both measured
+  present). Rationale: the call/result pair is one retrieval unit ("what did
+  that call return"); it saves ~308k nodes on a disk-tight instance; and
+  MADE_CALL stays the single tool chain. Unpaired results (measured ~500 of
+  308k — calls that never returned, or cross-batch strays) are counted on the
+  sync status (`orphan_results`), not silently dropped-and-forgotten.
+- **Timeline reconstruction** = `exec_run_detail`'s events
+  (ORDER BY ts) interleaved with its tool calls (call at `ts`, result at
+  `result_ts`) — the full page-equivalent timeline, from the graph alone.
+- **Fulltext:** one new per-label index `exec_event_text` over
+  `ExecEvent(text)` (created in the schema slice, while the label is empty —
+  §12 risk 5), and one new index `exec_toolcall_result` over
+  `ExecToolCall(result_text)` — a NEW index rather than a rebuild of
+  `exec_toolcall_text`, so the live name/args search surface is untouched
+  while the one-off build over the populated label runs (off-hours; the
+  single worker owns it for its duration, which is why it must not ride the
+  existing index).
+- **MCP/tool contract — extended, never repurposed:** `search_in=name|args`
+  and their `matched_field` semantics stay byte-identical. New, explicit
+  arms: `target='events'` (rows carry `kind`, `matched_field='event_text'`)
+  and `search_in='result'` for tool_calls (`matched_field='result_text'`).
+  A caller that never opts in sees exactly today's behaviour.
+
+**The §6.3-analogue decision for `thinking` (and `node_end`), decided in
+writing as the archived card demanded:** no per-run drop rule. Reasoning
+emitted by a run that called a secret-handling tool is projected, scrubbed,
+like everything else. Grounds: (1) the channels where a secret appears *by
+definition* — a secret tool's args AND its result — are dropped wholesale
+under the suffix rule, so what remains in thinking/output is a *restatement*
+risk; (2) `output_text` — the same restatement risk, demonstrably — has been
+projected scrubbed since v1; treating reasoning more harshly than output
+would be incoherent with the design's own §6; (3) the residual is contained
+by §13.5. What would change this: a measured restatement leak (a planted
+canary surviving into thinking text past the scrubber) — that evidence would
+reopen this as a per-run drop keyed on suffix-matched secret-tool usage,
+which the batch already computes (`rollup_called`).
+
+### 13.4 Size bounding
+
+`EVENT_TEXT_MAX = 16_384` chars and `RESULT_TEXT_MAX = 16_384` chars,
+enforced connector-side at build time (after scrubbing, so a truncation can
+never bisect-and-expose a value the scrubber would have matched — truncate
+the scrubbed text, never scrub the truncated text). Measured p95s are well
+under (thinking 5.1 KB, tool_result 5.7 KB, node_end 2.8 KB); the cap
+touches <5 % of events and exists for the unbounded tail (`llm_token`'s
+63 KB max shows what one event can be). `*_len` carries the true length and
+`*_truncated` makes the cut visible. §10 point 4's rule extends verbatim:
+search surfaces return match-centred snippets (`args_text_snippet`'s exact
+shape, the fix for the measured 83,609-char overflow); full stored text only
+through `exec_run_detail`.
+
+### 13.5 Does §6 point 2 survive? Yes — restated, carrying more weight
+
+The population-equivalence argument's content is unchanged and still true:
+every authorized reader of exec graph text (service callers; §10 exec-view's
+owner-allowlisted operators) can already read the unscrubbed originals in
+AP-MT Postgres. A scrubber miss grants nothing to anyone who didn't have it.
+What this projection changes is not the argument but the load on it:
+`tool_result` raises the per-event miss probability (it is the secret
+channel, and the third-party-credential hole is structural — §13.2's finding
+is the proof it bites in practice), and the durable surface (graph + nightly
+S3 dumps) grows by ~0.5 GB of scrubbed text. So the equivalence is restated
+as load-bearing rather than belt-and-braces, its §11 reopen triggers stay
+exactly as written (any audience widening revives digests first), and four
+containments ship with the slices: the suffix drop (args AND results), the
+caps, the retention valve extension, and the default-exclude kind registry.
+
+### 13.6 Governance — the three-state kind registry
+
+The kind set is OPEN — minted at `core/executor.py`'s `emit()`, at
+`bus.publish` sites across `api/runs.py`/`api/telegram.py`/`api/
+playground.py`, and forwarded from runner CLIs (`system.init`, `cli.*`,
+`thinking`); `auto_compact.*` appeared in 2026 with no schema change. So,
+exactly as the vault-coverage registry (§6 point 1) made "new and unreviewed"
+visibly distinct from "known safe":
+
+- `EVENT_KIND_REGISTRY`, committed in `aw-app-knowledgeable` beside
+  `exec_scrub.py`: `kind → {verdict: structured|text|excluded, fields: [...],
+  text_field, reason}` — §13.1's table, as code. A unit test pins every
+  `text`-verdict kind to a planted-fake-credential scrub test and every
+  field list to names that exist in sampled payloads.
+- **A kind not in the registry is NOT projected**, and the tick reports it in
+  `event_kinds_unreviewed` on the sync status → surfaced by the existing
+  doctor check (the `vault_names_uncovered` mechanism, proven to fire and
+  clear). New kind ⇒ visible degradation ⇒ a card ⇒ an Architect verdict ⇒
+  one registry row. Maintainer: whoever owns the doctor alarm, same as vault
+  coverage today.
+- **Server-side mirror:** aw-knowledgeable's ingest refuses an event row
+  whose `kind` is not on its own allowlist (the `SECRET_TOOL_NAMES`
+  two-copies-on-purpose pattern — a connector that regressed must not be
+  able to land an unreviewed kind just because it forgot).
+- **Kind-level (18 rows), not tool-level (662 live tool names)** — the
+  tool_result card's suggested per-tool result allowlist is rejected below
+  precisely because at 662 entries the registry would rot, and a rotten
+  allowlist reads as review that never happened.
+
+### 13.7 Cost, quantified (card demand: no hand-waving)
+
+Raw scrubbed-text/property volume by slice, from the measured
+`sum(pg_column_size(payload))`:
+
+| slice | nodes/props added | raw payload | est. store+Lucene |
+|---|---|---|---|
+| 1 (13 structured kinds) | ~113,000 ExecEvent + EMITTED | ~25 MB kept fields | ~100–150 MB |
+| 2 (thinking + node_end) | ~36,600 ExecEvent (text) | ~46 MB | ~100–150 MB |
+| 3 (tool_result on ExecToolCall) | 0 new nodes; ~308k props | ~397 MB | ~0.8–1.2 GB |
+| total | ~150k nodes (~0.37× current) | ~470 MB | **~1.0–1.5 GB** |
+
+Context: `/data` is 4.0 GB today; host disk 92 % used / 36 GB free — already
+AT §8's stated tripwire. Growth: run_events accrues ~29 MB/day raw, of which
+the timeline's projectable text is ~13 MB/day → ~30–40 MB/day store-side.
+Decisions that follow from the numbers rather than around them:
+
+- **Slices 1–2 (~0.3 GB) are within noise and proceed.**
+- **Slice 3 ships WITH the retention valve extension in the same slice** —
+  `exec_trim` grows arms for `result_text` and `ExecEvent.text` older than
+  `ARGS_TEXT_RETENTION_DAYS` (180 d) — bounding steady-state text at
+  ~2.3 GB raw / ~5–7 GB store. Not a follow-up: at these volumes the valve
+  is part of the feature, not an option on it.
+- **Slice 3's backfill gets a disk preflight:** refuse to start when host
+  free space < 25 GB, report why. The 92 % disk is a platform problem with
+  its own trajectory (host-disk card); this feature must not be the straw
+  that silently breaks it, nor hostage to it for the cheap slices.
+- Backup window: dump moves at disk speed; +1.5 GB ≈ +low tens of seconds
+  nightly. The §8 tripwire (`downtime_seconds` > 600 s) is unchanged and
+  stays the signal to revisit venue.
+
+### 13.8 Backfill and the watermark — no second watermark
+
+Events ride the existing run-scoped selection: the sync fetches events for
+the runs each batch selected, so the run watermark + 48 h non-terminal
+re-sweep already bound event freshness — a run only emits events while
+non-terminal, so a terminal run's event set is complete when the re-sweep
+last saw it. No per-event watermark, no second frontier to corrupt
+(`_watermark_of`'s complete/incomplete distinction keeps protecting both).
+
+Historical events (everything synced before each slice ships) need a one-off
+**watermark-reset backfill** per slice: the existing bounded-tick mechanism
+(§8: ~15 ticks × 2,000 runs), off-hours, MERGE-idempotent against the
+already-loaded runs. The Postgres trap is honored by construction: the event
+query is `SQL_TOOL_CALLS`' shape with `kind = ANY(%(kinds)s)` — payload
+selected RAW, parsed client-side by psycopg, NUL-stripped (`_clean`) —
+`->>`/`::text` never appear (the `rollup_called` crash is the precedent).
+
+### 13.9 Slices — safest first, each independently shippable
+
+- **Slice 0 — URGENT, independent of everything (coder-ready now):** §13.2's
+  fix. Suffix-segment matching for `SECRET_TOOL_NAMES` in both copies +
+  tests pinning the three measured spellings; purge template for landed
+  secret-tool `args_text`; live verification that the named rows are gone;
+  rotation card filed. Blocked on: nothing.
+- **Slice 1 — mechanism + the 13 structured/low-risk kinds:** ExecEvent
+  label, constraint, `exec_event_text` index (created empty), EMITTED edge,
+  upsert/detail/search/counts/wipe templates + K5 list additions + K7
+  extension (ExecEvent invisible through every generic surface), the
+  §13.6 registry + `event_kinds_unreviewed` doctor wiring + server-side kind
+  refusal, connector fetch/build/scrub for the 13 kinds, `error`/`log`
+  planted-credential scrub tests, backfill, live count verification
+  (~113k events vs SQL). Blocked on: nothing — this document is the decision.
+- **Slice 2 — the text kinds `thinking` + `node_end`:** registry rows flip
+  to `text`, planted-fake-credential tests per kind (including a
+  vault-style shapeless canary proving the §13.3 decision's stated residual
+  honestly), backfill (~37k events), live verification incl. a real
+  reasoning hit via the new `target='events'` arm. Blocked on: slice 1.
+- **Slice 3 — `tool_result`:** result pairing in the connector, suffix-rule
+  result DROP (+ server-side refusal of result text on secret-tool names),
+  scrub + cap, `exec_toolcall_result` index (off-hours build),
+  `search_in='result'` arm, retention valve extension, disk preflight,
+  off-hours backfill, live verification with planted-credential tests for
+  result-shaped fixtures (a `cat .env` output, a `docker inspect` dump, a
+  git remote URL with token, a `collect_secret` return → dropped). Blocked
+  on: slices 0+1 (not on 2).
+
+QA reviews each slice's delivery; `mark_flow_done` only after the last slice
+with a QA run id, per the flow contract.
+
+### 13.10 Rejected alternatives (this section's own)
+
+- **Label-per-kind (`ExecThinking`, `ExecNodeStart`, …).** Multiplies every
+  per-label enumeration in the static catalog (counts, wipes, constraints,
+  K5 lists, indexes) by 17 and turns every new kind into a schema change.
+  One label + `kind` + registry row wins on every axis that matters here.
+- **`tool_result` as separate ExecEvent nodes.** +308k nodes on a 92 %-full
+  disk to represent something that is 1:1 with an existing node; splits the
+  call/result retrieval unit across two fulltext hits. Runner-up; revisit if
+  unpaired results stop being rare or per-result provenance (its own id/ts
+  beyond `result_ts`) becomes load-bearing.
+- **A generic scrubbed-payload passthrough (`payload_json` property).**
+  Projects every future unreviewed field by default — the exact
+  env-snapshot-in-`system.init` scenario the card told this design to look
+  for. Field allowlists are the point, not an implementation detail.
+- **Per-TOOL result allowlist (the archived tool_result card's suggested
+  shape).** 662 live tool names, open set, no owner who could keep verdicts
+  honest at that cardinality — the registry would become exactly the
+  "chronically-absent review that reads as approval" its precedent exists to
+  prevent. Kind-level registry + channel-level deny (suffix-matched secret
+  tools) + scrub + cap instead.
+- **Dropping `thinking` for runs that touched a secret tool (§6.3
+  analogue).** Decided against, with grounds and a reopen condition, in
+  §13.3 — incoherent with `output_text`'s existing treatment, and the
+  by-definition channels are already dropped.
+- **Projecting reassembled `llm_token` text.** Redundant with `output_text`
+  (and with `node_end.text` per workflow node after slice 2); 573k rows of
+  deltas is cost with no per-row retrieval value. If per-node assistant
+  prose is ever wanted, it is a new ask against `node_end`, not the stream.
+- **A second server-side scrubber for event text.** §6's single-scrubbing-
+  point argument is unchanged; the server's role stays refusal (kinds,
+  secret-tool names), never redaction.
+- **Blocking all slices on the disk situation.** Slices 1–2 are ~0.3 GB on
+  36 GB free; holding the whole ask hostage to a host-level trajectory this
+  feature didn't create would be scope-shrinking by stealth. The expensive
+  slice carries the preflight instead.
+
+### 13.11 What this makes harder later (beyond §11, which stands)
+
+- **Per-kind placement changes become data migrations.** Everything shares
+  one label, so "move thinking to its own label later" is a property-scan
+  rewrite, not a rename. Accepted: the registry makes per-kind *policy*
+  cheap even though per-kind *storage* is uniform.
+- **`result_text` on ExecToolCall couples call and result lifecycles** —
+  trimming, wiping and (a future) per-result provenance all operate through
+  the call node. Splitting later = backfill-shaped migration (cheap only
+  because Postgres stays the record).
+- **Default-exclude means a new kind is invisible until a human acts.**
+  Deliberate — the doctor alarm is the mitigation, and the alternative
+  (default-include) is how an env snapshot walks into the graph unreviewed.
+- **More durable scrubbed text in every backup**, for the backups' retention
+  life — the §13.5 restatement is now carrying real weight, and any future
+  audience widening (§11 trigger 1) got strictly more expensive to grant.
+
+### 13.12 Risks for the Coders — where this breaks non-obviously
+
+1. **Never exact-match a tool name** — §13.2's lesson. Identity is the
+   terminal segment after the last `__` or `.`; pin all three measured
+   prefix spellings in tests, in both copies.
+2. **`tool_call.payload` keys its id as `id`; `tool_result` as
+   `tool_use_id`.** The pairing join is across those two names, within one
+   run's rows in one batch.
+3. **`node_end` is text-bearing despite its lifecycle-sounding name** — it
+   is slice 2, not slice 1; putting it in the structured slice ships
+   unscrubbed output text.
+4. **Create `exec_event_text` while ExecEvent is empty** (schema commit,
+   before any backfill — §12 risk 5); `exec_toolcall_result` is the one
+   index that MUST build over a populated label — off-hours, and never as a
+   modification of `exec_toolcall_text`.
+5. **The event SQL must stay raw-payload** — `kind = ANY(...)`, parse
+   client-side, `_clean` every string (the `rollup_called` crash recurs
+   otherwise, and the first N ticks passing proves nothing — the NUL rows
+   arrive when they arrive).
+6. **Scrub BEFORE truncating**, never after — a cap applied first can cut a
+   secret in half and hide it from both passes while leaving it greppable.
+7. **K7 extension in the same commit as the templates**: ExecEvent must be
+   unreachable through `search_nodes`/`get_node`/`get_graph`/`/api/search`/
+   `list_documents`, and the exec fulltext guard list
+   (`test_k5_exec_fulltext_templates_filter_tenant_and_the_reserved_bucket`)
+   gains the two new templates or it is lying.
+8. **`event_kinds_unreviewed` must count DISTINCT kinds seen, not rows** —
+   a burst of one new kind must read as one decision owed, and the tick must
+   still project everything registered (degrade visibly, never fatally —
+   the `vault_coverage_unknown` contract).
+9. **The registry's planted-credential tests use invented shapes only** —
+   a real value in a fixture is the leak the module exists to prevent
+   (§12 risk 8 verbatim, now for event text).
+10. **Backfill ticks share the single production worker** with live search
+    and the 10-minute sync: keep `MAX_RUNS_PER_TICK`/`BATCH_BYTES` bounds,
+    run resets off-hours, and remember the lease means a long backfill tick
+    delays, not corrupts, the scheduled tick.
