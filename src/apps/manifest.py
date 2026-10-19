@@ -381,6 +381,31 @@ class Manifest:
         return dict(profiles) if isinstance(profiles, dict) else {}
 
     @property
+    def mcp_indexing(self) -> list[dict[str, Any]]:
+        """``contributes.mcp.indexing`` — per-tool exec-indexing opt-outs this
+        app declares for the tools it contributes (docs/design/
+        exec-index-per-tool-policy.md). Each entry is ``{tool, call, output,
+        reason?}``; absence of an entry for a tool means "indexable"
+        (blacklist model) — this property returns only what was declared,
+        never a default row.
+
+        Validated at install AND load by ``_validate_mcp_indexing``, so by
+        the time code reads this property the shape is already trustworthy:
+        ``tool`` is a bare terminal segment, ``call``/``output`` are real
+        booleans, and a floor tool (``read_secret``/``collect_secret``/
+        ``write_secret``/``delete_secret``) can never appear with either axis
+        true. The knowledgeable connector's policy engine (slice 2) is the
+        consumer; this accessor does no resolution of its own — gateway-name
+        matching against the observed, prefixed tool name is that engine's
+        job, not this one's.
+        """
+        declared = self.contributes.get("mcp")
+        if not isinstance(declared, dict):
+            return []
+        indexing = declared.get("indexing")
+        return list(indexing) if isinstance(indexing, list) else []
+
+    @property
     def contributes_mcp(self) -> bool:
         """Does this app put anything into the MCP Gateway's app-scan?
 
@@ -837,6 +862,122 @@ def _validate_gateway_profiles(contributes: dict[str, Any]) -> None:
                     "non-empty string")
 
 
+#: The four secret-store tools that stay a hard-coded floor no manifest and
+#: no UI override can lift (docs/design/exec-index-per-tool-policy.md §2).
+#: A THIRD copy of the same frozenset that already lives in
+#: ``repos/aw-app-knowledgeable/knowledgeable_app/exec_scrub.py`` and
+#: ``repos/aw-knowledgeable/backend/app/core/exec_history.py`` — deliberately:
+#: those two refuse to INDEX a call at sync/service time; this one refuses to
+#: ACCEPT a manifest that lies about them at install/load time, the earliest
+#: point the lie can die. §13.2 measured why scrubbing cannot backstop these
+#: four: ``write_secret`` arguments are vault-only values (no exact-match
+#: hit) and shapeless (no pattern fires), so a declarative opt-out that could
+#: be talked into indexing them would be worse than the hard-coded pair it
+#: replaces.
+MCP_INDEXING_FLOOR_TOOLS = frozenset(
+    {
+        "read_secret",
+        "collect_secret",
+        "write_secret",
+        "delete_secret",
+    }
+)
+
+
+def _validate_mcp_indexing(contributes: dict[str, Any]) -> None:
+    """Validate ``contributes.mcp.indexing`` — per-tool exec-indexing
+    opt-outs (docs/design/exec-index-per-tool-policy.md §4).
+
+    Slice 1 of that design: this function and its marketplace-schema
+    sibling (``repos/aw-marketplace/scripts/validate_manifest.py``) are the
+    first code to exist for this field, by the standing rule that a core
+    validator change precedes any app shipping the field it validates — so
+    this runs with zero manifests using it yet. Absence of the key, or of
+    any one entry's tool, is therefore valid FOREVER, not a deprecation: the
+    ~36 apps installed today, and any app that never touches secrets, have
+    nothing to declare.
+
+    Four things are enforced, each tied to a measured failure:
+
+    1. **``tool`` is a bare terminal segment.** A manifest cannot enshrine a
+       gateway-prefixed spelling (``mcp__aw-gateway__aw__x__y``) — the
+       resolution grammar the policy engine (slice 2) applies is defined
+       entirely in terms of the terminal segment, and a prefixed value here
+       would never match anything it resolves.
+    2. **``call`` and ``output`` are both required real booleans.** An entry
+       whose meaning depends on a default is the exact ambiguity this
+       design exists to remove — a string ``"false"`` or a missing key must
+       fail loudly, not coerce.
+    3. **``reason`` is required whenever either axis is false.** An opt-out
+       nobody can review is the §13.10 rot this design is built to avoid in
+       miniature.
+    4. **A floor tool can never be declared indexable on either axis.** This
+       is the one Frederico called non-negotiable: the four secret-store
+       tools stay a hard floor no manifest can lift, checked here so the
+       lie dies at install/load — the earliest point — rather than only at
+       marketplace release. Both false is allowed (redundant under the
+       floor, but it is how an app like aw-app-secrets dogfoods the field).
+
+    Duplicate ``tool`` values are rejected too: two entries for the same
+    tool is nobody's intent and silently picks a winner by iteration order.
+    """
+    declared = contributes.get("mcp")
+    if not isinstance(declared, dict):
+        return
+    indexing = declared.get("indexing")
+    if indexing is None:
+        return
+    if not isinstance(indexing, list):
+        raise ManifestError("contributes.mcp.indexing must be a list")
+    seen: set[str] = set()
+    for entry in indexing:
+        if not isinstance(entry, dict):
+            raise ManifestError(
+                "each contributes.mcp.indexing entry must be an object"
+            )
+        tool = entry.get("tool")
+        if not isinstance(tool, str) or not tool.strip():
+            raise ManifestError(
+                "each contributes.mcp.indexing entry needs a non-empty 'tool'"
+            )
+        if "__" in tool or "." in tool:
+            raise ManifestError(
+                f"contributes.mcp.indexing tool {tool!r} must be a bare "
+                "terminal segment — no '__' or '.'. A gateway-prefixed "
+                "spelling here would never match the resolution grammar "
+                "that consults this field."
+            )
+        if tool in seen:
+            raise ManifestError(
+                f"contributes.mcp.indexing declares {tool!r} more than once"
+            )
+        seen.add(tool)
+        call = entry.get("call")
+        output = entry.get("output")
+        if not isinstance(call, bool) or not isinstance(output, bool):
+            raise ManifestError(
+                f"contributes.mcp.indexing[{tool!r}] needs 'call' and "
+                "'output' as real booleans, both required — a default "
+                "here is the ambiguity this field exists to remove"
+            )
+        if tool in MCP_INDEXING_FLOOR_TOOLS and (call or output):
+            raise ManifestError(
+                f"contributes.mcp.indexing[{tool!r}] sets an axis true for "
+                "a secret-store tool that is a hard floor — read_secret, "
+                "collect_secret, write_secret and delete_secret can never "
+                "be declared indexable on either axis, by any manifest"
+            )
+        reason = entry.get("reason")
+        if (not call or not output) and not (
+            isinstance(reason, str) and reason.strip()
+        ):
+            raise ManifestError(
+                f"contributes.mcp.indexing[{tool!r}] restricts an axis but "
+                "has no non-empty 'reason' — an opt-out nobody can review "
+                "is the stale-registry rot this field exists to avoid"
+            )
+
+
 def _validate_contributed_repos(
     contributes: dict[str, Any], permissions: list[str]
 ) -> None:
@@ -1225,6 +1366,7 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
 
     _validate_contributed_agents(contributes, permissions)
     _validate_gateway_profiles(contributes)
+    _validate_mcp_indexing(contributes)
     _validate_contributed_repos(contributes, permissions)
     _validate_sidecars(runtime, permissions)
     _validate_publish(runtime, tier, permissions)

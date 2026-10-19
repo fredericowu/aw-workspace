@@ -348,3 +348,123 @@ def test_contributes_mcp_true_when_reload_on_save_declared():
 def test_contributes_mcp_false_without_an_mcp_block():
     m = validate_manifest(_m(contributes={"routes": [{"prefix": "/api/apps/x"}]}, permissions=["routes:register"]))
     assert m.contributes_mcp is False
+
+
+# contributes.mcp.indexing (docs/design/exec-index-per-tool-policy.md §4) —
+# slice 1: the core validator learns the field before any app may ship it.
+
+def test_mcp_indexing_defaults_empty_when_not_declared():
+    # Every app installed today has no 'indexing' key — absence is valid
+    # forever, not a deprecation (design §4, point 9 for the Coders).
+    m = validate_manifest(_m(contributes={}, permissions=[]))
+    assert m.mcp_indexing == []
+
+
+def test_mcp_indexing_accepts_a_well_formed_restriction():
+    m = validate_manifest(_m(contributes={
+        "mcp": {"indexing": [
+            {"tool": "search_graph", "call": False, "output": True,
+             "reason": "arguments carry a free-text query that may include PII"},
+        ]},
+    }, permissions=[]))
+    assert m.mcp_indexing == [{
+        "tool": "search_graph", "call": False, "output": True,
+        "reason": "arguments carry a free-text query that may include PII",
+    }]
+
+
+def test_mcp_indexing_entry_with_both_axes_true_is_the_considered_indexable_state():
+    # Explicit third state (design §4/§7): "considered, indexable" — distinct
+    # from "never declared" even though both resolve to indexable. No reason
+    # required because neither axis restricts.
+    m = validate_manifest(_m(contributes={
+        "mcp": {"indexing": [{"tool": "search_graph", "call": True, "output": True}]},
+    }, permissions=[]))
+    assert m.mcp_indexing == [{"tool": "search_graph", "call": True, "output": True}]
+
+
+def test_mcp_indexing_restriction_without_reason_rejected():
+    bad = _m(contributes={
+        "mcp": {"indexing": [{"tool": "search_graph", "call": False, "output": True}]},
+    }, permissions=[])
+    with pytest.raises(ManifestError, match="reason"):
+        validate_manifest(bad)
+
+
+@pytest.mark.parametrize("axis", ["call", "output"])
+def test_mcp_indexing_floor_tool_declared_indexable_rejected(axis):
+    # The non-negotiable rule: a manifest declaring any of the four
+    # secret-store tools indexable on EITHER axis must be rejected outright.
+    bad = _m(contributes={
+        "mcp": {"indexing": [{"tool": "write_secret", "call": False, "output": False,
+                               axis: True, "reason": "trying to lift the floor"}]},
+    }, permissions=[])
+    with pytest.raises(ManifestError, match="hard floor"):
+        validate_manifest(bad)
+
+
+@pytest.mark.parametrize(
+    "tool", ["read_secret", "collect_secret", "write_secret", "delete_secret"]
+)
+def test_mcp_indexing_floor_tool_both_axes_false_is_allowed(tool):
+    # Redundant under the floor, but good dogfood (design §4) — e.g.
+    # aw-app-secrets declaring its own tools call:false, output:false.
+    m = validate_manifest(_m(contributes={
+        "mcp": {"indexing": [{"tool": tool, "call": False, "output": False,
+                               "reason": "redundant under the floor"}]},
+    }, permissions=[]))
+    assert m.mcp_indexing[0]["tool"] == tool
+
+
+def test_mcp_indexing_rejects_a_gateway_prefixed_tool_name():
+    # A manifest must never be able to enshrine a prefixed spelling — the
+    # resolution grammar (slice 2) only ever matches a bare terminal segment.
+    bad = _m(contributes={
+        "mcp": {"indexing": [{"tool": "mcp__aw-gateway__aw__aw_secrets__write_secret",
+                               "call": False, "output": False, "reason": "x"}]},
+    }, permissions=[])
+    with pytest.raises(ManifestError, match="bare terminal segment"):
+        validate_manifest(bad)
+
+
+def test_mcp_indexing_rejects_a_dotted_tool_name():
+    bad = _m(contributes={
+        "mcp": {"indexing": [{"tool": "aw-gateway.write_secret",
+                               "call": False, "output": False, "reason": "x"}]},
+    }, permissions=[])
+    with pytest.raises(ManifestError, match="bare terminal segment"):
+        validate_manifest(bad)
+
+
+def test_mcp_indexing_rejects_a_duplicate_tool():
+    bad = _m(contributes={
+        "mcp": {"indexing": [
+            {"tool": "search_graph", "call": True, "output": True},
+            {"tool": "search_graph", "call": False, "output": False, "reason": "x"},
+        ]},
+    }, permissions=[])
+    with pytest.raises(ManifestError, match="more than once"):
+        validate_manifest(bad)
+
+
+@pytest.mark.parametrize("bad_call", ["false", 0, None])
+def test_mcp_indexing_requires_real_booleans_for_call_and_output(bad_call):
+    bad = _m(contributes={
+        "mcp": {"indexing": [{"tool": "search_graph", "call": bad_call, "output": True}]},
+    }, permissions=[])
+    with pytest.raises(ManifestError, match="real booleans"):
+        validate_manifest(bad)
+
+
+def test_mcp_indexing_entry_needs_a_non_empty_tool():
+    bad = _m(contributes={
+        "mcp": {"indexing": [{"call": True, "output": True}]},
+    }, permissions=[])
+    with pytest.raises(ManifestError, match="'tool'"):
+        validate_manifest(bad)
+
+
+def test_mcp_indexing_must_be_a_list():
+    bad = _m(contributes={"mcp": {"indexing": {"write_secret": False}}}, permissions=[])
+    with pytest.raises(ManifestError, match="contributes.mcp.indexing must be a list"):
+        validate_manifest(bad)
