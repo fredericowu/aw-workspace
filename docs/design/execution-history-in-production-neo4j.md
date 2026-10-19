@@ -1524,3 +1524,259 @@ claiming coverage that was never built). Full connector suite: 639 passed.
 Full `aw-knowledgeable` backend suite: 897 passed, 1 pre-existing unrelated
 failure (`test_k1_every_get_route_is_classified`, documented elsewhere as
 always red locally — SPA-dist routing, blind in CI).
+
+### 13.15 Slice 3 built, server live, connector HELD — measured outcome (2026-10-19)
+
+**Read the status line first: this slice is deliberately not projecting
+anything yet.** Built and pushed in full; the server half is deployed and
+verified live; the connector half is released-but-**not installed**, by an
+explicit hold from `telegram-opus-aw`, the Source that owns this card's
+sequencing. The hold is not a defect in this slice and not a scope cut —
+it is a dependency this slice's own design did not price, found by someone
+reading both designs at once.
+
+Delivered:
+
+* `aw-knowledgeable` commit `4ecf63d` — **deployed and live**: the five
+  `result_*` properties, the `exec_toolcall_result` index, the
+  `search_in='result'` route + template, the valve's two new arms, K5+K7 in
+  the same commit. Safe to be live alone, and that is the whole point of the
+  deploy order: a service that accepts a field nobody sends is a no-op.
+* `aw-app-knowledgeable` commit `f5fc32e` — **pushed, release cut, NOT
+  installed**: pairing, the result drop, the scrub+cap, the disk preflight,
+  the MCP surface. The installed version in this workspace remains
+  **v0.61.0**, which contains none of it.
+
+**Why the hold, in the Source's own terms.** `result_text` is where a
+tool's OUTPUT lands, and the sibling card's per-tool **output axis**
+(`allow_output`) is resolved but consumed by nothing — that is
+`exec-index-per-tool-policy.md` slice 4. So with slice 3 installed today,
+every tool result would be governed by exactly two tiers: the hard floor
+(the four secret-store tools, whose results `scrub_tool_result` drops
+wholesale) and the pattern scrubber. The gap is the middle — a tool that is
+not a secret-store tool but whose OUTPUT carries credentials anyway: a
+`remote_host_read_file` on a `.env`, a bash tool returning a token on
+stdout, a config route echoing a key. Pattern scrubbing is the weakest tier
+this design has and is explicitly the FALLBACK for vault-only credentials
+(§6 point 1's own qualification), not a policy. ~1 GB of tool results
+projected under pattern-matching alone is the same shape of mistake as
+§13.2's 34 `write_secret` rows: a new channel, the same direction of
+failure. Slice 4 lands, then **one install carries both**.
+
+**So: is "don't install" sufficient, or is the first tick the real gate?**
+Both questions have exact answers, and they matter because the two differ:
+
+* `attach_results` mutates in-memory row dicts, and the graph write is
+  `exec_upsert_toolcalls` — `MERGE` on `(tenant, bucket, id)` with
+  `id = run_id:seq`, then an **unconditional** `SET tc.result_text = …`.
+  `run_id:seq` is stable across re-reads, so the MERGE finds the existing
+  node and the SET lands on **rows already in the graph**, not only on new
+  ones. That is deliberate (a connector-side scrub fix must be applicable
+  to landed rows without a wipe — the §13.2 position nobody wants to be in
+  twice), and it means the write is not confined to newly-seen calls.
+* What a FORWARD tick touches is nevertheless small: only the tool calls of
+  the runs that tick selected — `started_at > watermark OR ended_at >
+  watermark OR (non-terminal AND started_at > now-48h)`, measured at 2-4
+  runs per tick in steady state (§13.13's documented oscillation). So a
+  forward tick would backfill results onto a few hundred already-landed
+  calls per tick, growing with live traffic — **not** onto the 292,325
+  historical ones. Those move only under the explicit
+  `reset-watermark` backfill.
+
+The operational conclusion: **install is the only clean gate.** Not
+installing is sufficient and is what is in force. But if the connector were
+installed, the gate would have to be the first tick rather than the
+backfill — the contributed scheduled task fires every 10 minutes with no
+further command from anyone, and the only switch short of that is
+`exec_sync_enabled=false`, which stops the entire projection rather than
+just results.
+
+**Evidence that nothing is projecting, measured in the live container
+rather than inferred:** `MATCH (tc:ExecToolCall {bucket:'_exec-history'})
+WHERE tc.result_text IS NOT NULL RETURN count(tc)` → **0**, against 292,325
+`ExecToolCall` nodes. The live v0.61.0 connector sends no `result_text`, so
+the deployed `normalize_toolcall` writes null over null on every row its
+ticks touch — a content no-op that keeps that count at zero by
+construction, not by luck.
+
+**The Event-timeline projection is code-complete with this slice**, with one
+permanent exception (`llm_token`, excluded by the timeline's own upstream
+definition) and one relocation (`tool_result` rides `ExecToolCall`, not
+`ExecEvent`). It is not yet *live-complete*, and §13.16 — written after the
+joint install — is where the end-to-end numbers belong.
+
+**Deploy order, proven again — and the hold is why it paid off twice.**
+Server first and alone, connector second via `app-release.yml`, backfill
+third. The failure the order avoids is not hypothetical: slice 2 measured
+it, a connector posting a field the service refuses 400s every batch that
+reaches one and hard-stalls the live watermark on `_run_tick_locked`'s
+batch-abort. What the hold then showed is a second, unplanned benefit of
+the same order: because the server goes first and is a no-op alone, an
+order-of-release decision can be revisited AFTER the expensive half is
+already deployed and verified, at zero cost and with nothing to roll back.
+A connector-first order would have had to be undone.
+
+**Verified live in the running container, not trusted from green CI** (the
+slice-2 rule, and this estate has had a green CI lie): `docker exec
+aw-knowledgeable` →
+`backend/app/core/exec_history.py` carries `RESULT_TEXT_MAX` (3
+occurrences) and `graph.py` carries
+`EXEC_TOOLCALL_RESULT_FULLTEXT_INDEX` at line 156, from the deployed
+`/app` tree.
+
+**The index trap (§13.12 point 4), measured rather than feared.**
+`exec_toolcall_result` is the one index in this feature whose `CREATE` runs
+over an already-populated label, so it was treated as a real build: the
+pre-deploy baseline was captured first (12 exec indexes ONLINE,
+`exec_toolcall_result` absent, `ExecToolCall` 292,310 nodes, zero carrying
+a `result_text` property — Neo4j warned the property key did not exist,
+which is the clean before-picture) and the deploy was watched rather than
+fired and forgotten.
+
+**What the build actually cost: nothing measurable, for a reason worth
+writing down rather than treating as luck.** By the time the index was
+created, `result_text` existed on zero of the 292,325 nodes — because the
+server ships first and the connector that populates the property was not
+installed. A fulltext index over a property no node carries has nothing to
+analyse, so the `CREATE` is a label scan and not a text-indexing job:
+`exec_toolcall_result` came back `ONLINE` at `populationPercent 100.0`
+within the deploy's own health gate. So the §13.12 point 4 warning is
+correct about the general case and was defused in this one BY the deploy
+order — the expensive build is not the `CREATE`, it is the first backfill
+that writes ~290k text values into it. That is still ahead, and still
+off-hours work.
+
+It is a NEW index and emphatically not a widening of `exec_toolcall_text`:
+adding `tc.result_text` to that index's `ON EACH` would drop and rebuild
+the index the live `search_in=name|args` surface reads, so every name/args
+search would return nothing for the rebuild's duration.
+
+**Scope correction, the same shape as §13.13's.** The card's figures
+(~308k result rows / ~397 MB raw) were tenant-WIDE `run_events` counts. The
+projection is scoped to one source tenant (`tenant-bootstrap`), and the
+real numbers there, measured pre-deploy, are:
+
+| quantity | tenant-wide (card) | `tenant-bootstrap` (actual scope) |
+|---|---|---|
+| `tool_result` rows | ~308,000 | **291,826** |
+| raw `payload` bytes | ~397 MB | **357 MB** |
+| `tool_call` rows | ~308,000 | **292,309** |
+
+So 483 calls have no result at all (a call that never returned), which is
+the §13.3 "~500 of 308k" estimate landing almost exactly — and it is the
+right direction: calls WITHOUT results, not results without calls.
+`orphan_results` counts the latter.
+
+**Disk — and the measurement that embarrassed the feature's own guard.**
+
+| when | total | used | **free** | % |
+|---|---|---|---|---|
+| before the server deploy | 436 GB | 377 GB | **38 GB** | 92 % |
+| ~35 min later, after it | 436 GB | 383 GB | **31 GB** | 93 % |
+
+The preflight passes either way (floor 25 GB), so it was not tested against
+a wall. But the drop is the finding: **~7 GB went to this slice's own
+server deploy, which is more than the entire projection the preflight
+exists to guard.** Attributed, not guessed: `docker images` shows
+`aw-knowledgeable-app:latest` at **4.32 GB** built "4 minutes ago" plus
+`aw-knowledgeable-app:last-known-good` at 4.32 GB (the deploy's own
+rollback artifact, retained by design), with build cache on top. So the
+image swap for a ~200-line change cost more headroom than slice 3's
+~0.8-1.2 GB of store ever will, and the preflight — which gates the
+BACKFILL — cannot see that class of consumer at all. Not a reason to
+change the floor; a reason to record that the floor protects the smaller of
+the two risks on this host, and that the host-disk card remains the real
+mitigation. Margin as measured: **~6 GB above the floor.**
+
+Neo4j `/data` 4.2 GB, unchanged by the deploy (nothing was written). The
+preflight's probe path (`/opt/aw-workspace`, the host-mounted workspace
+tree) was verified to report that same `/dev/md2` filesystem as `df /` on
+the bare-metal host rather than a container overlay — a preflight
+measuring the wrong device would be worse than none.
+
+**Boundary with the sibling per-tool-policy card, stated here so a reader of
+either document finds it.** `exec-index-per-tool-policy.md` slice 2 landed
+in the SAME connector release window as this slice (two Coder runs editing
+`exec_sync.build_toolcall_row`/`_fetch_tool_calls` in the shared tree at
+once). The two compose by axis and not by accident: that card gates the
+CALL axis (`args_text`, via `exec_policy.apply_call_axis`), this one adds
+the RESULT axis. Its `Decision.allow_output` is resolved and carried today
+and consumed by **nothing** — `attach_results` applies the floor (the
+secret-tool drop) and the scrub/cap, not the per-app declaration. That
+document records it as a real gap with `attach_results` named as the wiring
+point for its own slice 4; it is harmless only because no installed app
+declares the field yet, and it stops being harmless the day one does.
+
+**Tests, and which of §13.9's verification items are satisfied vs deferred.**
+Connector suite **691 passed**; `aw-knowledgeable` backend suite **908
+passed, 1 pre-existing unrelated failure** (`test_k1_every_get_route_is_
+classified` — always red locally on the SPA-dist `/{full_path:path}` route,
+blind in CI; slice 3's new route IS classified in `GET_ROUTE_PLAN`, which
+is why that entry had to be added in the same commit). Frontend 7 vitest +
+`tsc --noEmit` clean.
+
+Satisfied now, without needing the connector installed:
+
+* **Result pairing across the two key names** — through the real tick, with
+  a reversed-order fixture so the join cannot be positional, plus a
+  cross-run collision case (same `tool_use_id`, different runs) that must
+  NOT pair. That last one is the failure no count would ever reveal: both
+  sides would look fully paired while one run's output sat on another
+  run's call.
+* **The secret-tool result drop**, over the bare name and all three
+  measured gateway spellings, on both sides — connector
+  (`scrub_tool_result`) and server (`normalize_toolcall`, which also
+  refuses to keep `result_len`: the length of a credential is information
+  about the credential). MUTATION, run and measured: deleting
+  `result_text = None` from the server's secret-tool branch turns 8 K7
+  tests red while every args-only test stays green.
+* **Scrub-before-cap on result text**, in the straddle shape slice 2
+  generalised — asserted on the leading FRAGMENT, because that is the only
+  shape that distinguishes the two orders.
+* **The retention valve's three arms**, exercised in K7 against a seeded
+  graph and deliberately NOT against production: the valve is irreversible
+  in the graph until a re-backfill, so "run it live to prove it works" is
+  the one verification this feature must not do. The test also pins that a
+  structured-only event is not counted, so `event_text == 1` is an
+  assertion rather than a tautology.
+* **The disk preflight**, including the low-disk refusal and the
+  measurement-failed refusal, with invented numbers — a guard whose trigger
+  condition is a disaster can only be proven honestly by injecting the
+  measurement.
+* **K5's own mechanism**, mutation-checked rather than asserted: removing
+  `exec_search_toolcall_results` from `_EXEC_FULLTEXT_TEMPLATES` does not
+  merely leave it unguarded, it lands in the KNOWLEDGE ANN guard and fails
+  the build on a collection predicate it has no business carrying
+  (`AssertionError: exec_search_toolcall_results: ANN template does not
+  post-filter bucket against $bucket_ids`). That is §12 risk 1 working as
+  designed.
+
+**Deferred to the joint install, and deferred rather than skipped** — every
+one of these needs the connector running, so none of them can be faked
+from here: `result_text` populated and paired on a known run via
+`exec_run_detail`; a real hit through `search_in='result'`; the spot-check
+that a live `write_secret`/`collect_secret` node has no `result_text`;
+`orphan_results` measured against the 483-call gap; the reconcile after the
+backfill; and the §13.16 end-to-end numbers. The `search_in='result'` arm
+has been exercised against a seeded graph through the real route (K7's
+positive control), so what is unverified is the live corpus, not the code
+path.
+
+**One scrubber behaviour measured and pinned rather than left to surprise
+someone.** A git remote whose USERNAME contains the word `token` —
+`https://x-access-token:SECRET@github.com/o/r`, the shape a `git remote -v`
+result actually has — loses its HOST as well as its credential, because the
+`credential-field` family is ordered ahead of `url-userinfo`, matches
+`x-access-token:` as a key/value pair and eats the rest of the line. The
+credential is removed either way; what is lost is the repo name. This
+contradicts `url-userinfo`'s own comment ("the host survives — it is the
+useful half"), so the test asserts the real behaviour and says so, which
+means a future reordering of `_PATTERNS` shows up as a changed assertion
+instead of silently.
+
+**What a reader of this section should do next:** slice 4 of
+`exec-index-per-tool-policy.md` (the output axis, whose wiring point is one
+call inside `exec_sync.attach_results`), then ONE
+`marketplace install knowledgeable --update` carrying both, then the
+`reset-watermark` backfill off-hours, then §13.16. Nothing in slice 3 needs
+re-doing to get there.
