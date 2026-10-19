@@ -245,10 +245,20 @@ connector does the heavy work:
   `source_slug`-not-`agent_slug` fact, and the `\u0000` client-side-parse
   rule are lifted verbatim from `scripts/load_exec_retrieval_neo4j.py:30-42,
   227-244`), **scrub** (§6), then POST batches to the ingest route with the
-  service secret. The connector holds the Postgres credential it already
-  effectively has (workspace side) and the service secret it already has;
-  it never holds the Neo4j password — which also retires the v2 script's
-  direct-HTTP-to-Neo4j pattern from anything production-facing.
+  service secret. The connector process never holds the Neo4j password —
+  which also retires the v2 script's direct-HTTP-to-Neo4j pattern from
+  anything production-facing.
+
+  **Correction, 2026-10-19 (card `3fe5bf3b-9510-8105-9a48-f85615d6bd1a`):**
+  an earlier version of this bullet said the *workspace* never holds the
+  password. Since the 2026-10-18 rotation that is false as written: the
+  vault entry `aw-stack-neo4j-auth` (aw-vault via aw-backend) is
+  workspace-scoped and readable from the workspace through the
+  approval-gated `read_secret` path. The property that actually holds, and
+  the one this design needs: **no connector code path reads the Neo4j
+  password, and the file SecretStore — the only store `exec_scrub` can
+  enumerate — never contains it.** The scrubbing consequence of that
+  distinction is §6 point 1, corrected the same day.
 - Batch sizing: ≤500 runs or ≤2,000 tool calls per request, target <10 s per
   request — production is single-worker, and the tunnel edge cuts requests
   at 30 s; a sync pass must interleave with live search traffic, not starve
@@ -300,13 +310,58 @@ today — every tenant caller gets every registered bucket. So:
 
 1. **Scrubbing on load is mandatory.** It happens in the connector, before
    the text crosses toward Neo4j, in two passes: (a) **exact-match
-   redaction of every value in the workspace secret store** — the connector
-   runs where `SecretStore` lives, so the set of known-live secrets is
-   enumerable, which is a far stronger guarantee than patterns; (b) pattern
+   redaction of every value in the workspace FILE secret store**
+   (`src.apps.secret_store.SecretStore` over `.aw-workspace/secrets/*.json`)
+   — the connector runs where that store lives, so its set of known-live
+   secrets is enumerable, which is a far stronger guarantee than patterns
+   *for the credentials that store holds*; (b) pattern
    families for secrets not in the store (`sk-…`, `ghp_`/`github_pat_`,
    `AKIA…`, `eyJ…` JWTs, `Authorization: Bearer …`, `password=`,
    `X-Internal-Secret`, URL userinfo). Replacement is `<REDACTED:kind>`,
    irreversible in the graph; Postgres keeps the originals.
+
+   **Correction, 2026-10-19 — exact-match does NOT cover the vault, by
+   decision.** There are two secret stores in this workspace: the per-app
+   file store above, and aw-vault (written by `aw-workspace-cli secrets` /
+   the `write_secret` tool, via aw-backend). `exec_scrub._secret_values()`
+   reads only the file store. Measured, not inferred: after the production
+   Neo4j password was written to the vault as `aw-stack-neo4j-auth`,
+   `scrub.exact_values` stayed at 10 — unchanged. **A vault-only credential
+   is therefore pattern-scrubbed only**, and an earlier version of point (a)
+   claimed exact-match coverage it did not have.
+
+   This is kept, not fixed, and the reason is the vault's own design: the
+   read path is approval-gated (a human on Telegram) precisely so a value
+   leaving the vault is always a conscious act. An unattended bulk read of
+   every vault secret on every 10-minute sync tick is impossible through
+   that gate and wrong around it — see §10 for the two rejected
+   alternatives. The containment for a vault-credential miss is §6 point 2's
+   population-equivalence argument, which holds in v1 regardless of which
+   store a secret lives in.
+
+   **What replaces the lost guarantee — a tested, monitored requirement,
+   not a coincidence:**
+
+   - *Tested:* every credential family known to transit the vault must have
+     a pinned pattern test in `tests/test_exec_scrub.py`. For
+     `aw-stack-neo4j-auth` this already holds: `NEO4J_AUTH=user/pass`
+     (env-assignment family, test_exec_scrub.py:146-152) and
+     `bolt://user:pass@…` (url-userinfo family, test_exec_scrub.py:237-248)
+     are both pinned, and both were verified to redact against the live
+     scrubber on 2026-10-19.
+   - *Monitored:* the connector keeps a committed coverage registry mapping
+     each vault secret NAME to the pattern families that cover its value's
+     shape (names are listable without approval — "listing is not a read",
+     aw-app-secrets). Each sync tick compares `list_secrets()` names against
+     the registry and reports unacknowledged names on the sync status
+     (`vault_names_uncovered`), surfaced by doctor — so a new vault secret
+     with no argued pattern coverage degrades *visibly*, which is the
+     property the silent gap violated. A unit test pins that each registry
+     entry's declared family redacts a representative invented shape, so the
+     registry cannot drift from the pattern table. (Implementation: a
+     follow-up Coder card; the registry lives in `aw-app-knowledgeable`
+     beside `exec_scrub.py`, the status field beside
+     `exact_match_unavailable` in `exec_sync.py`.)
 2. **Residual risk stated plainly:** pattern scrubbing is best-effort; a
    pasted credential with no recognisable shape survives it. The layers that
    contain that miss: the reserved unregistered bucket (no human-reachable
@@ -472,6 +527,34 @@ recoverable forward: wipe-and-backfill, since the graph is a projection.
   resolver, registration *is* exposure — every tenant caller would get it,
   and `search_nodes`/`get_node` would start returning exec nodes in the UI
   link picker. The unregistered reservation is the design, not an oversight.
+- **Making `_secret_values()` read the vault too (2026-10-19).** Rejected
+  on two grounds. First, it cannot be done through the sanctioned path: the
+  vault's `read_secret` is approval-gated by design (`aw-app-secrets` —
+  writing is ungated because the caller already holds the value; the gate
+  exists to stop values *leaving*), so a bulk unattended read every 10
+  minutes would either spam a human with approval prompts or require a new
+  ungated bulk-read endpoint — widening the single most deliberately
+  guarded boundary in the estate to strengthen a second-layer defence.
+  Second, it couples every scrub tick to vault availability, and the vault
+  has already gone dark for a day once (2026-10-02, the netns
+  decommissioning) — a scrubber whose strong pass silently depends on a
+  remote service reproduces the failure mode this estate is named for.
+- **Hash-only exact-match against vault values (2026-10-19).** Compare
+  digests, never hold plaintext: technically feasible (per distinct secret
+  length, a rolling-hash candidate scan over the text with a cryptographic
+  confirm — it matches only whole values, exactly like plaintext
+  exact-match, so substrings are no worse). Rejected because the digests
+  have to be computed somewhere that holds the plaintext, and both homes
+  are bad: a new aw-backend/vault digests endpoint is a new cross-repo
+  contract exposing offline-brute-forceable material for low-entropy
+  passwords; capturing digests at `write_secret` time in the workspace
+  covers only writes that pass through this workspace's write path — the
+  aw-backend UI or another workspace's write silently bypasses it, which
+  recreates the exact silent-divergence failure the 2026-10-19 card was
+  about. The marginal win over tested patterns is only the
+  no-recognisable-shape case, which §6 point 2's population-equivalence
+  argument already contains in v1. **Named runner-up:** this is the
+  approach to revive if the equivalence argument breaks — see §11.
 
 ## 11. What this makes harder later
 
@@ -489,6 +572,23 @@ recoverable forward: wipe-and-backfill, since the graph is a projection.
   in-place migration.
 - **Scrubber misses are durable** until someone re-scrubs and reloads;
   backups inherit them for their retention life.
+- **Vault credentials are pattern-scrubbed only (§6 point 1, corrected
+  2026-10-19)** — the exact-match guarantee is permanently narrowed to the
+  file store. Acceptable while §6 point 2's population-equivalence holds.
+  Three things would reopen it, in order of likelihood: (1) T2 exposes exec
+  search to human/browser tokens — the reader population then exceeds the
+  set who can read unscrubbed Postgres, the equivalence breaks, and the
+  digest approach (§10 runner-up) becomes worth its cost; (2) a vault
+  credential with no recognisable shape is measured transiting run text —
+  the "pattern coverage can be made a requirement" premise fails; (3) the
+  coverage registry rots in practice (unacknowledged vault names sitting in
+  doctor output) — evidence the manual registry doesn't scale, same
+  conclusion. Any of the three: revive the §10 digest runner-up rather than
+  re-arguing bulk vault reads.
+- **Secret-store consolidation got harder:** this section now documents
+  "two stores, two different scrub guarantees" as intended. Anyone merging
+  the file store and the vault later must update `exec_scrub`, the coverage
+  registry, and this document together.
 - **The shared-instance ceiling is real**: Community's stop-the-world backup
   grows with this data forever; the retention valve delays, not removes,
   that trajectory.
@@ -522,3 +622,16 @@ recoverable forward: wipe-and-backfill, since the graph is a projection.
    is knowledgeable's.** The mapping is explicit config (§2). Hardcoding
    `tenant-bootstrap` on the write side reproduces the exact class of bug
    `resolve_tenant_id`'s minting branch exists to prevent.
+8. **The vault coverage check (§6 point 1 correction) must list, never
+   read.** `list_secrets` returns names and metadata without approval;
+   `read_secret` puts a prompt on a human's phone — calling it from a
+   10-minute tick is an incident, not a bug. Reach the secrets app over the
+   app→app loopback; if it is absent or the backend link is down, report
+   `vault_coverage_unknown` on the sync status and carry on — the same
+   degrade-visibly-never-fatally contract `workspace_secret_values()`
+   already keeps. And the registry's unit test uses invented representative
+   shapes only; a real value in that file is the leak the whole module
+   exists to prevent. While touching `exec_scrub.py`, also fix its module
+   and `workspace_secret_values()` docstrings, which still claim "the set
+   of known-live secret VALUES is enumerable" unqualified — scope the claim
+   to the file store, mirroring this section.
