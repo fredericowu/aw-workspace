@@ -585,3 +585,42 @@ output, note}` — rejected for floor names), `DELETE /exec-policy/override`.
     The general rule for anyone extending this module: **when a function
     returns a security default, its error path needs the same scrutiny as
     its happy path, and the docstring must cover both.**
+12. **A CI replica run with an ambient `PYTHONPATH` is not a replica.** Paid
+    for on slice 3, and it is risk 10's own mitigation failing in the way
+    risk 10 describes.
+
+    `tests/test_exec_policy_store.py` shipped using `@pytest.mark.asyncio`.
+    `pytest-asyncio` is **not** a CI dependency — `aw-marketplace`'s
+    `.github/workflows/app-release.yml` installs exactly `pytest jsonschema
+    fastapi httpx uvicorn` — so in CI those were unknown marks on coroutines
+    nobody awaited: skipped with a warning on the pytest CI resolves, a hard
+    error on pytest 9. **36 tests reported green without executing a single
+    assertion**, every floor-refusal test among them. The release went green
+    on them twice.
+
+    Risk 10 already prescribes the fix ("verify in a CI replica — repo root,
+    no workspace checkout on `PYTHONPATH`, only the deps the workflow
+    installs"). That replica was run, and it passed, because this agent
+    container exports `PYTHONPATH=/opt/aw-workspace/.aw-workspace/venv/
+    lib/python3.12/site-packages` — which carries `pytest-asyncio`, and
+    which `python -m venv` does **not** shield a fresh venv from. Even
+    `pip install` inside that venv was a silent no-op, because every package
+    already imported. The replica was the workspace, wearing a venv.
+
+    So the instruction is narrower than "run a replica":
+
+    * `env -u PYTHONPATH` on BOTH the `pip install` and the `pytest` run, or
+      the venv is decorative;
+    * verify the replica is one before trusting it — `env -u PYTHONPATH
+      ./venv/bin/python -c "import importlib.util; print(importlib.util.
+      find_spec('pytest_asyncio'))"` must print `None`;
+    * and when a suite's own tests are the evidence, **mutation-check them**:
+      break one assertion and confirm it goes red. "36 passed" and "36 did
+      not run" are the same output.
+
+    The repo-level rule that follows: **this repo has no `pytest-asyncio`,
+    by standing convention.** Every async-touching suite here
+    (`test_bulk_ingest.py`, `test_client.py`, `test_forwarding.py`,
+    `test_fs_sync.py`) drives coroutines through a plain `_run(coro)` helper
+    and says so in its docstring. A new test file that reaches for the mark
+    instead is not a style deviation — it is a test that does not run.
