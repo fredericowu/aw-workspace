@@ -42,6 +42,7 @@ def test_emit_app_event_broadcasts_frame_shape():
     assert received, "emit_app_event did not reach the local listener"
     payload = json.loads(received[-1])
     assert payload["type"] == "app_event"
+    assert payload["version"] == 1
     assert payload["data"] == {
         "app": "google-workspace-mcp",
         "event": "oauth_completed",
@@ -58,3 +59,27 @@ def test_emit_app_event_is_a_noop_without_a_loop():
     mgr.emit_app_event("some-app", "some_event")
 
     assert ws.received == []
+
+
+def test_emit_app_event_payload_cannot_override_routing_identity():
+    async def scenario():
+        mgr = NotificationManager()
+        mgr.set_loop(asyncio.get_running_loop())
+        ws = _FakeWebSocket()
+        mgr.add_listener(ws)
+
+        mgr.emit_app_event("real-app", "real_event", {
+            "app": "spoofed-app", "event": "spoofed_event", "value": 1,
+        })
+
+        for _ in range(50):
+            if ws.received:
+                break
+            await asyncio.sleep(0.05)
+        return ws.received
+
+    received = asyncio.run(scenario())
+    assert received
+    assert json.loads(received[-1])["data"] == {
+        "app": "real-app", "event": "real_event", "value": 1,
+    }

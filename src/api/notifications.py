@@ -148,7 +148,10 @@ class NotificationManager:
             return
         payload = {
             "type": "app_event",
-            "data": {"app": app_id, "event": event, **(data or {})},
+            "version": 1,
+            # Reserved routing fields are always server-stamped.  A caller's
+            # payload must not be able to impersonate another app or event.
+            "data": {**(data or {}), "app": app_id, "event": event},
         }
         self._loop.call_soon_threadsafe(
             asyncio.ensure_future,

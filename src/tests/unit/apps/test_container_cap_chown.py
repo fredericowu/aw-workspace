@@ -129,3 +129,34 @@ def test_privileged_grant_still_short_circuits_correctly(sup, monkeypatch):
     s.start("trusted")
 
     assert client.runs[0]["privileged"] is True
+
+
+def test_event_credentials_are_only_injected_for_capable_apps(sup, monkeypatch):
+    s, client = sup
+    s._network = "aw-network"
+    monkeypatch.setattr("src.apps.app_events.app_event_token", lambda app: f"token:{app}")
+    monkeypatch.setattr("src.apps.app_events.app_event_url", lambda app: f"http://workspace/{app}")
+
+    s.register("emitter", image="ghcr.io/example/emitter:latest", port=9004,
+               emit_app_events=True)
+    s.start("emitter")
+
+    env = client.runs[0]["environment"]
+    assert env["AW_APP_EVENT_TOKEN"] == "token:emitter"
+    assert env["AW_APP_EVENT_URL"] == "http://workspace/emitter"
+
+
+def test_non_emitter_does_not_resolve_or_receive_event_credentials(sup, monkeypatch):
+    s, client = sup
+    s._network = "aw-network"
+
+    def unexpected(_app):
+        raise AssertionError("credential helper must not run for a non-emitter")
+
+    monkeypatch.setattr("src.apps.app_events.app_event_token", unexpected)
+    s.register("viewer", image="ghcr.io/example/viewer:latest", port=9005)
+    s.start("viewer")
+
+    env = client.runs[0]["environment"]
+    assert "AW_APP_EVENT_TOKEN" not in env
+    assert "AW_APP_EVENT_URL" not in env

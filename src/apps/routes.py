@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 
 import anyio
 import httpx
-from fastapi import Body, Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
 from src.api.identity import authorize_ws, require_identity, ws_close_code
@@ -1591,6 +1591,44 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
     @app.get("/api/apps/-/contributions")
     async def contributions(identity: dict = Depends(require_identity)):
         return runtime.contributions()
+
+    @app.post("/api/apps/{slug}/events")
+    async def emit_app_event(
+        slug: str,
+        data: dict = Body(...),
+        app_event_token_header: str = Header(default="", alias="X-AW-App-Event-Token"),
+    ):
+        """Tier-2 emission door. Identity is the authenticated path slug;
+        callers cannot put an app id in the body or borrow another app's token.
+        """
+        from src.apps.app_events import (
+            EVENT_RE, MAX_EVENT_PAYLOAD_BYTES, payload_size, verify_app_event_token,
+        )
+
+        loaded = runtime.get(slug)
+        if loaded is None:
+            raise HTTPException(status_code=404, detail="app not installed")
+        # Token derivation reads the workspace API key from the synchronous
+        # settings store; keep that I/O off uvicorn's single event-loop thread.
+        valid_token = await asyncio.to_thread(
+            verify_app_event_token, slug, app_event_token_header)
+        if not valid_token:
+            raise HTTPException(status_code=401, detail="invalid app event credential")
+        if "notifications:send" not in loaded.granted_permissions:
+            raise HTTPException(status_code=403, detail="notifications:send is not granted")
+        event = data.get("event")
+        payload = data.get("data", {})
+        if not isinstance(event, str) or not EVENT_RE.fullmatch(event):
+            raise HTTPException(status_code=400, detail="invalid event name")
+        declared = {hook.get("event") for hook in loaded.manifest.event_hooks}
+        if event not in declared:
+            raise HTTPException(status_code=403, detail="event is not declared in contributes.event_hooks")
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="data must be an object")
+        if payload_size(payload) > MAX_EVENT_PAYLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="event payload exceeds 8192 bytes")
+        app.state.notification_mgr.emit_app_event(slug, event, payload)
+        return {"ok": True, "app": slug, "event": event, "version": 1}
 
     @app.get("/api/apps/-/skills")
     async def skills(identity: dict = Depends(require_identity)):

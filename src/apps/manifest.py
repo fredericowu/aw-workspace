@@ -16,6 +16,7 @@ from typing import Any
 
 from src.apps.agents import KINDS as AGENT_KINDS
 from src.apps.capabilities import is_valid_capability
+from src.apps.app_events import validate_event_hooks
 
 # slug rule (ADR Decision 8): the namespace key for routes/tables/commands/...
 SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{1,40}$")
@@ -140,6 +141,10 @@ class Manifest:
     @property
     def settings_panels(self) -> list[dict[str, Any]]:
         return list(self.contributes.get("settings_panels", []))
+
+    @property
+    def event_hooks(self) -> list[dict[str, Any]]:
+        return list(self.contributes.get("event_hooks", []))
 
     @property
     def launchable_windows(self) -> list[dict[str, Any]]:
@@ -1307,6 +1312,19 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
             raise ManifestError(
                 f"window id {win.get('id')!r} must be namespaced under '{slug}.'"
             )
+
+    try:
+        validate_event_hooks(contributes, slug, permissions)
+    except ValueError as exc:
+        raise ManifestError(str(exc)) from exc
+    declared_window_ids = {
+        win.get("id") for win in contributes.get("windows", []) if isinstance(win, dict)
+    }
+    for hook in contributes.get("event_hooks", []):
+        window_id = hook["action"]["window"]
+        if window_id not in declared_window_ids:
+            raise ManifestError(
+                f"contributes.event_hooks action references undeclared window {window_id!r}")
 
     for skill in contributes.get("skills", []):
         if not isinstance(skill, dict) or not skill.get("id") or not skill.get("path"):

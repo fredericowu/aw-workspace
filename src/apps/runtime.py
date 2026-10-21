@@ -863,6 +863,7 @@ class AppRuntime:
         nav: list[dict[str, Any]] = []
         settings: list[dict[str, Any]] = []
         frontend: list[dict[str, Any]] = []
+        event_hooks: list[dict[str, Any]] = []
         for app in self._apps.values():
             slug = app.manifest.id
             for win in app.manifest.windows:
@@ -871,6 +872,8 @@ class AppRuntime:
                 nav.append({"app": slug, **entry})
             for panel in app.manifest.settings_panels:
                 settings.append({"app": slug, **panel})
+            for hook in app.manifest.event_hooks:
+                event_hooks.append({"app": slug, **hook})
             fe = app.manifest.frontend
             if fe:
                 bundle = fe.get("bundle")
@@ -908,7 +911,7 @@ class AppRuntime:
                     "granted_permissions": app.granted_permissions,
                 })
         return {"windows": windows, "nav": nav, "settings": settings,
-                "frontend": frontend}
+                "frontend": frontend, "event_hooks": event_hooks}
 
     @staticmethod
     def _bundle_exists(app: LoadedApp, bundle: str) -> bool:
@@ -1648,7 +1651,8 @@ class AppRuntime:
         self.containers.register(
             slug, image, port, run_flags=run_flags, resources=resources, env=env,
             volumes=volumes, host_power=host_power,
-            publish=rt.get("publish") or [])
+            publish=rt.get("publish") or [],
+            emit_app_events="notifications:send" in granted)
         self.journal.record(slug, "container:register", image,
                             {"port": port, "run_flags": run_flags, "resources": resources,
                              "host_power": list(host_power),

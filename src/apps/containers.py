@@ -449,7 +449,8 @@ class _Container:
                  volumes: dict[str, dict] | None = None,
                  container_name: str | None = None,
                  host_power: tuple[str, ...] | None = None,
-                 publish: list[dict] | None = None) -> None:
+                 publish: list[dict] | None = None,
+                 emit_app_events: bool = False) -> None:
         self.app_id = app_id
         self.image = image
         # 0 for a sidecar with nothing to expose — a database is dialled by
@@ -465,6 +466,7 @@ class _Container:
         # not the requested one, so nothing here re-decides policy.
         self.host_power = tuple(host_power or ())
         self.publish = list(publish or [])
+        self.emit_app_events = emit_app_events
         self._name = container_name
         self.container_id: str | None = None
 
@@ -706,7 +708,8 @@ class ContainerSupervisor:
                  volumes: dict[str, dict] | None = None,
                  container_name: str | None = None,
                  host_power: tuple[str, ...] | None = None,
-                 publish: list[dict] | None = None) -> None:
+                 publish: list[dict] | None = None,
+                 emit_app_events: bool = False) -> None:
         if app_id in self._containers:
             raise ContainerError(f"container already registered for {app_id!r}")
         if not image:
@@ -724,7 +727,7 @@ class ContainerSupervisor:
         host_power = hostpower.expand(host_power)
         _publish_ports(publish)
         c = _Container(app_id, image, port, run_flags, resources, env, self._network,
-                       volumes, container_name, host_power, publish)
+                       volumes, container_name, host_power, publish, emit_app_events)
         self._containers[app_id] = c
         log.info("apps: registered container %s (image=%s port=%s network=%s)",
                  c.name, image, port, self._network)
@@ -832,7 +835,7 @@ class ContainerSupervisor:
         kwargs: dict = {
             "name": c.name,
             "detach": True,
-            "environment": c.env,
+            "environment": dict(c.env),
             "volumes": c.volumes,
             # Default stays exactly as it was: no privilege, no devices, no
             # OTHER added capabilities. Only an app that cleared all three
@@ -911,6 +914,16 @@ class ContainerSupervisor:
             # container's hostname to its name by default, so gethostname()
             # gives that same resolvable name from inside the workspace.
             kwargs["environment"][WORKSPACE_HOST_ENV] = workspace_host()
+            # A Tier-2 app emits shell events through a credential scoped to
+            # its own id. Sidecars never receive it: they are implementation
+            # details of the app, not independent manifest identities.
+            if c.emit_app_events and ":" not in c.app_id:
+                from src.apps.app_events import (
+                    APP_EVENT_TOKEN_ENV, APP_EVENT_URL_ENV,
+                    app_event_token, app_event_url,
+                )
+                kwargs["environment"][APP_EVENT_TOKEN_ENV] = app_event_token(c.app_id)
+                kwargs["environment"][APP_EVENT_URL_ENV] = app_event_url(c.app_id)
             # The reverse direction: an app that needs to publish its OWN
             # address for something else to dial back in (e.g. aw-mcp-gateway
             # writing its own entry into the host's .mcp.json, ADR "container

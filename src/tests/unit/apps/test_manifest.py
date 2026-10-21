@@ -90,6 +90,38 @@ def test_window_id_must_be_namespaced():
         validate_manifest(bad)
 
 
+def test_event_hook_open_window_is_validated_and_exposed():
+    data = _m(permissions=["routes:register", "notifications:send"])
+    data["contributes"]["event_hooks"] = [{
+        "event": "open_note",
+        "action": {"type": "open_window", "window": "notes.main", "url_field": "url"},
+    }]
+    assert validate_manifest(data).event_hooks == data["contributes"]["event_hooks"]
+
+
+@pytest.mark.parametrize("hook,match", [
+    ({"event": "open_note", "action": {"type": "javascript", "window": "notes.main"}}, "action.type"),
+    ({"event": "open_note", "action": {"type": "open_window", "window": "other.main"}}, "namespaced"),
+    ({"event": "Open Note", "action": {"type": "open_window", "window": "notes.main"}}, "event must match"),
+    ({"event": "open_note", "action": {"type": "open_window", "window": "notes.missing"}}, "undeclared window"),
+])
+def test_invalid_event_hook_is_rejected_readably(hook, match):
+    data = _m(permissions=["routes:register", "notifications:send"])
+    data["contributes"]["event_hooks"] = [hook]
+    with pytest.raises(ManifestError, match=match):
+        validate_manifest(data)
+
+
+def test_event_hooks_require_notifications_capability():
+    data = _m()
+    data["contributes"]["event_hooks"] = [{
+        "event": "open_note",
+        "action": {"type": "open_window", "window": "notes.main"},
+    }]
+    with pytest.raises(ManifestError, match="notifications:send"):
+        validate_manifest(data)
+
+
 def test_container_tier_needs_no_entrypoint():
     m = validate_manifest(_m(tier="container", runtime={"image": "ghcr.io/x", "port": 8080},
                              permissions=["containers:manage"], contributes={}))
