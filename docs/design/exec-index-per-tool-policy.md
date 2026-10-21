@@ -316,8 +316,60 @@ output, note}` — rejected for floor names), `DELETE /exec-policy/override`.
   is resolved and carried (the §6 precedence rules govern both axes and
   §7's UI shows both) and is read by nothing — see the note on slice 4.
 - **Slice 3 — overrides + maintenance UI.** State-facade store, the three
-  routes, the `app_iframe` page with five-state source column, floor rows
-  locked. No modals.
+  routes, the page with five-state source column, floor rows locked. No
+  modals.
+
+  **Shipped 2026-10-21.** `exec_policy_store.py` (overrides,
+  acknowledgements and observed identities on `ctx.state.kv`, dedicated
+  `exec_policy.*` namespace, never the config blob), `exec_policy_view.py`
+  (the row builder, and the ONLY place `provides` is read), `policy_panel.py`
+  (the page), five routes on the authed surface — `GET /exec-policy`,
+  `PUT`/`DELETE /exec-policy/override`, `PUT`/`DELETE /exec-policy/ack` — and
+  `GET /policy-ui`. 97 new tests; 832 total, green in-workspace and in a CI
+  replica. Four things worth recording because they changed the design as
+  written:
+
+  * **`iframe`, not `app_iframe`.** §7 named `app_iframe`, which resolves to
+    the per-app SUBDOMAIN (`AppWindow.jsx`'s `appSubdomainUrl`) — a different
+    origin, and `null` on any non-workspace host, in which case the widget
+    renders nothing. Every sibling app that has actually shipped this shape
+    (`aw-app-secrets`, `-whatsapp`, `-plaud`, `-remote-screen`) uses
+    `iframe { src: "/api/apps/<slug>/…" }`, which `apiUrl()` rewrites to the
+    API origin — the same origin the page's own fetches go to, so the apex
+    `aw_id_jwt` cookie authorises them with no token plumbing. Every other
+    constraint §7 set is met unchanged (route-served self-contained page, not
+    under the reserved `/ui`, the existing declarative window, no UI-repo
+    change). Taking the measured idiom over the named widget.
+  * **The acknowledge path is the doctor fix, and it is now wired.** §9's
+    slice-2 note left `policy_unresolved` and the doctor alone. The doctor
+    check now reads the names NOT accounted for — `policy_unresolved` minus
+    `policy_unresolved_known` — so the two BYOD federations stop pinning it
+    red forever, while `policy_unresolved` itself stays exactly as slice 2
+    shipped it. Acknowledging silences a counter and never lifts a denial;
+    that invariant has its own tests on both sides of the store.
+  * **An unreadable OVERRIDE store is a new reported condition.**
+    `policy_overrides_unreadable` on the sentinel and the doctor, and a
+    banner on the page. §12 risk 11's lesson one read path further out: under
+    a blacklist, "no overrides" and "could not read the overrides" mean
+    opposite things. It cannot fail closed (an unreadable store does not say
+    WHICH tools a human restricted), so it is loud; writers refuse rather
+    than replace a blob they could not read, which would discard every other
+    human's opt-out.
+  * **A floor tool is one row, keyed on the TOOL.** Found on the first real
+    screenshot, not by a fixture: `apps/secrets` lists its four tools in
+    `provides`, so they arrived by three routes and rendered as EIGHT locked
+    rows for four names.
+
+  Verified against the real tree, not fixtures: 61 apps scanned, 39
+  upstreams, `scan_error: None`; all three measured spellings of
+  `write_secret` → `floor`, both axes denied; `spread_secret` → not floor;
+  every real production name attributed to the right app
+  (`aw_kanban`→`notion`, `playwright`→`mcp-tools`, `vscode`→`code-server`,
+  `paper_search`→`research-search`, `phd_knowledge_base`→`aw-app-uc-phd`,
+  `kali`→`kali-linux`); a `PUT` on `write_secret` refused at the route (both
+  bare and gateway-prefixed) with nothing reaching the store; an override on
+  `remote-host-cli/remote_host_read_file` round-tripping through the store
+  and changing the TICK's own decision for the real gateway name.
 - **Slice 4 — output axis + policy-driven retro-purge.** `allow_output`
   consumed by the §13-slice-3 `result_text` path. **Now a real gap, not a
   future one (2026-10-19):** §13 slice 3 landed in the connector the same
