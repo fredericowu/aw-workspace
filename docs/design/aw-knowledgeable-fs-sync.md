@@ -2835,3 +2835,218 @@ With `delete_policy = "random/=auto"` set and the latch clear:
 5. `delete_policy=""` → tick result and status byte-identical to
    today; the full existing suite green unmodified, the frozen valve
    ranges untouched.
+
+## 22. Amendment (2026-10-21): an UNDECIDED `pending_delete` mark never clears when the file comes back — restore by path, from the found-loop
+
+Written against card
+`4005bf3b-9510-815c-a9f3-e8150a8e5456`. §1.2's own table has promised
+this since the first version of this document: *"`POST
+/api/documents/{id}/restore` … Clears the pending-delete mark (file came
+back, OR a human declines)"*. Only the second trigger was ever wired up.
+This amendment closes the gap; it does not change the intent.
+
+### 22.1 The measured defect
+
+Found live 2026-10-21: **37 documents sat in aw-knowledgeable's
+pending-deletion queue, 24 of them with their file present on disk right
+then** — `apps/*/docs/**` and `docs/architecture/**` across `ssh`,
+`secrets`, `remote-host-cli`, `notion`, `knowledgeable`, `kb`, `uc-phd`,
+`aw-app-template`, `architecture` and `agents-platform-runners`. Stale
+marks from a transient tree disappearance around 2026-10-16/17 that
+simply never cleared. The 24 were declined by hand via
+`decline_pending_deletions` as a one-off; the gap is what this card
+fixes.
+
+Confirmed by reading the connector's found-loop
+(`knowledgeable_app/fs_sync.py`, `_run_tick_locked`'s `for relpath in
+sorted(found):`). Three cases, two already handled:
+
+- `missing_scans > 0` and the file is present → the counter resets. Correct,
+  already shipped.
+- `restore_suppressed = 1` (a human declined through the UI, §18.2) and the
+  file is present → the suppression clears. Correct, already shipped.
+- **`pending_delete = 1`, nobody has decided yet, and the file is present →
+  nothing at all.** The mark stayed `1` in the journal and `sync_status:
+  pending_delete` on the Document node, forever, until a human or an agent
+  explicitly called the by-id restore.
+
+The third case is the ordinary one, and the only one with no automatic
+exit. Worse, the live incident class is *unchanged content*: the file came
+back byte-identical, so it never reaches the upload path either — nothing
+downstream of the found-loop would ever have noticed.
+
+### 22.2 The decision
+
+**A new service-only by-path fan-out restore seam on the server, called
+from the connector's found-loop the first tick the file is seen present —
+and deliberately WITHOUT setting `restore_suppressed`.**
+
+The seam is the exact mirror of §17.2's `mark-delete-by-path`, for the
+exact same §17.1 reason: the journal is one row per path, the graph can
+hold several documents at one `source_path`, so a by-id restore reaches
+only the claimant a journal row happens to name and leaves §17.1's losers
+marked forever. Symmetric invariant to §17.4's mark-side one:
+
+> **A restored path means every claimant at that path is restored.**
+
+Three deliberate properties, each inherited from the mark side:
+
+1. **Idempotency gate in the Cypher** — `AND d.sync_status =
+   'pending_delete'`, the mirror of the mark template's `AND
+   (d.sync_status IS NULL OR d.sync_status <> 'pending_delete')`. A re-run
+   matches zero rows, re-stamps nothing, and produces no §18.1 feed churn.
+   A never-marked live sibling at the same path is untouched.
+2. **`updated_at` moves, `rev` does NOT** — §18.1, load-bearing. `rev` is
+   the content version; `updated_at` is the feed cursor key. Bumping `rev`
+   on a status-only transition would make an unchanged-content restore
+   look like a remote edit to §3.3's conflict rule, and the pull pass
+   would overwrite a local `authored/` edit with the server's copy. The
+   server suite asserts `rev` unchanged explicitly.
+3. **No `force`, no by-id variant** — a restore only ever clears a mark.
+
+**No suppression, and this asymmetry is the heart of the design.**
+`restore_suppressed` encodes *"a human declined; keep this document even
+though its file is gone"* (§18.2) — it necessarily grants the path one
+free disappearance cycle, because the file really is still missing and
+detection would otherwise re-mark it two ticks later. Here the trigger is
+hard disk evidence that the file is **present**, so there is nothing to
+suppress: detection must stay fully armed, and a later genuine
+disappearance is marked again through the ordinary ≥2-scans clock. Reusing
+`_apply_restore` would have conflated the two and bought every reappearing
+path an unearned free vanish.
+
+**Placement inside the tick is load-bearing.** The new block sits between
+§18.2's suppression-clear and the `missing_scans` reset, and therefore
+*before* the `digest == last_synced` unchanged short-circuit. Unchanged-content
+reappearance is exactly the 24-document incident class above and never
+reaches the upload path — a block placed after that short-circuit would
+never fire for it.
+
+### 22.3 Where it lands
+
+*`repos/aw-knowledgeable` (server — ships FIRST):*
+
+- **`backend/app/core/graph.py`** — `_CATALOG` template
+  `restore_documents_pending_delete_by_path`, beside the mark template:
+  same MATCH on `{tenant, bucket, source_path}`, same `workspace_slug =
+  $workspace_slug OR workspace_slug IS NULL` filter (the NULL-slug legacy
+  losers are restored too), the idempotency gate above, `REMOVE
+  d.sync_status, d.pending_delete_since, d.pending_delete_reason`, `SET
+  d.updated_at = datetime()`, `RETURN d.external_id`. Plus the async
+  `restore_documents_pending_delete_by_path(source_path, workspace_slug)`
+  beside `mark_documents_pending_delete_by_path`, returning the ids
+  actually transitioned by *that* call.
+- **`backend/app/api/documents.py`** — `POST
+  /api/documents/restore-by-path`, beside `mark-delete-by-path` and gated
+  identically: `require_bucket_write`, service-only 403 in the body (the
+  connector restores by path; a human declining in the approval UI keeps
+  using `POST /{id}/restore`), `validate_source_path` → 400, required
+  non-blank `workspace_slug` → 400. Body `{source_path, workspace_slug}`;
+  returns `{source_path, restored: [ids], count}`.
+- **`backend/tests/test_fs_sync_server_seams.py`** — fan-out including a
+  NULL-slug claimant; a non-pending sibling left untouched (no feed
+  churn); idempotent re-run `count=0` with an empty feed delta;
+  `updated_at` moved and `rev` unchanged; 403 for a human; 400 for a
+  dot/traversal path and for a blank slug.
+- **`backend/tests/test_bucket_scope.py`** — the new route added to both
+  registries the §7bis sweep keeps (`expected_wired`,
+  `_POST_JSON_BODIES`). An unclassified bucket-scoped route is a hard
+  failure there by design, so this is part of the change, not a fixup.
+
+*`repos/aw-app-knowledgeable` (connector — ships SECOND):*
+
+- **`knowledgeable_app/mcp/client.py`** — `restore_by_path(source_path,
+  workspace_slug, *, bucket)` beside `mark_delete_by_path`, with **`bucket`
+  as an explicit query param**. The route is `require_bucket_write`-gated
+  and an omitted bucket 400s as ambiguous the moment a second writable
+  bucket exists — that exact omission has already broken
+  `put_document_by_path` and `mark_delete_by_path` in production (memory
+  `fs-sync-writes-need-an-explicit-bucket`).
+- **`knowledgeable_app/fs_sync.py`** — the found-loop block described
+  above. On a client error: `log.warning` and `continue`, leaving the
+  journal row completely untouched — the file is still present next tick,
+  so retry *is* the recovery mechanism and no second one is needed. It
+  must never fall through on error: uploading into a still-marked document
+  would leave the server's `pending_delete` standing over fresh content.
+  On success — **including `count == 0`**, which means the server was
+  already restored through another channel and the goal state holds either
+  way — `UPDATE … SET pending_delete = 0, missing_scans = 0`, then fall
+  through to the ordinary flow (so a reappearance *with* a content change
+  restores and then takes the normal §20.2 quiet-window/upload path in the
+  same tick). New tick counter `pending_restored` in the result dict.
+- **`tests/test_fs_sync.py`** — unchanged-content reappearance fires the
+  restore exactly once with an explicit bucket and sets no suppression; a
+  failed restore leaves the row pending and the next healthy tick clears
+  it; a `restore_suppressed` row takes the §18.2 path and never calls the
+  new seam; a changed-content reappearance restores *then* uploads in one
+  tick; a still-missing pending row is not touched by the new block.
+
+### 22.4 Interactions verified
+
+- **§7 valve, untouched.** This is restore-direction only. §18.3 narrowed
+  the valve's numerator to mark-eligible rows while leaving the
+  denominator at all tracked rows; clearing a mark returns a row to the
+  numerator's eligible set, which *widens* tracked headroom rather than
+  consuming it. No threshold, guard or latch changes.
+- **§17.4's one-time catch-up runs BEFORE the found-loop**, and re-issues
+  the by-path mark for every row already `pending_delete=1` — including
+  one whose file is present. On that single catch-up tick the server is
+  therefore marked and then restored again within the same tick. End state
+  is correct, the catch-up never runs twice (it is flag-gated in
+  `FLAGS_TABLE`), and in production it has long since run. Noted rather
+  than guarded against.
+- **§21's `delete_policy` auto-approve pass runs AFTER the found-loop**, so
+  a same-tick restore wins: a reappeared path is no longer `pending_delete`
+  by the time the pass selects candidates. This *strengthens* §21.8
+  acceptance 4 — that row is now excluded twice over (mark cleared, and
+  `missing_scans` back under `rule.min`) instead of only by the counter.
+  Its test was updated to assert the stronger property.
+- **§18.1's feed and §18.2's chain.** A crash between the server restore
+  and the journal write self-heals: the restore surfaces on the feed, the
+  pull pass's restore detection calls `_apply_restore`, and the resulting
+  suppression clears on the next found-loop pass because the file is
+  present. One extra tick, no stuck state.
+- **§18.3's GC never touches these rows** — their claimants are alive, so
+  they appear in a full `sync-paths` enumeration.
+
+### 22.5 Rejected alternatives
+
+1. **Reuse `_apply_restore` (fs_sync.py:559).** It sets
+   `restore_suppressed = 1`, which conflates a human's decline with disk
+   evidence and grants the path one unearned free disappearance cycle —
+   the next real deletion goes unmarked for a whole extra cycle. Rejected:
+   the asymmetry in 22.2 is the point of the design, not an oversight.
+2. **Clear the journal flag only, and let the upload path fix the
+   server.** Never fires for unchanged content — i.e. never for the actual
+   incident — and even on a content change it only heals the one document
+   `put_document_by_path` resolves, leaving §17.1's losers marked.
+3. **Call the by-id `POST /{id}/restore` with the journal's
+   `external_id`.** §17.1 is precisely the finding that a journal row's
+   `external_id` is unsound as "the document at this path"; the losers
+   stay marked. This is the mistake the mark side already stopped making.
+4. **Auto-restore inside `upsert_document_by_path` on the server.** Only
+   fires when content changes, so it misses the incident class entirely,
+   and it couples a status decision to a content write.
+5. **A periodic reconcile pass over `GET /documents?pending_delete=1` plus
+   a disk check.** A second presence engine next to the scan, with its own
+   staleness and its own disagreement mode — against §17.2's "one
+   mechanism, one tick". §18.4's catch-up is deliberately one-shot for the
+   same reason.
+
+### 22.6 What this makes harder later
+
+- **"Mark now while the file still exists, decide later" becomes
+  impossible for path-level marks.** Any mark whose file is present on
+  disk clears within one tick. That was never a supported workflow, but it
+  is now structurally unavailable.
+- **A by-id orphan mark gets swept by the fan-out.**
+  `orphan_reconcile.py` marks the loser of a duplicate group by id,
+  deliberately leaving its live sibling alone. If that path's journal row
+  later goes `pending_delete` and then reappears, this restore clears the
+  orphan mark too. The reconciler re-marks on its next run, so the window
+  is one reconcile cycle. Accepted as symmetric with §17.4's mark-side
+  invariant — a path-level operation is path-level in both directions.
+- **An operator can no longer read `sync_status: pending_delete` as "a
+  decision is owed".** It now means "owed, *and* the file is still gone".
+  That is the more useful reading, but it is a changed meaning for anyone
+  with tooling over the queue.
