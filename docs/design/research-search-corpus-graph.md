@@ -1,5 +1,17 @@
 # research-search — corpus graph, lazy reference import, auto AI-Generate on import
 
+> **SUPERSEDED (2026-10-23, same day).** A second Architect pass on the same
+> parent card replaced this design with
+> [`research-search-graph-layer.md`](research-search-graph-layer.md)
+> (commit `79294f1`), which incorporates two refinements Frederico added
+> after this pass started (websocket-driven lazy import; graph placed below
+> the PDF in Document Viewer, not a standalone tab) and **keeps his explicit
+> sequencing** — graph work BEFORE auto-AI-Generate-on-import, which this
+> doc's D2 inverted. The D1 storage conclusion (keep pgvector, no Neo4j)
+> was reached independently by both passes and stands. The A/B/C/D
+> sub-cards from this doc are archived; build from the G1–G4 cards instead.
+> Do not implement anything from this document.
+
 Card `4025bf3b-9510-81ae-b5ea-e62a7af00bf2`. Architect design for Frederico's
 three connected asks: (1) auto-queue AI Generate whenever a paper is imported,
 (2) migrate the index backend from pgvector to Neo4j/GraphRAG, (3) a corpus
