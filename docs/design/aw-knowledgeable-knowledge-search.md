@@ -479,6 +479,73 @@ Reuse the A/B's method, made repeatable:
    gateway, not just in-container curl — in-container never crosses the hop
    (the BYOD-tunnel memory's lesson generalises).
 
+## 11. Addendum (2026-10-23): `also_in` compaction — a `documents` map, not a repeat per entry
+
+Card `aw-knowledgeable-knowledge_search-repete-metadado-completo-do-documento-
+em-cada-entrada-de-also_in-formato-compacto`. §5.5's `results`/`retrieve_only`
+naming above predates the shipped shape (the real response key is `chunks`,
+not `results`; `synthesize` not `retrieve_only`; plus `effective`, `clamped`,
+`rounds_run` — never corrected here, corrected now alongside this change).
+
+**The waste, measured on a live payload** (prod, same question as AP-MT run
+`6a93966f`, `X-Internal-Secret`, `synthesize=false`, `o200k_base` — the
+tokenizer the retrieval workers actually use): 20 fused chunks, 55 `also_in`
+entries across 18 chunks, 9 distinct documents — the worst single chunk had 7
+entries, 6 of them the *same* document varying only `chunk_index`. Each entry
+repeated `document_id` + a ~140-char `document_label` slug + `document_path`
+in full. Before: 48,736 B / 15,015 tok compact JSON (17,914 tok in the
+indent=2 text the Connector hands agents). The chunk text itself — the actual
+content — was only 5,002 tok, 33% of the payload.
+
+**The fix, in `core/knowledge_search.py` (`_compact_chunks`, ~line 516),
+applied only when the response is assembled (~line 701), never upstream:**
+- A chunk's `also_in` (`[{document_id, document_label, chunk_index}, ...]`)
+  becomes `{document_id: [chunk_index, ...]}` — label/path dropped from each
+  entry, order preserved (score-descending, same order the entries already
+  carried).
+- A new top-level `documents: {document_id: {label, path}}` map resolves
+  every document referenced by any chunk's own fields or by any `also_in`
+  entry, exactly once.
+- `citations` (`_citations`) drops `document_label` — resolve it via
+  `documents`.
+- `chunk_text_sha256` — fusion's internal dedupe key — no longer appears on
+  a response chunk row; it stays internal to `collapse_duplicate_chunks`/
+  `rrf_fuse`.
+- A chunk row's own `document_id`/`document_label`/`document_path`/
+  `heading_path`/`text`/`score`/`rrf_score`/`arms` are unchanged — only
+  `also_in` and `chunk_text_sha256` change shape.
+- An `also_in` entry with no `document_id` groups under the explicit
+  `ALSO_IN_UNKNOWN_DOCUMENT` sentinel — never a JSON-null key, never
+  silently dropped (collapse-never-drop, §5, applied to this compaction too).
+- `_compact_chunks` is pure and does not mutate `fused` — synthesis
+  (`_synthesis_messages`) still reads `fused` directly, and its
+  `_CONTEXT_FIELDS` still wants `document_label` on the chunk row unchanged.
+
+**Measured after:** 38,877 B / 11,973 tok compact (**-20.3%**); 14,388 tok
+indent=2 (**-19.7%**). The search-knowledge workflow makes 4 retrieval calls
+per run — roughly 14k fewer tokens per run from this alone.
+
+**Scope, deliberately narrow:** `collapse_duplicate_chunks`/`_also_in_entry`
+(`core/graph.py`, shared by `run_search`, `anchor_search`, and topics) are
+untouched — those surfaces (frontend, playground) keep the fat `also_in`
+shape. Compacting at the source would contaminate `/api/search` and topics,
+outside this card's scope.
+
+**Rejected variants:** also stripping a chunk's own `document_label`/
+`document_path` out to the `documents` map (an extra -3.1pp) — rejected
+because the dag/transform epic's JMESPath projections run per-chunk
+post-flatten and cannot join against a sibling map; dropping `arms` by
+default (measured -33.3% alone) — rejected, it is the documented provenance
+contract (§5.5), kept as a named opt-out follow-up
+(`include_provenance=false`) if the dag epic's live A/B still shows context
+pressure.
+
+**What this makes harder:** two `also_in` shapes now coexist in the codebase
+(this compact one vs. `run_search`/topics' fat one) until someone unifies
+them; without `chunk_text_sha256` on the response, cross-call textual dedup
+needs to recompute the sha256 of the normalized text rather than reuse the
+one already shipped.
+
 ---
 
 *Prior work consumed, not re-derived: the 2026-10-08/10-10 retrieval A/B and
