@@ -328,3 +328,70 @@ the generic registration pipeline.** The reasoning, falsifiably:
    parts can near ~100KB into the synthesizer. If synthesis quality drops,
    trim at the worker (its prompt can ask codegraph for fewer files via
    `maxFiles` — allow-listed in the registry) rather than touching the cap.
+
+## 7. Addendum 2026-10-23 — §2b/§2c's MCP transport is dead; `include_code` re-homed to the Knowledge Sources fan-out
+
+Architect, card `4025bf3b-9510-810e` (the repoint card), run
+`c2f2134e2138432982e43192a05488a5`. Records the decision the Coder on that
+card correctly escalated instead of making alone.
+
+**What happened since §2 was written.** The `knowledgeable-ws` McpServer row
+never completed Discover and never can under current topology: there is no
+network path from AP-MT's backend (bare-metal docker engine) to
+`aw-app-mcp-gateway:9200` (inside the nested `aw-remote-host` podman network,
+no published port) — proven live 2026-10-22, memory
+`ap-mt-cannot-reach-workspace-mcp-gateway-network`. The Coder (run
+`a4f1fb62daae48d`) repointed `knowledgeable-retriever-code` to the same
+transport the other three workers use — `tool_specs=["knowledge.search"]`,
+`mcp_config` byte-identical — and verified live (runs `a34360666eda…`:
+correct self-gate skip; `de39739fb874…`: correct gate-open + successful
+call). Connectivity parity achieved; the dead `knowledgeable-ws` reference is
+gone.
+
+**Consequence, verified by codegraph trace + empirical run output:** the
+`knowledge.search` integration tool
+(`agents-platform-multitenant/backend/app/core/tools/knowledgeable.py:21`,
+resolved via `langchain_tools.py:144`) carries no
+`include_code`/`code_only`/`code_query`, and aw-knowledgeable's
+`/api/knowledge/search` (`backend/app/api/knowledge_search.py:28`) has no
+such fields either. So the P6 worker currently produces a **KG-only
+retrieval under the code-reality label** — `code.status: "ok"` has never
+been reachable through AP-MT, by any transport that exists today.
+
+**Decision:**
+
+1. **Do NOT extend the REST primitive with code args** (the Coder's option
+   a). Impossible as stated — §0.2/§3.1 stand: aw-knowledgeable cannot reach
+   codegraph, composition is Connector-side by design. And now also
+   direction-violating: `/api/knowledge/search` is being demoted to a pure
+   retrieval primitive (`search-knowledge-entrypoint-migration-scoping.md`
+   §1); widening its schema with cross-boundary orchestration args would
+   re-grow exactly what is being removed.
+2. **Do NOT fix the AP-MT↔workspace-gateway network gap for this** (option
+   b). The gap is a deliberate isolation boundary (publishing the gateway
+   port is the hole the bare-metal skill warns against; the tunnel's 30s
+   edge was rejected in the transport design); `McpServer` rows are
+   tenant-wide with no `workspace` column, so (b) cannot satisfy Frederico's
+   per-workspace routing requirement anyway; and it would build a second,
+   parallel transport to the one already under Frederico's review.
+3. **The code-reality perspective is delivered by
+   `knowledgeable-knowledge-sources-registry.md` C1+C2+C4** — AP-MT calls a
+   new `knowledge.sources` direct REST tool → aw-knowledgeable
+   `POST /api/knowledge/sources/query` → per-workspace Connector callback
+   `POST /source-query` → `forwarding.forward()` → codegraph. That design's
+   §4e already names this card as the tactical bridge it supersedes. Pending
+   Frederico's approval and PO slicing; nothing further ships on the repoint
+   card.
+
+**Interim state, accepted consciously (option c until C4):** the worker's
+prompt still instructs `include_code: true, code_only: true` — arguments the
+`StructuredTool` signature drops harmlessly (verified: run `de39739f…`
+succeeded; its output has no `code` key). Left as-is deliberately: C4
+rewrites the prompt wholesale, and an interim edit would trade a verified
+live row for a cosmetically-honest unverified one. Until C4, a non-skipped
+code-arm answer is a KG search with a code-shaped query, not codegraph
+truth — C4's workflow-description update (§2d here, plus the "transitional"
+note from the migration doc §0) is where that becomes visible in the
+artifact itself. §2a's `code_only` Connector knob (shipped, v0.71) stays:
+workspace-local composed callers use it today, and it remains correct
+independent of this transport.
