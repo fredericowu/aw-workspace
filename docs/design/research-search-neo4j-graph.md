@@ -360,6 +360,61 @@ the app-side contract (`import_jobs` + websocket stay identical).
   delta restyles the node). Socket drop → one refetch of
   `/neighborhood` + reconnect with backoff.
 
+### 3.9 MCP tool `graph_neighborhood` — agent-flow access via the gateway (N5)
+
+Frederico's 2026-10-24 instruction (card `4035bf3b-9510-8188-ac64-ef59cb66efb5`,
+PT, verbatim): "precisamos usar o ap-mt pq ele terá o fluxo de agentes, pra
+resolver o problema de rede, a app vai externar uma mcp tool que vai fazer a
+busca no grafo, e o agente vai poder alcançar ela via mcp-gateway". This
+generalizes §3.7's resolution of the network constraint from import to
+**search**: AP-MT agent-flow agents run runner-backed and reach the gateway;
+a literal AP-MT node does not — so the graph's agent surface is an MCP tool
+on this app, behind the gateway, never a direct connection.
+
+- **Server: `research-search-index`** (`mcp_ingest.py`), the app's in-process
+  Streamable-HTTP server. Forced, not preferred: it is the only one of the
+  three servers with `ctx.db` + `ctx.config` in hand — `handle_request`
+  already receives both (`routes.py:182-188`), which is everything
+  `graph_db.connect` + `graph_db.neighborhood` need. The stdio
+  `research-search` server is a gateway-spawned child with neither; the
+  `paper-search` server is upstream's separate venv (`mcp_config.py:9-46`
+  records this same reasoning for `index_paper`).
+- **One tool, a thin wrapper over N2's one query function** — no second
+  implementation: one `_TOOLS_SCHEMA` entry + one dispatch branch calling
+  `graph_db.neighborhood(db, graph, root, depth, cap=...)` on a thread
+  (sync driver, async dispatcher — the `_generate_review` pattern),
+  impatient connect like the REST route (`api/graph.py:160-163`).
+- **Name**: `graph_neighborhood` → gateway-prefixed
+  `aw__research_search_index__graph_neighborhood`. Deliberately NOT
+  `search_graph`: aw-knowledgeable already serves
+  `aw__aw_knowledgeable__search_graph` and agents see both upstreams —
+  near-twin names across servers is a recorded confusion source.
+- **Input**: `root` (required, a research-search `document_id` — same root
+  the REST route takes), `depth` (1–3, clamped via `graph_db.clamp_depth`,
+  default 1), `max_nodes` (optional, default **100**, clamped 1–500 →
+  `neighborhood`'s existing `cap` kwarg). The lower agent-side default is
+  the one deviation from the REST route: 500 nodes is a UI canvas budget,
+  not an agent context budget; `stats.truncated` already says when to
+  re-ask bigger.
+- **Output**: §3.5's payload verbatim — nodes carry
+  `imported`/`import_state`/`import_error`, so the gray/yellow (and
+  N4-in-flight) distinction N3's UI draws ships to agents for free.
+- **Degradation**: on `GraphUnavailable`, the tool returns the structured
+  reason (`error: graph_unavailable`, `configured`, `detail`, pointer to
+  `GET /api/graph/health`) in the module's existing error idiom — never an
+  unhandled 500. Same two-causes contract as `api/graph.py:57-68`.
+- **Auth: nothing new.** The gateway already reaches `POST /mcp` with
+  `X-Api-Key` (`mcp_config.ingest_server`, `mcp_config.py:94-108`).
+  Per-agent scoping to exactly this tool reuses the scoped-gateway-profile
+  pattern proven on `knowledgeable-explorer`
+  (`aw-autoskill-ap-mt-scope-agent-to-one-tool`).
+- **Consumers it unblocks**: the future theme-convergence job's agent, a
+  Telegram-facing research assistant, and N4's importer (which may read the
+  neighborhood before disambiguating). Theme-rooted or ref-key-rooted
+  queries are **deferred** — they need new Cypher in `graph_db.py`, which
+  makes them N2-shaped work, not wiring; re-card if a consumer actually
+  asks.
+
 ---
 
 ## 4. Theme convergence — named, NOT built, and what v1 guarantees it
@@ -505,11 +560,13 @@ beyond the four guarantees above.
 | **N2 — Neo4j adapter + sync + read API** | `dependencies.apps` += `{"id": "neo4j", "required": true}` (C3), `neo4j_password` config field (C2), `graph_db.py` (driver, K5 discipline, lazy connect + backoff, `rs` prefix guard test), `sync_document`/`rebuild`/`health`, `GET /api/graph/neighborhood` | N1 + **aw-app-neo4j published** (contract frozen in `aw-app-neo4j.md` §2; the app itself is `4035bf3b…d2b1`'s coder card) | No — merges only after aw-app-neo4j is on the marketplace (the one deliberate serialization) |
 | **N3 — Document Viewer graph UI** | `DocGraph.jsx` below the PDF, cytoscape rooted layout, 4 node states, depth control, yellow→re-root nav, gray→import panel (panel wired to N4's endpoint, Import disabled until it exists) | N1; builds against §3.5's payload spec with a fixture until N2 serves it | **Yes, against the specced payload** |
 | **N4 — agentic import + websocket** | importer agent (contributed, tool-scoped, pre-approved), `POST /api/graph/import` + dispatch via `apmt_credential.py`, job watchdog, `/ws/graph/{id}` + Postgres watch, `DocGraph` live deltas | N1, N2 (node flip syncs to Neo4j), N3 (panel) | Last |
+| **N5 — `graph_neighborhood` MCP tool** (§3.9, card `4035bf3b-9510-8188-ac64-ef59cb66efb5`) | `_TOOLS_SCHEMA` entry + dispatch branch in `mcp_ingest.py` wrapping `graph_db.neighborhood`, `contributes.mcp.provides` += the tool, gateway re-dial + fresh-session verification, tests in `tests/test_mcp_ingest.py` | N2 **merged** (wraps its query function — not a second implementation) | Yes vs N3/N4 — shares no files with either |
 
 Sequence: **N1 now ∥ aw-app-neo4j (already running)** → N2 (on contract)
-∥ N3 (on fixture) → N4. This is the "só faz em paralelo o que não gerar
-retrabalho" split: N1 and N3 cannot be invalidated by any contract
-outcome; N2 is the only piece that waits.
+∥ N3 (on fixture) → N4, with **N5 any time after N2 merges** (independent
+of N3/N4). This is the "só faz em paralelo o que não gerar retrabalho"
+split: N1 and N3 cannot be invalidated by any contract outcome; N2 is the
+only piece that waits.
 
 **Deferred, named** (not in any N card): the **theme convergence job**
 (§4 — schema-ready, PO scopes the card); corpus-wide graph view (the old
