@@ -52,8 +52,8 @@ chunks, 570 figures).
    identities, and the future merge map live in Postgres, and the entire
    Neo4j graph is rebuildable from them with one idempotent sync
    (`POST /api/graph/rebuild`). This is deliberate: Neo4j Community's
-   backup is a stop-the-container dump, the dependency app's contract is
-   still TBD, and aw-knowledgeable's 2026-10-21 outage (app crash-looped
+   backup is a stop-the-container dump (and aw-app-neo4j defers backups
+   with a named trigger), and aw-knowledgeable's 2026-10-21 outage (app crash-looped
    at boot because Neo4j was unhealthy) is the failure mode we refuse to
    inherit — if `aw-app-neo4j` is down, research-search boots, serves
    search, and degrades the graph loudly.
@@ -75,51 +75,53 @@ chunks, 570 figures).
    websocket. No client poll loop.
 6. **Only rework-free work runs in parallel** (Frederico's own
    constraint): the Postgres identity layer (N1) and the `aw-app-neo4j`
-   app depend on nothing TBD; the Neo4j adapter (N2) waits for the
-   connection contract; the UI (N3) builds against the API payload spec,
-   which is fixed here independently of Neo4j specifics.
+   app share no moving parts; the Neo4j adapter (N2) waits for
+   aw-app-neo4j to be published (its contract is already frozen, §2); the
+   UI (N3) builds against the API payload spec, which is fixed here
+   independently of Neo4j specifics.
 
 ---
 
-## 2. Named assumptions about `aw-app-neo4j` (TBD — do not re-derive here)
+## 2. The `aw-app-neo4j` contract this builds against (frozen 2026-10-24)
 
-The dependency app is being designed in parallel on card
-`4035bf3b-9510-811b-951e-c074bd6fd2b1` (target `aw-app-neo4j`). Its exact
-contract is **that card's to decide**. This design depends on it only
-through a thin adapter (§3.4) and names its assumptions so a mismatch is a
-small adapter edit, not a redesign:
+The dependency app was designed in parallel on card
+`4035bf3b-9510-811b-951e-c074bd6fd2b1` and its connection contract is now
+**frozen** — [`docs/design/aw-app-neo4j.md`](aw-app-neo4j.md) §2 (commit
+`4d47e43`), written first precisely so this card could build against it.
+This design re-derives nothing; the five rules, as they bind
+research-search (consumer #1):
 
-- **A1 — app id**: `neo4j` ("app separada chamada neo4j"), installed as a
-  Tier-2 container. research-search declares it in `aw-app.json`
-  `dependencies.apps` — the mechanism is real and runtime-enforced
-  (`src/apps/reconciler.py:493` cycle check, `:855-916` resolution and
-  install of dependencies).
-- **A2 — connection surface**: a bolt endpoint + credentials reachable
-  from the workspace container, discovered via config or a documented
-  app-to-app convention. Until published, the adapter reads
-  `graph_bolt_url` / secret from research-search's own config as a
-  stopgap, swapped for the real discovery in one place.
-- **A3 — multi-tenancy**: Neo4j Community = **one** user database per
-  instance. A reusable dependency app therefore needs a namespacing
-  convention for its consumer apps (label prefixes or an `app` property).
-  That decision belongs to `aw-app-neo4j`; this design assumes **label
-  namespacing** and writes `:RS_Paper` / `:RS_Theme` (prefix `RS_`),
-  trivially renameable if the contract says otherwise.
-- **A4 — availability**: no uptime guarantee. The adapter connects lazily,
-  never at app boot; `GET /status` and `doctor` report the graph layer
-  degraded when the bolt endpoint is unreachable (anti-pattern on record:
-  aw-knowledgeable's boot crash-loop on unhealthy Neo4j, 2026-10-21).
+- **C1 — URI**: `bolt://aw-app-neo4j:7687`, resolvable from the workspace
+  process (research-search is Tier-1 in-process, so from here) over the
+  shared podman network. Not published to the host.
+- **C2 — credential**: database `neo4j`, user `neo4j`; research-search
+  adds a `neo4j_password` field to its own `config_schema`
+  (`x-secret: true`, no default) — the consumer carries the credential in
+  its own config, per contract rule 2.
+- **C3 — dependency declaration**: `dependencies.apps` +=
+  `{"id": "neo4j", "required": true, "reason": ...}` — the reconciler
+  auto-installs the dep first and protects it from uninstall
+  (`src/apps/reconciler.py` `_install_dependencies` /
+  `_loaded_dependency_closure`). `required: true` is the contract's rule 3
+  verbatim; it means **N2 cannot merge before `aw-app-neo4j` is published
+  to the marketplace** (an unresolvable required dep fails the consumer's
+  own install, `reconciler.py:892`) — which the §8 sequencing enforces
+  anyway.
+- **C4 — degrade, never crash** (contract rule 4, the aw-knowledgeable
+  10h-outage lesson inverted): install-time dependency is hard, runtime
+  dependency is soft. Empty password or failed bolt connection → the app
+  boots normally, graph features disable, degradation surfaces in
+  `GET /status` / doctor. Bolt readiness lags container-running by
+  10–30 s (JVM boot) — the adapter retries with backoff.
+- **C5 — namespacing** (Community = one shared database): labels
+  prefixed with the consumer slug — **`rs__Paper`, `rs__Theme`** —
+  relationship types **`RS_CITES`, `RS_HAS_THEME`**, every
+  constraint/index named `rs_...`. Convention, not enforcement: this app
+  ships a static guard test asserting all its Cypher stays inside the
+  prefix (aw-knowledgeable's K5 pattern, named in the contract itself).
 
-If the published contract contradicts A2/A3, only `graph_db.py` (§3.4)
-changes. If it contradicts A1 (different app id), one manifest line
-changes. Nothing else in this design touches the contract.
-
-**Dependency declaration**: ship with `required: false` + loud degradation
-while `aw-app-neo4j` is unpublished (a `required: true` dep on an app
-absent from the marketplace fails research-search's own install —
-`reconciler.py:892`), and flip to `required: true` in the release after
-`aw-app-neo4j` is published and installed. The flip is one line and is
-called out on card N2.
+Only `graph_db.py` (§3.4) touches C1/C2; only the manifest touches C3;
+nothing else in this design knows Neo4j's address or credential.
 
 ---
 
@@ -184,37 +186,41 @@ shape). Carried over from the superseded design with one addition:
 - `POST /api/graph/resolve` — idempotent backfill over all 40 existing
   documents (also the drift-recovery tool).
 
-### 3.3 Neo4j schema (namespaced per A3)
+### 3.3 Neo4j schema (namespaced per contract rule C5)
 
 ```
-(:RS_Paper {key, document_id?, title, year, first_author, doi,
-            imported: bool, has_review: bool})
-(:RS_Theme {theme_id, label, norm_label})
+(:rs__Paper {key, document_id?, title, year, first_author, doi,
+             imported: bool, has_review: bool})
+(:rs__Theme {theme_id, label, norm_label})
 
-(:RS_Paper)-[:CITES {source_document_id, ref_row_id}]->(:RS_Paper)
-(:RS_Paper)-[:HAS_THEME {document_id, source}]->(:RS_Theme)
+(:rs__Paper)-[:RS_CITES {source_document_id, ref_row_id}]->(:rs__Paper)
+(:rs__Paper)-[:RS_HAS_THEME {document_id, source}]->(:rs__Theme)
 ```
 
-- **One work = one `RS_Paper` node**, keyed by `ref_targets.key`; an
+Constraints/indexes all named `rs_...`: uniqueness on `rs__Paper.key` and
+`rs__Theme.theme_id`, index on `rs__Paper.document_id`.
+
+- **One work = one `rs__Paper` node**, keyed by `ref_targets.key`; an
   imported document is the same node with `document_id` set and
   `imported: true` (gray/yellow is a property, not two node types).
-  Uniqueness constraint on `key`; index on `document_id`.
 - **Theme-based paper↔paper linking is the 2-hop pattern**
-  `(a:RS_Paper)-[:HAS_THEME]->(t:RS_Theme)<-[:HAS_THEME]-(b:RS_Paper)` —
+  `(a:rs__Paper)-[:RS_HAS_THEME]->(t:rs__Theme)<-[:RS_HAS_THEME]-(b:rs__Paper)` —
   first-class in the data model, computed by traversal, and it converges
-  automatically when the future job merges `RS_Theme` nodes. No
-  materialized `THEME_LINK` edge in v1 (it would be a second copy of the
+  automatically when the future job merges `rs__Theme` nodes. No
+  materialized theme-link edge in v1 (it would be a second copy of the
   same fact that convergence would then have to rewrite); if viewer-query
-  timings ever demand one, it is a cache derived from `HAS_THEME`.
+  timings ever demand one, it is a cache derived from `RS_HAS_THEME`.
 - `imported` / `has_review` are denormalized at sync time from
   `documents` / `review_generate_jobs.state='done'`.
 
 ### 3.4 Neo4j adapter + sync — `research_search_app/graph_db.py`
 
 - Thin adapter owning the driver (`pip_requires` += `neo4j`), lazy
-  connect, short timeouts, one place reading the A2 connection config.
-  **The only module in this app allowed to import the Neo4j driver**
-  (aw-knowledgeable's K5 one-module discipline, adopted).
+  connect with backoff (C4's 10–30 s JVM-boot lag), short timeouts, the
+  one place reading C1's URI and C2's `neo4j_password` config field.
+  **The only module in this app allowed to import the Neo4j driver**, and
+  the ship point for C5's static guard test (all Cypher inside the `rs`
+  prefix) — aw-knowledgeable's K5 one-module discipline, adopted.
 - `sync_document(db, graph, document_id)` — idempotent `MERGE`s for the
   document's paper node, its references' paper nodes, `CITES` edges,
   theme nodes (by `theme_id`), `HAS_THEME` edges. Called from the §3.2
@@ -397,8 +403,8 @@ beyond the four guarantees above.
    wants vectors in Neo4j too, that is a PO scope conversation (it
    roughly doubles the work and touches every retrieval path).
 2. **Neo4j as system of record (no Postgres identity tables).** Loses:
-   rebuildability (Community backup = stop-the-container dump; the
-   dependency app's ops posture is TBD), the app's existing migration
+   rebuildability (Community backup = stop-the-container dump, and
+   aw-app-neo4j explicitly defers backups), the app's existing migration
    machinery for identity evolution (`norm_version`), and durable
    convergence merges across rebuilds. Costs one `MERGE`-sync module —
    cheap next to what it buys.
@@ -436,14 +442,15 @@ beyond the four guarantees above.
   slightly stale" is a new quiet state this app never had. `doctor`
   surfacing (§3.4) is the mitigation; silent degradation is this
   workspace's known failure mode.
-- **The TBD contract is load-bearing.** If `aw-app-neo4j` ships a
-  materially different consumer model (e.g. per-consumer databases on
-  Enterprise, or an HTTP facade instead of bolt), `graph_db.py` absorbs
-  it — but N2 cannot *finish* before that contract exists. Sequencing
-  (§8) keeps everything else off that critical path.
-- **Namespace rename is a migration.** If A3's `RS_` label assumption is
-  overruled, the rename is `rebuild`-cheap today (40 docs) and gets more
-  annoying with corpus growth.
+- **The frozen contract is now baked into two repos.** `rs__`/`RS_`
+  naming, the `neo4j_password` config field, and the bolt hostname bind
+  research-search to aw-app-neo4j's §2; if that contract ever changes
+  (e.g. Enterprise per-consumer databases), `graph_db.py` absorbs it but
+  it is a coordinated two-repo change. A namespace rename stays
+  `rebuild`-cheap today (40 docs) and gets more annoying with corpus
+  growth. N2 still cannot *merge* before `aw-app-neo4j` is published
+  (C3's `required: true`); sequencing (§8) keeps everything else off
+  that critical path.
 - **The websocket's server-side watch is a 1s/socket Postgres query.**
   Fine at one-user scale; a ctx-level event bus or LISTEN/NOTIFY is the
   named upgrade path if socket counts ever matter.
@@ -495,7 +502,7 @@ beyond the four guarantees above.
 | Card | Scope | Depends on | Parallel-safe? |
 |---|---|---|---|
 | **N1 — Postgres identity layer** | migration 0008 (`ref_targets`, `themes`, `theme_id` stamp, `import_jobs`), `graph_identity.py` (both resolutions + `resolve_themes`), hooks, `POST /api/graph/resolve` backfill, tests | — | **Yes — zero Neo4j surface; starts now** |
-| **N2 — Neo4j adapter + sync + read API** | `dependencies.apps` += `neo4j` (required:false → true flip named), `graph_db.py` (driver, K5 discipline, lazy connect), `sync_document`/`rebuild`/`health`, `GET /api/graph/neighborhood` | N1 + **aw-app-neo4j contract** (`4035bf3b…d2b1`) | No — waits for the contract (the one deliberate serialization) |
+| **N2 — Neo4j adapter + sync + read API** | `dependencies.apps` += `{"id": "neo4j", "required": true}` (C3), `neo4j_password` config field (C2), `graph_db.py` (driver, K5 discipline, lazy connect + backoff, `rs` prefix guard test), `sync_document`/`rebuild`/`health`, `GET /api/graph/neighborhood` | N1 + **aw-app-neo4j published** (contract frozen in `aw-app-neo4j.md` §2; the app itself is `4035bf3b…d2b1`'s coder card) | No — merges only after aw-app-neo4j is on the marketplace (the one deliberate serialization) |
 | **N3 — Document Viewer graph UI** | `DocGraph.jsx` below the PDF, cytoscape rooted layout, 4 node states, depth control, yellow→re-root nav, gray→import panel (panel wired to N4's endpoint, Import disabled until it exists) | N1; builds against §3.5's payload spec with a fixture until N2 serves it | **Yes, against the specced payload** |
 | **N4 — agentic import + websocket** | importer agent (contributed, tool-scoped, pre-approved), `POST /api/graph/import` + dispatch via `apmt_credential.py`, job watchdog, `/ws/graph/{id}` + Postgres watch, `DocGraph` live deltas | N1, N2 (node flip syncs to Neo4j), N3 (panel) | Last |
 
