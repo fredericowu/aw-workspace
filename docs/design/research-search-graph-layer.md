@@ -1,5 +1,21 @@
 # research-search — graph layer (GraphRAG), graph viz UI, lazy reference import — without Neo4j
 
+> **SUPERSEDED (2026-10-24).** Frederico overrode this design's "no Neo4j"
+> decision on the parent card (comment 2026-10-24T09:34, verbatim there):
+> Neo4j IS the graph backing store, via a new reusable Tier-2 dependency
+> app (`aw-app-neo4j`, card `4035bf3b-9510-811b-951e-c074bd6fd2b1`), with
+> theme-based paper↔paper linking first-class and a future
+> theme-convergence job. The replacement design is
+> [`research-search-neo4j-graph.md`](research-search-neo4j-graph.md),
+> which also folds in the two 2026-10-23T21:21 refinements this doc
+> missed (graph below the PDF in Document Viewer rooted on the open
+> document — not the Graph tab specced here; agentic DAG + MCP lazy
+> import with websocket push — not the §3.5 panel poll). The G1–G4
+> Backlog cards decomposed from this doc are archived; build from the
+> N1–N4 cards instead. What survives: the `ref_targets` identity design,
+> the bidirectional resolution module, and the hook sites — carried over
+> verbatim into the new doc. Do not implement anything from this document.
+
 Status: **design, not code.** Architect, 2026-10-23. Card
 `4025bf3b-9510-81c9-8daa-ec144a45a9b4`
 (`architecture:research-search-graphrag-neo4j-migration-and-graph-viz`).
