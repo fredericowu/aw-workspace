@@ -57,6 +57,8 @@ AP-MT repo (`repos/agents-platform-multitenant`):
    `[]` on the CLI-subshell path — passthrough is an API-direct-agent
    feature; CLI harness tools are invisible to the executor, documented
    limitation).
+   *(Superseded 2026-10-25: the CLI-subshell path populates it too — see
+   §6.7.)*
 3. **`backend/app/core/orchestrators/transforms.py`** (new, ~120 lines) —
    `run_steps(initial_value, steps) -> value`, the whole op vocabulary.
    Pure functions, no I/O. `jmespath` added to `pyproject.toml` (pure
@@ -270,10 +272,30 @@ Notes:
    wall-clock + verify `collect`'s `items_in > items_out` on a question
    with overlapping arms. Deploy caveat: green CI ≠ live — verify in the
    running container (`aw-autoskill-verify-deploy-in-container`).
-7. **CLI-runner agents have empty `tool_results`** — a transform after a
-   CLI-backed node silently gets `[]`. Validation can't know the agent's
-   runtime at save time; the `node_end` `items_in: 0` is the observable
-   symptom. Documented limitation, not a bug to chase.
+7. ~~**CLI-runner agents have empty `tool_results`**~~ — **no longer true
+   as of 2026-10-25** (kanban `4045bf3b-9510-81eb-9118-debfb076dbfc`). The
+   CLI/runner door now populates `tool_results` too, from the stream-json
+   parser both local-docker and runner runs already share
+   (`models/cli.py`'s `tool_result` meta chunks gained `meta_full_content`,
+   the untruncated output beside the unchanged 20k event payload;
+   `executor._cli_tool_result_entry` shapes it into the same
+   `{name, content}` entries the API-direct door produces, plus an additive
+   `is_error`). Two things to know when working on it:
+   - **Neither CLI names the tool on its result** — claude's carries
+     `tool_use_id`, codex's the item id — so the name comes from an
+     id→name map the stream loop fills from the earlier `tool_call`
+     chunks. An unmapped id yields `name: ""`, never a dropped result.
+   - **The capture is budgeted, not unbounded**: 512 KB per result
+     (cli.py) and 8 MB summed per run (`_CLI_TOOL_RESULTS_BUDGET`). Past
+     the run budget, entries fall back to the event's own 20k-truncated
+     content with one `log.warning` — the list stays complete and ordered,
+     only the richness degrades. That ceiling exists because this branch
+     runs for *every* runner-door agent on the platform (a 2h coder turn
+     makes hundreds of large tool calls), not just retrieval nodes.
+   What is still true: `run_events` is untouched (§6.4 below stands), and
+   capturing from the *event* payload alone would not have worked — a real
+   `knowledge_search` result measured 53 KB, and JSON cut at 20.000 chars
+   fails `parse_json`.
 
 ## 7. Rejected alternatives (so they aren't re-litigated)
 
