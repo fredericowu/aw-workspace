@@ -11,14 +11,13 @@ description: >-
   update from a terminal inside the workspace. Note: the root-level `./aw` in
   this repo is a DEPRECATED stub that only prints a pointer here — it is not
   the monolith's `./aw` and does not run any of these commands.
-last_updated: 2026-08-17
+last_updated: 2026-10-23
 last_update_note: >-
-  Corrected the "Auth" section — it described the old file-based
-  X-AW-Local-Cli-Token mechanism, which was removed 2026-08-08 and replaced
-  by the AW_WORKSPACE_API_KEY / X-Api-Key shared secret
-  (src/api/workspace_api_key.py). Found by aw-autoskill scanning 4 sessions
-  that hand-rolled curl+X-Api-Key boilerplate instead of using
-  local_client.request().
+  Added the "Convention: an app that needs an LLM completion doesn't hold a
+  provider key" section — the generic AP-MT self-mint shape, first shipped
+  end to end in aw-app-research-search (card
+  4025bf3b-9510-81d2-a14f-ed8ddbc8e020), documented here per CLAUDE.md's
+  "new conventions go in native-skills/aw-workspace/SKILL.md" rule.
 ---
 
 # aw-workspace's own CLI
@@ -362,3 +361,70 @@ can both be exercised without a running Postgres — `get_catalog()` is a
 filesystem/HTTP cache, and the auth dependency is pure. A `FastAPI` +
 `TestClient` app with just `require_identity` wired onto a stub route is
 enough to check the header logic when iterating on this.
+
+## Convention: an app that needs an LLM completion doesn't hold a provider key
+
+Standing directive (Frederico, Telegram, 2026-10-23: "vamos usar sempre o
+ap-mt pra fazer o backend de agentes, os agentes ficam configurados lá, lá
+tem uma interface opencompat") — **no app in this workspace should hold an
+Anthropic/OpenAI/etc. API key as its primary LLM path.** Agents Platform
+Multitenant (AP-MT) is the backend for every agent/LLM call; it configures
+the agent and exposes an OpenAI-compatible surface any app can speak. First
+shipped end-to-end in `aw-app-research-search` (card
+`4025bf3b-9510-81d2-a14f-ed8ddbc8e020`, superseding that app's original
+direct-Anthropic-key design); `aw-knowledgeable`'s `backend/app/core/apmt.py`
+is the older, sibling implementation this one copies its wire shape from.
+
+The shape, in order:
+
+1. **Declare the agent via `contributes.agents`** in `aw-app.json` — a
+   `models` entry naming an existing AP-MT provider model (declare-if-absent,
+   byte-identical spec, so a fresh platform gets it and an existing one is
+   left alone) and an `agents` entry for the app's own agent slug
+   (`model_slug` pointing at that model, `tool_specs: []`/`skill_slugs: []`
+   for a pure structured-completion agent, a short `system_prompt`). Seeded
+   by the runners app's `agent_provisioner.py` at install and every boot —
+   create-if-absent, never updated, so a user's later prompt edit in the UI
+   is never clobbered by a new app version.
+2. **Speak `POST /v1/chat/completions`** with model name `agent/<slug>` —
+   `Authorization: Bearer <key>` exactly (AP-MT does
+   `removeprefix("Bearer ")` and looks the remainder up verbatim; any other
+   scheme reads as a revoked key). Never send `max_tokens` — AP-MT accepts
+   and ignores it; the agent's model row owns the ceiling. **A 200 is not
+   proof of success**: a failed run still comes back HTTP 200 with
+   `[agent <slug> <status>] <error>` as the reply text
+   (`agents-platform-multitenant/backend/app/api/openai_compat.py::_run`) —
+   match that marker BEFORE parsing the reply as the app's own expected
+   shape (JSON, etc.), or the real platform error is lost behind a
+   downstream parse error that lies about what actually failed.
+3. **Get the credential by self-minting**, not by holding one. AP-MT's
+   `/v1` resolves its bearer token against the `ApiKey` table only — a JWT
+   is rejected there. What an app inherits from **agents-platform-runners**
+   (the file-read precedent in `aw-app-call-agent/call_agent_app/
+   settings.py:59-72`, reading
+   `$AW_WORKSPACE_HOME/app-config/agents-platform-runners.json`; Tier-2
+   apps use that same app's HTTP-poll `inherited_credential.py` instead,
+   since a container mounts no app-config volume) is that app's identity
+   JWT — which authenticates AP-MT's identity-gated REST instead
+   (`/api/api-keys` sits behind `require_tenant`). So the inheritance is
+   used one hop earlier: the JWT self-mints a scoped `ApiKey` once
+   (`POST /api/api-keys {name, agent_slugs: [<the app's agent slug>]}` —
+   deleting any stale same-named row first so re-mints don't accumulate
+   orphans), and the app persists the raw token (only ever returned at
+   creation) to its own `ctx.secrets` immediately, before anything else can
+   fail and orphan it. On a 401/403 later: drop the stored secret, re-mint
+   once, retry once — still failing is a real failure, not a loop.
+
+Minting is lazy (first real call, not app activation) — a workspace where
+the runners app isn't installed still installs and runs this app fine; the
+LLM-dependent feature just fails loudly, by name, the first time it's used.
+
+See `aw-app-research-search/research_search_app/apmt_credential.py` for a
+complete reference implementation (pure functions, injected
+`get_secret`/`set_secret`/`delete_secret` for testability — no real AP-MT
+needed in tests, `httpx.MockTransport` is enough) and
+`review_generate.py::call_llm_apmt` for the request/reply shape. Keep a
+manual, explicit opt-out for installs without the runners app (an enum
+config key, e.g. `llm_transport: ap-mt | anthropic`) — but the switch must
+be an explicit value, never the mere presence of a provider key, or a stale
+leftover key silently resurrects the path this convention exists to retire.
