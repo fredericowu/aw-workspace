@@ -85,8 +85,16 @@ What the declaration contains, per kind:
     `disable_harness_tools: true`, `workspace: "aw"`, the `mcp_servers`
     scoped reference above, `system_prompt_file`, live
     `name`/`description`/`use_cases`.
-  * `knowledgeable-retriever-sources`: same minus MCP (`mcp_config` live is
-    `{}`, so **no** `mcp_servers` key), `tool_specs: ["knowledge.sources"]`,
+  * `knowledgeable-retriever-sources`: **superseded by
+    `docs/design/knowledgeable-sources-mcp-tool.md` §2c (card
+    `4055bf3b-9510-81c5-8641-e7bf3e270ba4`)** — the live row now carries the
+    same `mcp_servers` scoped reference as the other three
+    (`knowledge_sources` added to the `knowledgeable-retriever` gateway
+    profile's `tools_allow`), not "same minus MCP". Declare it identically:
+    `model_slug: codex-runner-gpt-5`, `tool_specs: ["knowledge.sources"]`
+    (kept deliberately — inert on the runner path, restores the native tool
+    if ever flipped back to API-direct), `disable_harness_tools: true`,
+    `workspace: "aw"`, the `mcp_servers` scoped reference above,
     `params: {"max_tokens": 16000}`.
   * `knowledgeable-search-planner`, `knowledgeable-playground`: no tools, no
     MCP, `disable_harness_tools` stays false (omit), `workspace: "aw"`.
