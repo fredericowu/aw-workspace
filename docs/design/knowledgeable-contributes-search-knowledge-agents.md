@@ -46,6 +46,15 @@ Everything else is exact reproduction of the live rows: prompts as
 in the manifest, `workspace: "aw"` as a literal, the `codex-runner-gpt-5`
 model copied from the live row.
 
+> **Superseded in part by
+> `docs/design/search-knowledge-citable-external-sources.md` (card
+> `4055bf3b-9510-81de`):** once that card lands, the live graph is **14
+> nodes** (new `sources-digest` transform; `synthesize` gains it as a need
+> and a new template) and `knowledgeable-retriever-sources`' prompt step 4
+> replies `OK` instead of echoing the tool JSON. Copy-from-live at build
+> time absorbs this automatically; the counts and prompt prose in this doc
+> do not.
+
 ## 2. Where it lands
 
 All changes in **`repos/aw-app-knowledgeable`** (one marketplace release):
