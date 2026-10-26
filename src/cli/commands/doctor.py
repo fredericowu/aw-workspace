@@ -292,6 +292,7 @@ def _redis(section: dict) -> int:
         return 0
     url = section.get("url", "?")
     problems = _apps_changed_broadcast(section.get("broadcast"))
+    problems += _service_relay_down(section.get("service_relay"))
     if section.get("reachable"):
         print(f"Redis (redis_coord) — reachable at {url}")
         return problems
@@ -320,6 +321,25 @@ def _apps_changed_broadcast(row: dict | None) -> int:
     print("      an idle worker (e.g. the watchdog leader) stays behind until")
     print("      it serves a request. Check this Redis and restart core if it")
     print("      does not clear itself.")
+    return 1
+
+
+def _service_relay_down(row: dict | None) -> int:
+    """``src/apps/service_relay.py``'s own relay, as seen by the worker that
+    answered. A DIFFERENT ``RedisBroadcaster`` instance from the ``apps:changed``
+    one above — a dead or stuck relay here means a manual service
+    start/stop/restart/logs request landing on this worker cannot reach the
+    worker that actually owns the process, and silently falls back to a safe
+    local no-op instead of doing what was asked (card 4045bf3b-9510-814a)."""
+    if not row:
+        return 0
+    print(f"  ✗ service-command relay DOWN on the answering worker "
+          f"— {row.get('reason', 'unknown')}")
+    if row.get("last_error"):
+        print(f"      {row['last_error']}")
+    print("      a restart/stop/start/logs request for a service owned by")
+    print("      this worker will silently no-op instead of acting — check")
+    print("      this Redis and restart core if it does not clear itself.")
     return 1
 
 

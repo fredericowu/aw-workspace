@@ -137,6 +137,50 @@ def broadcast_rows(runtime) -> list[dict]:
     }]
 
 
+def service_relay_rows(runtime) -> list[dict]:
+    """``ServiceCommandRelay`` forwarding that is down on THIS worker — at
+    >1 workers. Same shape, same per-worker scope and same rationale as
+    :func:`broadcast_rows` above, for a DIFFERENT ``RedisBroadcaster``
+    instance: ``src/apps/service_relay.py``'s ``ServiceCommandRelay`` wraps
+    its own, separate from ``AppLifecycle``'s, so a dead or stuck relay here
+    is invisible to a check that only reads the other.
+
+    Found live (card 4045bf3b-9510-814a): a forwarded restart/logs request
+    for ``research-search:paper-search`` always burned the relay's full
+    timeout and silently fell back to a safe local no-op, 7x over several
+    minutes, while the owning worker's service lease stayed healthy
+    throughout (that heartbeat runs on a separate thread, so it only proves
+    the *process* was fine, not the relay). Nothing — not this service's own
+    health, not ``doctor``'s autostart check, not ``/api/health`` — ever
+    looked wrong, because only the forwarded command's own round-trip could
+    see the gap, and nothing was watching that round-trip until now.
+    """
+    if int(os.environ.get("AW_WORKSPACE_WORKERS", "1") or "1") <= 1:
+        return []
+    state = getattr(getattr(runtime, "host", None), "state", None)
+    relay = getattr(state, "service_relay", None)
+    health = getattr(relay, "relay_health", None)
+    if not callable(health):
+        return []
+    report = health()
+    if report.get("started") and report.get("relay_alive"):
+        return []
+    reason = ("never subscribed — Redis was unreachable when this worker booted"
+              if not report.get("started")
+              else "the relay task is down (or stuck) and reconnecting")
+    return [{
+        "kind": "broadcast", "app": "core", "tier": "core",
+        "service": "service-relay", "component": "core:service-relay",
+        "state": "off", "desired": "running", "autostart": True,
+        "reason": reason,
+        "last_error": (f"this worker (pid {os.getpid()}) cannot forward a manual "
+                       f"service start/stop/restart/logs request to the worker "
+                       f"that actually owns the process — it falls back to a "
+                       f"safe local no-op instead; relay reconnects so far: "
+                       f"{report.get('relay_failures', 0)}"),
+    }]
+
+
 def _collect(runtime) -> tuple[list[dict], bool]:
     """``(rows, redis_reachable)`` — the whole check, once.
 
@@ -224,6 +268,7 @@ def _collect(runtime) -> tuple[list[dict], bool]:
     # Appended after the give-up pass above, which keys on (app, service) and
     # has nothing to say about a broadcast row.
     rows.extend(broadcast_rows(runtime))
+    rows.extend(service_relay_rows(runtime))
     return rows, redis_ok
 
 

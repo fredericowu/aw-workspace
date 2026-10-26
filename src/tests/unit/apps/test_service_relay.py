@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -47,6 +48,11 @@ class FakeBroadcaster:
     def __init__(self, redis_url=None) -> None:
         self._bus = FakeBroadcaster.bus
         self._handler = None
+        # Mirrors the real RedisBroadcaster's relay_alive/relay_failures
+        # properties (src/libs/redis_coord.py) so relay_health() has
+        # something real to read, same posture as the rest of this fake.
+        self.relay_alive = True
+        self.relay_failures = 0
 
     async def start_relay(self, handler) -> None:
         self._handler = handler
@@ -409,6 +415,68 @@ def test_fetch_logs_raises_when_the_owner_fails(bus, lease_held):
         await other.stop()
 
     asyncio.run(run())
+
+
+def test_a_hung_handler_does_not_freeze_the_relay_for_later_commands(bus, lease_held):
+    """Card 4045bf3b-9510-814a: before the ``wait_for`` bound,
+    ``_handle_command``'s blocking action call had no timeout of its own, so
+    a hang there froze ``_relay_loop`` on that one message forever — every
+    LATER command on this worker (even for a different service) went
+    unanswered too, while ``relay_alive`` kept reporting True. This pins that
+    a second command gets a prompt answer right after the first one's
+    ``self.timeout`` elapses, instead of waiting for the hung action itself
+    to ever return."""
+    async def run():
+        class HangingSupervisor(FakeSupervisor):
+            def restart(self, app_id, service_id):
+                self.calls.append("restart")
+                time.sleep(0.6)  # much longer than the relay's own timeout
+                return {"service": service_id, "running": True, "pid": self.pid}
+
+        owner_sup = HangingSupervisor(owns=True)
+        other_sup = FakeSupervisor(owns=False)
+        # The owner's OWN timeout bounds its handler execution; the
+        # requester's is deliberately larger here so it patiently waits for
+        # that bounded reply instead of racing its own fallback against it.
+        owner = await _relay(owner_sup, timeout=0.1)
+        other = await _relay(other_sup, timeout=2.0)
+        lease_held["held"] = True
+
+        t0 = time.monotonic()
+        with pytest.raises(ServiceError, match="did not complete"):
+            await other.dispatch("app", "svc", "restart")
+        # The owner replied with a timeout error close to ITS OWN timeout,
+        # not after the hung action's full 0.6s sleep, and well under the
+        # requester's own (much larger) timeout.
+        assert time.monotonic() - t0 < 0.5
+
+        # The relay is free again: a second, unrelated command gets a real
+        # answer promptly, while the first hang is still sleeping in the
+        # background.
+        result = await other.dispatch("app", "svc", "start")
+        assert result["pid"] == owner_sup.pid
+        assert owner_sup.calls == ["restart", "start"]
+        await owner.stop()
+        await other.stop()
+
+    asyncio.run(run())
+
+
+def test_relay_health_reports_started_alive_and_failures(bus, lease_held):
+    async def run():
+        relay = await _relay(FakeSupervisor(owns=True))
+        health = relay.relay_health()
+        assert health == {"started": True, "relay_alive": True, "relay_failures": 0}
+        await relay.stop()
+
+    asyncio.run(run())
+
+
+def test_relay_health_before_start_reports_not_started():
+    relay = ServiceCommandRelay(SimpleNamespace(services=FakeSupervisor()))
+    assert relay.relay_health() == {
+        "started": False, "relay_alive": False, "relay_failures": 0,
+    }
 
 
 def test_timeout_is_env_overridable_and_stays_under_the_tunnel_cut(monkeypatch):

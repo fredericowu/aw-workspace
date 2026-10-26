@@ -283,6 +283,91 @@ def test_the_fan_out_row_stays_out_of_doctors_autostart_section(monkeypatch):
     assert _autostart_not_running(rt) == []
 
 
+# --- the service-command relay, reported per worker (card 4045bf3b-9510-814a)
+
+
+def _runtime_with_service_relay(health, apps=None):
+    """A runtime whose FastAPI app carries a ``service_relay``, the way
+    ``register_apps_routes`` wires the real one."""
+    rt = _Runtime(apps or {})
+    rt.host = SimpleNamespace(
+        state=SimpleNamespace(service_relay=SimpleNamespace(
+            relay_health=lambda: health)))
+    return rt
+
+
+def test_a_dead_service_relay_is_reported_at_more_than_one_worker(monkeypatch):
+    """The exact gap card 4045bf3b-9510-814a found: a forwarded restart for
+    research-search:paper-search always burned the full relay timeout and
+    silently fell back to a local no-op — this is what makes that visible."""
+    _no_redis(monkeypatch)
+    monkeypatch.setenv("AW_WORKSPACE_WORKERS", "5")
+    rt = _runtime_with_service_relay(
+        {"started": True, "relay_alive": False, "relay_failures": 2})
+
+    report = health_report(rt)
+    assert report["status"] == "degraded"
+    row = report["degraded"][0]
+    assert row["kind"] == "broadcast"
+    assert (row["app"], row["service"]) == ("core", "service-relay")
+    assert row["state"] == "off" and row["desired"] == "running"
+    assert "reconnecting" in row["reason"]
+    assert "pid" in degradations(rt)[0]["last_error"]
+
+
+def test_a_service_relay_that_never_subscribed_is_reported_too(monkeypatch):
+    _no_redis(monkeypatch)
+    monkeypatch.setenv("AW_WORKSPACE_WORKERS", "5")
+    rt = _runtime_with_service_relay(
+        {"started": False, "relay_alive": False, "relay_failures": 0})
+    assert "never subscribed" in health_report(rt)["degraded"][0]["reason"]
+
+
+def test_a_healthy_service_relay_reports_nothing(monkeypatch):
+    _no_redis(monkeypatch)
+    monkeypatch.setenv("AW_WORKSPACE_WORKERS", "5")
+    rt = _runtime_with_service_relay(
+        {"started": True, "relay_alive": True, "relay_failures": 1})
+    assert health_report(rt) == {"status": "ok", "degraded": []}
+
+
+def test_a_single_worker_never_reports_the_service_relay(monkeypatch):
+    _no_redis(monkeypatch)
+    monkeypatch.setenv("AW_WORKSPACE_WORKERS", "1")
+    rt = _runtime_with_service_relay(
+        {"started": False, "relay_alive": False, "relay_failures": 0})
+    assert health_report(rt) == {"status": "ok", "degraded": []}
+
+
+def test_a_runtime_with_no_service_relay_wired_reports_nothing(monkeypatch):
+    """Every CLI/unit-test runtime built without ``register_apps_routes``
+    must not become degraded by omission, same as the apps:changed fan-out."""
+    _no_redis(monkeypatch)
+    monkeypatch.setenv("AW_WORKSPACE_WORKERS", "5")
+    assert health_report(_Runtime({})) == {"status": "ok", "degraded": []}
+
+
+def test_a_dead_broadcast_and_a_dead_service_relay_are_both_reported(monkeypatch):
+    """Two DIFFERENT RedisBroadcaster instances (AppLifecycle's and
+    ServiceCommandRelay's own) can each be down independently — one must not
+    mask the other."""
+    _no_redis(monkeypatch)
+    monkeypatch.setenv("AW_WORKSPACE_WORKERS", "5")
+    rt = _Runtime({})
+    rt.host = SimpleNamespace(state=SimpleNamespace(
+        app_lifecycle=SimpleNamespace(
+            broadcast_health=lambda: {"started": True, "relay_alive": False,
+                                       "relay_failures": 1}),
+        service_relay=SimpleNamespace(
+            relay_health=lambda: {"started": True, "relay_alive": False,
+                                   "relay_failures": 4}),
+    ))
+    report = health_report(rt)
+    assert report["status"] == "degraded"
+    services = {row["service"] for row in report["degraded"]}
+    assert services == {"apps:changed", "service-relay"}
+
+
 def test_no_runtime_yet_is_ok():
     """``/api/health`` answers before the apps framework has attached
     anything — and must, since that is when a boot is watched most closely."""

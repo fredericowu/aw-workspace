@@ -739,7 +739,7 @@ async def _redis_coord_status(runtime=None) -> dict:
     save, with PING green throughout).
     """
     import redis.asyncio as aioredis
-    from src.apps.degradations import broadcast_rows
+    from src.apps.degradations import broadcast_rows, service_relay_rows
     from src.libs.redis_coord import get_workspace_redis_url
 
     url = get_workspace_redis_url()
@@ -747,15 +747,20 @@ async def _redis_coord_status(runtime=None) -> dict:
     # Empty at AW_WORKSPACE_WORKERS<=1 and when the fan-out is healthy — see
     # broadcast_rows() for why this is a per-worker answer.
     broadcast = (broadcast_rows(runtime) or [None])[0]
+    # Same per-worker caveat, for the service-command relay's OWN broadcaster
+    # instance — see service_relay_rows().
+    service_relay = (service_relay_rows(runtime) or [None])[0]
     client = aioredis.from_url(url, socket_connect_timeout=3)
     try:
         await asyncio.wait_for(client.ping(), timeout=3.0)
     except Exception as e:  # noqa: BLE001 — the failure itself IS the finding
         return {"reachable": False, "url": safe_url, "broadcast": broadcast,
+                "service_relay": service_relay,
                 "note": f"redis_coord cannot reach {safe_url}: {e}"}
     finally:
         await client.aclose()
     return {"reachable": True, "url": safe_url, "broadcast": broadcast,
+            "service_relay": service_relay,
             "note": "redis_coord's resolved Redis answers PING"}
 
 

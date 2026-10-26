@@ -58,6 +58,27 @@ Two topics, both on the existing ``aw:ws:<ws>:bcast:*`` namespace:
 The timeout's hard ceiling is the tunnel edge, which cuts requests at 30s — a
 forwarded restart has to come back with a real answer before that, not a 504
 the user cannot tell apart from a hang.
+
+**The owner's handler execution is bounded too** (card 4045bf3b-9510-814a).
+``RedisBroadcaster._relay_loop`` awaits ``handler(topic, payload)`` to
+completion before it can read the next message off the subscription — so an
+unbounded :meth:`_handle_command` that hangs (a subprocess that ignores
+SIGKILL, a wedged ``proc.wait``) freezes that worker's relay for every later
+command, for every service it owns, while ``relay_alive`` keeps reporting
+``True`` the whole time (the task is not dead, just stuck inside one
+``await``). Reproduced live: ``research-search:paper-search``'s owning
+worker answered nothing for 7 consecutive forwarded restarts over several
+minutes while its lease kept renewing (a separate heartbeat thread, proof the
+*process* was fine) — the symptom was never a dead task, it was a stuck one.
+:meth:`_handle_command` therefore wraps its blocking call in
+``asyncio.wait_for(..., timeout=self.timeout)``: the relay always gets its
+turn back within one timeout window, and the requester gets an honest
+"did not complete" error instead of a silent, misleading local fallback. This
+does NOT un-wedge the underlying action itself — cancelling an
+``asyncio.to_thread`` await abandons the wait, it does not kill the thread —
+so a *repeatedly* wedged action still needs the operator attention
+:func:`~src.apps.degradations.service_relay_rows` now makes visible; what
+this buys back is every OTHER command on that worker.
 """
 from __future__ import annotations
 
@@ -182,6 +203,25 @@ class ServiceCommandRelay:
         # acting locally — the same path a dead owner already produces.
         self._pending.clear()
 
+    def relay_health(self) -> dict:
+        """Can THIS worker still forward (or answer) a broadcast service
+        command? Same three-state shape as
+        ``AppLifecycle.broadcast_health`` (``src/apps/lifecycle.py`` — see its
+        docstring for what each key means) for a DIFFERENT
+        ``RedisBroadcaster`` instance: this one is this relay's own, so a dead
+        or merely-stuck relay here is invisible to a check that only reads
+        the other. Consumed by
+        :func:`~src.apps.degradations.service_relay_rows`.
+        """
+        broadcaster = self._broadcaster
+        if broadcaster is None:
+            return {"started": False, "relay_alive": False, "relay_failures": 0}
+        return {
+            "started": True,
+            "relay_alive": bool(getattr(broadcaster, "relay_alive", False)),
+            "relay_failures": int(getattr(broadcaster, "relay_failures", 0) or 0),
+        }
+
     # ---- receiving -------------------------------------------------------
 
     async def _on_message(self, topic: str, payload: dict) -> None:
@@ -215,9 +255,26 @@ class ServiceCommandRelay:
         try:
             # ServiceSupervisor is blocking (Popen, proc.wait, killpg) and this
             # runs on the worker's event loop thread — a 5s proc.wait here
-            # would freeze every other request on this worker.
-            result = await asyncio.to_thread(getattr(services, action), app_id, service_id)
+            # would freeze every other request on this worker. Bounded by
+            # ``wait_for`` on top of ``to_thread`` (not just offloaded to a
+            # thread): without it, a hang in the action itself freezes
+            # `_relay_loop` on this one message forever — see the module
+            # docstring's "owner's handler execution is bounded too".
+            result = await asyncio.wait_for(
+                asyncio.to_thread(getattr(services, action), app_id, service_id),
+                timeout=self.timeout,
+            )
             reply = {"corr_id": corr_id, "ok": True, "status": result,
+                     "owner_pid": os.getpid()}
+        except asyncio.TimeoutError:
+            log.error(
+                "apps: forwarded %r for service %s/%s did not complete within "
+                "%ss (corr_id=%s) — replying failed rather than leaving the "
+                "requester to time out and fall back silently; the action may "
+                "still be running in the background on this worker",
+                action, app_id, service_id, self.timeout, corr_id)
+            reply = {"corr_id": corr_id, "ok": False,
+                     "error": f"{action} did not complete within {self.timeout}s",
                      "owner_pid": os.getpid()}
         except Exception as e:  # noqa: BLE001 — must ALWAYS reply
             # Staying silent here costs the requester the full timeout and
