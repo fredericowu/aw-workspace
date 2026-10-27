@@ -153,14 +153,27 @@ Field semantics:
 - `timeout_s` — per-forwarded-call ceiling, clamped to ≤20s (§7).
 
 **What adding tool #2 later requires: one config entry** — any installed app
-exposing the standard `/api/apps/<slug>/mcp` route (which is every
-MCP-contributing app in this workspace, Tier-1 and Tier-2 alike, since they
-all self-register this exact shape) is forwardable by listing it with an
-allow-list. A future upstream that is *not* an installed app's MCP route
-(an external HTTP server, a stdio child) is a new `transport` kind and a code
-change — deliberately: federating external MCP servers is aw-mcp-gateway's
-job, and the Connector forwarding to the outside world would duplicate it
-with weaker controls.
+exposing the standard `/api/apps/<slug>/mcp` route is forwardable by listing
+it with an allow-list. **That is a Tier-1 property, not a universal one**
+(corrected 2026-10-27, card `4065bf3b-9510-81f6`): the route is one the app
+*registers for itself*, so it needs `tier: inprocess` plus `routes:register`.
+`src/apps/mcp_template.py`'s module docstring states the other half outright
+— "**A Tier-2 container app runs no workspace-side code at all**" — so a
+Tier-2 app can never have this route, and listing one with `transport:
+app-mcp` yields a 404: an upstream listed and serving nothing. A Tier-2 app
+declares its MCP surface in `apps/<slug>/mcp.json` instead, which is a
+different transport kind and was the code change below.
+
+A future upstream that is *not* an installed app's own `/mcp` route (a
+Tier-2 app's declared endpoint, an external HTTP server, a stdio child) is a
+new `transport` kind and a code change — deliberately: federating external
+MCP servers is aw-mcp-gateway's job, and the Connector forwarding to the
+outside world would duplicate it with weaker controls. The first such kind,
+`app-mcp-json`, shipped on the card above and is designed in
+`docs/design/knowledgeable-forwarder-declared-mcp-transport.md`: it stays
+inside this constraint by resolving URL/headers/enabled-state from an
+installed app's *own declaration*, never from registry fields a config
+writer could mint.
 
 ## 4. Transport, concretely — the loopback verdict
 
