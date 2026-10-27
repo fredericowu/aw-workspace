@@ -212,6 +212,12 @@ def test_extract_agent_session_id_from_codex_bare_resume():
     assert _extract_agent_session_id("codex resume abc-123") == "abc-123"
 
 
+def test_extract_agent_session_id_from_antigravity_conversation_flag():
+    from src.api.terminal_manager import _extract_agent_session_id
+
+    assert _extract_agent_session_id("agy --conversation conv-123") == "conv-123"
+
+
 def test_extract_agent_session_id_none_for_plain_terminal():
     from src.api.terminal_manager import _extract_agent_session_id
 

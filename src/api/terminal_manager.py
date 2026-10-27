@@ -2208,11 +2208,11 @@ def _set_command_insecure(command: str | None, session_type: str, insecure: bool
 # agent_session_id) the same session appeared a second time as a spurious
 # "discovered" entry with a garbled name. The id is trivially recoverable
 # from the launch command itself — every launch already embeds
-# `--session-id <uuid>` (new) or `--resume <uuid>`/`resume <uuid>`
+# `--session-id <uuid>` (new), `--resume <uuid>`/`resume <uuid>`, or
+# Antigravity's `--conversation <uuid>`
 # (reused) — no file-watching/DB needed for this.
 def _extract_resume_argument(command: str | None) -> str | None:
-    """Extract ``--resume <id>`` (or codex's bare ``resume <id>``) from a
-    command string."""
+    """Extract a CLI's explicit resume/conversation id from a command."""
     if not command:
         return None
     import shlex
@@ -2222,6 +2222,8 @@ def _extract_resume_argument(command: str | None) -> str | None:
         parts = command.split()
     for i, p in enumerate(parts):
         if p == "--resume" and i + 1 < len(parts):
+            return parts[i + 1]
+        if p == "--conversation" and i + 1 < len(parts):
             return parts[i + 1]
         if p == "resume" and i > 0 and parts[i - 1] == "codex" and i + 1 < len(parts):
             return parts[i + 1]
