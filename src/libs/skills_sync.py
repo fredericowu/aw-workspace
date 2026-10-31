@@ -155,8 +155,8 @@ def _prune_empty_dirs(root: Path) -> None:
         if not dirnames and not filenames:
             try:
                 Path(dirpath).rmdir()
-            except OSError:
-                pass
+            except OSError as exc:
+                log.debug("skills_sync: prune of empty dir %s failed: %s", dirpath, exc)
 
 
 def _sync_one(source: Path, target: Path) -> SyncResult:

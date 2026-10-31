@@ -854,7 +854,7 @@ def kill_proc_tree(pid: int, timeout: float = 2.0) -> None:
         try:
             os.kill(spid, signal.SIGKILL)
         except ProcessLookupError:
-            pass
+            logger.debug("kill_subtree: pid %s already gone", spid)
 
     pending = {spid for spid in subtree_pids if spid != pid}
     deadline = time.monotonic() + timeout
@@ -1158,8 +1158,8 @@ class TerminalSession:
         try:
             winsize = struct.pack("HHHH", rows, cols, 0, 0)
             fcntl.ioctl(self.fd, termios.TIOCSWINSZ, winsize)
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.debug("terminal %s: resize ioctl failed: %s", self.id, exc)
 
     # ---- readers / consumers -------------------------------------------
 
@@ -1341,8 +1341,8 @@ class TerminalSession:
         if TerminalSession._exit_callback:
             try:
                 TerminalSession._exit_callback(self.id, self.type)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("terminal %s: exit callback raised: %s", self.id, exc)
 
     def _on_eof(self, loop):
         """The PTY hit EOF — the shell is gone. Owner only.
@@ -1354,8 +1354,8 @@ class TerminalSession:
         """
         try:
             loop.remove_reader(self.fd)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("terminal %s: remove_reader on EOF failed: %s", self.id, exc)
         self._reader_started = False
         if streams_enabled():
             self._out_eof = True
@@ -1371,8 +1371,8 @@ class TerminalSession:
             return
         try:
             loop.remove_reader(self.fd)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("terminal %s: remove_reader on stop failed: %s", self.id, exc)
         self._reader_started = False
 
     def close_streams(self) -> None:
@@ -1417,12 +1417,13 @@ class TerminalSession:
             return
         try:
             os.close(self.fd)
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.debug("terminal %s: fd close on kill failed: %s", self.id, exc)
         try:
             os.kill(self.pid, signal.SIGTERM)
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.debug("terminal %s: SIGTERM to pid %s failed (already gone?): %s",
+                          self.id, self.pid, exc)
         # SIGTERM went out microseconds ago, so this WNOHANG almost always
         # answers "not dead yet" (0). Discarding the pid on that answer is what
         # leaked every closed terminal: the real SIGCHLD lands a moment later,
@@ -1435,8 +1436,9 @@ class TerminalSession:
             reaped, _ = os.waitpid(self.pid, os.WNOHANG)
         except ChildProcessError:
             _OWN_CHILD_PIDS.discard(self.pid)  # already reaped elsewhere
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.debug("terminal %s: waitpid on kill failed for pid %s: %s",
+                          self.id, self.pid, exc)
         else:
             if reaped:
                 _OWN_CHILD_PIDS.discard(self.pid)
@@ -2153,8 +2155,8 @@ def _stop_reader(session: "TerminalSession", loop=None) -> None:
             return
     try:
         session.stop_reader(loop)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("terminal %s: stop_reader failed: %s", session.id, exc)
 
 
 # The flag each CLI's "insecure" mode maps to (mirrors aw-workspace-ui's

@@ -479,8 +479,8 @@ class IdentityGuard:
         # carry a detail string).
         try:
             await receive()  # websocket.connect
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("apps: _reject_ws drain of websocket.connect failed: %s", exc)
         await send({"type": "websocket.accept"})
         await send({"type": "websocket.close", "code": code})
 
@@ -2280,8 +2280,9 @@ class AppRuntime:
             if old.startswith(f"{manifest.id}.") and old != os.path.basename(marker):
                 try:
                     os.remove(os.path.join(marker_dir, old))
-                except OSError:
-                    pass
+                except OSError as exc:
+                    log.debug("apps: stale pip_requires marker cleanup failed for %s: %s",
+                              old, exc)
         with open(marker, "w") as fh:
             fh.write("\n".join(sorted(set(reqs))))
         log.info("apps: pip_requires satisfied for %s", manifest.id)
