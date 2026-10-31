@@ -661,19 +661,24 @@ class AppRuntime:
         """Apply the app's pending migrations/*.sql, if it declares a dir
         (src/apps/migrations.py). Called on every load() — install AND
         update — after plugin.activate() so a migration can ALTER a table
-        the app's own bootstrap code just ensured exists. One app's
-        migration failure is logged, not fatal to the load — the app's
-        CREATE TABLE IF NOT EXISTS already gave it a working baseline
-        schema; a missed ALTER degrades a feature, it doesn't brick the app."""
+        the app's own bootstrap code just ensured exists.
+
+        A migration failure RAISES — it used to be logged and swallowed,
+        which let an app install/reload green and serve routes against a
+        schema it never actually migrated to, with no visible signal beyond
+        the ``_app_migrations`` ledger quietly stopping one version behind
+        (card core-app-migration-failures-are-silently-swallowed...). The
+        caller (``install``/update's ``_run_install`` etc., via
+        ``jobs.mark_failed``) already turns a raised exception from
+        ``load()`` into a visible failed-install status — swallowing it here
+        was the only thing standing between that existing path and a loud
+        failure."""
         from src.apps.migrations import apply_migrations, migrations_dir_for
 
         migrations_dir = migrations_dir_for(package_dir, manifest.migrations)
         if migrations_dir is None:
             return
-        try:
-            apply_migrations(manifest.id, migrations_dir)
-        except Exception:
-            log.exception("apps: applying migrations for %s failed", manifest.id)
+        apply_migrations(manifest.id, migrations_dir)
 
     # ---- system-CLI drift healing ----------------------------------------
 

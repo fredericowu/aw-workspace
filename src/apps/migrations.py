@@ -113,7 +113,19 @@ def apply_migrations(app_id: str, migrations_dir: str) -> list[str]:
             # a file that DOES qualify explicitly still works unchanged.
             conn.execute(text(f'SET LOCAL search_path TO "{schema}"'))
             if sql.strip():
-                conn.execute(text(sql))
+                # exec_driver_sql, not text(sql): text() scans the WHOLE file —
+                # comments included — for ":word" and treats every match as a
+                # bind parameter. A migration whose header comment describes a
+                # Python slice like "items[:40]" then fails with "a value is
+                # required for bind parameter '40'", even though the file has
+                # no bind params at all and applies fine via psql. A failure
+                # here used to only be logged (see runtime.py::_apply_migrations
+                # history), which is how a migration file with this pattern
+                # shipped and served production routes against tables that
+                # were never created. exec_driver_sql passes the string straight
+                # to the DBAPI with no bind-param scanning, removing this whole
+                # class of false positive rather than just detecting it.
+                conn.exec_driver_sql(sql)
             conn.execute(
                 text(f'INSERT INTO "{schema}"."{_TRACKING_TABLE}" (app_id, filename) '
                      "VALUES (:app_id, :filename)"),

@@ -45,6 +45,7 @@ def run(args: list[str]) -> int:
     problems += _app_checks(report.get("app_checks") or [])
     _autostart(report.get("autostart") or [])
     problems += _autostart_not_running(report.get("autostart_not_running") or [])
+    problems += _pending_migrations(report.get("pending_migrations") or [])
     _host_power(report.get("host_power") or {})
     problems += _mcp(report.get("mcp") or {})
     problems += _redis(report.get("redis") or {})
@@ -127,6 +128,23 @@ def _app_checks(rows: list) -> int:
             summary = str(detail)
         print(f"  ✗ {row['app']}: {row['label']} — {summary}")
     return len(bad)
+
+
+def _pending_migrations(rows: list) -> int:
+    """Loaded apps whose ``_app_migrations`` ledger is behind their
+    manifest's migrations dir — the signature a swallowed migration
+    failure used to leave behind (``_apply_migrations`` now raises
+    instead), so this should normally be empty."""
+    if not rows:
+        print()
+        print("Migrations — every loaded app's ledger is up to date")
+        return 0
+    print()
+    print(f"Migrations — {len(rows)} app(s) behind their migrations dir")
+    for row in rows:
+        pending = row.get("pending") or []
+        print(f"  ✗ {row['app']}: {len(pending)} pending — {', '.join(pending)}")
+    return len(rows)
 
 
 def _autostart(rows: list) -> None:

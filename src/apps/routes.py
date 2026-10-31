@@ -293,6 +293,37 @@ async def _app_doctor_checks(runtime) -> list[dict]:
     return out
 
 
+def _app_pending_migrations(runtime) -> list[dict]:
+    """Loaded apps whose ``_app_migrations`` ledger (src/apps/migrations.py)
+    is behind the ``.sql`` files their manifest's migrations dir declares.
+
+    A currently-loaded app with pending migrations is the exact shape a
+    migration failure used to leave behind before ``_apply_migrations``
+    started raising (card
+    core-app-migration-failures-are-silently-swallowed...): the app looks
+    installed and serves routes, but an earlier load never finished
+    bringing its schema up to date. ``load()`` now fails the install/reload
+    outright when a migration raises, so this should normally be empty —
+    it exists as the defence-in-depth signal for anything that got into
+    this state before that fix, or any future path that reaches
+    ``apply_migrations`` without going through ``load()``'s own failure
+    handling."""
+    from src.apps.migrations import migrations_dir_for, pending_migrations
+
+    out: list[dict] = []
+    for slug in runtime.loaded_slugs():
+        loaded = runtime.get(slug)
+        if loaded is None:
+            continue
+        migrations_dir = migrations_dir_for(loaded.package_dir, loaded.manifest.migrations)
+        if migrations_dir is None:
+            continue
+        pending = pending_migrations(slug, migrations_dir)
+        if pending:
+            out.append({"app": slug, "pending": pending})
+    return out
+
+
 def _config_for_install(app_id: str, data: dict, runtime, reconciler) -> dict:
     """Config to install ``app_id`` with: the caller's if it sent one,
     otherwise whatever is already on record for that app.
@@ -1707,6 +1738,13 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
           true`` but whose service/container is not actually running right
           now (see ``_autostart_not_running``) — the inverse gap, and the one
           that was actually silent: this IS counted as a problem.
+        * ``pending_migrations`` — loaded apps whose ``_app_migrations``
+          ledger is behind their manifest's migrations dir (see
+          ``_app_pending_migrations``). ``_apply_migrations`` now raises on
+          a migration failure instead of logging and continuing, so this
+          should normally be empty; it is folded into ``ok`` as the
+          defence-in-depth signal for anything that reached this state
+          before that fix, or any load path that bypasses it.
         * ``host_power`` — what the BYOD host opted into vs what each loaded
           app was actually granted. An app whose grant is empty while its
           manifest asks for one cannot be loaded at all (the load raises), so
@@ -1817,6 +1855,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         app_checks = await _app_doctor_checks(runtime)
         autostart_off = _autostart_disabled(runtime)
         autostart_not_running = await asyncio.to_thread(_autostart_not_running, runtime)
+        pending_migrations = await asyncio.to_thread(_app_pending_migrations, runtime)
 
         unhealthy = [c for c in clis if not c["healthy"]]
         failing_app_checks = [c for c in app_checks if not c["ok"]]
@@ -1839,9 +1878,11 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             # failure this exists to catch.
             "ok": (not unhealthy and not permissions and not failing_app_checks
                    and not mcp_status["degraded"] and not autostart_not_running
+                   and not pending_migrations
                    and vault_status.get("reachable") is not False
                    and not remote_host_postgres_backup["stale"]),
             "app_checks": app_checks,
+            "pending_migrations": pending_migrations,
             "system_clis": {
                 "total": len(clis),
                 "unhealthy": unhealthy,
