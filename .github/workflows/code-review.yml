@@ -26,7 +26,9 @@ name: Code Review
 #           extraction source was AP-MT, which has no CodeRabbit installed, so
 #           the template is the only repo in this rollout that would ever have
 #           hit it — and there it would have hung the gate on a pending
-#           third-party check until the 20-minute deadline.
+#           third-party check until the 20-minute deadline. (v1.3.0 deleted
+#           that deadline along with the poll; an advisory check that sits
+#           pending now simply never blocks anything.)
 #   v1.1.0  `secrets: inherit` does NOT cross an account boundary. GitHub only
 #           carries `inherit` within one org/enterprise, so the template
 #           (`tekflox/…` calling `fredericowu/…`) received an EMPTY
@@ -54,37 +56,83 @@ name: Code Review
 #      therefore could have it. Direct push to master stays available as the
 #      break-glass path, and not only for emergencies: the agent fleet,
 #      `sync_on_boot`, and `aw-workspace-cli repo-sync` all push master
-#      directly today. The shared workflow's `ci_gate` is consequently the
-#      ONLY thing between a red suite and a squash-merge, which is why it
+#      directly today. The shared workflow's own check read — in its
+#      `merge-attempt` job as of v1.3.0 — is consequently the ONLY thing
+#      between a red suite and a squash-merge, which is why `ci_check_name`
 #      must stay pinned to a real check name.
 #
 # ── ONE TRAP, IF YOU ARE EDITING *THIS FILE* IN A PR ──────────────────────
-# `pull_request` runs this file's PR copy (round 1 sees your edits live);
-# `issue_comment` (`/aw-review`, round 2) always runs the DEFAULT BRANCH's
-# copy. So a PR that changes this file — including one that only bumps the
-# `@vX.Y.Z` pin — cannot exercise its own round 2. Verify round 2 on the NEXT
-# PR after merge; don't burn time "debugging" that.
+# `pull_request` runs this file's PR copy, so rounds 1 and 2 both see your
+# edits live. `issue_comment` (`/aw-review`) and `workflow_run` BOTH always
+# run the DEFAULT BRANCH's copy. So a PR that changes this file — including
+# one that only bumps the `@vX.Y.Z` pin or edits the trigger list — cannot
+# exercise its own comment path or its own workflow_run path. Verify those on
+# the NEXT PR after merge; don't burn time "debugging" them. That is exactly
+# why v1.3.0's canary on tekflox/aw-app-template took two PRs rather than one.
 
+# ── THE TRIGGER SURFACE, AND WHY IT GREW IN v1.3.0 ────────────────────────
+# `synchronize` was deliberately absent here for four releases, for a real
+# reason that has NOT gone away: a full deep review (one judge run plus up to
+# 3 research runs) costs real subscription budget, and PR-Agent already
+# reviews every push. "Review every push" was never the ask.
+#
+# What v1.3.0 adds is narrower than that. The shared gate admits a
+# `synchronize` ONLY when the PR already carries `devteam:awaiting-fixes` —
+# i.e. the coder's fix push, which is precisely the event round 2 was sitting
+# and waiting for. Anything else is refused after a single label read, before
+# any paid run. So the budget rationale is preserved in the gate rather than
+# in this trigger list, and the manual step it replaces (`/aw-review` after
+# every fix push) is gone. `/aw-review` itself is untouched and remains the
+# override from any round.
+#
+# `workflow_run` is the other half, and it is what lets the merge stop
+# polling. The shared workflow's `merge-attempt` job re-attempts the merge
+# when THIS repo's own CI finishes, however long that takes — replacing a
+# 20-minute `gh pr checks` loop that gave up at its deadline. `workflows:`
+# takes the CI workflow's `name:`, NOT its filename and NOT its job id.
+# Rename that workflow and nothing fails loudly; the event simply stops
+# arriving and merges whose CI finishes after the review verdict quietly stop
+# happening. Confirm the string with
+#   gh api repos/<owner>/<repo>/actions/workflows --jq '.workflows[].name'
+#
+# The `|| github.event.workflow_run.head_branch` arm of the concurrency group
+# below is required alongside it: a workflow_run event has neither
+# `pull_request.number` nor `issue.number`, so without it every workflow_run
+# run in this repo collapses into the single group `code-review-` and, with
+# `cancel-in-progress: false`, queues one at a time.
+#
+# Proven on the canary before landing here: tekflox/aw-app-template PR #21
+# (same-run path, merged with no poll) and PR #22 (CI deliberately slowed, so
+# the same-run attempt declined with "still running" and the merge arrived via
+# the workflow_run hop).
+#
 on:
   pull_request:
+    # `synchronize` -> automatic round 2 on the coder's fix push; the shared
+    # gate refuses it on any other round. See the trigger note above.
+    #
     # `closed` is here only for the shared workflow's merged-event job; its
     # gate job excludes `closed` explicitly, so a close never dispatches a
     # review.
-    types: [opened, reopened, ready_for_review, closed]
+    types: [opened, reopened, ready_for_review, synchronize, closed]
   issue_comment:
     types: [created]
+  # This repo's own CI, BY ITS `name:` (not its filename, not its job id).
+  workflow_run:
+    workflows: ["Test"]
+    types: [completed]
 
 # Stays in the caller, not in the reusable workflow: what needs serializing is
 # "reviews of THIS repo's PR #N". A reusable workflow's own `concurrency`
 # would key on the shared file's identity instead, collapsing unrelated repos
 # into one queue.
 concurrency:
-  group: code-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  group: code-review-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.head_branch }}
   cancel-in-progress: false
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.2.1
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.3.0
     with:
       ci_check_name: unit
     # Declared here as well as in the called workflow: for a reusable
