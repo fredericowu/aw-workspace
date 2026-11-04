@@ -10,12 +10,22 @@ name: Code Review
 # a reusable workflow instead of a third ~975-line copy-paste.
 #
 # ── WHY AN EXACT TAG, NOT @master ─────────────────────────────────────────
-# `@v1.0.0` is immutable and is never retagged. A moving ref here would mean
+# `@v1.0.1` is immutable and is never retagged. A moving ref here would mean
 # an edit in the shared repo changes this repo's merge gate with no commit on
 # this repo — the same shape as app-release.yml, which ~45 app repos reference
 # via a moving `@master` and where one fail-loud edit reddened the whole
 # marketplace at once. Bumps are deliberate, one caller at a time, with
 # aw-app-template as the canary.
+#
+# v1.0.1, not v1.0.0, and the difference is the canary rule paying for itself
+# on its very first use: converting aw-app-template (done before the other
+# callers, deliberately) found that v1.0.0 had dropped `CodeRabbit` from the
+# merge gate's advisory set. The extraction source was AP-MT, which has no
+# CodeRabbit installed, so nothing in this rollout except the template would
+# ever have hit it — and there it would have hung the merge gate on a pending
+# third-party check until the 20-minute deadline. v1.0.0 was not retagged.
+# Nothing in that fix affects THIS repo; the bump is for one pin across all
+# three callers rather than silent drift between them.
 #
 # ── THIS REPO'S DELIBERATE DIFFERENCES ────────────────────────────────────
 #   1. `ci_check_name: unit` — test.yml's single job id. VERIFIED against a
@@ -61,7 +71,7 @@ concurrency:
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.0.0
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.0.1
     with:
       ci_check_name: unit
     # Declared here as well as in the called workflow: for a reusable
