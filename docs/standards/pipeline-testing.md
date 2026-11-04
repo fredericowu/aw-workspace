@@ -228,12 +228,38 @@ permissions**, and the fifth is the one that bites:
       checks: read        # <- omit this and PRIVATE repos break, silently
 ```
 
-**Why it cannot live in the shared file.** GitHub allows a reusable workflow's
-`GITHUB_TOKEN` to be equal to or *more restrictive* than its caller's, never
-broader. A scope the caller omits therefore cannot be granted downstream — so
-this is permanently a per-caller obligation, exactly the kind of drift §2 is
-otherwise trying to eliminate. It is in the shared file's caller checklist, and
-that checklist is the only enforcement.
+**It must be in BOTH places, and this is where I got it wrong first.** The
+effective token is the *intersection* of the caller's `uses:`-job block and the
+called workflow's own top-level `permissions:`. Once a `permissions:` key names
+any scope, every scope it does **not** name is forced to `none` rather than
+inherited (GitHub docs, `permissions`: *"If you specify the access for any of
+these permissions, all of those that are not specified are set to `none`"*).
+
+So the rule cuts both ways: a scope the caller omits cannot be granted
+downstream, **and** a scope the shared file omits cannot be granted by the
+caller. Either side alone caps the token to zero.
+
+`aw-shared-workflows@v1.1.1` was cut specifically to fix the missing
+`checks: read`, added it to all three callers and to the shared file's caller
+checklist, and never touched the shared file's own `permissions:` block. Net
+effect was no fix at all, just a better error message. Caught by the Dev Team
+reviewer on `aw-app-template#17` by resolving the pinned tag and reading the
+dependency rather than the diff in front of it, and fixed in **v1.1.2**.
+
+Two things worth taking from that, beyond the scope itself:
+
+- **Neither canary would have caught it by running.** A public repo's gate
+  works with or without the scope; a private one fails identically before and
+  after. Only reading both sides finds it. v1.1.2 therefore adds
+  `test_the_reusable_requests_every_scope_the_caller_checklist_demands`, which
+  parses the shared file's own block and its caller checklist and fails if they
+  diverge.
+- **A "fix" verified only against the repo that cannot exhibit the bug is not
+  verified.** I reported v1.1.1 as fixing the private-repo failure on the
+  strength of a green run on the public template.
+
+The per-caller half remains a standing obligation, exactly the kind of drift §2
+otherwise tries to eliminate. The checklist plus that test is the enforcement.
 
 **Why omitting it is invisible.** The merge gate reads the PR's checks with
 `gh pr checks`, which goes through the Checks API. A **public** repo's check
@@ -263,7 +289,8 @@ Two agents debugged the wrong workflow before the cause was found.
    longer indistinguishable from "zero checks exist" — empty stdout with
    stderr content now retries to the 20-minute deadline. That converts the
    symptom from an instant false negative into a timeout. It is **not** a
-   substitute for granting the scope.
+   substitute for granting the scope — and on v1.1.1 it was in fact the *only*
+   thing that landed, since the permissions half was inert until v1.1.2.
 2. **A public canary cannot prove a tag for a private consumer.** §8.2's
    template-first rollout order is still right, but it has this blind spot by
    construction: the template is public. A private consumer is a *second,

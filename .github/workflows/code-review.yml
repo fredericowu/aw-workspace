@@ -84,14 +84,18 @@ concurrency:
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.1
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.2
     with:
       ci_check_name: unit
     # Declared here as well as in the called workflow: for a reusable
     # workflow the effective GITHUB_TOKEN permissions are the INTERSECTION of
     # the two, so the caller's copy is what lifts this repo above its default
-    # workflow permissions. A scope omitted HERE therefore cannot be granted
-    # by the shared file — which is why `checks: read` has to be listed below.
+    # workflow permissions. That intersection cuts BOTH ways: a scope omitted
+    # here cannot be granted by the shared file, and a scope the shared file
+    # omits cannot be granted here. An unlisted scope is an explicit `none`,
+    # never an inherit. v1.1.1 added `checks: read` to the callers only and
+    # was therefore inert; v1.1.2 requests it on both sides and tests that
+    # the two lists match.
     permissions:
       contents: read
       pull-requests: write
