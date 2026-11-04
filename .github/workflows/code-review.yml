@@ -10,22 +10,35 @@ name: Code Review
 # a reusable workflow instead of a third ~975-line copy-paste.
 #
 # ── WHY AN EXACT TAG, NOT @master ─────────────────────────────────────────
-# `@v1.0.1` is immutable and is never retagged. A moving ref here would mean
+# `@v1.1.0` is immutable and is never retagged. A moving ref here would mean
 # an edit in the shared repo changes this repo's merge gate with no commit on
 # this repo — the same shape as app-release.yml, which ~45 app repos reference
 # via a moving `@master` and where one fail-loud edit reddened the whole
 # marketplace at once. Bumps are deliberate, one caller at a time, with
 # aw-app-template as the canary.
 #
-# v1.0.1, not v1.0.0, and the difference is the canary rule paying for itself
-# on its very first use: converting aw-app-template (done before the other
-# callers, deliberately) found that v1.0.0 had dropped `CodeRabbit` from the
-# merge gate's advisory set. The extraction source was AP-MT, which has no
-# CodeRabbit installed, so nothing in this rollout except the template would
-# ever have hit it — and there it would have hung the merge gate on a pending
-# third-party check until the 20-minute deadline. v1.0.0 was not retagged.
-# Nothing in that fix affects THIS repo; the bump is for one pin across all
-# three callers rather than silent drift between them.
+# v1.1.0, and the two bumps that got here are the canary rule paying for
+# itself twice on its first day. Converting aw-app-template FIRST (deliberate
+# — it is the oldest and most-exercised consumer) surfaced both, in a repo
+# whose own loop was already working, before either reached this one:
+#
+#   v1.0.1  `CodeRabbit` was missing from the merge gate's advisory set. The
+#           extraction source was AP-MT, which has no CodeRabbit installed, so
+#           the template is the only repo in this rollout that would ever have
+#           hit it — and there it would have hung the gate on a pending
+#           third-party check until the 20-minute deadline.
+#   v1.1.0  `secrets: inherit` does NOT cross an account boundary. GitHub only
+#           carries `inherit` within one org/enterprise, so the template
+#           (`tekflox/…` calling `fredericowu/…`) received an EMPTY
+#           AW_CODEREVIEW_V1_KEY despite having the secret set. The three
+#           secrets are now declared upstream and passed by name — see the
+#           `secrets:` block below.
+#
+# Neither fix was a retag: v1.0.0 and v1.0.1 remain published and unmodified,
+# which is the whole point of pinning exact tags. Strictly speaking neither
+# defect could affect THIS repo (no CodeRabbit here, and same-owner `inherit`
+# works), so this bump buys one pin and one secrets convention across all
+# three callers instead of silent drift between them.
 #
 # ── THIS REPO'S DELIBERATE DIFFERENCES ────────────────────────────────────
 #   1. `ci_check_name: unit` — test.yml's single job id. VERIFIED against a
@@ -71,7 +84,7 @@ concurrency:
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.0.1
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.0
     with:
       ci_check_name: unit
     # Declared here as well as in the called workflow: for a reusable
@@ -83,7 +96,21 @@ jobs:
       pull-requests: write
       issues: write
       statuses: write
-    # The shared workflow declares no `secrets:` block and reads
-    # AW_CODEREVIEW_V1_KEY / AW_DEVTEAM_MERGE_TOKEN / AW_DEVTEAM_EVENT_SECRET
-    # as inherited, each with an explicit fail-loud branch for "unset".
-    secrets: inherit
+    # Passed BY NAME, not `secrets: inherit` — v1.1.0's contract, and the
+    # same form the other two callers use. `inherit` would in fact still work
+    # here (this repo and aw-shared-workflows are both owned by
+    # `fredericowu`, and `inherit` only carries within one org/enterprise),
+    # but relying on that would make this caller the odd one out AND make it
+    # silently correct for a reason that has nothing to do with this repo. It
+    # broke for real on the cross-owner caller: tekflox/aw-app-template
+    # passed `inherit`, had AW_CODEREVIEW_V1_KEY set, and still received an
+    # EMPTY STRING. Being explicit costs three lines and removes a trap.
+    #
+    # Each is declared `required: false` upstream so a missing one produces
+    # the shared workflow's own fail-loud error, naming this repo and the
+    # secret, instead of GitHub refusing the whole call with a generic
+    # validation error before any of those diagnostics can run.
+    secrets:
+      AW_CODEREVIEW_V1_KEY: ${{ secrets.AW_CODEREVIEW_V1_KEY }}
+      AW_DEVTEAM_MERGE_TOKEN: ${{ secrets.AW_DEVTEAM_MERGE_TOKEN }}
+      AW_DEVTEAM_EVENT_SECRET: ${{ secrets.AW_DEVTEAM_EVENT_SECRET }}
