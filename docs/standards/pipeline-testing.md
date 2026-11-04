@@ -225,7 +225,7 @@ permissions**, and the fifth is the one that bites:
       pull-requests: write
       issues: write
       statuses: write
-      checks: read        # <- omit this and PRIVATE repos break, silently
+      checks: read        # <- needed HERE *and* in the shared file; see below
 ```
 
 **It must be in BOTH places, and this is where I got it wrong first.** The
