@@ -1,0 +1,149 @@
+name: AI Review
+
+# Thin caller. PR-Agent's advisory review itself lives in
+# fredericowu/aw-shared-workflows — read that file's header for the fork
+# threat model, why there is no checkout and no `runs_on` input, the
+# inference routing, and why `/improve` is on-demand only.
+#
+# NEW TO THIS REPO. There is no monolithic copy being replaced, unlike
+# `code-review.yml`: PR-Agent only ever ran in `tekflox/aw-app-template`,
+# and extracting it was done precisely so every repo in the personal-repos
+# rollout gets it from one place rather than by copy-paste.
+#
+# Publishes the commit status `devteam/ai-review` on the PR head SHA, and it
+# is ADVISORY — never make it a required check.
+# `code-review-reusable.yml`'s merge gate already carries
+# `devteam/ai-review` (and this workflow's job names) in its ADVISORY set, so
+# adding this file cannot make `code-review.yml` wait on a review it does not
+# own. Checked against the pinned v1.1.4 source, not assumed.
+#
+# ── WHY AN EXACT TAG, NOT @master ─────────────────────────────────────────
+# `@v1.2.0` is immutable and never retagged; the shared repo's tag ruleset
+# enforces that for everyone including the owner. This workspace holds the
+# cautionary precedent that rule exists for: `app-release.yml` is referenced
+# via a moving `@master` ref from ~45 app repos, and one fail-loud edit there
+# turned the whole marketplace red at once.
+#
+# v1.2.0 is the tag that ADDS `ai-review-reusable.yml` and changes nothing in
+# `code-review-reusable.yml`, so `code-review.yml`'s `@v1.1.4` pin is
+# deliberately left alone. The shared repo keeps ONE `v*` tag line for both
+# workflows rather than an `ai-v*` family, because the ruleset that makes
+# tags immutable targets `refs/tags/v*` only.
+#
+# This is the THIRD consumer, added only after the tag was proven twice on
+# real PRs — once public and `tekflox/*`-owned (aw-app-template #19) and once
+# PRIVATE and same-owner (AP-MT #8), because the v1.1.1 lesson is that a
+# green run on one of those shapes proves nothing about the other.
+#
+# ── runs-on: ubuntu-latest, AND THIS REPO IS WHY THAT IS HARDCODED ────────
+# The shared workflow hardcodes `ubuntu-latest` in all three jobs and
+# exposes no `runs_on` input. This repo is PUBLIC and the trigger below is an
+# open `pull_request`, so anyone can open a PR from a fork — and a fork PR on
+# a `[self-hosted, aw-baremetal]` runner would be arbitrary code execution on
+# the bare-metal host that runs this entire workspace. GitHub-hosted runners
+# are disposable and free on a public repo. There is also deliberately no
+# `actions/checkout` anywhere in the shared workflow: PR-Agent reads the diff
+# through the GitHub API, so untrusted PR code never lands on the runner at
+# all.
+#
+# ── THE GROUP KEY BELOW IS LOAD-BEARING ───────────────────────────────────
+# Not boilerplate, and copied exactly from the shared workflow's caller
+# checklist rather than written fresh. `concurrency` is evaluated at the
+# WORKFLOW level, before any job-level `if`, so the `sender.type != 'Bot'`
+# guard in the shared workflow's `gate` job is correct but unreachable in
+# time — and a bot-sent `issue_comment` run was cancelling the real
+# `pull_request` review it can never itself perform (card
+# 40c5bf3b-9510-810d-a7a2-c67f40939c92, fix 809a1a6, found on
+# aw-app-template PR #5 where CodeRabbit's auto-comment did exactly that).
+# The `bot-noop` arm keys bot senders out one layer earlier, where the kill
+# happens, while human comment runs stay in the review group so a human
+# `/review` still supersedes an in-flight one.
+#
+# The two halves of that invariant now live in different repos — the guard in
+# the shared workflow, the key here — which is why the shared repo's caller
+# checklist carries this exact string and two of its tests assert both
+# halves. Nothing has exercised it on this repo yet; the key is correct
+# anyway, because a repo that inherits a subtly wrong one is how the bug
+# spreads.
+#
+# ── A SEPARATE FILE FROM code-review.yml, BY CONSTRUCTION ─────────────────
+# The two concurrency groups must share no prefix, or that cancellation class
+# re-opens. `code-review-<pr#>` and `ai-review-<pr#>-<arm>` do not.
+#
+# ── TRIGGERS: `synchronize` IS HERE ───────────────────────────────────────
+# Unlike `code-review.yml`, which deliberately excludes it. PR-Agent reviews
+# every push by design (the shared workflow sets HANDLE_PUSH_TRIGGER and
+# PUSH_COMMANDS for exactly that), whereas a full deep review costs real
+# subscription budget and is round-driven.
+#
+# ── NO .pr_agent.toml IN THIS REPO, DELIBERATELY ──────────────────────────
+# Every load-bearing value is set as a host env var inside the shared
+# workflow, which is also what makes a change to them testable in the PR that
+# introduces it. PR-Agent reads a repo's `.pr_agent.toml` from the DEFAULT
+# BRANCH only, and rejects `[openai] api_base` from a repo file outright
+# (`pr_agent/config_security.py`: REPO_HOST_ONLY_KEYS_BY_SECTION). A file
+# here would look configured and silently do nothing. aw-app-template keeps
+# its own purely as documentation of that asymmetry.
+#
+# ── ONE TRAP, IF YOU ARE EDITING *THIS FILE* IN A PR ──────────────────────
+# `pull_request` runs this file's PR copy, so the PR that ADDS it does
+# exercise its own `pull_request` path live. `issue_comment` (`/review`,
+# `/improve`, `/ask`) ALWAYS runs the DEFAULT BRANCH's copy — and before this
+# merges there is no default-branch copy at all, so a `/review` comment on
+# the introducing PR does nothing whatsoever. Verify that path on the next PR
+# after merge; don't burn time "debugging" it.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created]
+
+# See "THE GROUP KEY BELOW IS LOAD-BEARING" above before touching this.
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event.sender.type == 'Bot' && 'bot-noop' || 'review' }}
+  cancel-in-progress: true
+
+jobs:
+  ai-review:
+    uses: fredericowu/aw-shared-workflows/.github/workflows/ai-review-reusable.yml@v1.2.0
+    # `api_base` left at its default
+    # (https://agents-platform.aw.tekflox.com/v1), the production Agents
+    # Platform door this workspace already talks to everywhere else.
+    #
+    # Declared here as well as in the called workflow: the effective
+    # GITHUB_TOKEN permissions are the INTERSECTION of the two, and it cuts
+    # BOTH ways — a scope either side omits is an explicit `none`, never an
+    # inherit, so either side alone caps the token to zero.
+    #
+    # NO `checks: read`, unlike `code-review.yml`'s block, and that is not an
+    # oversight: nothing in this workflow reads the Checks API. The gate
+    # resolves a fork with `gh api repos/.../pulls` (covered by `contents`),
+    # and the review publishes commit STATUSES, a different API from
+    # check-runs. The shared workflow does not request the scope either, and
+    # its parity test compares the two lists in both directions — so adding
+    # it here would fail that test rather than be a harmless extra.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+    # Passed BY NAME, never `secrets: inherit`. Same-owner here
+    # (`fredericowu/*` calling `fredericowu/*`), so `inherit` would in fact
+    # work — and it is still not used, for two reasons: it hands the called
+    # workflow every secret this repo has rather than the one it needs, and
+    # all three callers of these shared workflows should look identical so
+    # the next one copied from any of them is correct by default. The caller
+    # that is NOT same-owner (`tekflox/aw-app-template`) is where `inherit`
+    # silently delivered an empty string, measured on its PR #16.
+    #
+    # AW_PRAGENT_V1_KEY is this repo's OWN key, minted for it rather than
+    # shared with the other callers: an Agents Platform ApiKey bound to the
+    # `aw` workspace and scoped to the `pr-agent-llm` agent alone, so a leak
+    # cannot dispatch any other agent and revocation is per-repo. Verified
+    # against the live door before being set — HTTP 200 listing exactly one
+    # model (`agent/pr-agent-llm`), HTTP 403 for an out-of-scope agent, HTTP
+    # 401 for a garbage key. Workspace-binding is not optional: an unbound
+    # key gives an opaque 500 at `/v1`, not a 401.
+    secrets:
+      AW_PRAGENT_V1_KEY: ${{ secrets.AW_PRAGENT_V1_KEY }}
