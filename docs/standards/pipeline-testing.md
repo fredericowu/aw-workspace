@@ -123,13 +123,42 @@ invocations of `ruff`. It is dead config — which is worth stating plainly,
 because "AP-MT already uses ruff" is the kind of thing that reads as true and
 would quietly derail the lint decision in [§5](#5-lint).
 
-**`aw-workspace` (core) — a serious test job, no quality gates.**
+**`aw-workspace` (core) — ~~a serious test job, no quality gates~~ ON STANDARD
+as of 2026-11-04 for lint; coverage still open.**
 `.github/workflows/test.yml` stands up an ephemeral Postgres *and* Redis, joins
 a `python:3.12-slim` container into the Postgres netns, and runs `pytest src/tests`.
 The comments in that file are the best documentation in the estate of *why a
 skipped test is a failure* ("a skipped test is how a card's whole VERIFY step
-quietly stops running"). It has no coverage and no lint step, and the repo has
-no `pyproject.toml` at all.
+quietly stops running").
+
+The lint half of this entry is now closed. Core has a `pyproject.toml` (lint
+config only — deliberately **no `[project]` section**, so the repo cannot
+quietly become pip-installable alongside the `src/` it already imports off
+`PATH`), a `.pre-commit-config.yaml` on the Tier-B hook set, and a `lint` job
+in `test.yml`:
+
+- **pylint `--errors-only` is BLOCKING.** The tree is measured clean under it,
+  in the CI container with `requirements.txt` installed. Triage found **1 real
+  bug** — `src/tests/unit/apps/test_contributed_tasks.py` defined
+  `test_valid_agentic_output_task_is_accepted` twice, so Python's
+  redefinition rules meant pytest only ever collected the lower one. The dead
+  upper copy asserted that an `agentic_output` task with **no** `agent_slug` is
+  accepted, the exact opposite of the rule `485ca9c` had added, and would have
+  failed the moment it ran. The remaining 4 findings are false positives
+  disabled inline with a reason at each site.
+- **`ruff check` is REPORT-ONLY (`|| true`).** Measured: **78 pre-existing
+  violations across 247 files** — 50 `I001` (import sorting), 15 `F401`, then
+  6 `E741` / 2 `F841` / 2 `F541` / 2 `E702` / 1 `E731`. Same posture, and the
+  same precedent, as AP-MT: a blanket `ruff check --fix` is **not** safe here.
+  AP-MT tried it on its own baseline and reverted it when reordered imports
+  silently broke 2 passing tests via SQLAlchemy listener registration order;
+  core has the same hazard in a different place (`src/apps` registration is
+  import-order-sensitive) and 50 of the 78 findings *are* import reordering.
+  Cleanup is hand-done, test-verified, file by file, on its own card.
+
+Still open for core: **coverage**. No baseline has been measured (see
+[§11](#11-what-i-could-not-verify) — the suite needs a real Postgres and
+Redis), so there is no `fail_under` to set yet.
 
 ### 1.4 Runner and interpreter facts that constrain everything below
 
@@ -180,6 +209,92 @@ this codebase has already paid for once.
 the release path of all 48 apps simultaneously. That risk is already accepted
 (the moving ref is deliberate), but this standard increases the blast radius by
 adding steps to that file. Mitigation in [§8.1](#81-phase-0--make-the-shared-workflow-safe-to-change).
+
+---
+
+## 2a. A reusable-workflow caller must grant `checks: read` (addendum, 2026-11-04)
+
+The Tier-B review/merge loop now lives in
+`fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml`,
+called by three repos. **Every caller's `uses:` job must list all five
+permissions**, and the fifth is the one that bites:
+
+```yaml
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+      checks: read        # <- needed HERE *and* in the shared file; see below
+```
+
+**It must be in BOTH places, and this is where I got it wrong first.** The
+effective token is the *intersection* of the caller's `uses:`-job block and the
+called workflow's own top-level `permissions:`. Once a `permissions:` key names
+any scope, every scope it does **not** name is forced to `none` rather than
+inherited (GitHub docs, `permissions`: *"If you specify the access for any of
+these permissions, all of those that are not specified are set to `none`"*).
+
+So the rule cuts both ways: a scope the caller omits cannot be granted
+downstream, **and** a scope the shared file omits cannot be granted by the
+caller. Either side alone caps the token to zero.
+
+`aw-shared-workflows@v1.1.1` was cut specifically to fix the missing
+`checks: read`, added it to all three callers and to the shared file's caller
+checklist, and never touched the shared file's own `permissions:` block. Net
+effect was no fix at all, just a better error message. Caught by the Dev Team
+reviewer on `aw-app-template#17` by resolving the pinned tag and reading the
+dependency rather than the diff in front of it, and fixed in **v1.1.2**.
+
+Two things worth taking from that, beyond the scope itself:
+
+- **Neither canary would have caught it by running.** A public repo's gate
+  works with or without the scope; a private one fails identically before and
+  after. Only reading both sides finds it. v1.1.2 therefore adds
+  `test_the_reusable_requests_every_scope_the_caller_checklist_demands`, which
+  parses the shared file's own block and its caller checklist and fails if they
+  diverge.
+- **A "fix" verified only against the repo that cannot exhibit the bug is not
+  verified.** I reported v1.1.1 as fixing the private-repo failure on the
+  strength of a green run on the public template.
+
+The per-caller half remains a standing obligation, exactly the kind of drift §2
+otherwise tries to eliminate. The checklist plus that test is the enforcement.
+
+**Why omitting it is invisible.** The merge gate reads the PR's checks with
+`gh pr checks`, which goes through the Checks API. A **public** repo's check
+rollup is readable without `checks: read`; a **private** repo's read is
+*refused* — and returns an empty list rather than an error. The gate then
+reports:
+
+```
+refusing to merge — required check(s) ['pytest'] did not report a pass
+          on this head SHA. Saw: []
+```
+
+which reads like a CI failure, not a permissions problem.
+
+**Measured, 2026-11-04.** Identical caller code, opposite outcomes:
+
+| Repo | Visibility | Result |
+|---|---|---|
+| `tekflox/aw-app-template` | public | merged first try (PR #16) |
+| `fredericowu/agents-platform-multitenant` | **private** | 4 consecutive `/aw-review` rounds failed, ~40 min after `pytest` went green |
+
+Two agents debugged the wrong workflow before the cause was found.
+
+**Two consequences worth carrying forward.**
+
+1. `aw-shared-workflows@v1.1.1` hardened the reader so a *failed* read is no
+   longer indistinguishable from "zero checks exist" — empty stdout with
+   stderr content now retries to the 20-minute deadline. That converts the
+   symptom from an instant false negative into a timeout. It is **not** a
+   substitute for granting the scope — and on v1.1.1 it was in fact the *only*
+   thing that landed, since the permissions half was inert until v1.1.2.
+2. **A public canary cannot prove a tag for a private consumer.** §8.2's
+   template-first rollout order is still right, but it has this blind spot by
+   construction: the template is public. A private consumer is a *second,
+   independent* canary, not a follower.
 
 ---
 
@@ -552,6 +667,61 @@ its own CI half; it should be its own small card.
 
 ---
 
+## 6c. One correction to the §6/§6b hook set (2026-11-04)
+
+**The ruff *hook* must not have `I` in its effective `select` while the
+repo's import-order baseline is unclean — even though §6b correctly puts `I`
+in `[tool.ruff.lint]`.** The two are not the same switch, and conflating them
+is a live hazard rather than a tidiness point.
+
+§6b pins `select = ["E4","E7","E9","F","I"]` so a hook `rev` bump can't widen
+the gate. That is right, and it stays. But the §6 ruff hook also runs
+`--fix`, and a pre-commit hook inherits `pyproject.toml`'s `select` — so in
+any repo whose baseline still carries `I001` findings, the hook will
+**silently reorder the imports of whatever file a commit happens to touch**.
+Not as one reviewable sweep: one unrelated diff at a time, where it is easy
+to re-stage without reading. pre-commit does rewrite the file and demand a
+second `git add`, so it is not invisible — it is just not something a
+developer should have to notice.
+
+That is the same hazard CI already refuses to take. Every repo on this
+standard keeps `ruff check` **report-only** in CI precisely because a blanket
+`--fix` is unsafe on an unmeasured baseline — AP-MT tried it and reverted when
+reordered imports broke 2 passing tests through SQLAlchemy listener
+registration order. Leaving the hook unrestricted contradicts that decision
+while pointing at the same rule.
+
+So: override the hook's select to **`E4,E7,E9,F`** and leave `I` to CI's
+report-only run.
+
+```yaml
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.3
+    hooks:
+      - id: ruff
+        args: [--fix, --select, "E4,E7,E9,F"]   # NOT pyproject's select: drops I
+```
+
+Verified behaviourally, not assumed: on a file with an unsorted *and* an
+unused import, `--fix --select E4,E7,E9,F,I` reorders the imports and drops
+the unused one; `--fix --select E4,E7,E9,F` drops only the unused one and
+leaves import order alone.
+
+**Applies to:** `aw-workspace` core (done — 50 of its 78 findings are `I001`,
+concentrated in the import-order-sensitive `src/apps`). **Still outstanding
+at the time of writing:** `agents-platform-multitenant` has the identical
+combination (`select` includes `I`, hook is a bare `args: [--fix]`) against a
+469-violation baseline including 245 import-sort findings — strictly more
+exposed than core was. `aw-app-template` and any `aw-app-*` inheriting its
+config need the same check. Those are not this card's to change; raised to the
+Product Owner as separate work.
+
+Lift this override per repo once that repo's import-order baseline is
+genuinely zero — at which point the hook can keep it clean going forward,
+which is the end state §6b wants.
+
+---
+
 ## 7. What this makes harder later
 
 Every decision above closes a door. These are the ones it closes.
@@ -637,6 +807,29 @@ error-class lint finds. See [§10](#10-handoffs) for the list.
 (wire up the ruff it already configured, add pylint), `aw-workspace` core (needs
 a `pyproject.toml` first — it has none).
 
+**Progress, 2026-11-04.** Two of the three are done for *lint*; none for
+coverage.
+
+| Repo | Lint | Coverage |
+|---|---|---|
+| `agents-platform-multitenant` | **done** — `lint` job in `test.yml`, pylint `-E` blocking, ruff report-only (469 baseline). Also on the Tier-B hook set. | open — `--cov` is report-only, no `fail_under` |
+| `aw-workspace` (core) | **done** — `pyproject.toml` (lint config only, no `[project]`), `.pre-commit-config.yaml`, `lint` job in `test.yml`. pylint `-E` blocking (tree measured clean, 1 real bug fixed), ruff report-only (**78 baseline, ruff 0.17.3 — see [§9](#9-how-to-reproduce-every-number-here) before re-measuring**). See [§1.3](#13-tier-b--three-repos-that-already-tried-and-stopped-short). | open — no baseline measured |
+| `aw-backend` | not started | not started |
+
+Both finished repos took the same shape, and it is the recommended one for
+`aw-backend`: **pylint error-class blocking only after a real triage pass**
+(fix what is a bug, disable what is a false positive *at the site, with the
+reason*), and **ruff report-only until its baseline is cleaned by hand**. The
+reverse order — gating on ruff first because it looks mechanical — is what
+produced AP-MT's reverted `--fix` commit.
+
+Unblocked by core's new `pyproject.toml`, and worth noting because the §1.3
+entry listed it as the blocker: nothing else about core needed to change. The
+file carries `[tool.ruff]` and `[tool.pylint.main]` and nothing else, and it
+does **not** move pytest's rootdir (verified: still `src/tests`, `configfile:
+pytest.ini`) — which matters, because `test.yml`'s `-k` vs `--deselect` comment
+depends on node ids staying relative to `src/tests`.
+
 ---
 
 ## 9. How to reproduce every number here
@@ -656,7 +849,50 @@ cd /opt/aw-workspace/repos/agents-platform-multitenant/backend
 cd /opt/aw-workspace/repos
 for d in */; do r=${d%/}; printf "%-40s pre-commit=%s\n" "$r" \
   "$([ -f "$r/.pre-commit-config.yaml" ] && echo YES || echo no)"; done
+
+# The core ruff baseline (the §8.5 table). PIN THE VERSION — see below.
+docker run --rm -v /home/aw-remote-host/aw-workspace:/repo -w /repo \
+  -e RUFF_CACHE_DIR=/tmp/rc python:3.12-slim sh -euc '
+    pip install -q ruff
+    python -m ruff --version
+    python -m ruff check --select E4,E7,E9,F,I src/'
+# -> ruff 0.17.3, 247 files: 78 = 50 I001 + 15 F401 + 6 E741 + 2 F841
+#                               + 2 F541 + 2 E702 + 1 E731
 ```
+
+**Run it from the repo ROOT, where `pyproject.toml` is. That is not a detail,
+it changes the number.** Ruff's isort classifies first-party imports using the
+project it discovers from `pyproject.toml`; with no `pyproject.toml` in scope
+it classifies 4 more import blocks as unsorted and reports **82** instead of
+78. Isolated by removing *only* `pyproject.toml` from an otherwise untouched
+clone of this branch — `.git` and `.gitignore` left in place — and watching 78
+become 82, with all four extra findings `I001`. So linting a `src/` tree copied
+out on its own does **not** reproduce this baseline, and 78 is the
+operationally meaningful figure because it is what CI measures: the `lint` job
+runs inside the checkout, where `pyproject.toml` is present.
+
+**Record the tool version AND the working directory next to a lint count.**
+This number has now been wrong in the record three times, each time for a
+different reason, and only the last one was interesting:
+
+| Recorded | Why it was wrong |
+|---|---|
+| 86 | arithmetic — its own per-rule breakdown summed to 83 |
+| 83 | real at the time; the single `F811` was then fixed |
+| 82 | **measured against a detached `src/` copy with no `pyproject.toml`** |
+| **78** | current, reproduced by the command above and independently by QA |
+
+The per-rule breakdown is the cheap check and it must sum to the total — that
+is what caught the 86. It would **not** have caught the 82, because 82 was
+internally consistent; only re-running the documented command in the documented
+place caught that one. Which is the actual lesson: a count is only as good as
+the command recorded beside it, and a command is only reproducible if it names
+its working directory.
+
+Note the **host** path in the docker invocation. The daemon resolves binds
+against the host filesystem, not this container's view, so `-v $PWD:/repo` from
+`/opt/aw-workspace` silently mounts nothing and ruff reports `E902` on a
+missing `src/` — which looks like a lint finding rather than a mount failure.
 
 Caveats that will change the numbers: apps with a `requirements-dev.txt` need it
 installed (`aw-app-crispal` fails collection without `PIL`); CI runs Python 3.11
@@ -689,7 +925,7 @@ Grouped by effort to reach a 50% floor:
 |---|---|
 | `aw-backend` | 251 test files; coverage fully configured, `fail_under = 0`, `--no-cov` in CI ×3. Delete the switches, set a baseline. No lint. |
 | `agents-platform-multitenant` | 343 test files; `[tool.ruff]` + `ruff>=0.7` configured, **never invoked**. Wire it up, add pylint `-E`, add coverage. |
-| `aw-workspace` (core) | Serious test job (ephemeral PG + Redis), no coverage, no lint, **no `pyproject.toml`**. |
+| `aw-workspace` (core) | Serious test job (ephemeral PG + Redis). Lint **done 2026-11-04** (`pyproject.toml`, pre-commit, blocking pylint `-E`, report-only ruff at a 78 baseline). Coverage still unmeasured — that is what remains of this row. |
 | `aw-mcp-gateway` | 13 test files, 3 workflows. Unmeasured. |
 | `aw-marketplace` | Owns `app-release.yml` — Phase 0 lands here. 5 test files. |
 | `aw-console`, `aw-workspace-ui`, `aw-mobile` | Frontend; this standard is Python-shaped and does not cover them. Needs its own decision. |

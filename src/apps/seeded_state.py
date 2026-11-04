@@ -124,6 +124,14 @@ def _remote_read(app_id: str, key: str) -> dict[str, str] | None:
         return None
     obj_kind, _, slug = key.partition(":")
     try:
+        # pylint: disable=not-callable
+        # False positive, here and in _remote_write below: astroid infers
+        # `_provider` from its module-level initial value (`None`), so
+        # `getattr(_provider, "read_state", None)` can only ever be None to
+        # it — and the `is None` guard three lines up therefore reads as
+        # narrowing to nothing callable. At runtime `_provider` is whatever
+        # `register_provider` set, and the guard is exactly what makes this
+        # safe for the old-runners-app case the docstring above describes.
         row = read(obj_kind, slug)
     except Exception:  # noqa: BLE001 — a bad read must never crash a reconcile
         log.exception("seeded_state: failed to read remote state for %s %r", app_id, key)
@@ -141,6 +149,8 @@ def _remote_write(app_id: str, key: str, fingerprints: dict[str, str],
         return
     obj_kind, _, slug = key.partition(":")
     try:
+        # pylint: disable=not-callable
+        # Same false positive as _remote_read above — see its note.
         write(app_id, obj_kind, slug, app_version, fingerprints)
     except Exception:  # noqa: BLE001 — a bad write must never crash a reconcile
         log.exception("seeded_state: failed to write remote state for %s %r", app_id, key)

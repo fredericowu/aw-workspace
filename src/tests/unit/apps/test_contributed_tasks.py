@@ -26,13 +26,17 @@ def _manifest(**over):
 
 # --- manifest validation -----------------------------------------------------
 
-
-def test_valid_agentic_output_task_is_accepted():
-    m = validate_manifest(_manifest(contributes={"tasks": [{
-        "name": "Nightly cleanup", "type": "agentic_output",
-        "command": "echo hi", "schedules": [{"kind": "cron", "expr": "0 3 * * *"}],
-    }]}))
-    assert m.tasks[0]["name"] == "Nightly cleanup"
+# NOTE: `test_valid_agentic_output_task_is_accepted` used to be defined HERE
+# too (added by 77d4900, when `agentic_output` did not yet need an
+# `agent_slug`). 485ca9c made `agent_slug` mandatory for that task type and
+# added a second, corrected copy of the same function name further down this
+# file instead of editing this one — so from that commit on, Python's own
+# redefinition rules meant pytest only ever collected the LOWER one and this
+# copy was dead. Which hid the real problem: it asserted that an
+# `agentic_output` task with no `agent_slug` is ACCEPTED, i.e. the exact
+# opposite of the rule 485ca9c had just added (manifest.py:1379-1381). It
+# would have failed the moment it ran. Deleted rather than renamed: the copy
+# below is the current, correct assertion, not a different case.
 
 
 def test_tasks_require_the_capability():

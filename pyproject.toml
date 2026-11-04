@@ -1,0 +1,49 @@
+# Lint configuration ONLY. This repo is deliberately NOT a pip-installable
+# package.
+#
+# ── WHY THERE IS NO [project] SECTION ─────────────────────────────────────
+# aw-workspace core runs off PATH (the repo root is on PATH — see the
+# Dockerfile) with its dependencies installed from `requirements.txt`. It has
+# never been a distribution and must not quietly become one: adding
+# `[project]` here would make `pip install .` / `pip install -e .` succeed,
+# which invites a second, divergent copy of `src/` into site-packages on a
+# host that already imports it from the checkout. Without `[project]`, that
+# command fails loudly instead, which is the correct outcome.
+#
+# This file exists because `docs/standards/pipeline-testing.md` §1.3 and §8.5
+# both name the same blocker for putting core on the Tier-B lint standard:
+# "aw-workspace (core) — needs a `pyproject.toml` first — it has none". This
+# is that file, carrying nothing but the two linters' config.
+#
+# ── WHY pylint's MESSAGE SELECTION IS *NOT* HERE ──────────────────────────
+# `--disable=all --enable=E --disable=E0401,E1101` is passed explicitly on
+# the command line in BOTH places pylint runs (the `lint` job in
+# `.github/workflows/test.yml` and the `pylint-errors-only` hook in
+# `.pre-commit-config.yaml`), and deliberately not centralised here. pylint
+# only discovers `pyproject.toml` relative to its working directory; if that
+# discovery ever failed, a config-driven `disable=all` would silently stop
+# applying and pylint would run its FULL check set — turning a focused
+# error-class gate into hundreds of style findings and a red build nobody
+# asked for. Command-line flags cannot fail that way.
+
+[tool.ruff]
+# The deployed container and the CI test container are both
+# `python:3.12-slim` (see `.github/workflows/test.yml`). Linting against a
+# different interpreter than the one that runs is worth less than it looks.
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+# ruff's own default set (E4 imports, E7 statements, E9 syntax/IO, F
+# pyflakes) plus `I` (import sorting). `I` is included so the rule is
+# RECORDED rather than silently absent — it is the single largest category in
+# this tree's measured baseline, and the CI step that runs these rules is
+# report-only precisely because of it. See the `lint` job's own comment in
+# `.github/workflows/test.yml` for the measured numbers and for why a blind
+# `ruff check --fix` of that baseline is not safe in this repo.
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.pylint.main]
+# Matches `target-version` above and the runtime interpreter.
+py-version = "3.12"
+jobs = 0  # one process per core; the E-class sweep over src/ is CPU-bound.

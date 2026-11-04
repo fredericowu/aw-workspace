@@ -236,6 +236,11 @@ def cluster(tmp_path, monkeypatch):
         # process ends up with "No module named fastapi" (the same trap
         # `aw-workspace-cli test` hits with pytest — see the
         # aw-autoskill-core-pytest-direct skill).
+        # pylint: disable=used-before-assignment
+        # False positive: a conditional expression evaluates its CONDITION
+        # first, so the walrus in `if (p := ...)` has already bound `p` by the
+        # time `[p]` is built. pylint reads the line left-to-right textually
+        # and sees the use before the assignment.
         "PYTHONPATH": os.pathsep.join(
             [REPO_ROOT, *([p] if (p := os.environ.get("PYTHONPATH")) else [])]),
     }

@@ -1,0 +1,103 @@
+# pre-commit — fast local subset of CI, per docs/standards/pipeline-testing.md
+# §6, Tier-B adapted. That standard lives in THIS repo
+# (docs/standards/pipeline-testing.md); §1.3 and §8.5 both name core as the
+# Tier-B repo that had "no pyproject.toml at all" and therefore no lint gate.
+# This file and the new `pyproject.toml` are that gap closed.
+#
+# NOT a replacement for CI: hooks are bypassable (--no-verify) and are not
+# installed on a fresh clone until `pre-commit install` is run. The `lint` job
+# in .github/workflows/test.yml is the real gate; this is the fast feedback
+# loop in front of it.
+#
+# Install once per clone:
+#   pip install pre-commit && pre-commit install
+#
+# Scoped to `^src/` throughout, matching the CI job. The only tracked Python
+# outside src/ is one docs/ longform script and one scripts/ one-off — neither
+# is application code, neither was part of the measured baseline, and a stray
+# edit to either must not block a commit on numbers nobody took.
+#
+# ── DELIBERATELY NOT ENABLED (each with its reason) ───────────────────────
+#   - ruff-format: this tree has never been ruff-formatted, AND it is a SHARED
+#     working tree that many agent sessions edit at once. ruff-format rewrites
+#     a hook's target file in FULL, not just the touched lines — the
+#     aw-app-kb pilot measured a 2-line logic fix come back as a 336-line
+#     diff under this exact hook, and here that diff would also land on top of
+#     whatever a concurrent session is mid-edit on. Needs its own deliberate
+#     one-time `ruff format src/` commit first, as a separate decision.
+#   - eslint / any JS hook (§6a): there is no JS application tree in this
+#     repo. Core's frontend lives in the separate `aw-workspace-ui` repo, and
+#     §6a's precondition is a measured-clean tree in the repo the hook runs
+#     in. Nothing to lint here.
+#   - a test hook: the suite needs the ephemeral Postgres + Redis container
+#     harness that .github/workflows/test.yml stands up (it joins a
+#     python:3.12-slim container into the Postgres netns). A hook cannot spin
+#     that up, and a suite that silently skips its DB-backed files is the
+#     exact failure this repo's own test.yml comments warn about at length.
+#   - a manifest-validation hook: this is not a marketplace app; it has no
+#     aw-app.json to validate.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.3
+    hooks:
+      - id: ruff
+        # `--select` here deliberately NARROWER than pyproject.toml's, by
+        # exactly one rule: it drops `I` (import sorting).
+        #
+        # Without this override the hook inherits pyproject's
+        # select = [..., "I"] and, because it also runs `--fix`, would
+        # silently REORDER the imports of any file under src/ that a commit
+        # happens to touch — 54 of this tree's 82 measured violations are
+        # I001, concentrated in `src/apps`, which is import-order-sensitive.
+        # That is the same blanket-autofix hazard the CI `lint` job keeps
+        # `ruff check` report-only to avoid (AP-MT tried it and reverted when
+        # reordered imports broke 2 tests through SQLAlchemy listener
+        # registration order), just arriving one commit at a time instead of
+        # all at once — and attached to an unrelated diff, where it is easy
+        # to re-stage without reading.
+        #
+        # pre-commit does surface the rewritten file and demand a second
+        # `git add`, so it is not invisible; it is just not something a
+        # developer should have to notice. `I` stays in pyproject so CI keeps
+        # REPORTING it. Re-add it here once that baseline is cleaned by hand.
+        args: [--fix, --select, "E4,E7,E9,F"]
+        files: ^src/
+
+  - repo: local
+    hooks:
+      - id: pylint-errors-only
+        name: pylint (E-class only, blocking — same gate as CI)
+        # E0401 (import-error): this hook runs from the contributor's own env
+        # (language: system), which may not have every requirements.txt entry
+        # installed — same reasoning as every other repo on this standard.
+        # E1101 (no-member): SQLAlchemy/pydantic dynamic attribute magic
+        # defeats astroid's static inference across this codebase.
+        #
+        # The flags are spelled out here rather than read from pyproject.toml
+        # on purpose — see that file's own comment for why a config-driven
+        # `disable=all` is the dangerous version of this.
+        entry: pylint --disable=all --enable=E --disable=E0401,E1101
+        language: system
+        types: [python]
+        files: ^src/
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-added-large-files
+      - id: check-merge-conflict
+
+  # Pinned to the same major as the estate's CI scanner. There is direct
+  # evidence for this one in the rollout's own history: an
+  # AW_DEVTEAM_EVENT_SECRET plaintext-in-a-comment incident on a Kanban card
+  # for this very effort.
+  #
+  # `language: golang` bootstraps its own Go toolchain through pre-commit's
+  # environment manager on FIRST run — a few minutes once per clone, cached
+  # afterwards. That is not a hang; don't kill it.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
