@@ -146,14 +146,14 @@ in `test.yml`:
   accepted, the exact opposite of the rule `485ca9c` had added, and would have
   failed the moment it ran. The remaining 4 findings are false positives
   disabled inline with a reason at each site.
-- **`ruff check` is REPORT-ONLY (`|| true`).** Measured: **82 pre-existing
-  violations across 247 files** — 54 `I001` (import sorting), 15 `F401`, then
+- **`ruff check` is REPORT-ONLY (`|| true`).** Measured: **78 pre-existing
+  violations across 247 files** — 50 `I001` (import sorting), 15 `F401`, then
   6 `E741` / 2 `F841` / 2 `F541` / 2 `E702` / 1 `E731`. Same posture, and the
   same precedent, as AP-MT: a blanket `ruff check --fix` is **not** safe here.
   AP-MT tried it on its own baseline and reverted it when reordered imports
   silently broke 2 passing tests via SQLAlchemy listener registration order;
   core has the same hazard in a different place (`src/apps` registration is
-  import-order-sensitive) and 54 of the 82 findings *are* import reordering.
+  import-order-sensitive) and 50 of the 78 findings *are* import reordering.
   Cleanup is hand-done, test-verified, file by file, on its own card.
 
 Still open for core: **coverage**. No baseline has been measured (see
@@ -707,7 +707,7 @@ unused import, `--fix --select E4,E7,E9,F,I` reorders the imports and drops
 the unused one; `--fix --select E4,E7,E9,F` drops only the unused one and
 leaves import order alone.
 
-**Applies to:** `aw-workspace` core (done — 54 of its 82 findings are `I001`,
+**Applies to:** `aw-workspace` core (done — 50 of its 78 findings are `I001`,
 concentrated in the import-order-sensitive `src/apps`). **Still outstanding
 at the time of writing:** `agents-platform-multitenant` has the identical
 combination (`select` includes `I`, hook is a bare `args: [--fix]`) against a
@@ -813,7 +813,7 @@ coverage.
 | Repo | Lint | Coverage |
 |---|---|---|
 | `agents-platform-multitenant` | **done** — `lint` job in `test.yml`, pylint `-E` blocking, ruff report-only (469 baseline). Also on the Tier-B hook set. | open — `--cov` is report-only, no `fail_under` |
-| `aw-workspace` (core) | **done** — `pyproject.toml` (lint config only, no `[project]`), `.pre-commit-config.yaml`, `lint` job in `test.yml`. pylint `-E` blocking (tree measured clean, 1 real bug fixed), ruff report-only (**82 baseline, ruff 0.17.3**). See [§1.3](#13-tier-b--three-repos-that-already-tried-and-stopped-short). | open — no baseline measured |
+| `aw-workspace` (core) | **done** — `pyproject.toml` (lint config only, no `[project]`), `.pre-commit-config.yaml`, `lint` job in `test.yml`. pylint `-E` blocking (tree measured clean, 1 real bug fixed), ruff report-only (**78 baseline, ruff 0.17.3 — see [§9](#9-how-to-reproduce-every-number-here) before re-measuring**). See [§1.3](#13-tier-b--three-repos-that-already-tried-and-stopped-short). | open — no baseline measured |
 | `aw-backend` | not started | not started |
 
 Both finished repos took the same shape, and it is the recommended one for
@@ -856,17 +856,38 @@ docker run --rm -v /home/aw-remote-host/aw-workspace:/repo -w /repo \
     pip install -q ruff
     python -m ruff --version
     python -m ruff check --select E4,E7,E9,F,I src/'
-# -> ruff 0.17.3, 247 files: 82 = 54 I001 + 15 F401 + 6 E741 + 2 F841
+# -> ruff 0.17.3, 247 files: 78 = 50 I001 + 15 F401 + 6 E741 + 2 F841
 #                               + 2 F541 + 2 E702 + 1 E731
 ```
 
-**Always record the tool version next to a lint count.** A bare number is not
-reproducible and invites a bogus "correction": the 82 above was once
-"corrected" to 78 from a re-measurement whose ruff version was never captured,
-and 82 is in fact right for ruff 0.17.3 on this tree. The per-rule breakdown is
-the cheap check — it must sum to the total, which is also how the original
-intake figure of 86 was caught (its own breakdown summed to 83, and the single
-`F811` was then fixed, leaving 82).
+**Run it from the repo ROOT, where `pyproject.toml` is. That is not a detail,
+it changes the number.** Ruff's isort classifies first-party imports using the
+project it discovers from `pyproject.toml`; with no `pyproject.toml` in scope
+it classifies 4 more import blocks as unsorted and reports **82** instead of
+78. Isolated by removing *only* `pyproject.toml` from an otherwise untouched
+clone of this branch — `.git` and `.gitignore` left in place — and watching 78
+become 82, with all four extra findings `I001`. So linting a `src/` tree copied
+out on its own does **not** reproduce this baseline, and 78 is the
+operationally meaningful figure because it is what CI measures: the `lint` job
+runs inside the checkout, where `pyproject.toml` is present.
+
+**Record the tool version AND the working directory next to a lint count.**
+This number has now been wrong in the record three times, each time for a
+different reason, and only the last one was interesting:
+
+| Recorded | Why it was wrong |
+|---|---|
+| 86 | arithmetic — its own per-rule breakdown summed to 83 |
+| 83 | real at the time; the single `F811` was then fixed |
+| 82 | **measured against a detached `src/` copy with no `pyproject.toml`** |
+| **78** | current, reproduced by the command above and independently by QA |
+
+The per-rule breakdown is the cheap check and it must sum to the total — that
+is what caught the 86. It would **not** have caught the 82, because 82 was
+internally consistent; only re-running the documented command in the documented
+place caught that one. Which is the actual lesson: a count is only as good as
+the command recorded beside it, and a command is only reproducible if it names
+its working directory.
 
 Note the **host** path in the docker invocation. The daemon resolves binds
 against the host filesystem, not this container's view, so `-v $PWD:/repo` from
@@ -904,7 +925,7 @@ Grouped by effort to reach a 50% floor:
 |---|---|
 | `aw-backend` | 251 test files; coverage fully configured, `fail_under = 0`, `--no-cov` in CI ×3. Delete the switches, set a baseline. No lint. |
 | `agents-platform-multitenant` | 343 test files; `[tool.ruff]` + `ruff>=0.7` configured, **never invoked**. Wire it up, add pylint `-E`, add coverage. |
-| `aw-workspace` (core) | Serious test job (ephemeral PG + Redis). Lint **done 2026-11-04** (`pyproject.toml`, pre-commit, blocking pylint `-E`, report-only ruff at an 82 baseline). Coverage still unmeasured — that is what remains of this row. |
+| `aw-workspace` (core) | Serious test job (ephemeral PG + Redis). Lint **done 2026-11-04** (`pyproject.toml`, pre-commit, blocking pylint `-E`, report-only ruff at a 78 baseline). Coverage still unmeasured — that is what remains of this row. |
 | `aw-mcp-gateway` | 13 test files, 3 workflows. Unmeasured. |
 | `aw-marketplace` | Owns `app-release.yml` — Phase 0 lands here. 5 test files. |
 | `aw-console`, `aw-workspace-ui`, `aw-mobile` | Frontend; this standard is Python-shaped and does not cover them. Needs its own decision. |
