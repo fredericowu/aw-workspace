@@ -212,6 +212,65 @@ adding steps to that file. Mitigation in [§8.1](#81-phase-0--make-the-shared-wo
 
 ---
 
+## 2a. A reusable-workflow caller must grant `checks: read` (addendum, 2026-11-04)
+
+The Tier-B review/merge loop now lives in
+`fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml`,
+called by three repos. **Every caller's `uses:` job must list all five
+permissions**, and the fifth is the one that bites:
+
+```yaml
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+      checks: read        # <- omit this and PRIVATE repos break, silently
+```
+
+**Why it cannot live in the shared file.** GitHub allows a reusable workflow's
+`GITHUB_TOKEN` to be equal to or *more restrictive* than its caller's, never
+broader. A scope the caller omits therefore cannot be granted downstream — so
+this is permanently a per-caller obligation, exactly the kind of drift §2 is
+otherwise trying to eliminate. It is in the shared file's caller checklist, and
+that checklist is the only enforcement.
+
+**Why omitting it is invisible.** The merge gate reads the PR's checks with
+`gh pr checks`, which goes through the Checks API. A **public** repo's check
+rollup is readable without `checks: read`; a **private** repo's read is
+*refused* — and returns an empty list rather than an error. The gate then
+reports:
+
+```
+refusing to merge — required check(s) ['pytest'] did not report a pass
+          on this head SHA. Saw: []
+```
+
+which reads like a CI failure, not a permissions problem.
+
+**Measured, 2026-11-04.** Identical caller code, opposite outcomes:
+
+| Repo | Visibility | Result |
+|---|---|---|
+| `tekflox/aw-app-template` | public | merged first try (PR #16) |
+| `fredericowu/agents-platform-multitenant` | **private** | 4 consecutive `/aw-review` rounds failed, ~40 min after `pytest` went green |
+
+Two agents debugged the wrong workflow before the cause was found.
+
+**Two consequences worth carrying forward.**
+
+1. `aw-shared-workflows@v1.1.1` hardened the reader so a *failed* read is no
+   longer indistinguishable from "zero checks exist" — empty stdout with
+   stderr content now retries to the 20-minute deadline. That converts the
+   symptom from an instant false negative into a timeout. It is **not** a
+   substitute for granting the scope.
+2. **A public canary cannot prove a tag for a private consumer.** §8.2's
+   template-first rollout order is still right, but it has this blind spot by
+   construction: the template is public. A private consumer is a *second,
+   independent* canary, not a follower.
+
+---
+
 ## 3. Test standard
 
 **Decision: every public function reachable from a documented seam has at least
@@ -727,7 +786,7 @@ coverage.
 | Repo | Lint | Coverage |
 |---|---|---|
 | `agents-platform-multitenant` | **done** — `lint` job in `test.yml`, pylint `-E` blocking, ruff report-only (469 baseline). Also on the Tier-B hook set. | open — `--cov` is report-only, no `fail_under` |
-| `aw-workspace` (core) | **done** — `pyproject.toml` (lint config only, no `[project]`), `.pre-commit-config.yaml`, `lint` job in `test.yml`. pylint `-E` blocking (tree measured clean, 1 real bug fixed), ruff report-only (82 baseline). See [§1.3](#13-tier-b--three-repos-that-already-tried-and-stopped-short). | open — no baseline measured |
+| `aw-workspace` (core) | **done** — `pyproject.toml` (lint config only, no `[project]`), `.pre-commit-config.yaml`, `lint` job in `test.yml`. pylint `-E` blocking (tree measured clean, 1 real bug fixed), ruff report-only (**82 baseline, ruff 0.17.3**). See [§1.3](#13-tier-b--three-repos-that-already-tried-and-stopped-short). | open — no baseline measured |
 | `aw-backend` | not started | not started |
 
 Both finished repos took the same shape, and it is the recommended one for
@@ -763,7 +822,29 @@ cd /opt/aw-workspace/repos/agents-platform-multitenant/backend
 cd /opt/aw-workspace/repos
 for d in */; do r=${d%/}; printf "%-40s pre-commit=%s\n" "$r" \
   "$([ -f "$r/.pre-commit-config.yaml" ] && echo YES || echo no)"; done
+
+# The core ruff baseline (the §8.5 table). PIN THE VERSION — see below.
+docker run --rm -v /home/aw-remote-host/aw-workspace:/repo -w /repo \
+  -e RUFF_CACHE_DIR=/tmp/rc python:3.12-slim sh -euc '
+    pip install -q ruff
+    python -m ruff --version
+    python -m ruff check --select E4,E7,E9,F,I src/'
+# -> ruff 0.17.3, 247 files: 82 = 54 I001 + 15 F401 + 6 E741 + 2 F841
+#                               + 2 F541 + 2 E702 + 1 E731
 ```
+
+**Always record the tool version next to a lint count.** A bare number is not
+reproducible and invites a bogus "correction": the 82 above was once
+"corrected" to 78 from a re-measurement whose ruff version was never captured,
+and 82 is in fact right for ruff 0.17.3 on this tree. The per-rule breakdown is
+the cheap check — it must sum to the total, which is also how the original
+intake figure of 86 was caught (its own breakdown summed to 83, and the single
+`F811` was then fixed, leaving 82).
+
+Note the **host** path in the docker invocation. The daemon resolves binds
+against the host filesystem, not this container's view, so `-v $PWD:/repo` from
+`/opt/aw-workspace` silently mounts nothing and ruff reports `E902` on a
+missing `src/` — which looks like a lint finding rather than a mount failure.
 
 Caveats that will change the numbers: apps with a `requirements-dev.txt` need it
 installed (`aw-app-crispal` fails collection without `PIL`); CI runs Python 3.11
