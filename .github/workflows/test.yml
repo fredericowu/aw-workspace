@@ -260,7 +260,19 @@ jobs:
             -e PIP_DISABLE_PIP_VERSION_CHECK=1 \
             -e PYTHONDONTWRITEBYTECODE=1 \
             docker.io/library/python:3.12-slim \
-            sh -euc 'pip install -q ruff && python -m ruff check src/ || true'
+            sh -euc '
+              # `|| true` is on the ruff invocation ALONE, deliberately, and
+              # NOT on an `install && check` chain. In `pip install ... &&
+              # ruff check ... || true` the `|| true` scopes over the whole
+              # list, so a failed install also exits 0 and the job reads as a
+              # clean lint pass that never ran ruff — the silent-degradation
+              # shape this workspace names as its defining failure mode.
+              # Separate statements under `-e` make an install failure red,
+              # while lint findings stay report-only. (Verified: the chained
+              # form exits 0 with the install failed; this form exits 1.)
+              pip install -q ruff
+              python -m ruff check src/ || true
+            '
 
       - name: pylint (E-class only, blocking)
         run: |
