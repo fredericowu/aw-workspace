@@ -84,7 +84,7 @@ concurrency:
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.4
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.2.1
     with:
       ci_check_name: unit
     # Declared here as well as in the called workflow: for a reusable
@@ -112,6 +112,14 @@ jobs:
       # That exact confusion cost AP-MT (private) four consecutive rounds
       # while the public aw-app-template merged first try on identical code.
       checks: read
+      # SAME not-currently-load-bearing-here story, for a separate,
+      # later-discovered scope gap: `gh pr checks` always embeds
+      # checkSuite{workflowRun{...}} in its GraphQL query (gh v2.97.0), which
+      # needs actions: read, not checks: read. Public repos' rollups are
+      # readable without it; the private AP-MT hit a deterministic GraphQL
+      # 403 on every poll for 20 minutes despite green CI. See
+      # fredericowu/aw-shared-workflows#1.
+      actions: read
     # Passed BY NAME, not `secrets: inherit` — v1.1.0's contract, and the
     # same form the other two callers use. `inherit` would in fact still work
     # here (this repo and aw-shared-workflows are both owned by
