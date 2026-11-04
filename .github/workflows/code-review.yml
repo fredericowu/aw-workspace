@@ -84,18 +84,30 @@ concurrency:
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.0
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.1
     with:
       ci_check_name: unit
     # Declared here as well as in the called workflow: for a reusable
     # workflow the effective GITHUB_TOKEN permissions are the INTERSECTION of
     # the two, so the caller's copy is what lifts this repo above its default
-    # workflow permissions.
+    # workflow permissions. A scope omitted HERE therefore cannot be granted
+    # by the shared file — which is why `checks: read` has to be listed below.
     permissions:
       contents: read
       pull-requests: write
       issues: write
       statuses: write
+      # Not currently load-bearing on THIS repo, and listed anyway. The merge
+      # gate reads the PR's checks with `gh pr checks`, which goes through the
+      # Checks API; that read is refused without this scope on a PRIVATE repo
+      # and permitted without it on a public one. aw-workspace is public
+      # today, so omitting it would work — right up until the repo is ever
+      # made private, at which point the gate starts reporting `required
+      # check(s) ['unit'] did not report a pass ... Saw: []` on every round,
+      # which reads like a CI failure rather than a permissions problem.
+      # That exact confusion cost AP-MT (private) four consecutive rounds
+      # while the public aw-app-template merged first try on identical code.
+      checks: read
     # Passed BY NAME, not `secrets: inherit` — v1.1.0's contract, and the
     # same form the other two callers use. `inherit` would in fact still work
     # here (this repo and aw-shared-workflows are both owned by
