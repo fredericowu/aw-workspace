@@ -10,7 +10,7 @@ name: Code Review
 # a reusable workflow instead of a third ~975-line copy-paste.
 #
 # ── WHY AN EXACT TAG, NOT @master ─────────────────────────────────────────
-# `@v1.1.0` is immutable and is never retagged. A moving ref here would mean
+# `@v1.1.4` is immutable and is never retagged. A moving ref here would mean
 # an edit in the shared repo changes this repo's merge gate with no commit on
 # this repo — the same shape as app-release.yml, which ~45 app repos reference
 # via a moving `@master` and where one fail-loud edit reddened the whole
@@ -84,7 +84,7 @@ concurrency:
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.2
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.1.4
     with:
       ci_check_name: unit
     # Declared here as well as in the called workflow: for a reusable
