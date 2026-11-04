@@ -581,6 +581,61 @@ its own CI half; it should be its own small card.
 
 ---
 
+## 6c. One correction to the §6/§6b hook set (2026-11-04)
+
+**The ruff *hook* must not have `I` in its effective `select` while the
+repo's import-order baseline is unclean — even though §6b correctly puts `I`
+in `[tool.ruff.lint]`.** The two are not the same switch, and conflating them
+is a live hazard rather than a tidiness point.
+
+§6b pins `select = ["E4","E7","E9","F","I"]` so a hook `rev` bump can't widen
+the gate. That is right, and it stays. But the §6 ruff hook also runs
+`--fix`, and a pre-commit hook inherits `pyproject.toml`'s `select` — so in
+any repo whose baseline still carries `I001` findings, the hook will
+**silently reorder the imports of whatever file a commit happens to touch**.
+Not as one reviewable sweep: one unrelated diff at a time, where it is easy
+to re-stage without reading. pre-commit does rewrite the file and demand a
+second `git add`, so it is not invisible — it is just not something a
+developer should have to notice.
+
+That is the same hazard CI already refuses to take. Every repo on this
+standard keeps `ruff check` **report-only** in CI precisely because a blanket
+`--fix` is unsafe on an unmeasured baseline — AP-MT tried it and reverted when
+reordered imports broke 2 passing tests through SQLAlchemy listener
+registration order. Leaving the hook unrestricted contradicts that decision
+while pointing at the same rule.
+
+So: override the hook's select to **`E4,E7,E9,F`** and leave `I` to CI's
+report-only run.
+
+```yaml
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.3
+    hooks:
+      - id: ruff
+        args: [--fix, --select, "E4,E7,E9,F"]   # NOT pyproject's select: drops I
+```
+
+Verified behaviourally, not assumed: on a file with an unsorted *and* an
+unused import, `--fix --select E4,E7,E9,F,I` reorders the imports and drops
+the unused one; `--fix --select E4,E7,E9,F` drops only the unused one and
+leaves import order alone.
+
+**Applies to:** `aw-workspace` core (done — 54 of its 82 findings are `I001`,
+concentrated in the import-order-sensitive `src/apps`). **Still outstanding
+at the time of writing:** `agents-platform-multitenant` has the identical
+combination (`select` includes `I`, hook is a bare `args: [--fix]`) against a
+469-violation baseline including 245 import-sort findings — strictly more
+exposed than core was. `aw-app-template` and any `aw-app-*` inheriting its
+config need the same check. Those are not this card's to change; raised to the
+Product Owner as separate work.
+
+Lift this override per repo once that repo's import-order baseline is
+genuinely zero — at which point the hook can keep it clean going forward,
+which is the end state §6b wants.
+
+---
+
 ## 7. What this makes harder later
 
 Every decision above closes a door. These are the ones it closes.

@@ -41,7 +41,26 @@ repos:
     rev: v0.17.3
     hooks:
       - id: ruff
-        args: [--fix]
+        # `--select` here deliberately NARROWER than pyproject.toml's, by
+        # exactly one rule: it drops `I` (import sorting).
+        #
+        # Without this override the hook inherits pyproject's
+        # select = [..., "I"] and, because it also runs `--fix`, would
+        # silently REORDER the imports of any file under src/ that a commit
+        # happens to touch — 54 of this tree's 82 measured violations are
+        # I001, concentrated in `src/apps`, which is import-order-sensitive.
+        # That is the same blanket-autofix hazard the CI `lint` job keeps
+        # `ruff check` report-only to avoid (AP-MT tried it and reverted when
+        # reordered imports broke 2 tests through SQLAlchemy listener
+        # registration order), just arriving one commit at a time instead of
+        # all at once — and attached to an unrelated diff, where it is easy
+        # to re-stage without reading.
+        #
+        # pre-commit does surface the rewritten file and demand a second
+        # `git add`, so it is not invisible; it is just not something a
+        # developer should have to notice. `I` stays in pyproject so CI keeps
+        # REPORTING it. Re-add it here once that baseline is cleaned by hand.
+        args: [--fix, --select, "E4,E7,E9,F"]
         files: ^src/
 
   - repo: local
