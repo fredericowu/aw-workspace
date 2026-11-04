@@ -1,0 +1,79 @@
+name: Code Review
+
+# Thin caller. The whole two-round PR review -> merge loop lives in
+# fredericowu/aw-shared-workflows — read that file's header for the state
+# machine, the fail-closed `blocks_merge` rule, the RUNNER_TEMP discipline and
+# the reason the merge uses a PAT and never GITHUB_TOKEN.
+#
+# This repo is the THIRD consumer of that loop (tekflox/aw-app-template, then
+# fredericowu/agents-platform-multitenant, now core) and the reason it became
+# a reusable workflow instead of a third ~975-line copy-paste.
+#
+# ── WHY AN EXACT TAG, NOT @master ─────────────────────────────────────────
+# `@v1.0.0` is immutable and is never retagged. A moving ref here would mean
+# an edit in the shared repo changes this repo's merge gate with no commit on
+# this repo — the same shape as app-release.yml, which ~45 app repos reference
+# via a moving `@master` and where one fail-loud edit reddened the whole
+# marketplace at once. Bumps are deliberate, one caller at a time, with
+# aw-app-template as the canary.
+#
+# ── THIS REPO'S DELIBERATE DIFFERENCES ────────────────────────────────────
+#   1. `ci_check_name: unit` — test.yml's single job id. VERIFIED against a
+#      real `gh pr checks` run on this repo's own PR, not read off the YAML:
+#      test.yml triggers on BOTH `push` and `pull_request`, so the check can
+#      appear from two event types, and the shared workflow's gate requires it
+#      PRESENT and passing (absent never reads as fine).
+#   2. Default `runs_on` — GitHub-hosted `ubuntu-latest`. Core stays entirely
+#      off the single self-hosted `aw-baremetal` runner: that box already
+#      carries AP-MT's test + deploy (a ~27-min queue today) and core's own
+#      CI moved to GitHub-hosted runners in 2026-09. Zero new load there.
+#   3. NO branch protection on this repo, even though it is public and
+#      therefore could have it. Direct push to master stays available as the
+#      break-glass path, and not only for emergencies: the agent fleet,
+#      `sync_on_boot`, and `aw-workspace-cli repo-sync` all push master
+#      directly today. The shared workflow's `ci_gate` is consequently the
+#      ONLY thing between a red suite and a squash-merge, which is why it
+#      must stay pinned to a real check name.
+#
+# ── ONE TRAP, IF YOU ARE EDITING *THIS FILE* IN A PR ──────────────────────
+# `pull_request` runs this file's PR copy (round 1 sees your edits live);
+# `issue_comment` (`/aw-review`, round 2) always runs the DEFAULT BRANCH's
+# copy. So a PR that changes this file — including one that only bumps the
+# `@vX.Y.Z` pin — cannot exercise its own round 2. Verify round 2 on the NEXT
+# PR after merge; don't burn time "debugging" that.
+
+on:
+  pull_request:
+    # `closed` is here only for the shared workflow's merged-event job; its
+    # gate job excludes `closed` explicitly, so a close never dispatches a
+    # review.
+    types: [opened, reopened, ready_for_review, closed]
+  issue_comment:
+    types: [created]
+
+# Stays in the caller, not in the reusable workflow: what needs serializing is
+# "reviews of THIS repo's PR #N". A reusable workflow's own `concurrency`
+# would key on the shared file's identity instead, collapsing unrelated repos
+# into one queue.
+concurrency:
+  group: code-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.0.0
+    with:
+      ci_check_name: unit
+    # Declared here as well as in the called workflow: for a reusable
+    # workflow the effective GITHUB_TOKEN permissions are the INTERSECTION of
+    # the two, so the caller's copy is what lifts this repo above its default
+    # workflow permissions.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+    # The shared workflow declares no `secrets:` block and reads
+    # AW_CODEREVIEW_V1_KEY / AW_DEVTEAM_MERGE_TOKEN / AW_DEVTEAM_EVENT_SECRET
+    # as inherited, each with an explicit fail-loud branch for "unset".
+    secrets: inherit

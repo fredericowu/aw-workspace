@@ -3,6 +3,10 @@ __pycache__/
 .env
 .venv/
 .pytest_cache/
+# Lint tool caches. CI points both tools' caches outside the checkout
+# (RUFF_CACHE_DIR / PYLINT_HOME in test.yml's `lint` job), but a developer or
+# a pre-commit hook run from the repo root will drop them here.
+.ruff_cache/
 .coverage
 coverage.xml
 htmlcov/

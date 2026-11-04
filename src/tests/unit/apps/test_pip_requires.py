@@ -60,6 +60,12 @@ class _Runtime:
 
     def __init__(self):
         from src.apps.runtime import AppRuntime
+        # pylint: disable=assignment-from-none,no-value-for-parameter
+        # False positives: astroid reads `func.__get__(self)` as a CALL of
+        # `_install_pip_requires` itself (hence "no value for argument
+        # 'manifest'/'type'", and a None return), rather than as the
+        # descriptor protocol handing back a bound method. This line binds
+        # the method; it does not invoke it.
         self._install_pip_requires = AppRuntime._install_pip_requires.__get__(self)
 
 

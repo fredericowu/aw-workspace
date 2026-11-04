@@ -123,13 +123,42 @@ invocations of `ruff`. It is dead config — which is worth stating plainly,
 because "AP-MT already uses ruff" is the kind of thing that reads as true and
 would quietly derail the lint decision in [§5](#5-lint).
 
-**`aw-workspace` (core) — a serious test job, no quality gates.**
+**`aw-workspace` (core) — ~~a serious test job, no quality gates~~ ON STANDARD
+as of 2026-11-04 for lint; coverage still open.**
 `.github/workflows/test.yml` stands up an ephemeral Postgres *and* Redis, joins
 a `python:3.12-slim` container into the Postgres netns, and runs `pytest src/tests`.
 The comments in that file are the best documentation in the estate of *why a
 skipped test is a failure* ("a skipped test is how a card's whole VERIFY step
-quietly stops running"). It has no coverage and no lint step, and the repo has
-no `pyproject.toml` at all.
+quietly stops running").
+
+The lint half of this entry is now closed. Core has a `pyproject.toml` (lint
+config only — deliberately **no `[project]` section**, so the repo cannot
+quietly become pip-installable alongside the `src/` it already imports off
+`PATH`), a `.pre-commit-config.yaml` on the Tier-B hook set, and a `lint` job
+in `test.yml`:
+
+- **pylint `--errors-only` is BLOCKING.** The tree is measured clean under it,
+  in the CI container with `requirements.txt` installed. Triage found **1 real
+  bug** — `src/tests/unit/apps/test_contributed_tasks.py` defined
+  `test_valid_agentic_output_task_is_accepted` twice, so Python's
+  redefinition rules meant pytest only ever collected the lower one. The dead
+  upper copy asserted that an `agentic_output` task with **no** `agent_slug` is
+  accepted, the exact opposite of the rule `485ca9c` had added, and would have
+  failed the moment it ran. The remaining 4 findings are false positives
+  disabled inline with a reason at each site.
+- **`ruff check` is REPORT-ONLY (`|| true`).** Measured: **82 pre-existing
+  violations across 247 files** — 54 `I001` (import sorting), 15 `F401`, then
+  6 `E741` / 2 `F841` / 2 `F541` / 2 `E702` / 1 `E731`. Same posture, and the
+  same precedent, as AP-MT: a blanket `ruff check --fix` is **not** safe here.
+  AP-MT tried it on its own baseline and reverted it when reordered imports
+  silently broke 2 passing tests via SQLAlchemy listener registration order;
+  core has the same hazard in a different place (`src/apps` registration is
+  import-order-sensitive) and 54 of the 82 findings *are* import reordering.
+  Cleanup is hand-done, test-verified, file by file, on its own card.
+
+Still open for core: **coverage**. No baseline has been measured (see
+[§11](#11-what-i-could-not-verify) — the suite needs a real Postgres and
+Redis), so there is no `fail_under` to set yet.
 
 ### 1.4 Runner and interpreter facts that constrain everything below
 
@@ -637,6 +666,29 @@ error-class lint finds. See [§10](#10-handoffs) for the list.
 (wire up the ruff it already configured, add pylint), `aw-workspace` core (needs
 a `pyproject.toml` first — it has none).
 
+**Progress, 2026-11-04.** Two of the three are done for *lint*; none for
+coverage.
+
+| Repo | Lint | Coverage |
+|---|---|---|
+| `agents-platform-multitenant` | **done** — `lint` job in `test.yml`, pylint `-E` blocking, ruff report-only (469 baseline). Also on the Tier-B hook set. | open — `--cov` is report-only, no `fail_under` |
+| `aw-workspace` (core) | **done** — `pyproject.toml` (lint config only, no `[project]`), `.pre-commit-config.yaml`, `lint` job in `test.yml`. pylint `-E` blocking (tree measured clean, 1 real bug fixed), ruff report-only (82 baseline). See [§1.3](#13-tier-b--three-repos-that-already-tried-and-stopped-short). | open — no baseline measured |
+| `aw-backend` | not started | not started |
+
+Both finished repos took the same shape, and it is the recommended one for
+`aw-backend`: **pylint error-class blocking only after a real triage pass**
+(fix what is a bug, disable what is a false positive *at the site, with the
+reason*), and **ruff report-only until its baseline is cleaned by hand**. The
+reverse order — gating on ruff first because it looks mechanical — is what
+produced AP-MT's reverted `--fix` commit.
+
+Unblocked by core's new `pyproject.toml`, and worth noting because the §1.3
+entry listed it as the blocker: nothing else about core needed to change. The
+file carries `[tool.ruff]` and `[tool.pylint.main]` and nothing else, and it
+does **not** move pytest's rootdir (verified: still `src/tests`, `configfile:
+pytest.ini`) — which matters, because `test.yml`'s `-k` vs `--deselect` comment
+depends on node ids staying relative to `src/tests`.
+
 ---
 
 ## 9. How to reproduce every number here
@@ -689,7 +741,7 @@ Grouped by effort to reach a 50% floor:
 |---|---|
 | `aw-backend` | 251 test files; coverage fully configured, `fail_under = 0`, `--no-cov` in CI ×3. Delete the switches, set a baseline. No lint. |
 | `agents-platform-multitenant` | 343 test files; `[tool.ruff]` + `ruff>=0.7` configured, **never invoked**. Wire it up, add pylint `-E`, add coverage. |
-| `aw-workspace` (core) | Serious test job (ephemeral PG + Redis), no coverage, no lint, **no `pyproject.toml`**. |
+| `aw-workspace` (core) | Serious test job (ephemeral PG + Redis). Lint **done 2026-11-04** (`pyproject.toml`, pre-commit, blocking pylint `-E`, report-only ruff at an 82 baseline). Coverage still unmeasured — that is what remains of this row. |
 | `aw-mcp-gateway` | 13 test files, 3 workflows. Unmeasured. |
 | `aw-marketplace` | Owns `app-release.yml` — Phase 0 lands here. 5 test files. |
 | `aw-console`, `aw-workspace-ui`, `aw-mobile` | Frontend; this standard is Python-shaped and does not cover them. Needs its own decision. |
