@@ -1,6 +1,9 @@
 # Standard — pipeline testing, coverage, lint and pre-commit for `aw-*` repos
 
-**Status:** design, written 2026-09-09. Nothing here is implemented yet.
+**Status:** design, written 2026-09-09. Amended 2026-11-04: §6a (JS lint)
+and §6b (hook-set amendments) added alongside the `aw-app-template` Phase 1
+implementation; by then the `aw-app-kb` pilot and the template's own
+coverage gate (at 100%, not 80 — an explicit per-repo exception) were live.
 **Card:** `Architecture doc: pipeline testing standards` —
 `3d65bf3b-9510-8169-8392-c0d2d24e599a`, target `aw-pipelines-test-coverage`.
 **Scope:** this document decides the shape. Implementation lands in separate
@@ -428,6 +431,124 @@ clone, not versioned, no tool pinning, and every repo's copy drifts.
 is Python; neither is already present. `pre-commit` pins its own tool versions
 in the config, which is what keeps a hook and its CI counterpart running the
 same pylint.
+
+---
+
+## 6a. JS lint in pre-commit (addendum, 2026-11-04)
+
+§6's hook set is Python-only, and [§11](#11-what-i-could-not-verify) scoped
+the frontend repos out entirely. This section decides JS lint for repos whose
+*primary* surface is Python but which carry a small frontend — concretely
+`aw-app-template`'s `ui/`: 163 lines across `ui/src/client.js`,
+`ui/src/plugin.js`, `ui/src/standalone.js`, plus `ui/vite.config.js`. The
+dedicated frontend repos (`aw-console`, `aw-workspace-ui`, `aw-mobile`) still
+need their own standard; nothing here claims to be it.
+
+**Decision: ESLint (v10, flat config) with `@eslint/js` recommended rules
+only, config at `ui/eslint.config.js`, run as a `language: system` pre-commit
+hook shelling to `npm run lint --prefix ui`, blocking from day one. No
+Prettier.**
+
+Measured on 2026-11-04: ESLint 10.14.0 with `js.configs.recommended` plus
+browser globals produces **zero findings** on the template's four JS files.
+That measurement is why "blocking from day one" is safe here where §5 staged
+Python's rollout: the Python caution addressed ~40 repos of unmeasured lint
+debt; this is four files of measured zero.
+
+Mechanics:
+
+- `ui/eslint.config.js` — flat config, `@eslint/js` recommended; browser
+  globals for `ui/src/**`, node globals for `vite.config.js`; `ui/dist/`
+  ignored (committed build output, not source).
+- `ui/package.json` — `eslint`, `@eslint/js` and `globals` as
+  devDependencies (ESLint 10 line: `@eslint/js@10` requires `eslint@^10` —
+  measured, an `eslint@9` + `@eslint/js@*` install fails to resolve), plus a
+  `"lint": "eslint ."` script. `ui/package-lock.json` is committed, so the
+  version truth lives in exactly one place.
+- Hook: `language: system`, `pass_filenames: false`,
+  `files: ^ui/.*\.(js|jsx|mjs|cjs)$` — a commit touching no UI file never
+  runs it, so Python-only work (the overwhelming majority of commits in
+  these repos) never needs `node_modules`.
+- Per-clone setup gains one line next to §6's pip install:
+  `npm install --prefix ui` (only needed if you will touch `ui/`).
+- CI counterpart (the §6 invariant that pre-commit is never the only place a
+  check runs): a lint step in the template's own
+  `.github/workflows/test.yml` (`npm ci --prefix ui && npm run lint --prefix
+  ui`). The shared `app-release.yml` stays untouched — this is per-repo
+  configuration, exactly the [§2](#2-where-the-gate-lives) split.
+
+**Rejected: the official `mirrors-eslint` hook (`language: node`).** It is
+the shape that matches §6's "pre-commit pins its own tool versions", and it
+was the first draft here. It loses on a mechanical point: flat configs
+*import* their plugins (`import js from '@eslint/js'`), and Node resolves
+that import from the config file's location in the repo tree — not from
+pre-commit's hermetic hook env where `additional_dependencies` installs
+them. Making the mirror work means the repo needs `ui/node_modules` anyway,
+at which point the mirror's one advantage is gone and its cost remains: the
+eslint version pinned in two places (hook env vs `package.json`), drifting
+silently. `language: system` plus a committed lockfile has one version truth
+and matches the pylint hook's existing precedent — tool installed by a
+documented per-clone setup step, hook running the same command as CI.
+
+**Rejected: Prettier.** Three reasons, descending: (1) formatting churn —
+the template's own Python measured 12 of 13 files non-format-clean the day
+the formatter arrived (§6b); introducing a JS formatter to 163 readable
+lines buys the same whole-file-reformat problem for nothing; (2) §6's "two
+linters is a standing tax" applies to hook count too; (3) there is no JS
+formatter precedent anywhere in the estate to stay consistent with. Revisit
+when the real frontend-repo standard is written.
+
+**Rejected: report-only for the first landing.** In CI, report-only output
+lands in a job summary someone can read; a pre-commit hook that prints and
+exits 0 is invisible noise. With a measured-clean tree there is nothing to
+stage.
+
+## 6b. Two amendments to the §6 hook set (2026-11-04)
+
+**ruff-format: on from day one in repos that are format-clean; otherwise off
+until a dedicated format commit.** The `aw-app-kb` pilot shipped with `ruff
+format` deliberately disabled (`repos/aw-app-kb/.pre-commit-config.yaml:11-19`):
+that codebase had never been formatted, and ruff-format rewrites whole
+files, so the first 2-line fix to any file ballooned into a 336-line diff.
+That reasoning is correct and stays. For `aw-app-template` the same
+measurement says 12 of 13 Python files would reformat — but the template is
+13 files at a verified 100% coverage (43 tests green, re-measured
+2026-11-04), so the one-time `ruff format` commit the kb header asks for
+costs minutes and is proven safe by the suite. Do it in the same delivery
+and enable the hook. The payoff compounds: every future `aw-app-*` is born
+format-clean, which retires the kb caveat for the entire future estate
+instead of re-litigating it per repo.
+
+Related: ruff's *default* rule set drifts across versions — the kb hook's
+pinned `v0.9.9` and current `0.17.3` disagree on what to flag (measured:
+0.17.3 defaults add ASYNC/PLW/SIM/EXE/RUF-class findings that 0.9.9 never
+raised). A repo relying on defaults changes gate semantics on every hook
+`rev` bump. So the template's `[tool.ruff.lint]` pins `select` explicitly
+(defaults-equivalent `E4,E7,E9,F` plus `I` for import sorting), making a
+rev bump a no-op until someone deliberately widens the list.
+
+**gitleaks joins the hook set for `aw-app-*` repos.** Evidence, not
+nice-to-have: (1) every `aw-app-*` repo is required to be public by the
+marketplace release path, so a committed secret is published the moment it
+is pushed; (2) the template is cloned, so anything committed to it
+multiplies into every future app; (3) the estate already chose gitleaks —
+`aw-app-template/.github/workflows/security-scan.yml` runs the OSS CLI
+(v8.30.1) in CI, deliberately redundant with Trivy's secret scanner. But CI
+runs post-push: on a public repo, by the time it fires the secret is an
+incident, not a catch. The pre-commit hook is the only placement that is
+*prevention*. Same tool as CI (the official `gitleaks` hook, pinned to the
+same major) — **rejected: `detect-secrets`**, which would add a second
+secrets vocabulary, a committed baseline file to curate, and nothing the CI
+scanner doesn't already understand.
+
+One hook deliberately NOT added, left as a named candidate: a **`ui/dist`
+freshness check**. The dist is committed (`git ls-files ui/dist/` is
+non-empty) and nothing anywhere gates its freshness — `test.yml`,
+`release.yml` and the shared `app-release.yml` all have zero npm steps
+(measured 2026-11-04) — and the estate has a recorded lesson that a
+committed-dist repo needs exactly this gate. It clears the evidence bar but
+not the lint card's scope (it is build integrity, not lint), and it needs
+its own CI half; it should be its own small card.
 
 ---
 
