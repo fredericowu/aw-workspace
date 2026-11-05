@@ -1343,6 +1343,11 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
         if not isinstance(knowledge, dict) or not str(knowledge.get("path") or "").strip():
             raise ManifestError("contributes.knowledge must be an object with a non-empty 'path'")
 
+    agents_md = contributes.get("agents_md")
+    if agents_md is not None:
+        if not isinstance(agents_md, dict) or not str(agents_md.get("path") or "").strip():
+            raise ManifestError("contributes.agents_md must be an object with a non-empty 'path'")
+
     tasks = contributes.get("tasks", [])
     if tasks and "tasks:contribute" not in permissions:
         raise ManifestError("contributes.tasks requires the 'tasks:contribute' permission")

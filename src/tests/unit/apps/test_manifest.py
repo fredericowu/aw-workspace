@@ -315,6 +315,30 @@ def test_knowledge_entry_requires_a_path():
         validate_manifest(bad3)
 
 
+def test_agents_md_property_reads_contributes_agents_md():
+    m = validate_manifest(_m(contributes={"agents_md": {"path": "AGENTS_BLOCK.md"}}, permissions=[]))
+    assert m.agents_md == {"path": "AGENTS_BLOCK.md"}
+
+
+def test_agents_md_property_none_when_not_declared():
+    m = validate_manifest(_m(contributes={}, permissions=[]))
+    assert m.agents_md is None
+
+
+def test_agents_md_entry_requires_a_path():
+    bad = _m(contributes={"agents_md": {}}, permissions=[])
+    with pytest.raises(ManifestError, match="contributes.agents_md"):
+        validate_manifest(bad)
+
+    bad2 = _m(contributes={"agents_md": {"path": "  "}}, permissions=[])
+    with pytest.raises(ManifestError, match="contributes.agents_md"):
+        validate_manifest(bad2)
+
+    bad3 = _m(contributes={"agents_md": ["not", "a", "dict"]}, permissions=[])
+    with pytest.raises(ManifestError, match="contributes.agents_md"):
+        validate_manifest(bad3)
+
+
 def test_reload_mcp_gateway_on_save_true_when_declared():
     m = validate_manifest(_m(contributes={"mcp": {"reload_on_save": True}}, permissions=[]))
     assert m.reload_mcp_gateway_on_save is True
