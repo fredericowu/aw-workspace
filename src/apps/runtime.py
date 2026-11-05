@@ -38,6 +38,7 @@ from src.apps.capabilities import filter_grants
 from src.apps.commands import CommandInstaller, HealInFlightError
 from src.apps.containers import (WORKSPACE_HOST_ENV, ContainerError, ContainerSupervisor,
                                  expand_env, expand_value)
+from src.apps.agents_md import AgentsMdError, AgentsMdRegistry
 from src.apps.journal import ActionJournal
 from src.apps.manifest import Manifest, load_manifest
 from src.apps.proxy import ContainerReverseProxy
@@ -55,6 +56,7 @@ from src.apps.repos import RepoError, ReposRegistry
 from src.apps.skills import SkillError, SkillsRegistry
 from src.apps.tasks import TasksRegistry
 from src.apps.watchdog import WatchdogSupervisor
+from src.libs import agent_sync
 
 log = logging.getLogger(__name__)
 
@@ -643,6 +645,7 @@ class AppRuntime:
         self.watchdog = WatchdogSupervisor()
         self.secret_store = SecretStore()
         self.skills = SkillsRegistry()
+        self.agents_md = AgentsMdRegistry()
         self.knowledge = KnowledgeRegistry()
         self.tasks = TasksRegistry()
         self.agents = AgentsRegistry()
@@ -1017,6 +1020,30 @@ class AppRuntime:
                 continue
             self.journal.record(slug, "skill:register", skill_id, {"dest_path": dest_path})
 
+    def _register_agents_md(self, loaded: LoadedApp) -> None:
+        """Record this app's ``contributes.agents_md`` entry in the registry.
+
+        No-op for an app that declares none. A bad entry (missing file, path
+        escaping the package dir, marker injection) is logged and skipped
+        rather than failing the whole install — same non-fatal posture as
+        ``_register_skills``. Does NOT touch AGENTS.md itself — the caller
+        follows up with ``agent_sync.sync_agents_md()`` once every
+        registration for this app has run.
+        """
+        slug = loaded.manifest.id
+        entry = loaded.manifest.agents_md
+        if not entry:
+            return
+        path = entry.get("path")
+        if not path:
+            return
+        try:
+            self.agents_md.register(slug, loaded.package_dir, path, entry.get("title"))
+        except AgentsMdError:
+            log.exception("apps: failed to register agents_md block for %s", slug)
+            return
+        self.journal.record(slug, "agents_md:register", slug, {"app_id": slug})
+
     def _register_knowledge(self, loaded: LoadedApp) -> None:
         """Mirror this app's ``contributes.knowledge`` dir into the shared KB tree.
 
@@ -1255,6 +1282,15 @@ class AppRuntime:
             # here, where the plugin is live, because `agent sync` also runs from
             # the CLI with no apps loaded and must reach the same skills/.
             await skill_sources.refresh(slug, plugin, ctx)
+            self._register_agents_md(loaded)
+            # AGENTS.md + its mirrors updated at install time, not next boot.
+            # Only sync_agents_md() — never sync_all(): that also shells out to
+            # the Codex CLI per managed MCP entry and rematerializes skills,
+            # slow and out of scope for "one app's agents_md block changed".
+            try:
+                agent_sync.sync_agents_md()
+            except Exception:
+                log.exception("apps: agents_md sync failed after loading %s", slug)
             self._register_knowledge(loaded)
             self._register_tasks(loaded)
             self._register_agents(loaded)
@@ -1379,6 +1415,15 @@ class AppRuntime:
                 skill_sources.forget(slug)
             except Exception:
                 log.exception("apps: forgetting skill sources for %s failed", slug)
+            # Real uninstall only — an upgrade's unload+load nets out to a
+            # refresh anyway, via the inline sync load() already does after
+            # re-registering. The agents_md:register reversal above already
+            # dropped the registry entry; this is what actually rewrites
+            # AGENTS.md so the block is gone, not just unregistered.
+            try:
+                agent_sync.sync_agents_md()
+            except Exception:
+                log.exception("apps: agents_md sync after uninstalling %s failed", slug)
 
         # Unconditional, journal-independent purge of the whole knowledge
         # namespace (design §C) — NOT gated on purge_secrets like the two
@@ -1467,6 +1512,16 @@ class AppRuntime:
             # read-only) — deleting an entry is a provisioning act.
             if provision:
                 self.skills.unregister(entry.payload.get("dest_path", ""))
+        elif kind == "agents_md:register":
+            # The registry lives under AW_WORKSPACE_HOME, shared across
+            # workers — unregister() drops the entry; the explicit
+            # agent_sync.sync_agents_md() call in unload()'s real-uninstall
+            # branch below is what actually rewrites AGENTS.md. Removal is
+            # registry-based (keyed on app_id), not payload-based, which is
+            # why this runs the same whether or not this worker's in-memory
+            # journal still has the original register() payload.
+            if provision:
+                self.agents_md.unregister(loaded.manifest.id)
         elif kind == "knowledge:register":
             # Same shared-tree reasoning as skill:register. This is only one
             # of three uninstall layers (design §C) — the unconditional

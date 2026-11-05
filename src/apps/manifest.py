@@ -223,6 +223,14 @@ class Manifest:
         return list(self.contributes.get("skills", []))
 
     @property
+    def agents_md(self) -> dict[str, Any] | None:
+        """``contributes.agents_md`` — one Markdown block the app wants
+        injected into AGENTS.md's managed region (``{"path": ..., "title":
+        ...}``). ``None`` when the app declares none. See
+        ``src/apps/agents_md.py``."""
+        return self.contributes.get("agents_md")
+
+    @property
     def knowledge(self) -> dict[str, Any] | None:
         """``contributes.knowledge`` — the app's one docs dir, mirrored into
         ``knowledge_base/apps/<app-id>/docs/``. ``None`` when the app

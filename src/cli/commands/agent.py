@@ -151,6 +151,10 @@ def _check() -> int:
         elif not agent_sync._files_identical(source, target):
             drift.append(f"stale mirror: {target}")
 
+    region_drift = agent_sync.agents_md_region_drift(source)
+    if region_drift:
+        drift.append(region_drift)
+
     mcp_src = agent_sync.mcp_source()
     for target in agent_sync.mcp_targets():
         if mcp_src.exists() and (

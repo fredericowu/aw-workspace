@@ -136,6 +136,23 @@ aw-workspace-cli agent sync --check   # CI: report drift, write nothing
 aw-workspace-cli agent status         # what goes where
 ```
 
+## App-contributed AGENTS.md blocks
+
+Apps can contribute their own instruction block to this file via
+`contributes.agents_md` (`{"path": ..., "title": ...}` in `aw-app.json`),
+the same shape as `contributes.skills`. On install the apps framework
+records the block in a registry (`AW_WORKSPACE_HOME/agents-md-blocks.json`,
+see `src/apps/agents_md.py`); on uninstall it drops the entry. **The managed
+region at the bottom of this file — between the `aw-apps-md:begin`/`:end`
+markers — is regenerated whole from that registry on every
+`aw-workspace-cli agent sync`,** before the usual fan-out to CLAUDE.md /
+GEMINI.md / copilot-instructions.md. Everything above the markers (this
+whole file, up to that point) is hand-authored and never touched by
+machinery; don't hand-edit inside the region itself — it's overwritten
+whole on the next sync. See `src/libs/agent_sync.py`'s `sync_agents_md()`
+for the marker grammar and the fail-safe parse (a malformed region refuses
+the rewrite rather than guessing).
+
 ## The workspace CLI
 
 **`aw-workspace-cli`** is this workspace's own CLI, on `PATH` from any cwd
@@ -227,3 +244,11 @@ Conventions:
   different cwds.
 - If you create a new convention, document it in
   `native-skills/aw-workspace/SKILL.md` so the next agent finds it.
+
+<!-- aw-apps-md:begin -->
+<!-- GENERATED SECTION — app-contributed instruction blocks.
+     Managed by src/apps/agents_md.py + `aw-workspace-cli agent sync`.
+     Do not hand-edit below this line: any sync regenerates this whole
+     region from the installed apps' manifests. Put your own instructions
+     ABOVE the aw-apps-md:begin marker. -->
+<!-- aw-apps-md:end -->

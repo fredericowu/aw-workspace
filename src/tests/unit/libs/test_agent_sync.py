@@ -233,14 +233,23 @@ def test_delete_skill_refuses_an_app_owned_entry(two_source_workspace):
 
 
 # --- AGENTS.md ---------------------------------------------------------------
+#
+# sync_agents_md() rebuilds the managed region from the agents_md registry
+# BEFORE the per-CLI fan-out — see src/apps/agents_md.py. No app has
+# registered a block in the plain `workspace` fixture, so the region
+# rebuilds to its empty form (banner + no blocks), appended at EOF the first
+# time since the fixture's AGENTS.md starts with no markers at all.
 
 
 def test_agents_md_is_mirrored_to_every_cli_filename(workspace):
     results = agent_sync.sync_agents_md()
 
     assert all(r.success and r.changed for r in results)
-    assert (workspace / "CLAUDE.md").read_text() == "# Agent instructions\n"
-    assert (workspace / "GEMINI.md").read_text() == "# Agent instructions\n"
+    claude = (workspace / "CLAUDE.md").read_text()
+    assert claude.startswith("# Agent instructions\n")
+    assert agent_sync.REGION_BEGIN in claude
+    assert agent_sync.REGION_END in claude
+    assert (workspace / "GEMINI.md").read_text() == claude
     assert (workspace / ".github" / "copilot-instructions.md").exists()
 
 
@@ -253,6 +262,144 @@ def test_agents_md_missing_source_fails_cleanly(workspace):
     (workspace / "AGENTS.md").unlink()
     results = agent_sync.sync_agents_md()
     assert all(not r.success and "not found" in r.error for r in results)
+
+
+# --- AGENTS.md managed-region rebuild -----------------------------------------
+
+
+def _register_block(workspace, app_id, content, title=None):
+    from src.apps.agents_md import AgentsMdRegistry
+
+    pkg = workspace / "pkg" / app_id
+    pkg.mkdir(parents=True)
+    block = pkg / "AGENTS-block.md"
+    block.write_text(content)
+    AgentsMdRegistry().register(app_id, str(pkg), "AGENTS-block.md", title)
+    return block
+
+
+def test_region_absent_is_appended_at_eof(workspace):
+    before = (workspace / "AGENTS.md").read_text()
+    agent_sync.sync_agents_md()
+
+    after = (workspace / "AGENTS.md").read_text()
+    assert after.startswith(before)
+    assert after.count(agent_sync.REGION_BEGIN) == 1
+    assert after.count(agent_sync.REGION_END) == 1
+
+
+def test_a_registered_blocks_content_appears_in_the_rebuilt_region(workspace):
+    _register_block(workspace, "aw-app-demo", "Call `foo` before `bar`.\n", "Demo")
+
+    agent_sync.sync_agents_md()
+
+    agents_md = (workspace / "AGENTS.md").read_text()
+    assert "## Demo (app: aw-app-demo)" in agents_md
+    assert "Call `foo` before `bar`." in agents_md
+    # ...and it reaches the mirrors like everything else in the file.
+    assert "Call `foo` before `bar`." in (workspace / "CLAUDE.md").read_text()
+
+
+def test_unregistering_an_app_removes_its_block_on_the_next_sync(workspace):
+    from src.apps.agents_md import AgentsMdRegistry
+
+    _register_block(workspace, "aw-app-demo", "Demo content.\n", "Demo")
+    agent_sync.sync_agents_md()
+    assert "Demo content." in (workspace / "AGENTS.md").read_text()
+
+    AgentsMdRegistry().unregister("aw-app-demo")
+    agent_sync.sync_agents_md()
+
+    agents_md = (workspace / "AGENTS.md").read_text()
+    assert "Demo content." not in agents_md
+    assert agent_sync.REGION_BEGIN in agents_md  # the (now empty) region stays
+
+
+def test_rebuild_is_a_no_op_once_the_region_matches_the_registry(workspace):
+    _register_block(workspace, "aw-app-demo", "Demo content.\n")
+    agent_sync.sync_agents_md()
+
+    results = agent_sync.sync_agents_md()
+
+    assert all(r.success and not r.changed for r in results)
+
+
+def test_two_blocks_are_rendered_sorted_by_app_id(workspace):
+    _register_block(workspace, "aw-app-zebra", "Z content.\n")
+    _register_block(workspace, "aw-app-alpha", "A content.\n")
+
+    agent_sync.sync_agents_md()
+
+    agents_md = (workspace / "AGENTS.md").read_text()
+    assert agents_md.index("A content.") < agents_md.index("Z content.")
+
+
+def test_a_block_whose_source_file_vanished_is_dropped_with_a_warning(workspace, caplog):
+    block = _register_block(workspace, "aw-app-demo", "Demo content.\n")
+    block.unlink()
+
+    with caplog.at_level("WARNING"):
+        results = agent_sync.sync_agents_md()
+
+    assert all(r.success for r in results)
+    assert "Demo content." not in (workspace / "AGENTS.md").read_text()
+    assert any("aw-app-demo" in r.message for r in caplog.records)
+
+
+def test_malformed_region_refuses_the_rewrite_and_leaves_the_file_untouched(workspace):
+    """The core safety property: a bad rewrite here is instantly
+    workspace-wide (AGENTS.md mirrors into CLAUDE.md/GEMINI.md/copilot).
+    A duplicate begin marker must never be guessed at or truncated away."""
+    agents_md_path = workspace / "AGENTS.md"
+    before = (agents_md_path.read_text() + f"\n{agent_sync.REGION_BEGIN}\n"
+             f"one\n{agent_sync.REGION_END}\n\n{agent_sync.REGION_BEGIN}\n"
+             f"two\n{agent_sync.REGION_END}\n")
+    agents_md_path.write_text(before)
+
+    results = agent_sync.sync_agents_md()
+
+    assert all(not r.success for r in results)
+    assert agents_md_path.read_text() == before  # byte-identical — never truncated
+
+
+def test_end_before_begin_is_also_refused(workspace):
+    agents_md_path = workspace / "AGENTS.md"
+    before = (agents_md_path.read_text() +
+             f"\n{agent_sync.REGION_END}\n{agent_sync.REGION_BEGIN}\n")
+    agents_md_path.write_text(before)
+
+    results = agent_sync.sync_agents_md()
+
+    assert all(not r.success for r in results)
+    assert agents_md_path.read_text() == before
+
+
+def test_region_drift_check_is_read_only(workspace):
+    """``agent sync --check``'s primitive: must report drift without writing."""
+    _register_block(workspace, "aw-app-demo", "Demo content.\n")
+    before = (workspace / "AGENTS.md").read_text()
+
+    drift = agent_sync.agents_md_region_drift()
+
+    assert drift is not None
+    assert (workspace / "AGENTS.md").read_text() == before  # unchanged — check never writes
+
+
+def test_region_drift_check_is_clean_once_synced(workspace):
+    _register_block(workspace, "aw-app-demo", "Demo content.\n")
+    agent_sync.sync_agents_md()
+
+    assert agent_sync.agents_md_region_drift() is None
+
+
+def test_region_drift_check_reports_a_malformed_region(workspace):
+    agents_md_path = workspace / "AGENTS.md"
+    agents_md_path.write_text(
+        agents_md_path.read_text() + f"\n{agent_sync.REGION_BEGIN}\n")
+
+    drift = agent_sync.agents_md_region_drift()
+
+    assert drift is not None and "malformed" in drift
 
 
 # --- MCP ---------------------------------------------------------------------

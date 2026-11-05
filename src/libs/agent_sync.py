@@ -36,6 +36,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from src.apps import agents_md, fs_lock
 from src.libs import skills_sync
 from src.libs.skills_sync import workspace_root
 
@@ -44,6 +45,30 @@ log = logging.getLogger(__name__)
 # Only these MCP entries are managed on Codex/Gemini — anything the user added
 # by hand survives a sync untouched. Same rule as the monolith.
 MANAGED_PREFIXES = ("aw-", "playwright")
+
+# --- AGENTS.md managed region (app-contributed blocks) -----------------------
+#
+# See docs/design/apps-contribute-agents-md-blocks.md. The region is always
+# rebuilt WHOLE from the agents_md registry, never patched incrementally —
+# that is what makes an uninstalled app's block vanish on the next sync no
+# matter which worker ran the uninstall, and what makes this immune to the
+# "activate forgot to sync" bug class a push-only design would repeat.
+
+REGION_BEGIN = "<!-- aw-apps-md:begin -->"
+REGION_END = "<!-- aw-apps-md:end -->"
+_BLOCK_BEGIN_FMT = "<!-- aw-app-md:begin {app_id} -->"
+_BLOCK_END_FMT = "<!-- aw-app-md:end {app_id} -->"
+REGION_BANNER = (
+    "<!-- GENERATED SECTION — app-contributed instruction blocks.\n"
+    "     Managed by src/apps/agents_md.py + `aw-workspace-cli agent sync`.\n"
+    "     Do not hand-edit below this line: any sync regenerates this whole\n"
+    "     region from the installed apps' manifests. Put your own instructions\n"
+    "     ABOVE the aw-apps-md:begin marker. -->"
+)
+
+
+class AgentsMdRegionError(RuntimeError):
+    """The managed region's markers are malformed — refuse to rewrite."""
 
 
 def mcp_source() -> Path:
@@ -129,6 +154,142 @@ def _copy_file(source: Path, target: Path) -> FileSyncResult:
     return result
 
 
+def _render_block(app_id: str, title: str, content: str) -> str:
+    heading = f"## {title or app_id} (app: {app_id})"
+    body = content.rstrip("\n")
+    return (f"{_BLOCK_BEGIN_FMT.format(app_id=app_id)}\n{heading}\n\n{body}\n"
+            f"{_BLOCK_END_FMT.format(app_id=app_id)}")
+
+
+def _render_region(registry: dict[str, dict]) -> str:
+    """Render the whole managed region from the registry, sorted by app id.
+
+    A registry entry whose source file is no longer readable (app dir
+    manually deleted outside the normal uninstall path) drops that block
+    with a warning rather than failing the whole rebuild — missing means
+    uninstalled, there's no "transient outage" state to protect here (unlike
+    ``skill_sources``' ``ok: False`` keep-on-failure rule: this is a local
+    file read, not a plugin call).
+    """
+    blocks = []
+    for app_id in sorted(registry):
+        entry = registry[app_id]
+        path = entry.get("path", "")
+        try:
+            with open(path, encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            log.warning("agent_sync: agents_md source for %s is gone (%s) — "
+                        "dropping its block from AGENTS.md", app_id, path)
+            continue
+        blocks.append(_render_block(app_id, entry.get("title") or "", content))
+    body = "\n\n".join(blocks)
+    parts = [REGION_BEGIN, REGION_BANNER]
+    if body:
+        parts += ["", body]
+    parts.append(REGION_END)
+    # No trailing newline here — the two callers below own that: a replace
+    # keeps whatever trailing newline the original end marker already had,
+    # an append adds exactly one. Either would double it otherwise.
+    return "\n".join(parts)
+
+
+def _splice_region(text: str, rendered_region: str) -> str:
+    """Replace the managed region in ``text`` with ``rendered_region``.
+
+    Absent markers → append at EOF (first-run migration, automatic). Any
+    other malformed shape (not exactly one begin and one end, or end before
+    begin) raises :class:`AgentsMdRegionError` — refuse, never guess, never
+    truncate. A bad rewrite here is instantly workspace-wide (mirrored into
+    CLAUDE.md/GEMINI.md/copilot-instructions.md on every sync).
+    """
+    begin_count = text.count(REGION_BEGIN)
+    end_count = text.count(REGION_END)
+    if begin_count == 0 and end_count == 0:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        sep = "\n" if text else ""
+        return text + sep + rendered_region + "\n"
+    if begin_count != 1 or end_count != 1:
+        raise AgentsMdRegionError(
+            f"found {begin_count} {REGION_BEGIN!r} marker(s) and {end_count} "
+            f"{REGION_END!r} marker(s) — expected exactly one of each"
+        )
+    begin_idx = text.index(REGION_BEGIN)
+    end_idx = text.index(REGION_END) + len(REGION_END)
+    if end_idx <= begin_idx:
+        raise AgentsMdRegionError(f"{REGION_END!r} appears before {REGION_BEGIN!r}")
+    return text[:begin_idx] + rendered_region + text[end_idx:]
+
+
+def _compute_rebuilt_agents_md(source: Path) -> tuple[str | None, bool, str | None]:
+    """Read ``source`` + the agents_md registry, return the rebuilt text.
+
+    Returns ``(new_text, changed, error)``. ``error`` is set (and
+    ``new_text`` is ``None``) only on a malformed region — never on a
+    missing source, which the caller handles separately.
+    """
+    try:
+        current = source.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, False, str(exc)
+    rendered = _render_region(agents_md.read_registry())
+    try:
+        new_text = _splice_region(current, rendered)
+    except AgentsMdRegionError as exc:
+        return None, False, str(exc)
+    return new_text, new_text != current, None
+
+
+def agents_md_region_drift(source: Path | None = None) -> str | None:
+    """Would the managed-region rebuild change ``source``? Read-only, no
+    lock, no write — the ``agent sync --check`` primitive."""
+    src = source or agents_md_source()
+    if not src.exists():
+        return None  # the plain "missing source" drift check already covers this
+    new_text, changed, error = _compute_rebuilt_agents_md(src)
+    if error is not None:
+        return f"AGENTS.md managed region is malformed: {error}"
+    if changed:
+        return f"AGENTS.md managed region is stale (out of sync with the agents_md registry): {src}"
+    return None
+
+
+def _rebuild_region_file(source: Path) -> FileSyncResult | None:
+    """Regenerate ``source``'s managed region from the agents_md registry.
+
+    ``None`` means nothing to do (source missing — the existing "source not
+    found" per-target error in :func:`sync_agents_md` already covers that).
+    Atomic write (tmp + ``os.replace``) under the same flock
+    :func:`src.apps.agents_md.AgentsMdRegistry.register` uses, so a
+    register/unregister can never race this read-render-write. No-op when
+    the rebuilt text is byte-identical (keeps mtime stable, keeps
+    ``agent sync --check`` honest).
+    """
+    if not source.exists():
+        return None
+    fd = fs_lock.acquire(fs_lock.lock_path("agents-md"), timeout=30.0)
+    if fd is None:
+        return FileSyncResult(target=str(source), success=False,
+                              error="could not acquire the agents-md lock within 30s")
+    try:
+        new_text, changed, error = _compute_rebuilt_agents_md(source)
+        if error is not None:
+            log.error("agent_sync.sync_agents_md: refusing to rewrite %s: %s", source, error)
+            return FileSyncResult(target=str(source), success=False, error=error)
+        if not changed:
+            return FileSyncResult(target=str(source), success=True, changed=False)
+        tmp = source.with_name(source.name + ".tmp")
+        try:
+            tmp.write_text(new_text, encoding="utf-8")
+            os.replace(tmp, source)
+        except OSError as exc:
+            return FileSyncResult(target=str(source), success=False, error=str(exc))
+        return FileSyncResult(target=str(source), success=True, changed=True)
+    finally:
+        fs_lock.release(fd)
+
+
 def sync_agents_md(source: Path | None = None,
                    target_paths: tuple[Path, ...] | None = None) -> list[FileSyncResult]:
     """AGENTS.md → the per-CLI filenames each tool reads on its own.
@@ -138,8 +299,17 @@ def sync_agents_md(source: Path | None = None,
     copies in step, one file is authored and the rest are byte copies —
     which is why they're gitignored and carry a "do not edit" banner in
     AGENTS.md itself.
+
+    Before the fan-out, regenerates AGENTS.md's app-contributed managed
+    region from the ``agents_md`` registry (see :func:`_rebuild_region_file`)
+    — install/uninstall call this directly for immediate visibility, and
+    every other caller (boot, CLI, UI) self-heals through it too.
     """
     src = source or agents_md_source()
+    rebuild = _rebuild_region_file(src)
+    if rebuild is not None and not rebuild.success:
+        return [FileSyncResult(target=str(t), success=False, error=rebuild.error)
+                for t in (target_paths or agents_md_targets())]
     return [_copy_file(src, t) for t in (target_paths or agents_md_targets())]
 
 
