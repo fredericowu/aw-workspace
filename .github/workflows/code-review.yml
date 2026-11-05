@@ -106,6 +106,16 @@ name: Code Review
 # the same-run attempt declined with "still running" and the merge arrived via
 # the workflow_run hop).
 #
+# ── v1.4.0: provenance-gate ────────────────────────────────────────────────
+# New job between `gate` and `merge-attempt`: fails unless a PR commit
+# carries a well-formed `AW-Run-Id` trailer (stamped by a `prepare-commit-msg`
+# hook in the Dev Team's runner containers — card 40f5bf3b-9510-811d, still in
+# progress) or a human applies the `provenance-exempt` label (created on this
+# repo ahead of this bump). No caller-side change needed: no new permission
+# scope (its `gh api` calls are all covered by scopes already granted above)
+# and no new trigger. Proven end-to-end on the canary: tekflox/aw-app-template
+# PR #24.
+#
 on:
   pull_request:
     # `synchronize` -> automatic round 2 on the coder's fix push; the shared
@@ -132,7 +142,7 @@ concurrency:
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.3.0
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.4.0
     with:
       ci_check_name: unit
     # Declared here as well as in the called workflow: for a reusable
