@@ -36,7 +36,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from src.apps import agents_md, fs_lock
+from src.apps import agents_md, config_store, fs_lock
 from src.libs import skills_sync
 from src.libs.skills_sync import workspace_root
 
@@ -174,6 +174,8 @@ def _render_region(registry: dict[str, dict]) -> str:
     blocks = []
     for app_id in sorted(registry):
         entry = registry[app_id]
+        if not config_store.load(app_id).get("agents_md_contribution_enabled", True):
+            continue
         path = entry.get("path", "")
         try:
             with open(path, encoding="utf-8") as f:

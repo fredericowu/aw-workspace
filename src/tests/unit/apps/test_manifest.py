@@ -246,6 +246,29 @@ def test_config_with_defaults_forces_locked_public_true_even_if_persisted_false(
     assert m.config_with_defaults({"public": False})["public"] is True
 
 
+def test_agents_md_contribution_toggle_injected_only_when_block_declared():
+    # Test pin (design §"Risks for the Coders" #5): effective_config_schema
+    # injects agents_md_contribution_enabled iff contributes.agents_md is set.
+    with_block = validate_manifest(_m(contributes={
+        "agents_md": {"path": "docs/AGENTS-block.md", "title": "Demo"},
+    }, permissions=[]))
+    props = with_block.effective_config_schema["properties"]
+    assert props["agents_md_contribution_enabled"] == {
+        "type": "boolean",
+        "default": True,
+        "title": "AGENTS.md contribution",
+        "description": "Include this app's instruction block in "
+                        "AGENTS.md (and its CLAUDE.md/GEMINI.md/"
+                        "copilot mirrors). Takes effect on save.",
+        "x-framework": True,
+    }
+    assert with_block.has_config is True
+
+    without_block = validate_manifest(_m(contributes={}, permissions=[]))
+    assert "agents_md_contribution_enabled" not in \
+        without_block.effective_config_schema.get("properties", {})
+
+
 def test_what_you_get_derives_ui_screens_and_commands():
     m = validate_manifest(_m(contributes={
         "windows": [{"id": "notes.main", "title": "Notes"}],

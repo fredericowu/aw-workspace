@@ -504,6 +504,7 @@ class Manifest:
             self.settings_panels
             or self.config_schema.get("properties")
             or self.is_managed_app
+            or self.agents_md is not None
         )
 
     @property
@@ -567,6 +568,19 @@ class Manifest:
                 },
             }
             props = {**framework_props, **props}
+        if self.agents_md is not None:
+            props = {
+                "agents_md_contribution_enabled": {
+                    "type": "boolean",
+                    "default": True,
+                    "title": "AGENTS.md contribution",
+                    "description": "Include this app's instruction block in "
+                                    "AGENTS.md (and its CLAUDE.md/GEMINI.md/"
+                                    "copilot mirrors). Takes effect on save.",
+                    "x-framework": True,
+                },
+                **props,
+            }
         if props:
             schema["type"] = "object"
             schema["properties"] = props

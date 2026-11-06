@@ -52,6 +52,7 @@ from src.apps.manifest import ManifestError, load_manifest
 from src.apps.reconciler import AppSpec, Reconciler
 from src.apps.containers import ContainerError, expand_env
 from src.apps.fetch import package_dir_for
+from src.libs import agent_sync
 from src.apps.paths import workspace_home_path
 from src.apps.runtime import AppRuntime
 
@@ -1268,6 +1269,20 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         on_config_saved = getattr(loaded.plugin, "on_config_saved", None)
         if callable(on_config_saved):
             await on_config_saved(loaded.ctx)
+
+        # A toggle flip rebuilds AGENTS.md's managed region immediately,
+        # same "take effect on save" promise as the mcp re-render below.
+        # sync_agents_md() only — never sync_all(), which also shells out to
+        # the Codex CLI per MCP entry and rematerializes skills.
+        if (loaded.manifest.agents_md is not None
+                and bool(previous.get("agents_md_contribution_enabled", True))
+                != bool(loaded.config.get("agents_md_contribution_enabled", True))):
+            try:
+                await asyncio.to_thread(agent_sync.sync_agents_md)
+            except Exception:
+                log.exception("apps: AGENTS.md re-sync after a contribution-"
+                               "toggle flip failed for %s", slug)
+
         # A Tier-2 app has no plugin and therefore no on_config_saved, so the
         # hook above can't be what re-renders its mcp.json — this is. Pasting
         # a token into the settings form has to take effect on save, not on

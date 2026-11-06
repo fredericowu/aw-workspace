@@ -11,46 +11,6 @@
 > deep reference — the sections below are the irreducible bits every agent
 > needs on every run.
 
-## Knowledge Base — search before acting
-
-**Always call `search_knowledge_base` (via the workspace MCP gateway) at the
-start of every non-trivial task and before invoking any tool that touches the
-codebase, infrastructure, or project decisions.** This surfaces relevant docs,
-lessons learned, architecture notes, and prior decisions that would otherwise
-be invisible.
-
-When to search (mandatory):
-- Any new user request or task — use the user's message as the query
-- Before reading/editing a file you haven't seen this session — query the file
-  path or topic first
-- Before proposing an architecture or design — query the subject area
-- When unsure how something works in this project — query it before guessing
-
-How to search well:
-- Prefer short, focused queries (3–8 words) over long ones
-- Run 2–3 searches with different angles if the first yields thin results
-- If results contain a relevant doc, read it before proceeding
-
-This is not optional. Skipping the KB search is the single biggest cause of
-repeated mistakes and re-doing work that was already documented.
-
-The KB is an installed app (`kb`), not core, so the tool name you see depends
-on the gateway: `search_knowledge_base` directly, or
-`aw__kb__search_knowledge_base` when routed through `aw-mcp-gateway`. If the
-`kb` app genuinely isn't installed in this workspace there is nothing to
-query — but **verify that before concluding it**, don't assume from a tool
-you can't immediately see. A flaky or reconnecting MCP server is not the same
-as an absent one; retry once before giving up, and say so in your answer if
-you proceeded without the KB.
-
-## Inbound message routing
-
-When the **first user message starts with `/aw-agent-telegram`**, load and
-follow the **`aw-agent-telegram` skill** (`skills/aw-agent-telegram/SKILL.md`)
-before doing anything else. That skill teaches you how to reply (voice,
-photo, document, text), which bracket markers to use, and how to avoid
-duplicate bubbles.
-
 ## Project skills
 
 Skills are real directories under **`skills/<name>/SKILL.md`** (YAML
@@ -105,13 +65,6 @@ config** — installed apps write their own entries into it at boot (today:
 capability; see `_container_volumes` in `src/apps/runtime.py`). Regenerating
 it from a checked-in file would delete what the app framework just
 registered. Edit `.mcp.json` directly, then sync.
-
-Most tools reach this workspace through **`aw-gateway`** — the
-`aw-mcp-gateway` app, which aggregates every installed app's MCP surface
-behind one endpoint and prefixes tool names (`aw__kb__…`,
-`aw__playwright__…`, `aw__agents_platform_runners__…`). Which tools exist
-therefore depends on which apps are installed; `aw-workspace-cli apps` is the
-authoritative list.
 
 ### Fan-out targets (driven by `aw-workspace-cli agent sync`)
 
@@ -251,4 +204,75 @@ Conventions:
      Do not hand-edit below this line: any sync regenerates this whole
      region from the installed apps' manifests. Put your own instructions
      ABOVE the aw-apps-md:begin marker. -->
+
+<!-- aw-app-md:begin agents-platform-runners -->
+## Inbound message routing (app: agents-platform-runners)
+
+When the **first user message starts with `/aw-agent-telegram`**, load and
+follow the **`aw-agent-telegram` skill** (`skills/aw-agent-telegram/SKILL.md`)
+before doing anything else. That skill teaches you how to reply (voice,
+photo, document, text), which bracket markers to use, and how to avoid
+duplicate bubbles.
+<!-- aw-app-md:end agents-platform-runners -->
+
+<!-- aw-app-md:begin codegraph -->
+## Code graph (app: codegraph)
+
+Before a grep/Read loop to find where something is defined, how a flow
+works, or what breaks if you change a symbol, reach for
+`codegraph_explore` first — one call takes a natural-language question (or a
+bag of symbol/file names) and returns the **verbatim current source** of the
+symbols that matter, grouped by file and line-numbered, plus the call path
+among them and who else calls them.
+
+That source is re-read from disk on the call, so it is as fresh as a `Read`
+— treat it as one: don't re-open a file it already showed you.
+
+Through the gateway the tools are prefixed `aw__codegraph__…` (e.g.
+`aw__codegraph__codegraph_explore`). See the **`aw-codegraph`** skill for
+the full tool reference (narrower single-purpose tools, index freshness,
+what is and isn't indexed).
+<!-- aw-app-md:end codegraph -->
+
+<!-- aw-app-md:begin kb -->
+## Knowledge Base (app: kb)
+
+**Always call `search_knowledge_base` (via the workspace MCP gateway) at the
+start of every non-trivial task and before invoking any tool that touches the
+codebase, infrastructure, or project decisions.** This surfaces relevant docs,
+lessons learned, architecture notes, and prior decisions that would otherwise
+be invisible.
+
+When to search (mandatory):
+- Any new user request or task — use the user's message as the query
+- Before reading/editing a file you haven't seen this session — query the file
+  path or topic first
+- Before proposing an architecture or design — query the subject area
+- When unsure how something works in this project — query it before guessing
+
+How to search well:
+- Prefer short, focused queries (3–8 words) over long ones
+- Run 2–3 searches with different angles if the first yields thin results
+- If results contain a relevant doc, read it before proceeding
+
+This is not optional. Skipping the KB search is the single biggest cause of
+repeated mistakes and re-doing work that was already documented.
+
+The tool name you see depends on the gateway: `search_knowledge_base`
+directly, or `aw__kb__search_knowledge_base` when routed through
+`aw-mcp-gateway`. A flaky or reconnecting MCP server is not the same as an
+absent one; retry once before giving up, and say so in your answer if you
+proceeded without the KB.
+<!-- aw-app-md:end kb -->
+
+<!-- aw-app-md:begin mcp-gateway -->
+## MCP gateway (app: mcp-gateway)
+
+Most tools reach this workspace through **`aw-gateway`** — the
+`aw-mcp-gateway` app, which aggregates every installed app's MCP surface
+behind one endpoint and prefixes tool names (`aw__kb__…`,
+`aw__playwright__…`, `aw__agents_platform_runners__…`). Which tools exist
+therefore depends on which apps are installed; `aw-workspace-cli apps` is the
+authoritative list.
+<!-- aw-app-md:end mcp-gateway -->
 <!-- aw-apps-md:end -->

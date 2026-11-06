@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -372,6 +373,52 @@ def test_end_before_begin_is_also_refused(workspace):
 
     assert all(not r.success for r in results)
     assert agents_md_path.read_text() == before
+
+
+# --- agents_md_contribution_enabled toggle ------------------------------------
+#
+# The toggle (`src/apps/manifest.py:effective_config_schema`) is a plain
+# config_store value, gated inside `_render_region` — not a registry field.
+# These pin design doc "Risks for the Coders" tests 1, 2 and 4.
+
+
+def test_render_region_skips_a_disabled_app_and_includes_an_absent_key_app(workspace):
+    from src.apps import config_store
+
+    _register_block(workspace, "aw-app-demo", "Demo content.\n")
+    _register_block(workspace, "aw-app-other", "Other content.\n")
+    config_store.save("aw-app-demo", {"agents_md_contribution_enabled": False})
+
+    agent_sync.sync_agents_md()
+
+    agents_md = (workspace / "AGENTS.md").read_text()
+    assert "Demo content." not in agents_md
+    assert "Other content." in agents_md  # no config saved for it — default True
+
+
+def test_region_drift_check_is_clean_for_a_disabled_and_synced_state(workspace):
+    from src.apps import config_store
+
+    _register_block(workspace, "aw-app-demo", "Demo content.\n")
+    config_store.save("aw-app-demo", {"agents_md_contribution_enabled": False})
+    agent_sync.sync_agents_md()
+
+    assert agent_sync.agents_md_region_drift() is None
+
+
+def test_toggle_flip_does_not_touch_the_registry_file(workspace):
+    """Pure-mirror invariant: the registry records what the manifest
+    declared, never whether the block is currently shown."""
+    from src.apps import agents_md, config_store
+
+    _register_block(workspace, "aw-app-demo", "Demo content.\n")
+    before = Path(agents_md.registry_path()).read_bytes()
+
+    config_store.save("aw-app-demo", {"agents_md_contribution_enabled": False})
+    agent_sync.sync_agents_md()
+
+    after = Path(agents_md.registry_path()).read_bytes()
+    assert after == before
 
 
 def test_region_drift_check_is_read_only(workspace):
