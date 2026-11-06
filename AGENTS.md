@@ -198,6 +198,52 @@ Conventions:
 - If you create a new convention, document it in
   `native-skills/aw-workspace/SKILL.md` so the next agent finds it.
 
+## Dev Team: PR-first on this repo
+
+`fredericowu/aw-workspace`'s `master` carries an **active** GitHub ruleset
+(require pull request before merging, zero bypass actors — every agent and
+the human push as the same admin identity, so a bypass would be a no-op).
+A direct push is rejected outright. For any code change to this repo, or to
+any other repo reached from this workspace that is part of the PR-first
+rollout:
+
+1. **Never commit on the shared live tree** (`/opt/aw-workspace` itself, or
+   another repo's own checkout under `repos/`) — every Dev Team session
+   shares it, and an uncoordinated commit there is how another agent's
+   in-progress work gets stepped on.
+2. Isolate in a worktree, one per card. For a repo other than this one,
+   run this FROM that repo's own checkout (`cd` or `git -C
+   /opt/aw-workspace/repos/<repo>`) — the identical command run from the
+   wrong cwd silently creates a worktree carrying the wrong repo's git
+   history at a path that reads as if it belongs to `<repo>`:
+   ```bash
+   git fetch origin
+   git worktree add /opt/aw-workspace/.worktrees/<repo>/<card8> \
+     -b devteam/<card8>-<slug> origin/master
+   ```
+   `<repo>` is the repo's own name (`aw-workspace` for this one); `<card8>`
+   is the first 8 chars of the Kanban card's page id; `<slug>` is a short
+   kebab description.
+3. **Use absolute paths inside the worktree for every tool call** — a warm
+   container reuses its shell, and a `cd` from one Bash call does not
+   persist into the next.
+4. Push the branch and open a PR (`gh pr create`); let the repo's own
+   review/merge loop (`code-review.yml` + `ai-review.yml`) review and merge
+   it. Don't dispatch QA while that PR is still open — the merge event is
+   the handoff moment.
+5. After merge, sync the live tree and drop the worktree — fetch first,
+   the same as step 2: a stale cached `origin/master` makes `--ff-only`
+   merge a silent no-op, leaving the live tree one merge behind with no
+   error:
+   ```bash
+   cd /opt/aw-workspace && git fetch origin && git merge --ff-only origin/master
+   git worktree remove /opt/aw-workspace/.worktrees/<repo>/<card8>
+   ```
+
+`.worktrees/` is gitignored — it never gets committed, and it sits outside
+every current KB/fs-sync map path and outside codegraph's `includeIgnored`
+opt-in, so it isn't indexed by any of them either.
+
 <!-- aw-apps-md:begin -->
 <!-- GENERATED SECTION — app-contributed instruction blocks.
      Managed by src/apps/agents_md.py + `aw-workspace-cli agent sync`.

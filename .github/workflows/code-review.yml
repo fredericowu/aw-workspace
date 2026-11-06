@@ -52,14 +52,20 @@ name: Code Review
 #      off the single self-hosted `aw-baremetal` runner: that box already
 #      carries AP-MT's test + deploy (a ~27-min queue today) and core's own
 #      CI moved to GitHub-hosted runners in 2026-09. Zero new load there.
-#   3. NO branch protection on this repo, even though it is public and
-#      therefore could have it. Direct push to master stays available as the
-#      break-glass path, and not only for emergencies: the agent fleet,
-#      `sync_on_boot`, and `aw-workspace-cli repo-sync` all push master
-#      directly today. The shared workflow's own check read — in its
-#      `merge-attempt` job as of v1.3.0 — is consequently the ONLY thing
-#      between a red suite and a squash-merge, which is why `ci_check_name`
-#      must stay pinned to a real check name.
+#   3. BRANCH PROTECTION, as of card 4105bf3b-9510-81de — an active, zero-
+#      bypass-actor ruleset on refs/heads/master (require PR, block force-
+#      push, block deletion). This superseded the earlier "no branch
+#      protection, direct push is the break-glass path" state: that claim
+#      had already gone stale by the time it was checked — neither
+#      `sync_on_boot` nor `aw-workspace-cli repo-sync` ever pushes (both are
+#      fetch/pull-only; see `src/cli/commands/repo_sync.py`), so the only
+#      actual direct pushers were Dev Team agent sessions and the human,
+#      exactly the actors the ruleset now routes through a PR. Break-glass
+#      is a deliberate, auditable `gh api` ruleset disable, not a standing
+#      bypass. The shared workflow's own check read — in its
+#      `merge-attempt` job as of v1.3.0 — stays the thing this repo relies
+#      on between a red suite and a squash-merge; the ruleset adds "a human
+#      or an agent cannot skip review entirely," it doesn't replace CI.
 #
 # ── ONE TRAP, IF YOU ARE EDITING *THIS FILE* IN A PR ──────────────────────
 # `pull_request` runs this file's PR copy, so rounds 1 and 2 both see your
