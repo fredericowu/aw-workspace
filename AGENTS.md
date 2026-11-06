@@ -231,12 +231,14 @@ rollout:
    review/merge loop (`code-review.yml` + `ai-review.yml`) review and merge
    it. Don't dispatch QA while that PR is still open — the merge event is
    the handoff moment.
-5. After merge, sync the live tree and drop the worktree — fetch first,
-   the same as step 2: a stale cached `origin/master` makes `--ff-only`
-   merge a silent no-op, leaving the live tree one merge behind with no
-   error:
+5. After merge, sync the live tree and drop the worktree — `cd` to that
+   repo's own checkout first (this repo itself for `aw-workspace`, or
+   `/opt/aw-workspace/repos/<repo>` otherwise, same as step 2), then fetch
+   before merging: a stale cached `origin/master` makes `--ff-only` merge a
+   silent no-op, leaving the live tree one merge behind with no error:
    ```bash
-   cd /opt/aw-workspace && git fetch origin && git merge --ff-only origin/master
+   cd /opt/aw-workspace/repos/<repo>   # or /opt/aw-workspace itself for aw-workspace
+   git fetch origin && git merge --ff-only origin/master
    git worktree remove /opt/aw-workspace/.worktrees/<repo>/<card8>
    ```
 
