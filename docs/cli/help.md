@@ -1,8 +1,8 @@
 ---
 source: aw-workspace-cli help
 type: cli-reference
-checksum: sha256:38673d576ee94095f162116b1feb5fef81ab64a50b2f643ece0e150d6c4fff9e
-captured: 2026-10-19
+checksum: sha256:7bc4f8f1779d4b3a9d621a46f5bb5918880948d80fed9bd4bbecc00e6f34c041
+captured: 2026-11-04
 edited: false
 ---
 
@@ -40,6 +40,7 @@ Commands:
   marketplace               Install or update apps from the marketplace catalog
   notion-sync               Mirror Notion notes + Kanban cards into the knowledge base
   remote-hosts              Status/exec/ps on the remote hosts linked to this account (BYOD)
+  repo-sync                 Fast-forward a shared repos/<name> checkout (master + clean only; refuses otherwise)
   restart                   Restart a workspace component (app container or managed service), or the core process itself
   rsync                     rsync over ssh with the key/password injected from the workspace vault
   secrets                   read, write and list the workspace's shared secrets
