@@ -108,6 +108,7 @@ jobs:
           "$PODMAN" run --rm --network "container:${{ steps.pg.outputs.name }}" \
             -e AWSERV_DB_URL="postgresql+psycopg://postgres:postgres@127.0.0.1:5432/awserv" \
             -e OTEL_SDK_DISABLED=true \
+            -e COVERAGE_FILE=/tmp/.coverage \
             -v "$PWD:/repo:ro" -w /repo docker.io/library/python:3.12-slim \
             sh -c "apt-get -qq update && apt-get -qq install -y --no-install-recommends git procps >/dev/null && \
                    git config --global --add safe.directory /repo && \
@@ -181,6 +182,12 @@ jobs:
           # this PR's own CI run before committing a fail_under in a
           # follow-up commit, same discipline as every other repo on this
           # standard (AP-MT's test.yml, aw-stack's ci.yml).
+          # COVERAGE_FILE=/tmp/.coverage: `/repo` is bind-mounted `:ro` above
+          # (this container never writes to the checkout), so coverage.py's
+          # default `.coverage` data file at the cwd fails with "OSError:
+          # [Errno 30] Read-only file system: '/repo/.coverage'" the instant
+          # pytest-cov tries to erase/create it — caught by this PR's own
+          # first CI run.
 
       # Redis first: it lives in the Postgres container's network namespace,
       # so removing Postgres out from under it leaves a container whose netns
