@@ -41,6 +41,15 @@ recording which app owns it — a re-``register()`` by that same app is the
 normal no-clobber case above, but a *different* app claiming an
 already-owned id raises :class:`SkillError` instead of silently overwriting
 or silently losing the second app's skill.
+
+The "workspace's own copy is the user's to edit" promise above holds only
+while nothing else has claimed the id: once a registered skill source (see
+``src/apps/skill_sources.py`` / ``src/libs/skills_sync.py``) takes over a
+pushed id — marked by ``.aw-skill-source`` appearing beside ``.aw-app-id`` —
+the content is server-owned instead. ``register()`` then defers rather than
+copying (see below), and a manual edit to that entry is reverted on the next
+sync; the skill registry connector's own ``doctor`` surfaces that drift
+(``drifted[]`` in its ``materializer.py``).
 """
 from __future__ import annotations
 
@@ -50,11 +59,13 @@ import os
 import shutil
 
 from src.apps import paths
+from src.apps.skill_sources import SOURCE_MARKER
 
 log = logging.getLogger(__name__)
 
 OWNER_MARKER = ".aw-app-id"
 HASH_MARKER = ".aw-skill-source-hash"
+_SOURCED_HASH_EXCLUDE = frozenset({OWNER_MARKER, HASH_MARKER, SOURCE_MARKER})
 
 
 class SkillError(RuntimeError):
@@ -98,11 +109,41 @@ class SkillsRegistry:
         skipped. A leftover **symlink** from before this registry switched to
         copying is replaced with a real copy.
 
+        A dest already carrying ``.aw-skill-source`` has been claimed by a
+        registered skill source (``src/libs/skills_sync.py``'s pull pass,
+        gated by that source's ``takeover`` flag) — this call **defers**
+        instead: no copy, no exception, just the dest path back as if it had
+        succeeded. Raising :class:`SkillError` here is what used to turn the
+        accidental mass-adoption already live in production (§17.7: 50 of 56
+        pushed entries silently re-owned by the skill registry) into a
+        ``SkillError`` on every single boot. A real content mismatch between
+        what this app ships and what the sourced entry actually serves is
+        still surfaced — as a WARNING naming both hashes, never as an
+        exception, since the sourced copy wins either way. Provenance is
+        rewritten back to the real pushing app on every call (idempotent —
+        the pull pass only stamps ``.aw-app-id`` when it's absent, so the two
+        writers never fight over it).
+
         Returns the copy's absolute path (journaled so ``unregister`` reverts it).
         """
         skill_dir = resolve_skill_dir(package_dir, skill_path)
         dest_path = os.path.join(paths.skills_dir(), skill_id)
         source_hash = self._hash_dir(skill_dir)
+        if os.path.isdir(dest_path) and os.path.isfile(os.path.join(dest_path, SOURCE_MARKER)):
+            served_hash = self._hash_dir(dest_path, exclude=_SOURCED_HASH_EXCLUDE)
+            if served_hash != source_hash:
+                log.warning(
+                    "apps: skill %r is sourced from a registered skill source; "
+                    "%s's own copy (hash %s) differs from what's actually served "
+                    "(hash %s) — the served copy wins",
+                    skill_id, app_id, source_hash, served_hash,
+                )
+            try:
+                with open(os.path.join(dest_path, OWNER_MARKER), "w") as f:
+                    f.write(app_id)
+            except OSError:
+                log.warning("apps: could not record provenance for sourced skill %r", skill_id)
+            return dest_path
         if os.path.islink(dest_path):
             os.unlink(dest_path)
         elif os.path.isdir(dest_path):
@@ -141,12 +182,19 @@ class SkillsRegistry:
             return ""
 
     @staticmethod
-    def _hash_dir(dir_path: str) -> str:
-        """Stable content hash of a skill source dir (path + bytes, sorted)."""
+    def _hash_dir(dir_path: str, *, exclude: frozenset[str] = frozenset()) -> str:
+        """Stable content hash of a skill source dir (path + bytes, sorted).
+
+        ``exclude`` skips named files — used to keep this registry's own
+        ownership markers out of a comparison against a pristine app-package
+        source dir that never had them.
+        """
         hasher = hashlib.sha256()
         for root, dirs, files in os.walk(dir_path):
             dirs.sort()
             for name in sorted(files):
+                if name in exclude:
+                    continue
                 full = os.path.join(root, name)
                 hasher.update(os.path.relpath(full, dir_path).encode())
                 with open(full, "rb") as f:
@@ -157,6 +205,14 @@ class SkillsRegistry:
         if not dest_path:
             return
         try:
+            if os.path.isdir(dest_path) and os.path.isfile(os.path.join(dest_path, SOURCE_MARKER)):
+                # Sourced — a registered skill source (or another
+                # takeover-flagged source) owns this content now; only
+                # skills_sync.py's own pull-pass delete loop may remove it.
+                # Checked fresh on disk, not via the in-memory Action
+                # Journal, so this holds even on a worker that never itself
+                # provisioned the app (AW_WORKSPACE_WORKERS>1).
+                return
             if os.path.islink(dest_path):
                 os.unlink(dest_path)
             elif os.path.isdir(dest_path):

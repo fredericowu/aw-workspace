@@ -203,6 +203,130 @@ def test_register_overwrites_on_version_bump_but_skips_when_content_is_unchanged
     assert "own note" not in open(os.path.join(dest_path, "SKILL.md")).read()
 
 
+def test_register_defers_to_a_sourced_entry_instead_of_raising(tmp_path, monkeypatch):
+    """Reproduces the live §17.7 production state: a dest already carrying
+    both ``.aw-app-id`` and ``.aw-skill-source`` (the registry's own
+    accidental mass-adoption stamped both, with no HASH_MARKER left — see
+    src/libs/skills_sync.py's module docstring). The app that originally
+    pushed this id calling register() again must defer, not raise
+    SkillError, and provenance must be rewritten back to the real app."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
+    from src.apps import paths
+    from src.apps.skill_sources import SOURCE_MARKER
+    from src.apps.skills import OWNER_MARKER, SkillsRegistry
+
+    dest_path = os.path.join(paths.skills_dir(), "how-to")
+    os.makedirs(dest_path)
+    with open(os.path.join(dest_path, "SKILL.md"), "w") as f:
+        f.write("# How to\n")
+    with open(os.path.join(dest_path, OWNER_MARKER), "w") as f:
+        f.write("skills")  # the production lie: stamped to the registry's own id
+    with open(os.path.join(dest_path, SOURCE_MARKER), "w") as f:
+        f.write("skills")
+    # deliberately no HASH_MARKER — matches the live production state.
+
+    pkg = _write_app(tmp_path, "notes", with_skill=True)  # ships "# How to\n"
+    result = SkillsRegistry().register("notes", "how-to", pkg, "skills/how-to/SKILL.md")
+
+    assert result == dest_path
+    assert open(os.path.join(dest_path, OWNER_MARKER)).read() == "notes"
+    assert open(os.path.join(dest_path, "SKILL.md")).read() == "# How to\n"
+
+
+def test_register_warns_but_still_defers_when_sourced_content_diverges(tmp_path, monkeypatch, caplog):
+    """A real content mismatch between what the app ships and what the
+    sourced entry serves must be surfaced — but only as a WARNING, never as
+    an exception, since the served copy wins either way."""
+    import logging
+
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
+    from src.apps import paths
+    from src.apps.skill_sources import SOURCE_MARKER
+    from src.apps.skills import OWNER_MARKER, SkillsRegistry
+
+    dest_path = os.path.join(paths.skills_dir(), "how-to")
+    os.makedirs(dest_path)
+    with open(os.path.join(dest_path, "SKILL.md"), "w") as f:
+        f.write("served by the registry\n")
+    with open(os.path.join(dest_path, OWNER_MARKER), "w") as f:
+        f.write("skills")
+    with open(os.path.join(dest_path, SOURCE_MARKER), "w") as f:
+        f.write("skills")
+
+    pkg = _write_app(tmp_path, "notes", with_skill=True)  # ships "# How to\n"
+    with caplog.at_level(logging.WARNING):
+        result = SkillsRegistry().register("notes", "how-to", pkg, "skills/how-to/SKILL.md")
+
+    assert result == dest_path
+    assert open(os.path.join(dest_path, "SKILL.md")).read() == "served by the registry\n"
+    assert any("differs" in r.message for r in caplog.records)
+
+
+def test_unregister_refuses_to_delete_a_sourced_entry(tmp_path, monkeypatch):
+    """Checked fresh on disk at delete time, not via the in-memory Action
+    Journal — the AW_WORKSPACE_WORKERS>1 hole this closes: a worker that
+    never itself provisioned the app must still not delete adopted content."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
+    from src.apps import paths
+    from src.apps.skill_sources import SOURCE_MARKER
+    from src.apps.skills import OWNER_MARKER, SkillsRegistry
+
+    dest_path = os.path.join(paths.skills_dir(), "how-to")
+    os.makedirs(dest_path)
+    with open(os.path.join(dest_path, "SKILL.md"), "w") as f:
+        f.write("served by the registry\n")
+    with open(os.path.join(dest_path, OWNER_MARKER), "w") as f:
+        f.write("notes")
+    with open(os.path.join(dest_path, SOURCE_MARKER), "w") as f:
+        f.write("skills")
+
+    SkillsRegistry().unregister(dest_path)
+
+    assert os.path.isdir(dest_path)
+    assert os.path.isfile(os.path.join(dest_path, "SKILL.md"))
+
+
+def test_uninstalling_the_pushing_app_does_not_delete_an_adopted_skill(tmp_path, monkeypatch):
+    """End-to-end: once a registered skill source has taken an id over, the
+    pushing app's own uninstall (AppRuntime.unload -> journal reverse ->
+    SkillsRegistry.unregister) must not remove it — the pull pass's own
+    delete loop in skills_sync.py is the only thing allowed to."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
+    from src.apps import paths, skill_sources
+    from src.apps.skill_sources import SOURCE_MARKER
+    from src.libs import skills_sync
+
+    pkg = _write_app(tmp_path, "notes", with_skill=True)
+
+    async def run():
+        rt = AppRuntime(FastAPI(), journal=ActionJournal())
+        await rt.load(pkg)
+
+        dest_path = os.path.join(paths.skills_dir(), "how-to")
+        (tmp_path / "root" / "native-skills").mkdir(parents=True, exist_ok=True)
+
+        registry_src = tmp_path / "registry-cache" / "how-to"
+        registry_src.mkdir(parents=True)
+        with open(os.path.join(dest_path, "SKILL.md")) as f:
+            (registry_src / "SKILL.md").write_text(f.read())
+        skill_sources.record("skills", {
+            "ok": True, "dirs": [str(registry_src.parent)], "takeover": True,
+        })
+        skills_sync.materialize()
+        assert os.path.isfile(os.path.join(dest_path, SOURCE_MARKER))
+
+        await rt.unload("notes")
+
+        assert os.path.isdir(dest_path)
+        assert os.path.isfile(os.path.join(dest_path, "SKILL.md"))
+
+    _async(run())
+
+
 def test_two_apps_with_the_same_skill_id_collide_instead_of_clobbering(tmp_path, monkeypatch):
     """Skill ids are unprefixed at the destination now (no more <app>__<id>),
     so two apps declaring the same id land at the same path. The second

@@ -14,11 +14,13 @@ next session simply runs without them.
 """
 from __future__ import annotations
 
+import logging
 import shutil
 
 import pytest
 
 from src.apps import skill_sources
+from src.apps.skills import SkillsRegistry
 from src.libs import skills_sync
 
 
@@ -115,8 +117,14 @@ def test_uninstall_removes_the_sourced_skills(sourced_workspace):
         assert not (target / "aw-autoskill-demo").exists()
 
 
-def test_sourced_pass_never_touches_native_or_pushed_skills(sourced_workspace):
-    """Scoped by marker in both directions, so the three halves stay disjoint."""
+def test_sourced_pass_without_takeover_never_touches_native_or_pushed_skills(sourced_workspace):
+    """Scoped by marker in both directions, so the three halves stay disjoint —
+    *as long as no source claims a pushed id with ``takeover``*. This fixture's
+    ``maintenance-agents`` source has no takeover rights and no overlapping
+    slug, so this is the ordinary (no-collision) case; the takeover exception
+    itself — a source explicitly allowed to claim a pushed id — is covered by
+    ``test_takeover_source_adopts_pushed_skill_silently_when_hash_matches`` and
+    its siblings below."""
     root, _ = sourced_workspace
     skills_sync.sync_all()
     skill_sources.forget("maintenance-agents")
@@ -175,3 +183,142 @@ def test_a_corrupt_registry_reads_as_empty(sourced_workspace):
     skills_sync.materialize()
 
     assert (root / "skills" / "aw-native" / "SKILL.md").exists()
+
+
+def test_record_persists_the_takeover_flag(tmp_path, monkeypatch):
+    """Dropped silently before this change (``record`` only ever wrote
+    ``{"dirs": [...]}`` back) — the pushed->sourced transition below reads
+    it straight off the registry, so a lossy round-trip would make every
+    source look like it has no takeover rights regardless of what it
+    reported."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / ".aw-workspace"))
+    skill_sources.record("skills", {"ok": True, "dirs": ["/some/dir"], "takeover": True})
+
+    assert skill_sources.read_registry()["skills"]["takeover"] is True
+
+    skill_sources.record("maintenance-agents", {"ok": True, "dirs": ["/other/dir"]})
+    assert skill_sources.read_registry()["maintenance-agents"]["takeover"] is False
+
+
+@pytest.fixture()
+def takeover_workspace(tmp_path, monkeypatch):
+    """A skill pushed by one app, plus a takeover-flagged registry source
+    claiming the SAME id — the §17.7 pushed->sourced transition this module
+    gates. ``native-skills/`` must exist (even empty) or ``materialize()``
+    returns before ever reaching the sourced pass."""
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path))
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / ".aw-workspace"))
+    (tmp_path / "native-skills").mkdir(parents=True)
+
+    pushed = tmp_path / "skills" / "shared-skill"
+    pushed.mkdir(parents=True)
+    (pushed / "SKILL.md").write_text("---\nname: shared-skill\n---\npushed body\n")
+    (pushed / skills_sync.OWNER_MARKER).write_text("mini-browser")
+    # A real push (src/apps/skills.py's register()) always leaves this too —
+    # present here so the hash comparison below is tested against the real
+    # on-disk shape, not an idealized one missing a marker.
+    (pushed / skills_sync.HASH_MARKER).write_text("irrelevant-pushed-hash")
+
+    registry_copy = tmp_path / "registry-cache" / "shared-skill"
+    registry_copy.mkdir(parents=True)
+    (registry_copy / "SKILL.md").write_text("---\nname: shared-skill\n---\npushed body\n")
+
+    skill_sources.record("skills", {
+        "ok": True, "dirs": [str(registry_copy.parent)], "takeover": True,
+    })
+    return tmp_path, pushed, registry_copy
+
+
+def test_pushed_skill_with_no_takeover_source_is_left_alone(takeover_workspace, caplog):
+    """Without the takeover flag, a source naming an id some other app
+    already pushed is reported and skipped — same posture as a genuine
+    sourced×sourced collision, never a silent steal."""
+    root, pushed, _ = takeover_workspace
+    skill_sources.record("maintenance-agents", {
+        "ok": True, "dirs": [str((root / "registry-cache"))],
+    })
+    skill_sources.forget("skills")  # only the no-takeover source claims it now
+
+    with caplog.at_level(logging.WARNING):
+        skills_sync.materialize()
+
+    entry = root / "skills" / "shared-skill"
+    assert entry.joinpath(skills_sync.OWNER_MARKER).read_text() == "mini-browser"
+    assert not entry.joinpath(skill_sources.SOURCE_MARKER).exists()
+    assert any("takeover" in r.message for r in caplog.records)
+
+
+def test_takeover_source_adopts_pushed_skill_silently_when_hash_matches(takeover_workspace, caplog):
+    """Byte-identical content: the markers change, nothing else does, and
+    there is nothing worth a WARNING about."""
+    root, pushed, _ = takeover_workspace
+
+    with caplog.at_level(logging.WARNING):
+        skills_sync.materialize()
+
+    entry = root / "skills" / "shared-skill"
+    assert entry.joinpath(skill_sources.SOURCE_MARKER).read_text() == "skills"
+    # provenance kept — the pull pass only stamps OWNER when absent.
+    assert entry.joinpath(skills_sync.OWNER_MARKER).read_text() == "mini-browser"
+    assert entry.joinpath("SKILL.md").read_text().endswith("pushed body\n")
+    assert not any("takes over" in r.message for r in caplog.records)
+
+
+def test_takeover_source_overwrites_with_warning_when_hash_differs(takeover_workspace, caplog):
+    """A real content mismatch is the registry winning anyway, but logged —
+    the opposite of the silent §17.7 steal this module replaces."""
+    root, pushed, registry_copy = takeover_workspace
+    (registry_copy / "SKILL.md").write_text("---\nname: shared-skill\n---\nregistry body v2\n")
+
+    with caplog.at_level(logging.WARNING):
+        skills_sync.materialize()
+
+    entry = root / "skills" / "shared-skill"
+    assert entry.joinpath("SKILL.md").read_text().endswith("registry body v2\n")
+    assert entry.joinpath(skill_sources.SOURCE_MARKER).read_text() == "skills"
+    assert any("takes over" in r.message for r in caplog.records)
+
+
+def test_pull_then_push_and_push_then_pull_converge_on_the_same_state(tmp_path, monkeypatch):
+    """register() (the push half, src/apps/skills.py) and materialize()'s
+    pull pass are two independent writers on one shared tree with no third
+    pass arbitrating order between them (design §16 risk 5) — whichever
+    writer runs first must land in the same state as whichever runs
+    second."""
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path))
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / ".aw-workspace"))
+    (tmp_path / "native-skills").mkdir(parents=True)
+
+    app_pkg = tmp_path / "notes-app"
+    skill_src = app_pkg / "skills" / "how-to"
+    skill_src.mkdir(parents=True)
+    (skill_src / "SKILL.md").write_text("# How to\n")
+
+    registry_src = tmp_path / "registry-cache" / "how-to"
+    registry_src.mkdir(parents=True)
+    (registry_src / "SKILL.md").write_text("# How to\n")  # byte-identical
+    skill_sources.record("skills", {
+        "ok": True, "dirs": [str(registry_src.parent)], "takeover": True,
+    })
+
+    def _state():
+        entry = tmp_path / "skills" / "how-to"
+        return {
+            "content": entry.joinpath("SKILL.md").read_text(),
+            "owner": entry.joinpath(skills_sync.OWNER_MARKER).read_text(),
+            "source": entry.joinpath(skill_sources.SOURCE_MARKER).read_text(),
+        }
+
+    # Order A: push first, then pull.
+    SkillsRegistry().register("notes", "how-to", str(app_pkg), "skills/how-to/SKILL.md")
+    skills_sync.materialize()
+    state_a = _state()
+
+    shutil.rmtree(tmp_path / "skills")
+
+    # Order B: pull first, then push.
+    skills_sync.materialize()
+    SkillsRegistry().register("notes", "how-to", str(app_pkg), "skills/how-to/SKILL.md")
+    state_b = _state()
+
+    assert state_a == state_b == {"content": "# How to\n", "owner": "notes", "source": "skills"}

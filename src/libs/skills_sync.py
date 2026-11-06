@@ -36,6 +36,13 @@ pass is scoped the same way in the other direction — it only ever touches
 entries carrying ``.aw-skill-source``, so a pushed skill stays the uninstall
 journal's to remove and a native one stays the native pass's.
 
+A pushed entry can still change hands, deliberately: a registered source
+whose ``list_skill_sources()`` answer sets ``"takeover": True`` (only the
+skill registry connector does, today) may claim an id some other app already
+pushed — see :func:`_materialize_app_sources`. Once claimed, the entry is
+sourced like any other: ``src/apps/skills.py``'s ``register()`` defers to it
+instead of raising, and ``unregister()`` refuses to delete it.
+
 Sync semantics into the per-CLI mirrors are an **exact mirror**: a file that
 leaves ``skills/`` leaves every target, and directories left empty are pruned.
 Anything weaker leaves an uninstalled app's skill lying around teaching agents
@@ -44,6 +51,7 @@ to call tools that no longer exist.
 from __future__ import annotations
 
 import filecmp
+import hashlib
 import logging
 import os
 import shutil
@@ -51,7 +59,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from src.apps.paths import DEFAULT_WORKSPACE_CONTAINER_DIR
-from src.apps.skills import OWNER_MARKER
+from src.apps.skills import HASH_MARKER, OWNER_MARKER
 from src.apps import skill_sources
 from src.apps.skill_sources import SOURCE_MARKER
 
@@ -239,23 +247,72 @@ def _sourced_entries(merged: Path) -> dict[str, str]:
     return out
 
 
+_OWNERSHIP_MARKERS = (OWNER_MARKER, SOURCE_MARKER, HASH_MARKER)
+
+
+def _hash_excluding_markers(dir_path: Path) -> str:
+    """Content hash (relative path + bytes, sorted) of a skill dir, ignoring
+    the ownership markers this module and ``src/apps/skills.py`` stamp.
+
+    Used only to compare a *pushed* entry's real content against what a
+    ``takeover`` source would replace it with. A real pushed entry always
+    carries :data:`HASH_MARKER` (``register()`` writes it on every copy) that
+    a pristine registry source dir never has, so excluding only the two
+    ownership markers would make every single adoption read as "divergent"
+    regardless of whether the actual skill content matches.
+    """
+    if not dir_path.is_dir():
+        return ""
+    hasher = hashlib.sha256()
+    for rel in sorted(_iter_relative_files(dir_path)):
+        if rel in _OWNERSHIP_MARKERS:
+            continue
+        hasher.update(rel.encode())
+        hasher.update((dir_path / rel).read_bytes())
+    return hasher.hexdigest()
+
+
 def _materialize_app_sources(dest: Path, result: SyncResult) -> None:
     """Pull each registered app source dir into ``skills/``.
 
     Runs after the native pass and is scoped to entries carrying
-    :data:`SOURCE_MARKER`, so it can neither see nor delete a native skill or
-    an app's pushed one.
+    :data:`SOURCE_MARKER` plus, as of this change, entries carrying only
+    :data:`OWNER_MARKER` (pushed, never sourced) — but only to decide whether
+    a ``takeover``-flagged source may claim one, never to let it reach a
+    native skill.
 
     An app absent from the registry has been uninstalled (or never reported),
     so its entries go — the exact-mirror rule. An app whose hook answered
     ``ok: False`` never reaches the registry write at all, so its last known
     dirs are still listed here and its skills survive the outage.
+
+    **The pushed→sourced transition (§17.7).** A destination entry that is
+    pushed (``.aw-app-id`` present) but not yet sourced (``.aw-skill-source``
+    absent) used to be silently stolen here: ``owner = existing.get(name)``
+    only looks at :data:`SOURCE_MARKER`-carrying entries, so a pushed one
+    always read as ``owner is None`` and fell straight into the unconditional
+    copy below — no hash check, no log. That is exactly how 50 of 56
+    ``contributes.skills`` entries in production ended up silently re-owned
+    by the skill registry, each then raising ``SkillError`` out of
+    ``register()`` on every boot. The transition is now explicit and gated by
+    the claiming source's own ``takeover`` flag (``skill_sources.record``):
+    without it, a source naming an id some other app already pushed is
+    reported and left alone, same posture as a genuine collision below. With
+    it, the source wins — silently if the pushed content is byte-identical
+    (adoption, only the markers change), with one WARNING naming both hashes
+    and the losing app if it differs. ``takeover`` never applies between two
+    *sourced* sources — that case keeps the first-writer-alphabetical rule
+    this function already had (iteration order is ``sorted(registry.items())``,
+    which is why ``maintenance-agents`` has always beaten ``skills`` there —
+    the right outcome today, left unchanged).
     """
     registry = skill_sources.read_registry()
     existing = _sourced_entries(dest)
+    pushed_only = _app_owned_entries(dest) - set(existing)
 
     seen: set[str] = set()
     for app_id, entry in sorted(registry.items()):
+        takeover = bool(entry.get("takeover", False))
         for raw_dir in entry.get("dirs", []):
             src_root = Path(raw_dir)
             if not src_root.is_dir():
@@ -265,13 +322,40 @@ def _materialize_app_sources(dest: Path, result: SyncResult) -> None:
                 if not (skill_dir / "SKILL.md").is_file():
                     continue
                 name = skill_dir.name
-                owner = existing.get(name)
-                if name in seen or (owner is not None and owner != app_id):
-                    # Same collision rule as the push half: first writer keeps
-                    # the id, the loser is reported rather than silently losing
-                    # its skill to whoever synced last.
+                if name in seen:
                     log.warning("skills_sync: skill id %r claimed by more than one source; "
-                                "keeping %s", name, owner or "the first")
+                                "keeping the first", name)
+                    continue
+                owner = existing.get(name)
+                if owner is not None:
+                    if owner != app_id:
+                        # sourced×sourced collision — takeover is not
+                        # consulted here; first writer keeps the id.
+                        log.warning("skills_sync: skill id %r claimed by more than one source; "
+                                    "keeping %s", name, owner)
+                        continue
+                    seen.add(name)
+                    _copy_source_skill(skill_dir, dest / name, app_id, result)
+                    continue
+                if name in pushed_only:
+                    if not takeover:
+                        log.warning(
+                            "skills_sync: skill id %r is pushed by an installed app; "
+                            "source %s has no takeover — leaving it alone", name, app_id)
+                        continue
+                    dest_entry = dest / name
+                    dest_hash = _hash_excluding_markers(dest_entry)
+                    src_hash = _hash_excluding_markers(skill_dir)
+                    if dest_hash == src_hash:
+                        log.info("skills_sync: source %s adopts pushed skill %r "
+                                 "(content identical)", app_id, name)
+                    else:
+                        log.warning(
+                            "skills_sync: source %s takes over pushed skill %r — content "
+                            "differs (pushed hash %s, source hash %s)",
+                            app_id, name, dest_hash, src_hash)
+                    seen.add(name)
+                    _copy_source_skill(skill_dir, dest_entry, app_id, result, stamp_owner=False)
                     continue
                 seen.add(name)
                 _copy_source_skill(skill_dir, dest / name, app_id, result)
@@ -286,8 +370,18 @@ def _materialize_app_sources(dest: Path, result: SyncResult) -> None:
             log.warning("skills_sync: failed to delete sourced skill %s: %s", name, exc)
 
 
-def _copy_source_skill(src: Path, dest: Path, app_id: str, result: SyncResult) -> None:
-    """Mirror one skill dir in, then stamp both ownership markers."""
+def _copy_source_skill(src: Path, dest: Path, app_id: str, result: SyncResult,
+                        *, stamp_owner: bool = True) -> None:
+    """Mirror one skill dir in, then stamp ownership markers.
+
+    ``stamp_owner=False`` is the pushed→sourced takeover path: ``dest``
+    already carries :data:`OWNER_MARKER` naming the app that originally
+    pushed this id, and that is the truthful provenance to keep — this
+    function only writes it when absent. ``register()``'s own defer branch
+    (``src/apps/skills.py``) is what rewrites that marker back to the real
+    pushing app on *its* side, on its own cadence; the two never fight over
+    it because this side only ever writes it once, the first time.
+    """
     dest.mkdir(parents=True, exist_ok=True)
     src_files = _iter_relative_files(src)
     for rel in sorted(src_files):
@@ -315,7 +409,8 @@ def _copy_source_skill(src: Path, dest: Path, app_id: str, result: SyncResult) -
     # native delete pass's reserved set) treats this like any app-owned entry;
     # SOURCE_MARKER on top so _sourced_entries can tell pulled from pushed.
     try:
-        (dest / OWNER_MARKER).write_text(app_id, encoding="utf-8")
+        if stamp_owner or not (dest / OWNER_MARKER).is_file():
+            (dest / OWNER_MARKER).write_text(app_id, encoding="utf-8")
         (dest / SOURCE_MARKER).write_text(app_id, encoding="utf-8")
     except OSError as exc:
         log.warning("skills_sync: could not mark %s as owned by %s: %s", dest, app_id, exc)

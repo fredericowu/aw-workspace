@@ -111,6 +111,13 @@ def record(app_id: str, result: Any) -> None:
 
     ``ok: False`` deliberately writes nothing — the previous answer stands, so
     an app that is briefly unable to enumerate its skills does not lose them.
+
+    ``takeover`` (optional, default ``False``) is a trust bit: only a source
+    with it set may claim a skill id some other app already *pushed* via
+    ``contributes.skills`` (see ``src/libs/skills_sync.py``'s pull pass). It
+    never affects a sourced×sourced collision — that stays first-writer. Core
+    defaults every app to ``False``; today only the skill registry connector
+    (``skills``) declares it.
     """
     if result is None:
         forget(app_id)
@@ -124,7 +131,7 @@ def record(app_id: str, result: Any) -> None:
 
     dirs = [str(d) for d in (result.get("dirs") or []) if isinstance(d, (str, os.PathLike))]
     registry = read_registry()
-    registry[app_id] = {"dirs": dirs}
+    registry[app_id] = {"dirs": dirs, "takeover": bool(result.get("takeover", False))}
     _write_registry(registry)
 
 
