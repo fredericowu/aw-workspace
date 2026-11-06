@@ -76,6 +76,13 @@ GEMINI.md
 # (`.codegraph/`) is already covered by the `/.*/` rule above.
 /codegraph.json
 
+# Dev Team PR-first worktrees (AGENTS.md's "Dev Team: PR-first on this
+# repo") — one per in-flight card, created and removed by hand. Already
+# covered by the `/.*/` rule above; named explicitly so it's obvious this is
+# deliberate scratch state, not an oversight, and survives a future edit to
+# that catch-all.
+/.worktrees/
+
 # docs/ is meant to hold generic, workspace-level documentation, but agents
 # (architect/doc-writer) have been dumping per-app design docs in there too,
 # and every commit under it ships a release. Ignored wholesale for now to stop
