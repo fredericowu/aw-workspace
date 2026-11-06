@@ -964,3 +964,122 @@ Grouped by effort to reach a 50% floor:
   read and confirmed in the source; the rest of pylint's output on other repos
   was not.** Expect false positives when the gate first runs — budget for a
   triage pass per repo rather than assuming a clean bill.
+
+---
+
+## 12. Shared-workflow drift auto-PR (addendum, 2026-11-06)
+
+**Decision: a content-aware daily scheduled workspace task — not a GitHub
+Actions workflow, not Dependabot — diffs each consumer's pinned
+`fredericowu/aw-shared-workflows` file against the latest tag's content, and
+auto-opens a one-line bump PR only when the §2a caller contract is unchanged.
+No new secret, no new GitHub-side infra: it runs under the workspace's own
+ambient admin `gh` identity, the same one every other Dev Team delivery in
+this estate already uses.**
+
+This is §2a's enforcement sibling: §2a decided *what* a caller must grant;
+this section decides *how staying current with the shared file's content* is
+kept from becoming either manual toil or a PR flood.
+
+### 12.1 The decisive measurement
+
+Measured 2026-11-06, with `aw-shared-workflows` at `v1.6.0`: **22 consumer
+repos pin one of its three reusable workflows, 25 pins total, ranging
+`v1.2.0`→`v1.6.0`.** Content-diffing every pinned *file* between its pin and
+`v1.6.0`: `ai-review-reusable.yml` is byte-identical since `v1.2.0`,
+`code-review-reusable.yml` byte-identical since `v1.5.0`. **24 of 25 pins are
+tag-stale but content-current; exactly one is real drift** — `aw-stack`'s
+`code-review-reusable.yml@v1.2.1`, ~1,100 lines behind.
+
+This is the direct, unavoidable consequence of the deliberate design choice
+in [the repo's own README](../../repos/aw-shared-workflows/README.md) to run
+one `v*` tag line across three independent workflow files, rather than a tag
+family each (a per-workflow family would be unprotected by the immutability
+ruleset, which only targets `refs/tags/v*`). A fix to one workflow cuts a tag
+every consumer of the *other two* is, by tag number, instantly "behind" —
+with nothing to actually bump. **Any drift detector keyed on tag number
+instead of content generates a mostly-no-op PR flood on every single tag
+cut, forever.** Content-diffing is therefore not an optimization on top of
+the design; it is the design.
+
+### 12.2 Mechanism
+
+Runs daily as a scheduled Agents Platform agent (`shared-workflow-drift-checker`
+in `tekflox/aw-app-maintenance-agents`), the same shape as this workspace's
+existing `system-analyst` / `kanban-sweeper` scheduled tasks — see the
+`aw-shared-workflow-drift-checker` skill for the exact steps. Per run:
+
+1. **Discover** the latest `v*` tag, and every consumer **live**, via `gh api
+   search/code` for `uses: fredericowu/aw-shared-workflows` across both the
+   `tekflox` and `fredericowu` orgs — not a committed manifest (goes stale the
+   moment the fleet migration adds a consumer) and not local checkouts under
+   `repos/` (misses every repo that was never cloned here).
+2. **Compare by content, not tag number**: for each pin `<file>@vX`, diff the
+   file between `vX` and latest inside a local `aw-shared-workflows`
+   checkout. Byte-identical → skip, silently — this is the 24-of-25 case
+   above and is the expected, majority outcome on every run.
+3. **On real drift, classify against the §2a contract** — the shared file's
+   `permissions:`, `workflow_call.inputs:` and `workflow_call.secrets:`
+   blocks, the exact checklist
+   `test_the_reusable_requests_every_scope_the_caller_checklist_demands`
+   ([§2a](#2a-a-reusable-workflow-caller-must-grant-checks-read-addendum-2026-11-04))
+   already machine-compares:
+   - **Unchanged** → auto-open a mechanical bump PR (branch
+     `devteam/wfbump-<tag>-<slug>`, one-line `uses:` change, body embeds the
+     diffstat), opened under the admin identity so the consumer's own gates
+     (test, ai-review, code-review loop) fire normally — **not** a
+     `GITHUB_TOKEN` Actions-bot PR, which would not trigger them.
+   - **Changed** → do not blind-bump. Open a Kanban card routed to a coder,
+     citing this section, to bump the pin **and** edit the caller's own
+     `permissions:`/secrets together.
+4. **Never merges, never touches a tag or branch inside `aw-shared-workflows`
+   itself** — merge authority stays with each consumer's own PR-first
+   review/merge loop.
+5. **Capped at ~10 PRs per run, staggered across days** — the self-hosted
+   runner and the GitHub rate limit both argued for this after the
+   mass-rollout burn on an earlier security-scan rollout (see
+   [§7](#7-what-this-makes-harder-later)'s sibling concerns). At ~22
+   consumers today, one tag cut drains in ≤3 days; at the full ~60-repo
+   fleet, about a week. Tag cuts are rare and bumps are not urgent, so this
+   is an acceptable latency, not a gap — and the checker's own report names
+   whatever it deferred to the next run rather than letting a partial sweep
+   read as complete.
+
+**Does not special-case an already-open PR on the same repo.** When a repo
+is already getting touched by some other PR (e.g. a fleet-migration batch),
+the preferred path is for *that* PR to bump its own shared-workflow pin
+inline, rather than waiting on this checker — a convention for other
+dispatches to follow, not logic this checker implements. This checker is the
+fallback for repos nothing else is touching, not the only path.
+
+### 12.3 Rejected alternatives
+
+- **Dependabot (`github-actions` ecosystem, grouped).** The standard answer,
+  and the runner-up. Loses on two structural points: (1) it is tag-number
+  based, so under the single `v*` tag line it would open ~24 no-op PRs
+  *today* and repeat that on every future cut; (2) Dependabot-actor runs get
+  restricted secrets and need org-level enablement on self-hosted runners,
+  which would break the ai-review/code-review loop on exactly the PRs it
+  opens. Reconsider only if the tag-line design itself ever changes to
+  per-workflow families.
+- **Tag-push fan-out workflow inside `aw-shared-workflows`.** Event-driven,
+  nicer latency — but needs a cross-org PAT with write access to ~60 repos
+  stored as a repo secret, a brand-new standing credential surface, plus
+  consumer discovery from inside Actions and real tag cuts to test it. Daily
+  polling from the workspace gets the same outcome with zero new secrets.
+  Could be added later as a thin trigger that just pokes the same workspace
+  checker, if latency ever becomes the actual complaint.
+- **Moving major alias (`@v1`).** Explicitly violates the repo's own
+  invariant ("not a moving major alias") and the immutability ruleset only
+  protects exact `v*` tags, not an alias. Dead on arrival.
+
+### 12.4 What this makes harder later
+
+A second automation writing to consumer repos under the same admin identity
+makes attribution muddier when diagnosing *why* a PR appeared. The §2a
+checklist must stay machine-parseable forever — the existing shared-repo test
+is the only thing keeping §12.2 step 3's classification honest. `gh` code
+search will rate-limit as the fleet grows past ~60 repos, mitigated for now
+by the per-run cap. A consumer that hand-edits its own caller file while a
+bump PR from this checker is open gets a merge conflict, not a merge —
+acceptable, since PRs here are cheap to re-cut.
