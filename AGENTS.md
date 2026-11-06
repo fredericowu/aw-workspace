@@ -211,7 +211,11 @@ rollout:
    another repo's own checkout under `repos/`) — every Dev Team session
    shares it, and an uncoordinated commit there is how another agent's
    in-progress work gets stepped on.
-2. Isolate in a worktree, one per card:
+2. Isolate in a worktree, one per card. For a repo other than this one,
+   run this FROM that repo's own checkout (`cd` or `git -C
+   /opt/aw-workspace/repos/<repo>`) — the identical command run from the
+   wrong cwd silently creates a worktree carrying the wrong repo's git
+   history at a path that reads as if it belongs to `<repo>`:
    ```bash
    git fetch origin
    git worktree add /opt/aw-workspace/.worktrees/<repo>/<card8> \
@@ -227,9 +231,12 @@ rollout:
    review/merge loop (`code-review.yml` + `ai-review.yml`) review and merge
    it. Don't dispatch QA while that PR is still open — the merge event is
    the handoff moment.
-5. After merge, sync the live tree and drop the worktree:
+5. After merge, sync the live tree and drop the worktree — fetch first,
+   the same as step 2: a stale cached `origin/master` makes `--ff-only`
+   merge a silent no-op, leaving the live tree one merge behind with no
+   error:
    ```bash
-   cd /opt/aw-workspace && git merge --ff-only origin/master
+   cd /opt/aw-workspace && git fetch origin && git merge --ff-only origin/master
    git worktree remove /opt/aw-workspace/.worktrees/<repo>/<card8>
    ```
 
