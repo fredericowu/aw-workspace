@@ -51,12 +51,16 @@ jobs = 0  # one process per core; the E-class sweep over src/ is CPU-bound.
 [tool.coverage.report]
 # Baseline measured 2026-11-06 on the existing ephemeral-PG+Redis `unit` job
 # (`.github/workflows/test.yml`), rounded down, same discipline as every
-# other repo on docs/standards/pipeline-testing.md: three consecutive CI
-# runs of the identical commit all measured TOTAL=89% (31345 statements,
-# ~3545-3557 missed — the small variance is itself evidence of the finding
-# below, not noise worth chasing). coverage.py auto-discovers this section
-# from pyproject.toml with no `--cov-config` needed, same as
-# `aw-app-template`/`aw-app-uc-phd`.
+# other repo on docs/standards/pipeline-testing.md. The term-missing table's
+# TOTAL column rounds to 89%, but the precise figure — what `fail_under`
+# actually compares against — is 88.69% (31345 statements, ~3545-3557
+# missed across 3 CI runs of the identical commit; the small variance is
+# itself evidence of the flake below, not noise worth chasing). A first
+# commit here set `fail_under = 89` off the rounded display and that CI run
+# caught its own mistake: "Required test coverage of 89.0% not reached.
+# Total coverage: 88.69%". 88 is the correct floor. coverage.py
+# auto-discovers this section from pyproject.toml with no `--cov-config`
+# needed, same as `aw-app-template`/`aw-app-uc-phd`.
 #
 # Known flake, not a regression: 2 of those 3 runs failed on
 # src/tests/integration/apps/test_services.py::
@@ -73,4 +77,4 @@ jobs = 0  # one process per core; the E-class sweep over src/ is CPU-bound.
 # code unrelated to this card's scope, and masking them with retries would
 # hide the real finding. Flagged on card 4105bf3b-9510-8176 for separate
 # triage.
-fail_under = 89
+fail_under = 88
