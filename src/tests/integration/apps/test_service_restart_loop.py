@@ -46,6 +46,11 @@ from src.apps.service_lease import (ServiceLease, gave_up_markers,
                                     is_lease_held_anywhere)
 from src.apps.services import (STATE_BACKING_OFF, STATE_GAVE_UP,
                                STATE_STOPPED, ServiceSupervisor)
+from src.tests.integration.apps.conftest import (
+    DETACHED_SLEEP_S as _DETACHED_SLEEP_S,
+    find_session_leader as _find_session_leader,
+    kill_detached_sleep as _kill_detached_sleep,
+)
 
 
 @pytest.fixture()
@@ -116,63 +121,6 @@ def _wait(predicate, timeout=20.0, interval=0.02):
             return True
         time.sleep(interval)
     return False
-
-
-# A deliberately long window for the ``setsid``'d detached child these tests
-# spawn to hold the pump's pipe open — long enough that a scheduling delay
-# under CI/coverage load can never make it expire mid-test on its own. Killed
-# explicitly right after the window it exists for, below, rather than relying
-# on either end of its own timer.
-#
-# The real race this child is vulnerable to is NOT its own expiry, though —
-# see test_a_deliberate_stop_is_not_respawned's docstring for the confirmed
-# fork-vs-setsid mechanism a long sleep alone does not close.
-_DETACHED_SLEEP_S = 300
-
-
-def _find_session_leader(argv: list[str], cwd) -> int | None:
-    """PID of the ``setsid``'d detached child matching ``argv`` under ``cwd``.
-
-    Reuses ``ServiceSupervisor._candidate_pids``'s scan, but checks session
-    leadership (``os.getsid(pid) == pid``, exactly what ``setsid`` produces)
-    rather than ``_spawn_real_orphan``'s ``_ppid(pid) == 1`` — this child's
-    parent (the service's own ``sh``) is still alive while these tests run,
-    so the orphan check would never match it.
-    """
-    for pid in ServiceSupervisor._candidate_pids():
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                if [p.decode() for p in f.read().split(b"\0") if p] != argv:
-                    continue
-            if os.path.realpath(f"/proc/{pid}/cwd") != os.path.realpath(str(cwd)):
-                continue
-            if os.getsid(pid) != pid:
-                continue
-            return pid
-        except (OSError, UnicodeDecodeError):
-            continue
-    return None
-
-
-def _kill_detached_sleep(cwd) -> None:
-    """End every detached ``sleep`` child under ``cwd`` explicitly, so the
-    pump's pipe closes on a signal instead of racing the sleep's own timer.
-
-    A restart spawns a SECOND generation of this same detached command
-    (start() backgrounds a fresh one), so one match is not always enough —
-    loop until none are left rather than stopping after the first kill. The
-    short sleep between attempts gives a just-forked second generation the
-    moment it needs to finish its own ``setsid()`` and become matchable.
-    """
-    for _ in range(10):
-        pid = _find_session_leader(["sleep", str(_DETACHED_SLEEP_S)], cwd)
-        if pid is None:
-            return
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        time.sleep(0.02)
 
 
 def test_a_killed_service_is_respawned(supervisor, fast_backoff, tmp_path):
