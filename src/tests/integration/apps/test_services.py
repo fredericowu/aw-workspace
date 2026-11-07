@@ -22,6 +22,11 @@ from src.apps.runtime import AppRuntime
 from src.apps.service_lease import is_lease_held_anywhere
 from src.apps.service_relay import ServiceCommandRelay
 from src.apps.services import ServiceSupervisor
+from src.tests.integration.apps.conftest import (
+    DETACHED_SLEEP_S as _DETACHED_SLEEP_S,
+    find_session_leader as _find_session_leader,
+    kill_detached_sleep as _kill_detached_sleep,
+)
 
 
 def _async(coro):
@@ -168,14 +173,28 @@ def test_restart_on_the_owner_keeps_the_lease_for_the_new_process(tmp_path):
     # The interleaving has to be FORCED, not waited for. With a plain `sleep`
     # the log pipe closes the instant the process dies, so the old pump
     # usually reaches its finally before the restart's start() has acquired
-    # the new lease — and then the bug is invisible. `setsid sleep 5`
+    # the new lease — and then the bug is invisible. `setsid sleep N`
     # inherits the captured stdout but lands in its OWN session, so stop()'s
-    # killpg cannot reach it and the pipe stays open for 5s after the service
-    # process itself is gone. That puts the old pump's finally deterministically
-    # AFTER the new lease exists, which is exactly the window a real service
-    # with a surviving child (or a merely slow thread) hits by chance.
+    # killpg cannot reach it and the pipe stays open after the service
+    # process itself is gone, until the explicit kill below closes it. That
+    # puts the old pump's finally deterministically AFTER the new lease
+    # exists, which is exactly the window a real service with a surviving
+    # child (or a merely slow thread) hits by chance.
+    #
+    # CONFIRMED by direct repro (not just the "a fixed 5s margin is too
+    # narrow" theory this test previously relied on): the actual race is
+    # fork-vs-setsid, not the detached child's own timer. `setsid CMD &`
+    # forks a child that is briefly still a MEMBER of the service's own
+    # process group until it completes its own `setsid()` call; `stop()`'s
+    # `killpg` can reach — and kill — that child if it fires inside that
+    # window, regardless of how long its sleep argument is. Lengthening the
+    # sleep to 300s alone did NOT make this deterministic (still failed on
+    # the first 15 of 15 CI-representative reruns); waiting for the child to
+    # actually BECOME its own session leader before calling stop()/restart()
+    # does (15 of 15 passed everything downstream of that confirmation).
     worker = ServiceSupervisor()
-    worker.register(app_id, service_id, "sh -c 'setsid sleep 5 & echo ready; sleep 60'",
+    worker.register(app_id, service_id,
+                    f"sh -c 'setsid sleep {_DETACHED_SLEEP_S} & echo ready; sleep 60'",
                     str(tmp_path), autostart=False)
     try:
         first = worker.start(app_id, service_id)
@@ -191,18 +210,29 @@ def test_restart_on_the_owner_keeps_the_lease_for_the_new_process(tmp_path):
             time.sleep(0.02)
         else:
             pytest.fail("the service never reported its detached child")
+        # "ready" only proves the fork happened, not that the child has
+        # finished detaching into its own session — see the comment above.
+        for _ in range(500):
+            if _find_session_leader(["sleep", str(_DETACHED_SLEEP_S)], tmp_path) is not None:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("the detached child never became its own session leader")
 
-        second = worker.restart(app_id, service_id)
-        assert second["running"] is True
-        assert second["pid"] != first["pid"]
+        try:
+            second = worker.restart(app_id, service_id)
+            assert second["running"] is True
+            assert second["pid"] != first["pid"]
 
-        # The forced interleaving, asserted rather than assumed: if this pump
-        # had already finished, the detached child never held the pipe (no
-        # `setsid`? no fork yet?) and everything below would pass vacuously,
-        # proving nothing about the fix.
-        assert old_pump.is_alive() is True, (
-            "the old process's log pipe closed before the restart completed — "
-            "this test cannot reach the window the bug lives in")
+            # The forced interleaving, asserted rather than assumed: if this
+            # pump had already finished, the detached child never held the
+            # pipe (no `setsid`? no fork yet?) and everything below would
+            # pass vacuously, proving nothing about the fix.
+            assert old_pump.is_alive() is True, (
+                "the old process's log pipe closed before the restart completed — "
+                "this test cannot reach the window the bug lives in")
+        finally:
+            _kill_detached_sleep(tmp_path)
 
         # Now let it run its finally to completion.
         old_pump.join(timeout=30)
@@ -215,6 +245,10 @@ def test_restart_on_the_owner_keeps_the_lease_for_the_new_process(tmp_path):
         assert worker.owns_locally(app_id, service_id) is True
     finally:
         worker.stop(app_id, service_id)
+        # The restart above spawned a SECOND detached child (its own start()
+        # backgrounds a fresh one) — the kill above only ever guarantees the
+        # first generation is gone; sweep again so nothing outlives the test.
+        _kill_detached_sleep(tmp_path)
         assert is_lease_held_anywhere(app_id, service_id) is False
 
 

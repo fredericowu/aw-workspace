@@ -16,6 +16,8 @@ import psycopg
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
+from src.libs import skills_sync
+
 
 def _postgres_reachable() -> bool:
     try:
@@ -61,7 +63,21 @@ def client(tmp_path, monkeypatch):
     async def noop_reconcile(app):
         return None
 
+    async def noop_sync_on_boot():
+        return None
+
     monkeypatch.setattr(app_mod, "reconcile_on_boot", noop_reconcile)
+    # The lifespan's own skills mirror (sync_on_boot -> agent_sync.sync_all ->
+    # skills_sync.materialize()) runs as an unawaited background task
+    # (app.py's `_boot_reconcile_and_sync`, fired via `asyncio.ensure_future`
+    # and never awaited before `yield`) — racing it, as this fixture used to,
+    # depends on the thread-pool copy winning against TestClient's own
+    # request-dispatch overhead, a margin coverage's per-line tracing can
+    # invert. Stubbed here the same way `reconcile_on_boot` already is, and
+    # materialize() is called synchronously below instead, so the merged
+    # skills/ tree these tests assert on is never a race.
+    monkeypatch.setattr(app_mod, "sync_on_boot", noop_sync_on_boot)
+    skills_sync.materialize()
 
     with TestClient(app_mod.create_app()) as c:
         yield c

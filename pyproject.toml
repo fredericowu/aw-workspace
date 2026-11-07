@@ -62,19 +62,55 @@ jobs = 0  # one process per core; the E-class sweep over src/ is CPU-bound.
 # auto-discovers this section from pyproject.toml with no `--cov-config`
 # needed, same as `aw-app-template`/`aw-app-uc-phd`.
 #
-# Known flake, not a regression: 2 of those 3 runs failed on
+# Known flake, now FIXED (card 4115bf3b-9510-8123), not a regression in the
+# baseline above. Card 4105bf3b-9510-8176 (this card's own first commit)
+# originally named 2 flaky tests from 3 PR-time CI runs; QA then re-ran the
+# merge commit's `unit` job and found a 2-of-3 failure rate spanning 4
+# distinct tests across 2 files, plus a 5th same-shape test not yet observed
+# failing — two genuinely distinct mechanisms, both fixed below rather than
+# retried or skipped.
+#
+# Mechanism A — originally suspected to be "a fixed 5s real sleep is the
+# test's entire safety margin, eaten by coverage-tracing overhead". That
+# theory was wrong, or at least incomplete: lengthening the sleep alone (5s
+# -> 300s) did NOT make the race deterministic — it still failed on the
+# first 8+ of several hundred CI-representative reruns with the longer
+# sleep. Direct repro traced the real mechanism to fork-vs-setsid, not
+# timer expiry: `setsid sleep N &`'s backgrounded child is briefly still a
+# MEMBER of the service's own process group until it completes its own
+# `setsid()` syscall, and `stop()`'s `killpg` can reach — and kill — that
+# child if it fires inside that window, regardless of the sleep argument.
+# "ready" in the service's log only proves the fork happened, not that
+# `setsid()` has completed, so waiting on "ready" alone (the original test
+# design) leaves this window open on every run; coverage/CI-load scheduling
+# delay widens how often a run actually lands inside it, which is why it
+# correlated with coverage without being caused by coverage tracing speed.
+# Affects src/tests/integration/apps/test_service_restart_loop.py::
+# test_a_deliberate_stop_is_not_respawned and
+# ::test_a_straggler_pump_does_not_spawn_a_third_copy, plus
 # src/tests/integration/apps/test_services.py::
-# test_restart_on_the_owner_keeps_the_lease_for_the_new_process and/or
-# src/tests/integration/api/test_skills_routes.py::
-# test_open_returns_a_code_server_url — both passed clean on their own
-# before coverage instrumentation existed, and the third run (identical
-# commit, no retry logic, no code change) passed all 1797. Coverage.py's
-# per-line trace function adds enough overhead to shift the relative
-# timing these two tests depend on (the first explicitly engineers a
-# process/thread race via real sleeps; the second's failure mode — a 404
-# where a fixture-created skill should exist — points at a setup step not
-# finishing in its usual window). Neither is fixed here: both races live in
-# code unrelated to this card's scope, and masking them with retries would
-# hide the real finding. Flagged on card 4105bf3b-9510-8176 for separate
-# triage.
+# test_restart_on_the_owner_keeps_the_lease_for_the_new_process — all three
+# assert the service's log pump is still alive immediately after
+# stop()/restart(), relying on the detached child to still hold the stdout
+# pipe open. Fixed by waiting for the detached child to actually become its
+# own session leader (`os.getsid(pid) == pid`) before calling stop()/
+# restart(), which closes the race outright (20+ of 20 CI-representative
+# reruns clean), plus lengthening the sleep to 300s and explicitly killing
+# the child right after the assertion as defense in depth against any
+# narrower residual window.
+#
+# Mechanism B — an unawaited background task raced the test's first HTTP
+# request. src/tests/integration/api/test_skills_routes.py::
+# test_list_skills_includes_native_and_app_owned_with_correct_editable_flag
+# and ::test_open_returns_a_code_server_url both read the merged `skills/`
+# tree, which `src/api/app.py`'s lifespan populates via an
+# `asyncio.ensure_future`'d background task (`_boot_reconcile_and_sync` ->
+# `sync_on_boot` -> `skills_sync.materialize()`) that the fixture never
+# awaited — only `reconcile_on_boot` was stubbed, not this second,
+# independent setup step. At normal speed the thread-pool copy won by a wide
+# margin against TestClient's own request-dispatch overhead; coverage's
+# uneven tracing overhead could invert that margin. Fixed by stubbing
+# `sync_on_boot` the same way `reconcile_on_boot` already was, and calling
+# `skills_sync.materialize()` synchronously in the fixture instead of
+# racing it.
 fail_under = 88

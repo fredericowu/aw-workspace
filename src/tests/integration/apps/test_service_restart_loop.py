@@ -46,6 +46,11 @@ from src.apps.service_lease import (ServiceLease, gave_up_markers,
                                     is_lease_held_anywhere)
 from src.apps.services import (STATE_BACKING_OFF, STATE_GAVE_UP,
                                STATE_STOPPED, ServiceSupervisor)
+from src.tests.integration.apps.conftest import (
+    DETACHED_SLEEP_S as _DETACHED_SLEEP_S,
+    find_session_leader as _find_session_leader,
+    kill_detached_sleep as _kill_detached_sleep,
+)
 
 
 @pytest.fixture()
@@ -149,15 +154,24 @@ def test_a_deliberate_stop_is_not_respawned(supervisor, fast_backoff, tmp_path):
     pump would read a stale ``running`` and respawn the service the operator
     just stopped — a deliberate stop would become impossible.
 
-    ``setsid sleep 5`` inherits the captured stdout but lands in its OWN
+    ``setsid sleep N`` inherits the captured stdout but lands in its OWN
     session, so ``stop()``'s killpg cannot reach it and the pipe stays open
-    for ~5s after the service process itself is gone. That puts the pump's
-    ``finally`` deterministically after ``stop()`` has returned, which is
-    the window the bug lives in.
+    after the service process itself is gone, until the explicit kill below
+    closes it. That puts the pump's ``finally`` deterministically after
+    ``stop()`` has returned, which is the window the bug lives in.
+
+    CONFIRMED by direct repro: the actual race is fork-vs-setsid, not the
+    detached child's own timer expiring too early. ``setsid CMD &`` forks a
+    child that is briefly still a MEMBER of the service's own process group
+    until it completes its own ``setsid()`` call; ``stop()``'s ``killpg``
+    can reach — and kill — that child if it fires inside that window,
+    regardless of how long its sleep argument is. Lengthening the sleep
+    alone did not make this deterministic; waiting for the child to actually
+    become its own session leader before calling ``stop()`` does.
     """
     app_id, service_id = _ids()
     supervisor.register(app_id, service_id,
-                        "sh -c 'setsid sleep 5 & echo ready; sleep 60'",
+                        f"sh -c 'setsid sleep {_DETACHED_SLEEP_S} & echo ready; sleep 60'",
                         str(tmp_path), autostart=False)
 
     supervisor.start(app_id, service_id)
@@ -165,12 +179,20 @@ def test_a_deliberate_stop_is_not_respawned(supervisor, fast_backoff, tmp_path):
     pump = svc._reader_thread
     assert _wait(lambda: "ready" in supervisor.logs(app_id, service_id)), \
         "the service never reported its detached child"
+    # "ready" only proves the fork happened, not that the child has finished
+    # detaching into its own session — see the comment above.
+    assert _wait(lambda: _find_session_leader(
+        ["sleep", str(_DETACHED_SLEEP_S)], tmp_path) is not None), \
+        "the detached child never became its own session leader"
 
-    supervisor.stop(app_id, service_id)
-    assert pump.is_alive() is True, (
-        "the log pipe closed before stop() returned — this test cannot reach "
-        "the interleaving it exists for")
-    assert svc.desired == "stopped"
+    try:
+        supervisor.stop(app_id, service_id)
+        assert pump.is_alive() is True, (
+            "the log pipe closed before stop() returned — this test cannot reach "
+            "the interleaving it exists for")
+        assert svc.desired == "stopped"
+    finally:
+        _kill_detached_sleep(tmp_path)
 
     pump.join(timeout=30)
     assert pump.is_alive() is False
@@ -190,26 +212,43 @@ def test_a_straggler_pump_does_not_spawn_a_third_copy(supervisor, fast_backoff, 
     copy next to the one already running."""
     app_id, service_id = _ids()
     supervisor.register(app_id, service_id,
-                        "sh -c 'setsid sleep 5 & echo ready; sleep 60'",
+                        f"sh -c 'setsid sleep {_DETACHED_SLEEP_S} & echo ready; sleep 60'",
                         str(tmp_path), autostart=False)
 
-    first = supervisor.start(app_id, service_id)
-    old_pump = supervisor._require(app_id, service_id)._reader_thread
-    assert _wait(lambda: "ready" in supervisor.logs(app_id, service_id))
+    try:
+        first = supervisor.start(app_id, service_id)
+        old_pump = supervisor._require(app_id, service_id)._reader_thread
+        assert _wait(lambda: "ready" in supervisor.logs(app_id, service_id))
+        # "ready" only proves the fork happened, not that the child has
+        # finished detaching into its own session (see
+        # test_a_deliberate_stop_is_not_respawned's docstring for the
+        # confirmed fork-vs-setsid race this closes) — restarting before
+        # that leaves the old pipe's extra fd reference vulnerable to the
+        # restart's own killpg.
+        assert _wait(lambda: _find_session_leader(
+            ["sleep", str(_DETACHED_SLEEP_S)], tmp_path) is not None)
 
-    second = supervisor.restart(app_id, service_id)
-    assert second["pid"] != first["pid"]
-    assert old_pump.is_alive() is True, (
-        "the old pipe closed before the restart completed — this test cannot "
-        "reach the window the identity check exists for")
+        try:
+            second = supervisor.restart(app_id, service_id)
+            assert second["pid"] != first["pid"]
+            assert old_pump.is_alive() is True, (
+                "the old pipe closed before the restart completed — this test cannot "
+                "reach the window the identity check exists for")
+        finally:
+            _kill_detached_sleep(tmp_path)
 
-    old_pump.join(timeout=30)
-    time.sleep(0.5)
+        old_pump.join(timeout=30)
+        time.sleep(0.5)
 
-    status = supervisor.status(app_id, service_id)
-    assert status["pid"] == second["pid"], (
-        "the straggler pump respawned the service on top of its own replacement")
-    assert status["running"] is True
+        status = supervisor.status(app_id, service_id)
+        assert status["pid"] == second["pid"], (
+            "the straggler pump respawned the service on top of its own replacement")
+        assert status["running"] is True
+    finally:
+        # The restart above spawned a SECOND detached child (its own start()
+        # backgrounds a fresh one) — the kill above only ever guarantees the
+        # first generation is gone; sweep again so nothing outlives the test.
+        _kill_detached_sleep(tmp_path)
 
 
 def test_five_startup_crashes_give_up_and_it_sticks(supervisor, fast_backoff, tmp_path):
