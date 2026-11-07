@@ -866,3 +866,32 @@ python3 -c "import json;print(json.load(open('apps/<slug>/aw-app.json'))['runtim
 The ADR that §2 restates:
 `repos/agentic-workspace/docs/knowledge_base/docs/architecture/adr-app-front-back-routes-dual-mode.md`
 (Decisions 1 and 2). It is in the **monolith** repo, not this one.
+
+## 14. Testing a socket — the `TestClient` context manager is not optional (addendum, 2026-11-07)
+
+**Every test that touches a websocket uses the `with TestClient(app) as
+client:` form.** A bare `TestClient(app)` makes a websocket test **hang**
+rather than fail, which is a much more expensive symptom to diagnose than an
+assertion error.
+
+Starlette/FastAPI's `TestClient` only runs the app's lifespan
+(startup/shutdown) events inside that context manager. Without it lifespan
+never starts, and a `websocket_connect` against an app that never finished
+starting up simply blocks instead of raising anything legible.
+
+```python
+with TestClient(app) as client:
+    with client.websocket_connect("/ws") as ws:
+        ...
+```
+
+If a test file already establishes this pattern — it usually does, once
+anyone has hit this — match it rather than instantiating a bare
+`TestClient(app)` for a new socket test. And **if a websocket test hangs
+instead of failing, check this before any lower-level debugging**: one
+session spent ~15 tool calls building four throwaway repro scripts
+(`repro_test.py` … `repro_test4.py`) to isolate exactly this.
+
+Added 2026-11-07 from `aw-autoskill-fastapi-testclient-websocket-hang-without-context-manager`,
+card `4115bf3b-9510-81fb-8509-de540f23bca0`, target
+`aw-autoskill-registry-sync-triage`.
