@@ -35,7 +35,7 @@ is specific to this tenant, it goes in that third location — never
 shipped to every deployment of aw-workspace, so a tenant workflow parked
 there leaks this workspace's accumulated knowledge into every other install
 on the next sync + commit + release. It is also not durable on its own — one
-such skill was written to `native-skills/aw-phd-notes/SKILL.md`, never
+such skill was written to `native-skills/aw-<topic>/SKILL.md`, never
 committed, and is simply gone. Write to the tenant store, then run
 `aw-workspace-cli agent sync`; no `git add`, no commit, no push, and it
 survives container recreation and a host-tree revert. The `aw-autoskill-`
