@@ -1,5 +1,5 @@
-# Lint configuration ONLY. This repo is deliberately NOT a pip-installable
-# package.
+# Lint and coverage configuration ONLY. This repo is deliberately NOT a
+# pip-installable package.
 #
 # ── WHY THERE IS NO [project] SECTION ─────────────────────────────────────
 # aw-workspace core runs off PATH (the repo root is on PATH — see the
@@ -47,3 +47,34 @@ select = ["E4", "E7", "E9", "F", "I"]
 # Matches `target-version` above and the runtime interpreter.
 py-version = "3.12"
 jobs = 0  # one process per core; the E-class sweep over src/ is CPU-bound.
+
+[tool.coverage.report]
+# Baseline measured 2026-11-06 on the existing ephemeral-PG+Redis `unit` job
+# (`.github/workflows/test.yml`), rounded down, same discipline as every
+# other repo on docs/standards/pipeline-testing.md. The term-missing table's
+# TOTAL column rounds to 89%, but the precise figure — what `fail_under`
+# actually compares against — is 88.69% (31345 statements, ~3545-3557
+# missed across 3 CI runs of the identical commit; the small variance is
+# itself evidence of the flake below, not noise worth chasing). A first
+# commit here set `fail_under = 89` off the rounded display and that CI run
+# caught its own mistake: "Required test coverage of 89.0% not reached.
+# Total coverage: 88.69%". 88 is the correct floor. coverage.py
+# auto-discovers this section from pyproject.toml with no `--cov-config`
+# needed, same as `aw-app-template`/`aw-app-uc-phd`.
+#
+# Known flake, not a regression: 2 of those 3 runs failed on
+# src/tests/integration/apps/test_services.py::
+# test_restart_on_the_owner_keeps_the_lease_for_the_new_process and/or
+# src/tests/integration/api/test_skills_routes.py::
+# test_open_returns_a_code_server_url — both passed clean on their own
+# before coverage instrumentation existed, and the third run (identical
+# commit, no retry logic, no code change) passed all 1797. Coverage.py's
+# per-line trace function adds enough overhead to shift the relative
+# timing these two tests depend on (the first explicitly engineers a
+# process/thread race via real sleeps; the second's failure mode — a 404
+# where a fixture-created skill should exist — points at a setup step not
+# finishing in its usual window). Neither is fixed here: both races live in
+# code unrelated to this card's scope, and masking them with retries would
+# hide the real finding. Flagged on card 4105bf3b-9510-8176 for separate
+# triage.
+fail_under = 88
