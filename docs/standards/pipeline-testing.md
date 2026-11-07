@@ -1083,3 +1083,111 @@ search will rate-limit as the fleet grows past ~60 repos, mitigated for now
 by the per-run cap. A consumer that hand-edits its own caller file while a
 bump PR from this checker is open gets a merge conflict, not a merge —
 acceptable, since PRs here are cheap to re-cut.
+
+## 13. A committed `ui/dist` needs its own CI gate (addendum, 2026-11-07)
+
+**Decision: any `aw-app-*` repo that commits a built `ui/dist` adds a
+`check-dist` job to its own `release.yml` and gates `release` on it with
+`needs: check-dist`.** Without it the repo can release, marketplace-update
+and pass code review while shipping a byte-identical **stale** frontend
+bundle, because the shared `app-release.yml` (§2) is Python-only and never
+runs `npm run build`.
+
+This is the frontend counterpart to §2's gate: §2 decides what the shared
+workflow enforces for Python; this decides what a repo must enforce locally
+for a bundle the shared workflow cannot see.
+
+### 13.1 The decisive measurement
+
+On 2026-09-27 `aw-app-tasks` and `aw-app-presentations` each had the same
+`plugin.jsx` fix released and marketplace-updated **twice**, and neither
+release ever reached a browser. `apps/<slug>/aw-app.json`'s
+`contributes.frontend.bundle` points at `ui/dist/*` and `routes.py` serves it
+straight off disk, so the stale committed bundle is what ships. A QA session
+caught it by diffing the **installed** dist against the guard string it
+expected — not by reading `ui/src/plugin.jsx` (correct) and not from the
+release run (green).
+
+Exposure check for any repo:
+
+```bash
+cd repos/aw-app-<slug>
+[ -d ui/dist ] && echo "dist tracked — exposed unless gated"
+grep -l check-dist .github/workflows/*.yml 2>/dev/null || echo "no gate yet"
+```
+
+As of 2026-09-28 only `aw-app-tasks` and `aw-app-presentations` had the gate.
+Confirmed exposed then (committed `ui/dist`, no `check-dist`), 17 repos:
+`aw-app-architecture`, `aw-app-call-agent`, `aw-app-code-agent-clis`,
+`aw-app-devctl`, `aw-app-diff-tool`, `aw-app-feed-subscriber`,
+`aw-app-mcp-tools`, `aw-app-mini-browser`, `aw-app-mobile`, `aw-app-plaud`,
+`aw-app-portrait`, `aw-app-remote-host-terminal`, `aw-app-remote-screen`,
+`aw-app-research-search`, `aw-app-template`, `aw-app-uc-phd`,
+`aw-app-whiteboard`. Re-measure before acting — that list is a 2026-09-28
+snapshot, not a contract (§9). `aw-app-kb` also commits a `ui/dist` but is
+Tier-2/container-built; check its own publish pipeline rather than assuming
+this gap applies verbatim.
+
+### 13.2 The job (verified live in `aw-app-tasks` and `aw-app-presentations`)
+
+```yaml
+  check-dist:
+    # Same skip condition as app-release.yml's own `release` job — the bot's
+    # own version-bump commit re-triggers this push event and never touches
+    # ui/, so there is nothing to check.
+    if: ${{ !contains(github.event.head_commit.message, '[skip release]') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Rebuild ui/dist and diff against the committed copy
+        run: |
+          set -euo pipefail
+          cd ui
+          npm ci --cache "$RUNNER_TEMP/npm-cache"
+          npm run build
+          cd ..
+          if ! git diff --exit-code -- ui/dist; then
+            echo "::error::ui/dist does not match a fresh build of ui/src — commit the rebuilt bundle (cd ui && npm run build) before pushing."
+            exit 1
+          fi
+```
+
+Then on the existing job:
+
+```yaml
+  release:
+    needs: check-dist
+```
+
+Pins above match the two live gated repos as of 2026-11-07
+(`actions/checkout@v7`, `actions/setup-node@v5`, `runs-on: ubuntu-24.04`) —
+re-read one of them rather than copying this verbatim once it has aged (§9).
+
+Simulate before pushing — `rm -rf ui/node_modules && npm ci && npm run build
+&& git status --short -- ui/dist` should come back clean if source and
+committed dist already agree. Watch the first real `check-dist` run
+(`gh run view <id> --log | grep -A5 check-dist`) rather than assuming it
+fired.
+
+### 13.3 Verifying one specific fix shipped
+
+Don't trust source or CI alone:
+
+```bash
+grep -o "<your guard string>" apps/<slug>/ui/dist/*.js
+# or the live served bundle:
+curl -s http://127.0.0.1:9030/api/apps/<slug>/ui/<bundle>.js | grep -o "<guard>"
+```
+
+Present in `ui/src/plugin.jsx` but missing from `ui/dist` means the fix never
+shipped: rebuild (`cd ui && npm ci && npm run build`), commit the diff,
+re-release. Edit `repos/aw-app-<slug>` — `apps/<slug>` is an installed copy,
+not the source.
+
+Added 2026-11-07 from
+`aw-autoskill-app-committed-dist-needs-check-dist-gate`, card
+`4115bf3b-9510-81fb-8509-de540f23bca0`, target
+`aw-autoskill-registry-sync-triage`.

@@ -21,12 +21,33 @@ marketplace, or agent orchestration, **open and follow the matching
 `SKILL.md` instead of improvising.**
 
 **`skills/` is generated and gitignored — never edit it.** It is the merge of
-two sources, and which one you edit depends on who owns the skill:
+three sources, and which one you edit depends on who owns the skill:
 
 | Source | Holds | Committed? |
 |---|---|---|
 | `native-skills/<name>/` | the skills this repo owns | yes, here |
 | an app's `contributes.skills` | everything an installed app adds | in that app's repo |
+| `.aw-workspace/data/aw-autoskill/skills/<name>/` | **this tenant's own** skills — anything shaped by this workspace's hosts, accounts, corpus or personal workflow | no, and it must not be |
+
+**If you decide mid-task that a recurring workflow deserves a skill, and it
+is specific to this tenant, it goes in that third location — never
+`native-skills/`.** `native-skills/` is this repo's product tree: public, and
+shipped to every deployment of aw-workspace, so a tenant workflow parked
+there leaks this workspace's accumulated knowledge into every other install
+on the next sync + commit + release. It is also not durable on its own — one
+such skill was written to `native-skills/aw-phd-notes/SKILL.md`, never
+committed, and is simply gone. Write to the tenant store, then run
+`aw-workspace-cli agent sync`; no `git add`, no commit, no push, and it
+survives container recreation and a host-tree revert. The `aw-autoskill-`
+prefix is not required — that prefix marks skills written by the *scheduled*
+`aw-autoskill` run; a session-authored tenant skill can use a plain
+`aw-<topic>` name. Also publish it to this workspace's own skills registry
+(`aw__skills__create_skill(..., visibility='private')`) — the store write is
+the offline fallback, the registry is the copy every other consumer reads;
+see the `aw-autoskill` skill for the retry and REST-fallback detail. Write to
+`native-skills/` only when the knowledge is genuinely generic product
+behaviour meant for every deployment, and then follow through with the real
+commit, because an uncommitted change there is not expected to survive.
 
 Each app-contributed copy carries a hidden `.aw-app-id` naming its owner —
 that marker is how the sync knows which entries are not its to delete, and

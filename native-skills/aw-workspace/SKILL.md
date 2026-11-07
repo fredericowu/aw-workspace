@@ -176,13 +176,61 @@ user" — anyone who can read `.env` inside the container already has that
 level of access. It is intentionally **not** wired into `update.py` (below),
 which needs real per-user, cross-workspace auth.
 
-If you add a new `aw-workspace-cli` command — or any ad hoc script — that
-needs to call this workspace's own API, reuse `src/cli/local_client.py`'s
-`request(method, path, json_body=None)`; it already resolves the right base
-URL (loopback vs. the tunnel URL) and attaches the `X-Api-Key` header. Don't
-hand-roll a `curl -H "X-Api-Key: ..."` by grepping `.env` yourself — that
-duplicates exactly what `local_client.request()` already does correctly,
-including the loopback/tunnel fallback.
+**Any time you call this workspace's own API from a terminal — for any
+reason** — reuse `src/cli/local_client.py`'s
+`request(method, path, json_body=None, timeout=30.0)`. That covers adding a
+new `aw-workspace-cli` command, but equally: curl-testing a route on an app
+you are building, and ad-hoc diagnostics against a live app. It already
+resolves the right base URL (loopback vs. the tunnel URL) and attaches the
+`X-Api-Key` header. Don't hand-roll a `curl -H "X-Api-Key: ..."` by grepping
+`.env` yourself — that duplicates exactly what `local_client.request()`
+already does correctly, including the loopback/tunnel fallback, and because
+each shell invocation is a fresh process with no persisted variables, the
+boilerplate gets re-derived on every single call. Three sessions did it 32+
+times between them.
+
+```bash
+cd /opt/aw-workspace && python3 -c "
+from src.cli.local_client import request
+status, body = request('GET', '/api/apps/<slug>/config')
+print(status, body)
+"
+```
+
+**A slow endpoint needs `timeout=` on the call itself. A shell `timeout N`
+wrapper does not extend it** — that only bounds the outer process, while the
+httpx read timeout inside still fires at its own 30s default. One session
+used `request()` correctly 128 times and *also* fell back to raw
+`curl --max-time 300` 111 times in the same investigation, having first hit
+`httpx.ReadTimeout` and then wrapped the Bash call in `timeout 300` with no
+effect, before finding the kwarg:
+
+```bash
+cd /opt/aw-workspace && timeout 300 python3 -c "
+from src.cli.local_client import request
+status, body = request('POST', '/api/apps/<slug>/<slow-route>', {}, timeout=280)
+print(status, body)
+"
+```
+
+For anything expected to run long — a sync tick, a `refresh=true` catalog
+rebuild, a bulk ingest or reconcile passthrough — set `timeout=` from the
+start rather than waiting for a `ReadTimeout` to discover it.
+
+**Don't guess a host:port first.** An app's HTTP routes are mounted under
+`/api/apps/<app_slug>/...` on the main workspace server, which is not the
+same thing as the Tier-2 container the app may wrap — two sessions each
+wasted a round trip curling a container's own address (`<service>:8090`,
+`localhost:8787`) before falling back to `local_client`. Grep the router for
+the real path, then call it through `request()`:
+
+```bash
+grep -rn '@app\.\(get\|post\|patch\|delete\)' <app_dir>
+```
+
+A Tier-2 app's own container is a legitimate target for *some* calls, but a
+connector or wrapper app's routes are not the same thing as the backend
+container it wraps.
 
 ## `aw-workspace-cli restart core` vs. `update workspace`
 
