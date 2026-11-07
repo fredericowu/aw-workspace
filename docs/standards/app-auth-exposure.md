@@ -43,7 +43,7 @@ search.
 | `src/apps/manifest.py` | where an app declares `public` / `auth_required` in its manifest |
 | `src/apps/proxy.py` | reads that flag when proxying a request into the app's container |
 | `src/apps/runtime.py` | `_attach_mount` / container mount wiring; also the subdomain-adjacent logic |
-| `src/api/app.py` | `AppSubdomainMiddleware` — the ASGI-level piece deciding enforcement from the `Host:` header for subdomain-mounted apps (`<app>.app.aw.workspace.*`) |
+| `repos/aw-backend/src/api/app.py` | `AppSubdomainMiddleware` — the ASGI-level piece deciding enforcement from the `Host:` header for subdomain-mounted apps (`<app>.app.aw.workspace.*`). **Not in this repo**: `src/api/app.py` here carries only `_ScopedCORSMiddleware` and `_ConfigGenerationMiddleware` |
 | `repos/aw-backend/src/api/routes/app_auth_gate.py` | the gate aw-backend actually runs in front of a proxied app |
 | `repos/aw-backend/src/libs/caddy_template.py`, `…/workspace_caddy_template.py` | generate the Caddy config fronting the app's hostname; per-hostname auth policy is baked in here too |
 | `repos/aw-backend/src/api/routes/workspace_tunnel_proxy.py` | the path taken when the app is reached through the workspace tunnel domain instead of a direct subdomain |

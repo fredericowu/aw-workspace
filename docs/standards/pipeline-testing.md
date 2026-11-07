@@ -1136,10 +1136,10 @@ this gap applies verbatim.
     # own version-bump commit re-triggers this push event and never touches
     # ui/, so there is nothing to check.
     if: ${{ !contains(github.event.head_commit.message, '[skip release]') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
       - name: Rebuild ui/dist and diff against the committed copy
@@ -1161,6 +1161,10 @@ Then on the existing job:
   release:
     needs: check-dist
 ```
+
+Pins above match the two live gated repos as of 2026-11-07
+(`actions/checkout@v7`, `actions/setup-node@v5`, `runs-on: ubuntu-24.04`) —
+re-read one of them rather than copying this verbatim once it has aged (§9).
 
 Simulate before pushing — `rm -rf ui/node_modules && npm ci && npm run build
 && git status --short -- ui/dist` should come back clean if source and

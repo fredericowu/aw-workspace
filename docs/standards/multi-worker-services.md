@@ -161,36 +161,62 @@ traffic.
   own this". Fix the ownership claim.
 - Don't trust a green deploy workflow as proof for this class of bug.
 
-## 6. Known-open instance
+## 6. The reference instance — architecture provision jobs (**closed** 2026-09-30)
 
-`apps/architecture/architecture_app/jobs.py:47` keeps its provision-run job
-registry (`_jobs`) as a bare in-process dict under
-`AW_WORKSPACE_WORKERS=10`. `POST /provision/run` returns a job id from
-whichever worker handled it; the CLI's first poll
-(`GET /testcases/jobs/<id>`) can land on a different worker and get
-`404 no such run job`, surfacing as "lost track of the job" even though no
-component failed to provision. **Pattern A**, first documented 2026-09-07,
-re-diagnosed from scratch 10+ times since.
+The most expensive instance of **pattern A** in this workspace, and the one
+to read as a second worked example of §2, because the measurement and the
+cost are both on record.
 
-It is also a self-inflicted dispatch loop: the scheduled task *Architecture
-Test Provisioning* (`task-e2ee290d09af`, cron `20 * * * *`) runs
-`aw-workspace-cli architecture autoprovision` hourly and dispatches a fresh,
-memory-less agent whenever the exit code **changes**. The race is genuinely
-probabilistic, so the exit code flips unpredictably and every flip is a
-"change" — 10 separate dispatches in one 48h window, each re-grepping
-`jobs.py` to reach the same conclusion.
+`apps/architecture/architecture_app/jobs.py` kept its provision-run job
+registry as a bare in-process `_jobs` dict under `AW_WORKSPACE_WORKERS=10` —
+ten processes, ten heaps, no request stickiness. `POST /provision/run`
+created the job on whichever worker answered; the very next
+`GET /testcases/jobs/<id>` landed on a different one, found nothing and
+returned `404 no such run job`, surfacing to a user as "lost track of the
+job" even though every component had provisioned correctly.
 
-**If you land here:** run `aw-workspace-cli architecture provision --check`
-(read-only, ~10s) and report "known cross-worker job-registry race, no
-component failed". Do not re-grep `jobs.py` cold.
+**Measured before the fix: 7 of 12 consecutive polls of one healthy job came
+back 404.** That is the shape of evidence this class of bug needs — not a
+re-read of the diff.
 
-**To actually close it**, one of: (a) apply §2 — move `_jobs` to
-Redis/Postgres with an atomic claim, using §2's worked template; this is the
-only option that stops the exit code flapping at all; or (b) change
-`task-e2ee290d09af` so a bare `no such run job` 404 with all components
-`--check`-clean is a non-notable exit. Neither has been done. (a) is a
-cross-worker state migration and (b) changes a monitoring task's alerting
-contract, so both want a human decision rather than an unprompted change.
+The cost was not the 404. `aw-workspace-cli architecture autoprovision` read
+it as a failure and exited non-zero, and the hourly *Architecture Test
+Provisioning* task escalated every exit-code **change** to a fresh,
+memory-less agent. Because the race is probabilistic the exit code flapped,
+so every flip was a "change": ~1.56M input tokens in one 14h window, and at
+least ten rounds since 2026-09-07 each independently re-deriving the same
+diagnosis.
+
+**The fix is §2 applied literally** (landed 2026-09-30, Kanban
+`3eb5bf3b-9510-810a-a513-ec5628c2656f`): each job is **also** written to a
+TTL'd Redis key (`aw:ws:<ws>:architecture:job:<id>`) that every worker can
+read. Four details worth copying:
+
+- **The mirror is strictly additive.** The owning worker's `_jobs` entry stays
+  authoritative for its own jobs — it holds the live object the run thread
+  mutates. Only *visibility* moved to Redis, not ownership of the object.
+- **A TTL plus a heartbeat answers the original objection.** The module used
+  to argue against a shared registry on durability grounds: a workspace
+  restart kills whatever was running, so a "running" row would outlive the
+  thing it describes. A short-lived entry renewed by a heartbeat from the
+  owning worker means a dead worker takes its claim with it (§2's expiry
+  rule); a finished job is retained for exactly the same window the
+  in-process copy was, then expires. The durable record is still
+  `last_run_status` on the testcase.
+- **Every store call degrades, never fails a request.** An unreachable Redis
+  falls back to exactly the pre-fix worker-local behaviour.
+- **A failed call opens a breaker for 30s.** Otherwise "Redis is unreachable"
+  becomes "every poll waits for a socket timeout first", which is worse than
+  the bug.
+
+`AW_ARCHITECTURE_JOBS_SHARED=0` turns the mirror off outright — tests that
+want purely worker-local behaviour, and the field escape hatch.
+
+**If you land on a `no such run job` 404 today**, it is not the known race:
+that is closed and on by default. Run `aw-workspace-cli architecture
+provision --check` (read-only, ~10s) to establish whether any component
+actually failed, then investigate as a new bug — including whether the mirror
+is disabled or the store is unreachable.
 
 ## 7. Provenance
 
@@ -199,3 +225,9 @@ Consolidated on 2026-11-07 from the `aw-autoskill` tenant store, card
 
 - `aw-autoskill-workers-n-fanout-audit-and-fix` → §1, §2, §4, §5, §6
 - `aw-autoskill-uvicorn-worker-silent-log-drop` → §3
+
+§6 **corrects** its source skill, which recorded the architecture job-registry
+race as still open and option (a) as not done. It shipped 2026-09-30 and is on
+by default; `jobs.py`'s own module docstring is the authority. The section is
+kept, rewritten as the closed reference instance, because its measurement and
+its cost are the best argument this document has for §2.
