@@ -542,6 +542,49 @@ def test_boot_style_reconcile_does_not_fan_the_skill_mirrors_out(tmp_path, monke
     _async(run())
 
 
+def test_concurrent_installs_do_not_race_the_skill_mirror_fan_out(tmp_path, monkeypatch):
+    """``_provisioning()`` releases its lock before the fan-out runs
+    (deliberately — see ``install()``'s own docstring, so a slow fan-out
+    never makes another worker's install wait on it), so two installs of
+    DIFFERENT apps could otherwise launch two concurrent
+    ``asyncio.to_thread(skills_sync.sync_all)`` calls and interleave writes/
+    deletes against the same shared mirror dirs. ``_skill_mirror_lock`` must
+    serialize them within this process."""
+    from src.libs import skills_sync as skills_sync_mod
+
+    repo_a = _make_app_repo(tmp_path, "aaa")
+    repo_b = _make_app_repo(tmp_path, "bbb")
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    in_flight = 0
+    max_concurrent = 0
+    real_sync_all = skills_sync_mod.sync_all
+
+    def spy_sync_all(*a, **kw):
+        nonlocal in_flight, max_concurrent
+        in_flight += 1
+        max_concurrent = max(max_concurrent, in_flight)
+        try:
+            time.sleep(0.05)  # runs on a real OS thread via asyncio.to_thread
+            return real_sync_all(*a, **kw)
+        finally:
+            in_flight -= 1
+
+    monkeypatch.setattr(skills_sync_mod, "sync_all", spy_sync_all)
+
+    async def run():
+        await asyncio.gather(
+            rc.install(AppSpec(app_id="aaa", repo=repo_a, ref="main")),
+            rc.install(AppSpec(app_id="bbb", repo=repo_b, ref="main")),
+        )
+        assert max_concurrent == 1, (
+            f"{max_concurrent} concurrent skills_sync.sync_all() calls — the "
+            "fan-out lock did not serialize them")
+
+    _async(run())
+
+
 def test_reconcile_no_version_drift_is_a_noop(tmp_path, monkeypatch):
     repo = _make_app_repo(tmp_path, "widget", "1.0.0")
     cloud = FakeCloud()

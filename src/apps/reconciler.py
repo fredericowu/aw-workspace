@@ -251,6 +251,16 @@ class Reconciler:
         # survives. Created lazily; safe because there is no await between the
         # lookup and the insert.
         self._app_locks: dict[str, asyncio.Lock] = {}
+        # Serializes the skill-mirror fan-out ONLY — deliberately a separate,
+        # cheap, in-process lock rather than reusing _provisioning()'s
+        # cross-worker mutex, since the whole point of running the fan-out
+        # outside that lock is to not make every other worker's next install
+        # wait on this one's Redis round-trip. Without this, two installs of
+        # DIFFERENT apps (which _provisioning() does not serialize against
+        # each other once each has released it) could each launch their own
+        # asyncio.to_thread(skills_sync.sync_all) and interleave writes/
+        # deletes against the same shared mirror dirs.
+        self._skill_mirror_lock = asyncio.Lock()
 
     # ---- MCP gateway rescan triggers ---------------------------------------
 
@@ -970,10 +980,13 @@ class Reconciler:
                 spec, write_cloud=write_cloud, _dependency_stack=_dependency_stack)
         # Outside the lock: the shared state is already committed, so holding
         # the mutex across the fan-out would only make every other worker's
-        # next install wait on this one's Redis round-trip.
+        # next install wait on this one's Redis round-trip. _skill_mirror_lock
+        # still serializes the fan-out itself against a concurrent install of
+        # a DIFFERENT app in this same process (see its own docstring).
         if sync_skill_mirrors:
             try:
-                await asyncio.to_thread(skills_sync.sync_all)
+                async with self._skill_mirror_lock:
+                    await asyncio.to_thread(skills_sync.sync_all)
             except Exception:
                 log.exception(
                     "apps: skill mirror fan-out failed after installing %s",
@@ -1264,7 +1277,8 @@ class Reconciler:
             result = await self._reconcile_provisioned(desired)
         if sync_skill_mirrors and (result.get("installed") or result.get("upgraded")):
             try:
-                await asyncio.to_thread(skills_sync.sync_all)
+                async with self._skill_mirror_lock:
+                    await asyncio.to_thread(skills_sync.sync_all)
             except Exception:
                 log.exception("apps: skill mirror fan-out failed after reconcile")
         return result
