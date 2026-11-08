@@ -500,9 +500,15 @@ class _RecordingLifecycle:
         yield
 
 
-def _wedge_reconciler(monkeypatch):
+def _wedge_reconciler(monkeypatch, tmp_path):
     from src.apps.reconciler import Reconciler
 
+    # reconcile()'s skill-mirror fan-out (sync_skill_mirrors, default True)
+    # runs for real once a pass reports something installed/upgraded — the
+    # fake _reconcile_pass bodies below return exactly that, so without this
+    # it would materialize/mirror the REAL skills/ tree this suite runs
+    # inside instead of staying a pure in-memory test.
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
     lifecycle = _RecordingLifecycle()
     reconciler = Reconciler(AppRuntime(FastAPI()), lifecycle=lifecycle)
     monkeypatch.setattr(type(reconciler.cloud), "configured",
@@ -510,7 +516,7 @@ def _wedge_reconciler(monkeypatch):
     return reconciler, lifecycle
 
 
-def test_a_reconcile_pass_that_raises_leaves_the_flags_disarmed(monkeypatch):
+def test_a_reconcile_pass_that_raises_leaves_the_flags_disarmed(monkeypatch, tmp_path):
     """The wedge, as a regression test (card 3fc5bf3b).
 
     ``_pending_broadcast = False`` does not mean "nothing pending" — it means
@@ -519,7 +525,7 @@ def test_a_reconcile_pass_that_raises_leaves_the_flags_disarmed(monkeypatch):
     that worker, including the one at the end of every config save it served:
     measured live as 1-in-5 workers holding fresh config, with no log line.
     """
-    reconciler, lifecycle = _wedge_reconciler(monkeypatch)
+    reconciler, lifecycle = _wedge_reconciler(monkeypatch, tmp_path)
 
     async def _boom(desired=None):
         # An app installed earlier in the pass asked for a broadcast...
@@ -543,7 +549,7 @@ def test_a_reconcile_pass_that_raises_leaves_the_flags_disarmed(monkeypatch):
     assert lifecycle.published[-1] == ("config", "knowledgeable")
 
 
-def test_a_cancelled_reconcile_pass_leaves_the_flags_disarmed(monkeypatch):
+def test_a_cancelled_reconcile_pass_leaves_the_flags_disarmed(monkeypatch, tmp_path):
     """The likelier trigger of the two: ``reconcile_on_boot`` bounds the boot
     pass with ``asyncio.wait_for(..., 1200)`` and a manual reconcile can be cut
     by the tunnel edge at 30s — both CANCEL the coroutine mid-pass.
@@ -553,7 +559,7 @@ def test_a_cancelled_reconcile_pass_leaves_the_flags_disarmed(monkeypatch):
     that the ``finally`` does not ``await`` on this path: an ``await`` in a
     cancelled task re-raises at once, which would skip whatever came after it.
     """
-    reconciler, lifecycle = _wedge_reconciler(monkeypatch)
+    reconciler, lifecycle = _wedge_reconciler(monkeypatch, tmp_path)
     started = asyncio.Event()
 
     async def _hangs(desired=None):
@@ -582,10 +588,10 @@ def test_a_cancelled_reconcile_pass_leaves_the_flags_disarmed(monkeypatch):
     assert lifecycle.published == [("config", "knowledgeable")]
 
 
-def test_a_clean_reconcile_pass_still_publishes_exactly_once(monkeypatch):
+def test_a_clean_reconcile_pass_still_publishes_exactly_once(monkeypatch, tmp_path):
     """Control case for the two above: the finally must not DOUBLE-publish the
     broadcast the pass already flushed itself."""
-    reconciler, lifecycle = _wedge_reconciler(monkeypatch)
+    reconciler, lifecycle = _wedge_reconciler(monkeypatch, tmp_path)
 
     asyncio.run(reconciler.reconcile(desired=[]))
 

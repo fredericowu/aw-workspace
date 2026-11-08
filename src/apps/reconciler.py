@@ -57,6 +57,7 @@ from src.apps.capabilities import filter_grants
 from src.apps.manifest import load_manifest
 from src.apps.registry_client import CloudRegistry
 from src.apps.runtime import AppRuntime
+from src.libs import skills_sync
 
 if TYPE_CHECKING:  # pragma: no cover
     from src.apps.lifecycle import AppLifecycle
@@ -942,7 +943,8 @@ class Reconciler:
     # ---- install / uninstall -----------------------------------------------
 
     async def install(self, spec: AppSpec, *, write_cloud: bool = True,
-                      _dependency_stack: tuple[str, ...] = ()) -> dict[str, Any]:
+                      _dependency_stack: tuple[str, ...] = (),
+                      sync_skill_mirrors: bool = True) -> dict[str, Any]:
         """Fetch → validate → enforce → hot-load → persist. Returns a summary.
 
         W3: this is the PROVISION half in full (see ``src/apps/lifecycle.py``)
@@ -952,6 +954,16 @@ class Reconciler:
         :meth:`_provisioning` and announced to them by the ``apps:changed``
         broadcast at the end. The other workers reach the same end state
         through :meth:`attach`, which can do none of those things.
+
+        ``sync_skill_mirrors`` fans skills/ out to .claude/.cursor/.gemini
+        right here, in-request, so a mid-life update doesn't leave those
+        mirrors stale until the next boot or a manual ``agent sync``
+        (``_register_skills``/``skill_sources.refresh`` inside
+        ``runtime.load`` already refresh ``skills/`` itself — this is only
+        the mirror fan-out, which they deliberately skip). Callers that
+        converge many apps in one pass (reconcile's own install_one/upgrade
+        loop) pass ``False`` and let the pass fan out once at its own level
+        instead of once per app.
         """
         async with self._provisioning():
             summary = await self._install_provisioned(
@@ -959,6 +971,13 @@ class Reconciler:
         # Outside the lock: the shared state is already committed, so holding
         # the mutex across the fan-out would only make every other worker's
         # next install wait on this one's Redis round-trip.
+        if sync_skill_mirrors:
+            try:
+                await asyncio.to_thread(skills_sync.sync_all)
+            except Exception:
+                log.exception(
+                    "apps: skill mirror fan-out failed after installing %s",
+                    summary.get("app_id"))
         await self._trigger_broadcast("install", summary.get("app_id"))
         return summary
 
@@ -1216,7 +1235,8 @@ class Reconciler:
 
     # ---- the reconcile itself ----------------------------------------------
 
-    async def reconcile(self, desired: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    async def reconcile(self, desired: list[dict[str, Any]] | None = None, *,
+                        sync_skill_mirrors: bool = True) -> dict[str, Any]:
         """Converge actual (loaded) → desired (registry). Install missing,
         uninstall extra. ``desired`` defaults to the cloud registry, falling
         back to the local mirror when the cloud isn't configured/reachable.
@@ -1227,9 +1247,27 @@ class Reconciler:
         single ``apps:changed`` this publishes at the end. Callers decide who
         that one worker is (see ``src/api/app.py``'s boot path); this method
         just makes sure two of them can never overlap.
+
+        ``sync_skill_mirrors`` (default True) fans ``skills/`` out to
+        .claude/.cursor/.gemini ONCE after the pass, when it actually
+        installed or upgraded something — the pass's own internal
+        ``install()`` calls always pass ``sync_skill_mirrors=False`` so N
+        converged apps don't each redo the same mirror copy. This is what
+        makes the single-app ``POST /api/apps/{slug}/update`` route (which
+        goes through this method, not ``install()`` directly) refresh the
+        mirrors in-request. Boot (``reconcile_on_boot``) and the periodic
+        convergence watchdog pass ``False`` — boot is already followed by
+        ``sync_on_boot()``, and an unattended background pass has no reason
+        to eagerly rewrite shared mirror dirs on its own schedule.
         """
         async with self._provisioning():
-            return await self._reconcile_provisioned(desired)
+            result = await self._reconcile_provisioned(desired)
+        if sync_skill_mirrors and (result.get("installed") or result.get("upgraded")):
+            try:
+                await asyncio.to_thread(skills_sync.sync_all)
+            except Exception:
+                log.exception("apps: skill mirror fan-out failed after reconcile")
+        return result
 
     async def _reconcile_provisioned(
             self, desired: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -1472,7 +1510,10 @@ class Reconciler:
                     # failure now leaves `dest` untouched instead of gone.
                     await self.uninstall(app_id, write_cloud=False,
                                          purge_secrets=False, remove_repo=False)
-                    await self.install(spec, write_cloud=False)
+                    # sync_skill_mirrors=False: this pass fans skill mirrors
+                    # out once at its own level (see reconcile()), not once
+                    # per upgraded app.
+                    await self.install(spec, write_cloud=False, sync_skill_mirrors=False)
                     upgraded.append(app_id)
                 except Exception as e:  # noqa: BLE001
                     log.exception("apps: reconcile failed to upgrade %s", app_id)
@@ -1487,7 +1528,8 @@ class Reconciler:
                     # deleted, so nothing is lost even when both attempts do.
                     if previous is not None and previous.package_dir:
                         try:
-                            await self.install(previous, write_cloud=False)
+                            await self.install(previous, write_cloud=False,
+                                              sync_skill_mirrors=False)
                             log.warning("apps: %s rolled back to %s after a failed "
                                         "upgrade", app_id, running_version or "?")
                             errors[-1]["rolled_back_to"] = running_version or "?"
@@ -1579,7 +1621,10 @@ class Reconciler:
         async def install_one(app_id: str, spec: AppSpec) -> None:
             started = time.monotonic()
             try:
-                summary = await self.install(spec, write_cloud=False)
+                # sync_skill_mirrors=False: fanned out once at the reconcile()
+                # level instead of once per installed app in this pool.
+                summary = await self.install(spec, write_cloud=False,
+                                             sync_skill_mirrors=False)
                 if summary.get("skipped") == "already-loaded":
                     already_loaded.append(app_id)
                 else:

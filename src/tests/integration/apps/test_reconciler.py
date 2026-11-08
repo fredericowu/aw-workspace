@@ -250,6 +250,12 @@ async def _get(host, path):
 
 def _reconciler(tmp_path, monkeypatch, cloud, fetch=None):
     monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path / "apps"))
+    # Isolate skills_sync's workspace root too: install()/reconcile() now
+    # fan the skills mirrors out as part of a normal install/upgrade (see
+    # Reconciler.install/reconcile's sync_skill_mirrors), and without this
+    # that fan-out would materialize/mirror the REAL skills/ tree this
+    # suite happens to run inside.
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
     host = FastAPI()
     rt = AppRuntime(host, guard_identity=False)
     rc = Reconciler(rt, cloud=cloud, local=FakeMirror(),
@@ -465,6 +471,77 @@ def test_reconcile_version_drift_triggers_upgrade_uninstall_then_install(tmp_pat
     _async(run())
 
 
+def test_update_shaped_reconcile_fans_the_skill_mirrors_out_in_request(tmp_path, monkeypatch):
+    """The residual gap this card closes (card 3ca5bf3b): ``POST
+    /api/apps/{slug}/update`` goes through ``Reconciler.reconcile()``, not
+    ``install()`` directly (see ``update_app`` in src/apps/routes.py) — so a
+    single-app version-drift upgrade, exactly like the one above, must also
+    refresh the .claude/.cursor/.gemini mirrors in-request, without a manual
+    ``aw-workspace-cli agent sync`` and without waiting for the next boot.
+    ``reconcile()``'s ``sync_skill_mirrors`` defaults to True for exactly
+    this caller."""
+    repo_v1 = _make_app_repo(tmp_path, "widget", "1.0.0")
+    cloud = FakeCloud()
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    root = tmp_path / "root"
+    native_skill = root / "native-skills" / "demo-skill"
+
+    async def run():
+        await rc.install(AppSpec(app_id="widget", repo=repo_v1, ref="main"))
+
+        # Added only AFTER the initial install, so the mirror copy below can
+        # only have come from the upcoming reconcile()'s OWN fan-out — not
+        # from install()'s (which already ran, before this skill existed).
+        native_skill.mkdir(parents=True)
+        (native_skill / "SKILL.md").write_text("# demo skill\n")
+
+        repo_v2 = _make_app_repo(tmp_path, "widget", "2.0.0")
+        cloud.rows = [{"app_id": "widget", "version": "2.0.0", "repo": repo_v2,
+                       "ref": "main", "granted_permissions": ["routes:register"],
+                       "config": {}, "state": "installed"}]
+
+        result = await rc.reconcile()  # default sync_skill_mirrors=True
+        assert result["upgraded"] == ["widget"]
+
+        for cli in ("claude", "cursor", "gemini"):
+            mirrored = root / f".{cli}" / "skills" / "demo-skill" / "SKILL.md"
+            assert mirrored.is_file(), f".{cli}/skills was not fanned out in-request"
+            assert mirrored.read_text() == "# demo skill\n"
+
+    _async(run())
+
+
+def test_boot_style_reconcile_does_not_fan_the_skill_mirrors_out(tmp_path, monkeypatch):
+    """The other half of the same constraint: an unattended multi-app
+    convergence pass — what ``reconcile_on_boot`` and the periodic
+    convergence watchdog both run, see their ``sync_skill_mirrors=False``
+    calls in src/apps/routes.py — must NOT rewrite the shared mirror dirs
+    itself. ``sync_on_boot`` (boot) or the next explicit action owns that
+    instead, so N converged apps never redo the same mirror copy."""
+    repo = _make_app_repo(tmp_path, "widget", "1.0.0")
+    cloud = FakeCloud([{"app_id": "widget", "version": "1.0.0", "repo": repo,
+                        "ref": "main", "granted_permissions": ["routes:register"],
+                        "config": {}, "state": "installed"}])
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    root = tmp_path / "root"
+    native_skill = root / "native-skills" / "demo-skill"
+    native_skill.mkdir(parents=True)
+    (native_skill / "SKILL.md").write_text("# demo skill\n")
+
+    async def run():
+        result = await rc.reconcile(sync_skill_mirrors=False)
+        assert result["installed"] == ["widget"]
+        assert rt.is_loaded("widget")
+
+        for cli in ("claude", "cursor", "gemini"):
+            assert not (root / f".{cli}" / "skills" / "demo-skill").exists(), (
+                f".{cli}/skills was fanned out during a boot-style reconcile pass")
+
+    _async(run())
+
+
 def test_reconcile_no_version_drift_is_a_noop(tmp_path, monkeypatch):
     repo = _make_app_repo(tmp_path, "widget", "1.0.0")
     cloud = FakeCloud()
@@ -560,6 +637,7 @@ def test_install_does_not_block_the_event_loop_during_fetch(tmp_path, monkeypatc
         return _fake_fetch(*args, **kwargs)
 
     monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path / "apps"))
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
     host = FastAPI()
     rt = AppRuntime(host, guard_identity=False)
     rc = Reconciler(rt, cloud=cloud, local=FakeMirror(), fetch=slow_fetch)
@@ -1533,9 +1611,9 @@ def test_boot_starts_the_gateway_rescan_watchdog_while_the_pass_is_still_running
             (as BOOT_PRIORITY now guarantees), then keeps running for a long
             time — the other 46 apps."""
 
-            async def reconcile(self):
+            async def reconcile(self, *, sync_skill_mirrors=True):
                 await rc.install(AppSpec(app_id="mcp-gateway", repo=gw_repo, ref="main"),
-                                 write_cloud=False)
+                                 write_cloud=False, sync_skill_mirrors=False)
                 gateway_up.set()
                 await release.wait()
                 return {"installed": ["mcp-gateway"]}

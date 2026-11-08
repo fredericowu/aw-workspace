@@ -2113,7 +2113,8 @@ def _start_convergence_watchdog(
         in_flight["running"] = True
         try:
             result = await asyncio.wait_for(
-                reconciler.reconcile(), timeout=_BOOT_RECONCILE_TIMEOUT)
+                reconciler.reconcile(sync_skill_mirrors=False),
+                timeout=_BOOT_RECONCILE_TIMEOUT)
             # Only when it DID something — a converged workspace would
             # otherwise log an identical line every interval forever.
             if result:
@@ -2156,7 +2157,9 @@ async def reconcile_on_boot(app: FastAPI) -> None:
     # watchdog start ticking then, covering every app that comes up behind it.
     rescan_starter = asyncio.ensure_future(_start_gateway_rescan_when_loaded(app))
     try:
-        result = await asyncio.wait_for(reconciler.reconcile(), timeout=_BOOT_RECONCILE_TIMEOUT)
+        result = await asyncio.wait_for(
+            reconciler.reconcile(sync_skill_mirrors=False),
+            timeout=_BOOT_RECONCILE_TIMEOUT)
         log.info("apps: boot reconcile — %s", result)
     except asyncio.TimeoutError:
         log.error(
