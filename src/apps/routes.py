@@ -43,6 +43,7 @@ from src.api.identity import authorize_ws, require_identity, ws_close_code
 from src.apps import config_store
 from src.apps import hostpower
 from src.apps.catalog import get_catalog, is_marketplace_app, list_tags
+from src.apps.activation_audit import last_run_age_s as _activation_audit_last_run_age_s
 from src.apps.degradations import (degradations,
                                    invalidate_cache as invalidate_degradation_cache)
 from src.apps.install_jobs import InstallJobs
@@ -1871,6 +1872,14 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         autostart_off = _autostart_disabled(runtime)
         autostart_not_running = await asyncio.to_thread(_autostart_not_running, runtime)
         pending_migrations = await asyncio.to_thread(_app_pending_migrations, runtime)
+        # Design §A.2: the audit itself must not rot silently the way the
+        # doctor-watch task once did (disabled 2026-09-09, noticed
+        # 2026-10-11) — 5x its own ~60s cadence is generous headroom for
+        # leader-election/boot jitter while still catching a genuinely dead
+        # watchdog within minutes, not days.
+        activation_audit_age_s = await asyncio.to_thread(_activation_audit_last_run_age_s)
+        activation_audit_stale = (activation_audit_age_s is None
+                                  or activation_audit_age_s > 300.0)
 
         unhealthy = [c for c in clis if not c["healthy"]]
         failing_app_checks = [c for c in app_checks if not c["ok"]]
@@ -1895,9 +1904,14 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                    and not mcp_status["degraded"] and not autostart_not_running
                    and not pending_migrations
                    and vault_status.get("reachable") is not False
-                   and not remote_host_postgres_backup["stale"]),
+                   and not remote_host_postgres_backup["stale"]
+                   and not activation_audit_stale),
             "app_checks": app_checks,
             "pending_migrations": pending_migrations,
+            "activation_audit": {
+                "last_run_age_s": activation_audit_age_s,
+                "stale": activation_audit_stale,
+            },
             "system_clis": {
                 "total": len(clis),
                 "unhealthy": unhealthy,
@@ -2139,6 +2153,72 @@ def _start_convergence_watchdog(
     log.info("apps: convergence reconcile watchdog armed (every %ss)", interval_s)
 
 
+# Cadence of the activation audit below (design §A.2). Short on purpose — this
+# is the backstop for "activate() was silently skipped", and the 2026-10-11
+# incident ran ≥27 minutes before a human happened to run `doctor`. 60s is
+# the design's own number: short enough that a skipped activation is caught
+# within about one minute, cheap enough (one poll() per service, one Redis
+# MGET) that running it 15x more often than the 900s convergence tick costs
+# nothing measurable.
+DEFAULT_ACTIVATION_AUDIT_INTERVAL_S = float(
+    os.environ.get("AW_ACTIVATION_AUDIT_INTERVAL_S", "60"))
+
+_ACTIVATION_AUDIT_APP_ID = "core"
+_ACTIVATION_AUDIT_TASK_ID = "activation-audit"
+
+
+def _start_activation_audit_watchdog(
+        app: FastAPI,
+        interval_s: float = DEFAULT_ACTIVATION_AUDIT_INTERVAL_S) -> None:
+    """Register the activation audit's own periodic tick (design §A.2),
+    independent of the 900s convergence pass and of whatever end-of-pass hook
+    ``Reconciler.reconcile()`` already runs it from — the tick is what covers
+    the long, steady-state gaps BETWEEN reconcile passes, which is exactly
+    when the restart loop's own worker-died blind spot (design §B.1) matters
+    most.
+
+    Same ``WatchdogSupervisor`` pattern as :func:`_start_convergence_watchdog`
+    right above: leader-gated (``FlockLease``), registered in EVERY worker so
+    a later failover already has it, spun only by the one that holds the
+    lease. ``run_immediately=False`` — a reconcile pass just ran (boot) or
+    the audit itself just ran a moment ago (attach); firing again instantly
+    buys nothing.
+    """
+    runtime = app.state.app_runtime
+    if interval_s <= 0:
+        log.info("apps: activation audit watchdog disabled (interval=%s)", interval_s)
+        return
+    if _ACTIVATION_AUDIT_TASK_ID in runtime.watchdog.task_ids_for(_ACTIVATION_AUDIT_APP_ID):
+        return
+
+    reconciler: Reconciler = app.state.app_reconciler
+    in_flight = {"running": False}
+
+    async def _tick() -> None:
+        # Same reentrancy guard as the convergence tick: a run can legitimately
+        # outlast the interval (a repair install is a real network fetch), and
+        # two concurrent audit passes repairing the same app is exactly the
+        # concurrent-repair failure mode the design calls out by name.
+        if in_flight["running"]:
+            log.warning("apps: skipping activation audit tick — the previous "
+                        "run is still in flight")
+            return
+        in_flight["running"] = True
+        try:
+            from src.apps.activation_audit import run_once
+            await run_once(reconciler, runtime)
+        except Exception:
+            log.exception("apps: activation audit tick failed")
+        finally:
+            in_flight["running"] = False
+
+    runtime.watchdog.register(
+        _ACTIVATION_AUDIT_APP_ID, _ACTIVATION_AUDIT_TASK_ID, _tick,
+        interval_s, run_immediately=False,
+    )
+    log.info("apps: activation audit watchdog armed (every %ss)", interval_s)
+
+
 async def reconcile_on_boot(app: FastAPI) -> None:
     """Reconcile to the cloud registry on startup (ADR Decision 5).
 
@@ -2204,6 +2284,10 @@ async def reconcile_on_boot(app: FastAPI) -> None:
     # 2026-10-08 incident the timeout branch above used to name out loud.
     # Same every-worker/leader-spins split as the healers around it.
     _start_convergence_watchdog(app)
+    # Design §A.2: the steady-state backstop between reconcile passes. Same
+    # every-worker/leader-spins split as the healers and the convergence
+    # watchdog above.
+    _start_activation_audit_watchdog(app)
     # At boot an already-running mcp-gateway will have scanned BEFORE the
     # inprocess apps above activated and (re)wrote their own mcp.json, and
     # nothing in that path is ordered — so reload once, now that they have.
@@ -2285,5 +2369,6 @@ async def attach_on_boot(app: FastAPI) -> None:
     # watchdog-leader flock holder's supervisor spins it, so every worker
     # must have it registered to cover a later failover.
     _start_convergence_watchdog(app)
+    _start_activation_audit_watchdog(app)
     from src.api.otel import ensure_export_state
     ensure_export_state(app.state.app_runtime)

@@ -1,6 +1,16 @@
 # Service supervision: activation audit, restart loop, health surface, and the core-restart contract
 
-**Status:** design — approved for implementation planning, not yet built.
+**Status:** SHIPPED in full. §B, §C, §D landed 2026-10-11 (`ba82486`,
+`f333bc8`). §A (the activation audit) landed via card
+`resilience:service-supervisor-has-no-liveness-recheck` (4125bf3b-9510-81fd):
+`src/apps/activation_audit.py` (I1/I2 + the LOUD escalation),
+§A.1 total accounting in `src/apps/reconciler.py`, the ~60s watchdog and the
+end-of-reconcile-pass hook in `src/apps/routes.py`/`Reconciler.reconcile`,
+and the escalation-failure degradation row in `src/apps/degradations.py` /
+`src/apps/service_lease.py`. The `$framework.autostart` ADR blocker named in
+§A below is DEAD — `repos/agentic-workspace`, where that ADR lived, is fully
+deactivated — so §A shipped with desired-state for I2 coming solely from
+`src/apps/degradations.py`, per the amendment recorded on the shipping card.
 **Card:** `reliability:core-activate-skips-on-boot-and-no-service-restart-loop` (3f65bf3b-9510-8171).
 **Evidence:** debugger run `3aa454de242c42bfa862ef33b3444236` on card
 `reliability:proxy-server-dies-silently-killing-all-browser-mcp` (2026-10-11) — not re-derived here.
@@ -317,13 +327,15 @@ Draft text:
 
 - **Desired-state now lives in three places:** the app's `auto_start`
   config, the supervisor's `desired` flag, and the Redis give-up marker.
-  The open `$framework.autostart` design (ADR
-  `app-launcher-live-preview-autostart.md`, card
-  `feature:app-autostart-framework-setting`) **must** integrate with the
-  audit when it lands, or the audit will resurrect apps a user deliberately
-  stopped. Rule to carry over: the audit treats config-level
-  `auto_start=false` (doctor's existing source) and any future
-  `$framework.autostart=false` as `desired=stopped`.
+  The `$framework.autostart` design this paragraph originally deferred to
+  (ADR `app-launcher-live-preview-autostart.md`, card
+  `feature:app-autostart-framework-setting`) lived in `repos/agentic-workspace`,
+  now fully deactivated — that blocker is dead, and §A shipped without it.
+  Rule carried over as a live constraint on `src/apps/degradations.py`
+  instead of a future ADR: desired-state for I2 comes SOLELY from that
+  module (config-level `auto_start=false` today); any future
+  framework-level autostart setting must land there first, or the audit
+  will resurrect an app a user deliberately stopped.
 - **`kill -9` as a debugging tool stops working.** Today a manually killed
   service stays dead; after this, the supervisor or the audit resurrects
   it within seconds to a minute. Deliberate downtime must go through

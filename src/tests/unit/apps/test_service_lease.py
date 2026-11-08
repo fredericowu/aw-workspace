@@ -58,6 +58,10 @@ class FakeRedis:
         self._expire_if_due(key)
         return 1 if key in self._store else 0
 
+    def delete(self, key):
+        self._expire_if_due(key)
+        return 1 if self._store.pop(key, None) is not None else 0
+
     def eval(self, script, numkeys, *args):
         self._expire_if_due(args[0])
         if script is _RENEW_LUA:

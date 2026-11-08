@@ -40,7 +40,7 @@ import threading
 import time
 
 from src.apps.containers import ContainerError
-from src.apps.service_lease import gave_up_markers
+from src.apps.service_lease import escalation_failed_marker, gave_up_markers
 
 log = logging.getLogger(__name__)
 
@@ -181,6 +181,33 @@ def service_relay_rows(runtime) -> list[dict]:
     }]
 
 
+def escalation_rows(runtime) -> list[dict]:
+    """The activation audit's LOUD escalation path (design §A.2) failing to
+    shout — surfaced on the SAME choke point as everything else here rather
+    than as a second, novel kind of silence.
+
+    The escalation itself is a best-effort "run now" of the workspace's
+    degradation-watch task, whose own agent dispatch is the one path that
+    only ever fires in the bad case — and that exact dispatch has already
+    failed silently once (`system-analyst`, 5 days, card `40f5bf3b-9510-8106`).
+    So a failed escalation attempt writes a durable marker
+    (``src/apps/service_lease.py``), and this is what reads it back onto the
+    surface ``doctor``/``/api/health`` already share. Workspace-wide, not
+    per-service: one escalation attempt covers every current degradation.
+    """
+    marker = escalation_failed_marker()
+    if not marker:
+        return []
+    return [{
+        "kind": "escalation", "app": "core", "tier": "core",
+        "service": "degradation-watch-dispatch",
+        "component": "core:activation-audit:escalation",
+        "state": "off", "desired": "running", "autostart": True,
+        "reason": marker.get("reason") or "unknown",
+        "last_error": marker.get("detail") or "",
+    }]
+
+
 def _collect(runtime) -> tuple[list[dict], bool]:
     """``(rows, redis_reachable)`` — the whole check, once.
 
@@ -269,6 +296,7 @@ def _collect(runtime) -> tuple[list[dict], bool]:
     # has nothing to say about a broadcast row.
     rows.extend(broadcast_rows(runtime))
     rows.extend(service_relay_rows(runtime))
+    rows.extend(escalation_rows(runtime))
     return rows, redis_ok
 
 

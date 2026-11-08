@@ -109,6 +109,10 @@ def _gave_up_key(app_id: str, service_id: str) -> str:
     return f"{_key_prefix()}svc:gaveup:{app_id}:{service_id}"
 
 
+def _escalation_failed_key() -> str:
+    return f"{_key_prefix()}svc:escalation-failed"
+
+
 # ---------------------------------------------------------------------------
 # Give-up markers — the DURABLE half of the restart loop's state
 # ---------------------------------------------------------------------------
@@ -186,6 +190,82 @@ def gave_up_markers(pairs: list[tuple[str, str]], *,
         except ValueError:
             out[pair] = {"reason": "unknown"}
     return out, True
+
+
+# ---------------------------------------------------------------------------
+# Escalation-failure marker — the activation audit's LOUD-path backstop
+# ---------------------------------------------------------------------------
+# The activation audit (design §A.2) escalates a `gave_up`/repair-failure by
+# best-effort "running now" the workspace's degradation-watch task, whose own
+# agent dispatch is the one path that only ever fires in the bad case (and
+# which has itself failed silently before — see the activation_audit module
+# docstring). This marker makes THAT failure structurally identical to every
+# other degradation `doctor`/`/api/health` already read, instead of a second,
+# novel kind of silence. One workspace-wide marker, not per-service: the
+# escalation attempt covers every current degradation in one dispatch.
+
+
+def set_escalation_failed(*, reason: str, detail: str = "",
+                          redis_url: Optional[str] = None) -> bool:
+    """Record that the audit's own LOUD escalation attempt did not succeed."""
+    payload = json.dumps({"reason": reason, "detail": detail, "at": time.time()})
+    try:
+        _get_shared_client(redis_url).set(_escalation_failed_key(), payload)
+        return True
+    except Exception:
+        log.warning(
+            "service_lease: could not record the escalation-failed marker — "
+            "this failure stays invisible to doctor/health too", exc_info=True)
+        return False
+
+
+def clear_escalation_failed(*, redis_url: Optional[str] = None) -> bool:
+    """Drop the marker once an escalation attempt succeeds."""
+    try:
+        _get_shared_client(redis_url).delete(_escalation_failed_key())
+        return True
+    except Exception:
+        log.warning("service_lease: could not clear the escalation-failed marker",
+                    exc_info=True)
+        return False
+
+
+def escalation_failed_marker(*, redis_url: Optional[str] = None) -> Optional[dict]:
+    """The current marker, or ``None`` if there isn't one (or Redis is away —
+    degrades open like every other read in this module: a failure to CHECK
+    for a failure must never itself read as a failure)."""
+    try:
+        raw = _get_shared_client(redis_url).get(_escalation_failed_key())
+    except Exception:
+        log.warning("service_lease: could not read the escalation-failed marker",
+                    exc_info=True)
+        return None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return {"reason": "unknown"}
+
+
+def acquire_escalation_debounce(ttl_s: float, *, redis_url: Optional[str] = None) -> bool:
+    """One escalation attempt per ``ttl_s`` workspace-wide, so a boot storm of
+    give-ups costs one page, not N. ``True`` means the caller just won the
+    right to fire; ``False`` means someone already did within the window.
+
+    Degrades OPEN (returns ``True``) on a Redis failure — proceeding
+    un-debounced is strictly better than silently dropping the one thing this
+    whole mechanism exists to make loud."""
+    try:
+        won = _get_shared_client(redis_url).set(
+            f"{_key_prefix()}svc:escalation-debounce", "1",
+            nx=True, px=int(ttl_s * 1000))
+        return bool(won)
+    except Exception:
+        log.warning(
+            "service_lease: could not reach Redis to debounce the escalation — "
+            "proceeding unguarded (single-worker fallback)", exc_info=True)
+        return True
 
 
 def is_lease_held_anywhere(app_id: str, service_id: str, *, redis_url: Optional[str] = None) -> bool:

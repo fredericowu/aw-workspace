@@ -466,6 +466,18 @@ class Reconciler:
             finally:
                 self._provision_depth -= 1
 
+    @property
+    def is_provisioning(self) -> bool:
+        """True while THIS worker is inside its own ``_provisioning()`` pass.
+
+        Read by the activation audit (design §A.2) to skip a run entirely
+        rather than race a provisioning pass's uninstall/install halves — an
+        upgrade is uninstall-then-install, and the audit firing between the
+        two halves would see a desired app as "not loaded" and repair-install
+        it mid-upgrade (see the design's "Risks for the Coders").
+        """
+        return self._provision_depth > 0
+
     async def _trigger_broadcast(self, reason: str, app_id: str | None = None) -> None:
         """Publish ``apps:changed`` now, or mark it pending inside a pass.
 
@@ -917,6 +929,15 @@ class Reconciler:
                 chain = " -> ".join((*stack, dep_id))
                 raise ValueError(f"cyclic app dependency chain: {chain}")
             if self.runtime.is_loaded(dep_id):
+                # Silent path #3 of design §A.1: a dependency already loaded
+                # is a bare `continue`. The dependency's OWN disposition
+                # (installed/upgraded/present_unchanged/skipped) is still
+                # accounted for separately, via its own entry in
+                # `desired_active` if it has one — this line exists purely so
+                # the skip itself leaves a trace, per §A.1's "each gain one
+                # INFO line".
+                log.info("apps: dependency %s of %s is already loaded — "
+                         "skipping its install", dep_id, manifest.id)
                 continue
             dep_spec = self._dependency_spec(dep, known_rows, parent_package_dir=parent_package_dir)
             # _install_provisioned, not install: the caller already holds the
@@ -1281,6 +1302,18 @@ class Reconciler:
                     await asyncio.to_thread(skills_sync.sync_all)
             except Exception:
                 log.exception("apps: skill mirror fan-out failed after reconcile")
+        # Design §A.2: end of EVERY reconcile pass (boot and the 900s
+        # convergence tick both go through this method), outside the
+        # provisioning lock this pass just released — a repair install
+        # re-acquires it itself. Best-effort: an audit failure must not turn
+        # a successful reconcile into a failed one.
+        try:
+            from src.apps.activation_audit import run_once as _run_activation_audit
+            audit_result = await _run_activation_audit(self, self.runtime)
+            if audit_result.get("repairs") or audit_result.get("errors"):
+                result["activation_audit"] = audit_result
+        except Exception:
+            log.exception("apps: activation audit failed after reconcile")
         return result
 
     async def _reconcile_provisioned(
@@ -1353,11 +1386,18 @@ class Reconciler:
                     except Exception:  # noqa: BLE001 — same
                         log.exception("apps: the post-failure apps:changed publish raised")
 
-    async def _reconcile_pass(
-            self, desired: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        """One reconcile pass. Only ever called by :meth:`_reconcile_provisioned`,
-        which owns arming and disarming the two coalescing flags this body
-        relies on — do not call it directly, and do not arm them here."""
+    async def _resolve_desired_active(
+            self, desired: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, "AppSpec"], str]:
+        """``(desired_active, source)`` — the cloud-or-local resolution a
+        reconcile pass starts from.
+
+        Factored out so the activation audit's I1 check (design §A.2) reads
+        the IDENTICAL desired set a reconcile pass would, rather than a
+        second computation that could drift from it — ``desired`` lets a
+        caller (only ``_reconcile_pass`` does) supply already-fetched rows
+        instead of re-resolving.
+        """
         source = "provided"
         if desired is None:
             if self.cloud.configured:
@@ -1375,6 +1415,14 @@ class Reconciler:
 
         specs = [AppSpec.from_row(r) for r in desired]
         desired_active = {s.app_id: s for s in specs if s.state != "disabled"}
+        return desired_active, source
+
+    async def _reconcile_pass(
+            self, desired: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """One reconcile pass. Only ever called by :meth:`_reconcile_provisioned`,
+        which owns arming and disarming the two coalescing flags this body
+        relies on — do not call it directly, and do not arm them here."""
+        desired_active, source = await self._resolve_desired_active(desired)
         # BOOT_PRIORITY first, everything else alphabetically behind it. Two
         # separate reasons, both real:
         #
@@ -1443,6 +1491,11 @@ class Reconciler:
         # Phases 1+2: BOOT_PRIORITY serially to completion, then the rest
         # through the bounded pool.
         already_loaded = await self._install_missing(missing, installed, errors, durations)
+        # Silent path #2 of design §A.1: an app partitioned as MISSING that
+        # turned out already-loaded by the time its own install slot ran (a
+        # concurrent peer's dependency resolution won the race). Recorded here
+        # rather than left to merge invisibly into `present` below.
+        already_loaded_set = set(already_loaded)
         # An app a pooled peer pulled in as ITS dependency is now loaded but was
         # partitioned as missing. Hand it to the present-side checks below —
         # that is where the old serial loop put it when it got there and found
@@ -1450,6 +1503,7 @@ class Reconciler:
         for app_id in already_loaded:
             present[app_id] = missing[app_id]
         present = dict(sorted(present.items(), key=_boot_order_key))
+        present_unchanged: list[str] = []
 
         # Phase 3, unchanged and still sequential: for apps present on both
         # sides, a version bump OR a trust/grant change in the registry is an
@@ -1551,6 +1605,15 @@ class Reconciler:
                             log.exception("apps: %s could not be rolled back and is "
                                           "now DOWN", app_id)
                 durations[app_id] = round(time.monotonic() - app_started, 1)
+            elif app_id not in already_loaded_set:
+                # Silent path #1 of design §A.1: an app that was already
+                # loaded before this pass started (or settled into `present`
+                # above with no version/trust change) is touched by NOTHING
+                # else in this loop and used to vanish from the summary
+                # entirely. `already_loaded_set` apps are excluded — they
+                # already have their own disposition (`skipped_already_loaded`
+                # below) and must not double-count.
+                present_unchanged.append(app_id)
 
         # uninstall extra (loaded but not desired) — converge actual to desired;
         # leave the (absent) desired row alone.
@@ -1592,10 +1655,38 @@ class Reconciler:
         if swept:
             log.info("apps: knowledge sweep removed orphaned namespace(s): %s", swept)
 
+        # §A.1 total accounting (design doc): every app in `desired_active`
+        # must land in exactly one explicit disposition. A violation used to
+        # be invisible by construction — present_unchanged and
+        # skipped_already_loaded above are what make it visible — so this is
+        # the backstop for whatever disposition this pass forgets to assign
+        # NEXT time the code changes, not a check expected to ever fire today.
+        skipped_already_loaded = [
+            {"app_id": app_id,
+             "reason": "concurrent-install (already loaded by the time this "
+                       "app's own install slot ran — a peer's dependency "
+                       "resolution won the race)"}
+            for app_id in sorted(already_loaded_set)]
+        accounted = (set(installed) | set(upgraded) | set(present_unchanged)
+                    | already_loaded_set
+                    | {e["app_id"] for e in errors if e.get("app_id")})
+        unaccounted = sorted(set(desired_active) - accounted)
+        if unaccounted:
+            log.error("apps: reconcile total-accounting assertion FAILED for: %s — "
+                      "see docs/design/service-supervision-activation-audit.md §A.1",
+                      unaccounted)
+            for app_id in unaccounted:
+                errors.append({
+                    "app_id": app_id, "action": "accounting",
+                    "error": "no explicit disposition recorded for this pass — "
+                             "total-accounting assertion failed (design §A.1)"})
+
         duration_s = round(time.monotonic() - pass_started, 1)
         concurrency = _reconcile_concurrency()
         result = {"source": source, "desired": sorted(desired_active),
                   "installed": installed, "upgraded": upgraded, "removed": removed,
+                  "present_unchanged": present_unchanged,
+                  "skipped_already_loaded": skipped_already_loaded,
                   "errors": errors, "mcp_gateway_reloaded": wanted_reload,
                   "apps_changed_published": wanted_broadcast,
                   "duration_s": duration_s, "concurrency": concurrency,
