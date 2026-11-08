@@ -37,28 +37,41 @@ container — **every Tier-2 app container too**.
 `autostart and ctx.provision`, and `provision` is a **per-boot one-shot**
 held by a single elected worker (`src/apps/boot_reconcile_coord.py`).
 
-**Guarantee today — read this before assuming recovery:**
+**Guarantee as of the activation audit (§A, shipped — see below):**
 
-> A core restart permanently stops any Tier-1 service whose activation is
-> missed on the next boot, and **nothing will notice**.
+> A core restart converges every Tier-1 service whose activation is missed
+> on the next boot within one boot pass plus one ~60s audit interval, **or**
+> the gap is named in the reconcile summary's `errors`, in `doctor`, and in
+> `/api/health`.
 
-That is not hyperbole, it is the mechanism: follower workers and every
-post-boot convergence pass load apps with `provision=False`, which registers
-services with autostart suppressed by design (correct — it prevents duplicate
-spawns). The boot leader's one-shot is therefore the *only* code path in the
-system that ever starts an autostart service. Miss it once and no later pass
-— attach, converge, or the 900s reconcile — will ever start it, because the
-reconcile diffs **packages**, never **processes**.
+The mechanism this closes: follower workers and every post-boot convergence
+pass load apps with `provision=False`, which registers services with
+autostart suppressed by design (correct — it prevents duplicate spawns). The
+boot leader's one-shot used to be the *only* code path in the system that
+ever started an autostart service, and the reconcile diffs **packages**,
+never **processes** — so missing the one-shot once used to mean no later
+pass (attach, converge, the 900s reconcile) would ever start it.
 
-The missing piece is the **activation audit** (§A of the source design): a
-post-pass assertion that every desired app is loaded and every autostart
-service is accounted for, re-run on a ~60s cadence. It is **deliberately not
-built yet** — it introduces a third home for desired-state and has to land
-after the open `$framework.autostart` ADR
-(`app-launcher-live-preview-autostart.md`, card
-`feature:app-autostart-framework-setting`) or it will resurrect apps a user
-switched off on purpose. Until it ships, the sentence in the quote above is
-the honest contract, dated.
+The **activation audit** (`src/apps/activation_audit.py`, §A of the source
+design) closes that gap with an end-state assertion instead of trusting
+control flow: **I1** — every app in `desired_active` is loaded, one
+`install()`-path repair on a miss; **I2** — every autostart service is
+running locally, running on another worker's lease, or in an explicit exempt
+state (`gave_up`, `desired=stopped`), with a lease-arbitrated
+`ServiceSupervisor.start()` repair otherwise. It runs at the end of every
+reconcile pass (boot and the 900s tick) and on its own ~60s leader-gated
+watchdog cadence, capped at 5 repairs/run, and skips entirely while a
+provisioning pass is in flight. The `$framework.autostart` ADR blocker named
+in the source design is dead — `repos/agentic-workspace`, where that ADR
+lived, is fully deactivated — so desired-state for I2 comes solely from
+`src/apps/degradations.py`, the one choke point `doctor` and `/api/health`
+already share; a future framework-level autostart setting has to land there
+first. A `gave_up` service or a repair failure escalates: a debounced (15
+min, workspace-wide) best-effort "run now" of the existing degradation-watch
+task, with a failed escalation DISPATCH itself recorded as a degradation on
+the same `doctor`/`/api/health` surface — see
+`src/apps/activation_audit.py`'s module docstring for why the escalation
+path cannot be allowed to depend solely on that dispatch succeeding.
 
 What *does* hold today, and is new as of this standard:
 
@@ -179,7 +192,9 @@ message.
   theory never reach give-up.
 - **The supervisor's knowledge dies with its worker.** It covers "the
   service died"; it does not cover "the service was never started" or "the
-  worker that owned it is gone". That is §1's missing audit.
+  worker that owned it is gone" — that is the activation audit (§1, shipped),
+  a cross-worker backstop over process table + lease state rather than a
+  second restart policy.
 - **`desired` is per-worker memory too**, which bounds both of the
   declined-start rules above. A peer still renewing its lease after the full
   retry window is taken at its word and this worker stands down; if that peer
@@ -216,17 +231,20 @@ a degraded workspace. That alarm is the feature.
 What can be promised today, in one sentence:
 
 > A restart of core or of the workspace container brings back every Tier-1
-> service whose activation runs, within seconds of any later death; and a
+> service whose activation runs, within seconds of any later death; a
 > service that is *not* running while its config says it should be is named
 > in three places a human or an agent actually looks — `doctor`,
-> `/api/health`, and the service's own `state` — with the one somebody
-> switched off told apart from the one that is broken. What is **not** yet
-> guaranteed is the activation itself: a service whose `activate()` is
-> skipped on boot still stays down, and the activation audit that would
-> close that is deferred (§1).
+> `/api/health`, and the service's own `state`; and a service whose
+> `activate()` is itself skipped on boot — the 2026-10-11 incident's exact
+> signature, no `Popen` for the restart loop to even watch — converges within
+> one boot pass plus one ~60s activation-audit interval, or is named in the
+> reconcile summary's `errors` and the same `doctor`/`/api/health` surface.
 
-The second half of that sentence is the remaining work, tracked on
-`reliability:core-activate-skips-on-boot-and-no-service-restart-loop`.
+That closes `reliability:core-activate-skips-on-boot-and-no-service-restart-loop`.
+Wedged-but-running detection (a live `Popen` that stopped doing useful work)
+remains explicitly out of scope — the audit's liveness signal is `poll()`,
+deliberately, because a probe-based guess at "healthy" is a worse failure
+mode than the one this standard fixes.
 
 ## 7. Where this is referenced from
 
