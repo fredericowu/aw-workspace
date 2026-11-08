@@ -34,6 +34,10 @@ def _async(coro):
 
 def _app(tmp_path, monkeypatch, cloud):
     monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path / "apps"))
+    # install()/reconcile()'s skill-mirror fan-out (sync_skill_mirrors,
+    # default True) would otherwise materialize/mirror the REAL skills/
+    # tree this suite happens to run inside.
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
     app = FastAPI()
     runtime = register_apps_routes(app)
     app.dependency_overrides[require_identity] = lambda: {"sub": "test"}

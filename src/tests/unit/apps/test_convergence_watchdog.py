@@ -49,7 +49,7 @@ def _app(reconcile_impl):
     )), watchdog
 
 
-async def _noop_reconcile():
+async def _noop_reconcile(**_kwargs):
     return {}
 
 
@@ -98,7 +98,7 @@ def test_overlapping_ticks_never_run_two_passes_at_once():
     started = []
     release = asyncio.Event()
 
-    async def slow_reconcile():
+    async def slow_reconcile(**_kwargs):
         started.append(1)
         await release.wait()
         return {}
@@ -126,7 +126,7 @@ def test_the_guard_is_released_even_when_a_pass_times_out():
     point is that the NEXT tick picks up where it left off."""
     calls = []
 
-    async def hanging_reconcile():
+    async def hanging_reconcile(**_kwargs):
         calls.append(1)
         await asyncio.sleep(10)
 
@@ -153,7 +153,7 @@ def test_a_timed_out_pass_does_not_propagate_to_the_supervisor_backoff():
     backoff, stretching the interval out to 30min — punishing the
     slow-but-progressing case, where each pass installs some apps and
     leaves fewer for the next."""
-    async def hanging_reconcile():
+    async def hanging_reconcile(**_kwargs):
         await asyncio.sleep(10)
 
     app, watchdog = _app(hanging_reconcile)

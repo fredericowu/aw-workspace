@@ -104,6 +104,10 @@ def test_reconcile_sweeps_an_orphaned_knowledge_namespace(tmp_path, monkeypatch)
 
     monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path / "apps"))
     monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    # install()'s skill-mirror fan-out (sync_skill_mirrors, default True)
+    # would otherwise materialize/mirror the REAL skills/ tree this suite
+    # happens to run inside.
+    monkeypatch.setenv("AW_WORKSPACE_CONTAINER_DIR", str(tmp_path / "root"))
     repo = _make_app_repo_with_knowledge(tmp_path, "notes")
     cloud = FakeCloud()
     host = FastAPI()
