@@ -11,6 +11,21 @@
 > deep reference — the sections below are the irreducible bits every agent
 > needs on every run.
 
+## Reply language
+
+Reply to the user in the same language their prompt is written in. Default
+to English when the language is ambiguous or on a session's first message
+with no signal yet.
+
+This covers conversational replies only — chat responses, explanations,
+status updates. All written code stays English always, regardless of the
+conversation's language: source, comments, identifiers, commit messages, PR
+titles/descriptions, docstrings. This is a standing convention, not new —
+this section just makes it explicit here. A per-channel agent (e.g.
+`aw-agent-telegram`) may layer its own voice-language detection and
+`[[LANG: xx]]` override on top of this baseline; see that skill for the
+richer per-channel logic.
+
 ## Project skills
 
 Skills are real directories under **`skills/<name>/SKILL.md`** (YAML
