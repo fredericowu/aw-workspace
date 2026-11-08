@@ -58,6 +58,22 @@ attempt per 15 minutes workspace-wide (:func:`acquire_escalation_debounce`)
 so a boot storm of give-ups costs one page, not N, and fired from a detached
 ``asyncio.create_task`` so a slow/hanging agents-platform round trip
 (documented up to 30 minutes) can never stall the audit tick that found it.
+
+The marker is cleared on every run that finds nothing to escalate — not
+merely left for the next failure to overwrite. ``set_escalation_failed`` has
+exactly one caller (:func:`_fire_escalation`'s failure paths), which only
+ever runs while ``reasons`` is non-empty; a marker set by a past failed
+dispatch would otherwise outlive the condition that caused it (the gave_up
+service recovers, a later repair succeeds) and ``escalation_rows()`` would
+report a PERMANENT degradation on a healthy workspace — the same defect
+this module exists to prevent, inverted: a surface that never clears is as
+useless as one that never fires. No TTL on the marker: this workspace's
+degrade-open convention would make a TTL either redundant (it only matters
+once an explicit clear already would have fired) or actively unsafe (one
+short enough to matter can expire while the dispatch is still genuinely
+broken, silently dropping a real failure). The audit's own staleness check
+(:func:`last_run_age_s`, read by ``doctor``) already covers "the clearing
+mechanism itself stopped running" as its own, separate degradation.
 """
 from __future__ import annotations
 
@@ -286,6 +302,18 @@ async def run_once(reconciler: "Reconciler", runtime: "AppRuntime") -> dict[str,
             escalated = True
         else:
             escalated = "debounced"
+    else:
+        # A quiet run is the clear signal, not merely the absence of a new
+        # one. Without this, a marker set by a PAST failed dispatch outlives
+        # the condition that caused it: the underlying gave_up/repair-error
+        # resolves, `reasons` goes empty, `_fire_escalation` (the only other
+        # writer) never runs again, and `escalation_rows()` reports a
+        # PERMANENT degradation on doctor/`/api/health` — a surface that
+        # never clears is as useless as one that never fires, just louder.
+        # Unconditional: `clear_escalation_failed` already no-ops safely
+        # when nothing is set, so this costs one harmless Redis DEL on every
+        # quiet tick rather than a read-then-maybe-clear round trip.
+        clear_escalation_failed()
 
     summary = {
         "source": source,

@@ -547,6 +547,56 @@ def test_run_once_debounces_a_second_escalation(monkeypatch, fake_redis):
     assert calls["n"] == 1, "the debounce window did not prevent a second dispatch"
 
 
+def test_run_once_clears_a_stale_marker_once_the_condition_resolves(fake_redis):
+    """The defect caught in review: a marker set by a PAST failed dispatch
+    must not outlive the condition that caused it. Once a run finds nothing
+    to escalate (``reasons == []``), the marker has to go — otherwise
+    ``escalation_rows()`` reports a PERMANENT degradation on a healthy
+    workspace forever, which is the same failure this module exists to
+    prevent, just inverted (always red instead of never red)."""
+    service_lease.set_escalation_failed(reason="dispatch-raised", detail="boom")
+    assert service_lease.escalation_failed_marker() is not None
+
+    rt = SimpleNamespace(
+        loaded_slugs=lambda: [], get=lambda slug: None,
+        services=SimpleNamespace(), is_loaded=lambda slug: True,
+    )
+
+    class _FakeReconciler:
+        is_provisioning = False
+
+        async def _resolve_desired_active(self):
+            return {}, "local"
+
+    result = _async(aa.run_once(_FakeReconciler(), rt))
+
+    assert result["escalated"] is False
+    assert service_lease.escalation_failed_marker() is None
+    from src.apps.degradations import degradations
+    assert degradations(rt) == []
+
+
+def test_run_once_with_no_marker_and_nothing_to_escalate_stays_quiet(fake_redis):
+    """The companion case: a quiet tick with no marker set must not become
+    noisy — the unconditional clear is a no-op, not a new write every run."""
+    assert service_lease.escalation_failed_marker() is None
+    rt = SimpleNamespace(
+        loaded_slugs=lambda: [], get=lambda slug: None,
+        services=SimpleNamespace(), is_loaded=lambda slug: True,
+    )
+
+    class _FakeReconciler:
+        is_provisioning = False
+
+        async def _resolve_desired_active(self):
+            return {}, "local"
+
+    result = _async(aa.run_once(_FakeReconciler(), rt))
+
+    assert result["escalated"] is False
+    assert service_lease.escalation_failed_marker() is None
+
+
 # ---------------------------------------------------------------------------
 # degradations() surfaces a failed escalation on the SAME choke point
 # ---------------------------------------------------------------------------
