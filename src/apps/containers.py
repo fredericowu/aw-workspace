@@ -189,6 +189,10 @@ def expand_env(env: dict[str, Any] | None, config: dict[str, Any] | None,
       URL, its host token).
     * ``${app.url}``      — this app's own external URL, composed from the
       workspace slug and base domain (see :func:`app_public_url`).
+    * ``${app.event_token}`` / ``${app.event_url}`` — this app's scoped
+      credential and endpoint for manifest-declared shell events. These are
+      primarily useful in ``mcp.template.json`` for a stdio MCP process that
+      runs under the gateway rather than inside the app container.
     * ``${data.uid}`` / ``${data.gid}`` — who owns this app's
       ``$AW_APP_DATA`` directory right now, for images that take a ``PUID``/
       ``PGID`` (see :func:`app_data_owner`). Derived rather than declared,
@@ -240,7 +244,16 @@ def expand_value(raw: str, config: dict[str, Any] | None,
         if kind == "env":
             return os.environ.get(name)
         if kind == "app":
-            return app_public_url(app_id) if name == "url" else None
+            if name == "url":
+                return app_public_url(app_id)
+            if name in ("event_token", "event_url"):
+                # Lazy import: app_events imports workspace_host from this
+                # module when it builds the URL.
+                from src.apps.app_events import app_event_token, app_event_url
+
+                return (app_event_token(app_id) if name == "event_token"
+                        else app_event_url(app_id))
+            return None
         if kind == "data":
             if name not in ("uid", "gid"):
                 return None

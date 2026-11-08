@@ -30,7 +30,8 @@ The design
 An app ships **``mcp.template.json``** instead of ``mcp.json``. On every
 activation — and again on every config save — the runtime expands it into
 ``mcp.json`` next to it, using the same ``${config.x}`` / ``${env.X}`` /
-``${app.url}`` grammar a manifest's ``runtime.env`` already speaks (see
+``${app.url}`` / ``${app.event_token}`` grammar a manifest's ``runtime.env``
+already speaks (see
 ``containers.expand_value``; one dialect, not two).
 
 Because the template is versioned and the output is generated, an update

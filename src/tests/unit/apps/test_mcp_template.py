@@ -146,6 +146,36 @@ def test_env_and_chained_sources_resolve(tmp_path, monkeypatch):
     assert headers == {"A": "from-env", "B": "from-env", "C": "from-config"}
 
 
+def test_app_event_credential_is_rendered_for_gateway_stdio_upstream(
+        tmp_path, monkeypatch):
+    """A gateway-owned stdio child needs the same scoped credential the
+    runtime injects into the app container; it cannot inherit that container's
+    environment."""
+    monkeypatch.setattr("src.apps.app_events.app_event_token",
+                        lambda app_id: f"token:{app_id}")
+    monkeypatch.setattr("src.apps.app_events.app_event_url",
+                        lambda app_id: f"http://workspace/{app_id}/events")
+    pkg = str(tmp_path)
+    write_template(pkg, {
+        "mcpServers": {
+            "s": {
+                "enabled": True,
+                "env": {
+                    "AW_APP_EVENT_TOKEN": "${app.event_token}",
+                    "AW_APP_EVENT_URL": "${app.event_url}",
+                },
+            }
+        }
+    })
+
+    mcp_template.render(pkg, {}, "code-server")
+
+    assert read_output(pkg)["mcpServers"]["s"]["env"] == {
+        "AW_APP_EVENT_TOKEN": "token:code-server",
+        "AW_APP_EVENT_URL": "http://workspace/code-server/events",
+    }
+
+
 def test_nested_lists_are_walked(tmp_path):
     pkg = str(tmp_path)
     write_template(pkg, {
