@@ -121,15 +121,28 @@ def _autostart_not_running(runtime) -> list[dict]:
     fan-out on an endpoint uptime monitors poll — design §C). What is left
     here is the doctor-side projection of that shared primitive: every key it
     produces except the ones only health wants.
+
+    **Also the escalation-failed marker (``kind="escalation"``)**, folded in
+    on 2026-11-08 (card 4125bf3b-9510-81fd-b8e5-d564cfcf6145): the §A.2 audit
+    writes that row (``escalation_rows`` in ``degradations.py``) shaped
+    exactly like an autostart row — ``autostart: True``, ``desired:
+    "running"``, ``state: "off"`` — specifically so it rides this SAME choke
+    point rather than becoming a second, novel kind of silence (see its own
+    docstring). This filter predated that row and was never updated when it
+    landed, so a failed escalation dispatch reached ``/api/health``
+    (unfiltered) while staying invisible to ``doctor``'s ``ok`` field, which
+    is computed from THIS function's output rather than from
+    ``degradations()`` directly.
     """
-    # Services and containers only. ``degradations()`` also reports the
-    # ``apps:changed`` fan-out being down on this worker (card 3fc5bf3b), and
-    # that is not an auto-start app — the CLI prints it from the ``redis``
-    # section below, where its wording fits.
+    # Services, containers, and the escalation-failed marker — see the
+    # docstring above. ``degradations()`` also reports the ``apps:changed``
+    # fan-out being down on this worker (card 3fc5bf3b), and that is not an
+    # auto-start app — the CLI prints it from the ``redis`` section below,
+    # where its wording fits.
     return [{k: v for k, v in row.items()
              if k not in ("kind", "service", "autostart")}
             for row in degradations(runtime)
-            if row.get("kind") in ("service", "container")]
+            if row.get("kind") in ("service", "container", "escalation")]
 
 
 def _referenced_gateway_profiles(runtime) -> dict[str, str]:
@@ -1753,7 +1766,10 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         * ``autostart_not_running`` — apps whose config says ``auto_start:
           true`` but whose service/container is not actually running right
           now (see ``_autostart_not_running``) — the inverse gap, and the one
-          that was actually silent: this IS counted as a problem.
+          that was actually silent: this IS counted as a problem. Also
+          carries the §A.2 activation audit's own escalation-failed marker
+          (see ``_autostart_not_running``'s docstring) — a failed attempt to
+          shout about a degradation is itself a degradation.
         * ``pending_migrations`` — loaded apps whose ``_app_migrations``
           ledger is behind their manifest's migrations dir (see
           ``_app_pending_migrations``). ``_apply_migrations`` now raises on

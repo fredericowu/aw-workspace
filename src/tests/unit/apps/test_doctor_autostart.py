@@ -16,6 +16,9 @@ table ever caught it. See finding_key
 """
 from types import SimpleNamespace
 
+import pytest
+
+from src.apps import service_lease
 from src.apps.containers import ContainerError
 from src.apps.routes import _autostart_disabled, _autostart_not_running
 
@@ -175,4 +178,43 @@ def test_an_app_with_nothing_to_start_is_not_checked_for_running():
                     schema_has_autostart=False, tier="inprocess")},
         containers=_Containers({"kb": {"running": False}}),
     )
+    assert _autostart_not_running(rt) == []
+
+
+# ---------------------------------------------------------------------------
+# A failed §A.2 escalation dispatch reaches THIS surface, not just
+# degradations() — card 4125bf3b-9510-81fd-b8e5-d564cfcf6145. The bug QA
+# caught: this function's own ``kind in ("service", "container")`` filter
+# predated the ``kind="escalation"`` row and silently dropped it, so
+# `/api/health` (which reads degradations() unfiltered) saw the failure
+# while `doctor`'s `ok` field — computed from THIS function's output — did
+# not.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def fake_redis(monkeypatch):
+    from src.tests.unit.apps.test_service_lease import FakeRedis
+    fake = FakeRedis()
+    monkeypatch.setattr(service_lease, "_get_shared_client", lambda *a, **k: fake)
+    return fake
+
+
+def test_a_failed_escalation_dispatch_flips_autostart_not_running(fake_redis):
+    rt = _Runtime({})
+    assert _autostart_not_running(rt) == []
+
+    service_lease.set_escalation_failed(reason="dispatch-raised", detail="boom")
+    rows = _autostart_not_running(rt)
+    assert len(rows) == 1
+    assert rows[0]["app"] == "core"
+    assert rows[0]["component"] == "core:activation-audit:escalation"
+    assert rows[0]["state"] == "off"
+    assert rows[0]["desired"] == "running"
+    assert rows[0]["reason"] == "dispatch-raised"
+    assert rows[0]["last_error"] == "boom"
+    # doctor's `ok` is `not autostart_not_running and ...` — a non-empty
+    # list here is exactly what flips it to False.
+
+    service_lease.clear_escalation_failed()
     assert _autostart_not_running(rt) == []
