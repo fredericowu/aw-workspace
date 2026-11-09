@@ -90,6 +90,19 @@ string keys — a few KB, self-expiring.
   started/resolved *pair* has a skew problem the ratio doesn't (a watcher
   started at the window's edge resolves outside it). If a mass-kill
   incident ever wedges it red, apply the same bucketing then.
+
+  **Superseded for the warm-watcher check, 2026-11-09, card
+  4135bf3b-9510-8132-880e-ce48d0644338.** The premise above ("currently
+  green") was falsified by measurement: the lifetime gap climbed
+  8 → 23 → 24 → 56 → 81 → 84 and never went down — an unconditional
+  ratchet, not a stable signal. The skew problem flagged here as a reason
+  to defer windowing turned out to be real and is why a naive windowed
+  gap was rejected too; see
+  `docs/design/execution-index-warm-watcher-inflight-registry.md` for the
+  actual fix (a crash-safe in-flight registry, not a windowed subtraction
+  of the two counters). The lifetime counters themselves are unchanged and
+  still reported in `detail.counters` — only the doctor's gate on them is
+  gone.
 - **The other three `contributes.doctor` checks** were audited and do not
   have this pattern: aw-app-call-agent `/credentials/check` is a live
   probe (`call_agent_app/routes.py:114-133`), aw-app-architecture
