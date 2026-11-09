@@ -86,9 +86,12 @@ new scheduled job.
 (`sweep_retry_queue`; registered hourly + on boot)
 
 - Before draining the queue: `HGETALL` inflight; every entry older than
-  `ORPHAN_ADOPT_AFTER_S` → `HDEL` from inflight, `_queue_retry(run_id,
-  "watcher_orphaned")`, `_incr("warm_watchers_orphaned")` (new name in
-  `COUNTER_NAMES`; `_incr` dual-writes the window bucket for free).
+  `ORPHAN_ADOPT_AFTER_S` → `_queue_retry(run_id, "watcher_orphaned")`
+  **then** `HDEL` from inflight (that order, not the reverse — a crash
+  between the two calls must leave the run recoverable from at least one
+  of the two structures, caught in PR review and fixed before merge), then
+  `_incr("warm_watchers_orphaned")` (new name in `COUNTER_NAMES`; `_incr`
+  dual-writes the window bucket for free).
 - Orphans then flow through the existing retry machinery: idempotent
   dual-write upsert, `_RETRY_MAX_ATTEMPTS=24`, `retry_exhausted`
   visibility. Never touches `warm_watchers_resolved` — lifetime counters
