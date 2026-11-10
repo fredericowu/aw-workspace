@@ -16,7 +16,9 @@ via `host_id=bare-metal-privileged`); re-measure before trusting them later.
 
 Extend the **existing aw-stack nightly backup pipeline** — the GitHub Actions
 workflow that already dumps the two docker-hosted clusters to S3 every night at
-03:00 UTC (`repos/aw-stack/.github/workflows/backup-postgres.yml`,
+07:00 UTC — moved from 03:00 UTC on 2026-11-10 to land ~2am US-Eastern, see
+`backup-postgres.yml`'s own cron comment for the DST caveat —
+(`repos/aw-stack/.github/workflows/backup-postgres.yml`,
 `repos/aw-stack/scripts/backup-postgres.sh`) — with a **second, independent
 job** that:
 
@@ -157,7 +159,7 @@ the key.
 
 ## 6. Q4 + Q5 — scheduling, and restore verification as part of the job
 
-**Scheduling: a second job in `backup-postgres.yml`** (same 03:00 UTC cron,
+**Scheduling: a second job in `backup-postgres.yml`** (same 07:00 UTC cron,
 same `aw-baremetal` runner, same `concurrency: backup-postgres` group so the
 two jobs serialize, `workflow_dispatch` with the same `slot/skip_upload/
 keep_artifact` inputs). New script
@@ -258,7 +260,7 @@ design, not a follow-up):
   writes can vanish. If that RPO is unacceptable, that's a scope conversation
   with the PO — the answer is WAL archiving (wal-g/pgBackRest), a different
   design, deliberately not smuggled into this one.
-- **The workspace container being down at 03:00:** that night's job dies at
+- **The workspace container being down at 07:00:** that night's job dies at
   preflight (loudly — red run), and because this is a *separate job*, the two
   existing clusters' backup is unaffected. Next night self-heals; the doctor
   check flags it if it persists.
@@ -298,7 +300,7 @@ fine; confirm, don't assume).
 5. **Workspace-internal scheduled task** — agent-session scheduler, LLM in a
    backup loop, workspace container as single point. (§6)
 6. **Folding this cluster into the existing `TARGETS` loop / same artifact** —
-   couples failure domains: a workspace-container recreate at 03:00 would
+   couples failure domains: a workspace-container recreate at 07:00 would
    `die` the whole run and take the two healthy clusters' backup with it; the
    exec mechanism and the verify stage differ anyway. Separate job, separate
    artifact prefix, untouched validated path.
@@ -353,10 +355,11 @@ fine; confirm, don't assume).
   in the timeout math.
 - **Don't verify via `docker logs`.** `--since` undercounts on this podman
   (known trap); the GHA run output and the status file are the truth.
-- **Schedule contention.** 03:00 UTC is deliberate (`backup-postgres.yml:39-41`
-  — 05:00 Sunday maintenance, 06:17 e2e). The added verify stage lengthens the
-  window; the shared concurrency group keeps the two backup jobs serialized —
-  keep it.
+- **Schedule contention.** 07:00 UTC is deliberate (moved from 03:00 on
+  2026-11-10 to land ~2am US-Eastern — see `backup-postgres.yml`'s own cron
+  comment for the full collision check and the DST caveat). The added verify
+  stage lengthens the window; the shared concurrency group keeps the two
+  backup jobs serialized — keep it.
 - **Credentials.** Reuse `secrets.AWS_ACCESS_KEY_ID`/`SECRET` already on
   tekflox/aw-stack. Do not introduce a host-side env file (the dead
   `SERVICE_AWS_*` precedent), and if a new destination is chosen in §3, its
