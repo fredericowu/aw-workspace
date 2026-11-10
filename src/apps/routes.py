@@ -339,6 +339,53 @@ def _app_pending_migrations(runtime) -> list[dict]:
     return out
 
 
+def _knowledge_mirror_problems(runtime) -> list[dict]:
+    """Loaded apps declaring ``contributes.knowledge`` whose mirror
+    (``knowledge_base/apps/<id>/docs/``) is missing or stale.
+
+    SET+CLEAR+GATE on the same choke point as ``_app_pending_migrations``
+    and ``_autostart_not_running`` above: on 2026-11-08 all ~10 declared
+    mirrors vanished for ~23h with zero signal anywhere doctor or an agent
+    would look, because ``_register_knowledge`` (``src/apps/runtime.py``)
+    only ``log.exception()``s a failed mirror and ``sweep()``
+    (``src/apps/knowledge.py``) can delete every mirror at once if a
+    reconcile pass computes an empty/wrong installed roster. Read-only —
+    never writes or repairs the mirror itself; ``KnowledgeRegistry.register``
+    / ``sweep`` (called from the reconciler) own that. A declared source dir
+    that no longer resolves (``KnowledgeError``) is reported the same way as
+    a missing/stale mirror — both mean the app's docs are not reaching the
+    KB right now, regardless of which side rotted.
+    """
+    from src.apps.knowledge import KnowledgeError, KnowledgeRegistry, resolve_knowledge_dir
+    from src.apps.paths import knowledge_apps_dir
+
+    out: list[dict] = []
+    for slug in runtime.loaded_slugs():
+        loaded = runtime.get(slug)
+        if loaded is None:
+            continue
+        knowledge = loaded.manifest.knowledge
+        if not knowledge:
+            continue
+        knowledge_path = knowledge.get("path") if isinstance(knowledge, dict) else None
+        if not knowledge_path:
+            continue
+        try:
+            src_dir = resolve_knowledge_dir(loaded.package_dir, knowledge_path)
+        except KnowledgeError as exc:
+            out.append({"app": slug, "reason": f"source dir invalid: {exc}"})
+            continue
+        dest_path = os.path.join(knowledge_apps_dir(), slug, "docs")
+        if not os.path.isdir(dest_path):
+            out.append({"app": slug, "reason": "mirror missing"})
+            continue
+        source_hash = KnowledgeRegistry._hash_dir(src_dir)
+        dest_hash = KnowledgeRegistry._read_hash(dest_path)
+        if source_hash != dest_hash:
+            out.append({"app": slug, "reason": "mirror content stale (hash mismatch)"})
+    return out
+
+
 def _config_for_install(app_id: str, data: dict, runtime, reconciler) -> dict:
     """Config to install ``app_id`` with: the caller's if it sent one,
     otherwise whatever is already on record for that app.
@@ -1803,6 +1850,12 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
           on purpose — this is the one failure mode a red GHA run can never
           show, because it's what catches the job no longer being scheduled
           at all.
+        * ``knowledge_mirrors`` — loaded apps declaring ``contributes.knowledge``
+          whose mirror (see ``_knowledge_mirror_problems``) is missing or
+          whose ``.aw-knowledge-source-hash`` no longer matches a fresh hash
+          of the app's source docs dir. Folded into ``ok``: on 2026-11-08
+          every one of the ~10 declared mirrors vanished for ~23h with zero
+          signal anywhere — nothing on the box could have told anyone.
         """
         clis = runtime.commands.system_cli_report()
 
@@ -1888,6 +1941,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         autostart_off = _autostart_disabled(runtime)
         autostart_not_running = await asyncio.to_thread(_autostart_not_running, runtime)
         pending_migrations = await asyncio.to_thread(_app_pending_migrations, runtime)
+        knowledge_mirror_problems = await asyncio.to_thread(_knowledge_mirror_problems, runtime)
         # Design §A.2: the audit itself must not rot silently the way the
         # doctor-watch task once did (disabled 2026-09-09, noticed
         # 2026-10-11) — 5x its own ~60s cadence is generous headroom for
@@ -1919,11 +1973,13 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             "ok": (not unhealthy and not permissions and not failing_app_checks
                    and not mcp_status["degraded"] and not autostart_not_running
                    and not pending_migrations
+                   and not knowledge_mirror_problems
                    and vault_status.get("reachable") is not False
                    and not remote_host_postgres_backup["stale"]
                    and not activation_audit_stale),
             "app_checks": app_checks,
             "pending_migrations": pending_migrations,
+            "knowledge_mirrors": knowledge_mirror_problems,
             "activation_audit": {
                 "last_run_age_s": activation_audit_age_s,
                 "stale": activation_audit_stale,
