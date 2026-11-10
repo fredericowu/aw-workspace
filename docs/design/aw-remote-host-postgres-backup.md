@@ -260,7 +260,7 @@ design, not a follow-up):
   writes can vanish. If that RPO is unacceptable, that's a scope conversation
   with the PO — the answer is WAL archiving (wal-g/pgBackRest), a different
   design, deliberately not smuggled into this one.
-- **The workspace container being down at 03:00:** that night's job dies at
+- **The workspace container being down at 07:00:** that night's job dies at
   preflight (loudly — red run), and because this is a *separate job*, the two
   existing clusters' backup is unaffected. Next night self-heals; the doctor
   check flags it if it persists.
@@ -300,7 +300,7 @@ fine; confirm, don't assume).
 5. **Workspace-internal scheduled task** — agent-session scheduler, LLM in a
    backup loop, workspace container as single point. (§6)
 6. **Folding this cluster into the existing `TARGETS` loop / same artifact** —
-   couples failure domains: a workspace-container recreate at 03:00 would
+   couples failure domains: a workspace-container recreate at 07:00 would
    `die` the whole run and take the two healthy clusters' backup with it; the
    exec mechanism and the verify stage differ anyway. Separate job, separate
    artifact prefix, untouched validated path.
