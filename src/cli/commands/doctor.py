@@ -46,6 +46,7 @@ def run(args: list[str]) -> int:
     _autostart(report.get("autostart") or [])
     problems += _autostart_not_running(report.get("autostart_not_running") or [])
     problems += _pending_migrations(report.get("pending_migrations") or [])
+    problems += _knowledge_mirrors(report.get("knowledge_mirrors") or [])
     _host_power(report.get("host_power") or {})
     problems += _mcp(report.get("mcp") or {})
     problems += _redis(report.get("redis") or {})
@@ -144,6 +145,24 @@ def _pending_migrations(rows: list) -> int:
     for row in rows:
         pending = row.get("pending") or []
         print(f"  ✗ {row['app']}: {len(pending)} pending — {', '.join(pending)}")
+    return len(rows)
+
+
+def _knowledge_mirrors(rows: list) -> int:
+    """Loaded apps whose declared ``contributes.knowledge`` mirror is
+    missing or stale — see ``_knowledge_mirror_problems`` in
+    ``src/apps/routes.py``. On 2026-11-08 every one of the ~10 declared
+    mirrors vanished for ~23h with zero signal; this is the row that would
+    have caught it."""
+    if not rows:
+        print()
+        print("Knowledge mirrors — every declared contributes.knowledge mirror "
+              "is present and current")
+        return 0
+    print()
+    print(f"Knowledge mirrors — {len(rows)} app(s) with a missing or stale mirror")
+    for row in rows:
+        print(f"  ✗ {row['app']}: {row.get('reason', 'unknown')}")
     return len(rows)
 
 
