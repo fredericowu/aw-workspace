@@ -79,6 +79,20 @@ def test_an_eval_needs_a_name():
                    "dataset": [], "metric": "judge_llm"}])))
 
 
+def test_a_full_declaration_with_plans_is_accepted():
+    m = validate_manifest(_manifest(contributes=_agents(
+        plans=[{"slug": "kanban-sweep", "name": "Kanban Sweep",
+               "follow_up_agent_slug": "kanban-sweeper"}],
+    )))
+    assert m.agents["plans"][0]["slug"] == "kanban-sweep"
+
+
+def test_a_plan_needs_a_name():
+    with pytest.raises(ManifestError, match="needs a 'name'"):
+        validate_manifest(_manifest(contributes=_agents(
+            plans=[{"slug": "kanban-sweep"}])))
+
+
 def test_a_target_needs_a_name():
     with pytest.raises(ManifestError, match="needs a 'name'"):
         validate_manifest(_manifest(contributes=_agents(
@@ -448,11 +462,12 @@ def test_an_empty_declaration_never_reaches_the_provider():
 
 
 def test_kinds_orders_workflows_and_evals_between_agents_and_flows():
-    # Workflows reference agents by slug (comes after); evals target either
-    # an agent or a workflow by slug (comes after both); agent_flows
+    # Workflows reference agents by slug (comes after); plans reference an
+    # agent and a workflow by slug (comes after both); evals target either
+    # an agent or a workflow by slug (comes after both too); agent_flows
     # reference agents by slug too, so it still goes last.
     assert KINDS == ("targets", "models", "agent_configs", "groups", "agents",
-                     "workflows", "evals", "agent_flows")
+                     "workflows", "plans", "evals", "agent_flows")
 
 
 def test_a_workflow_and_eval_are_seeded_in_order():
@@ -468,6 +483,33 @@ def test_a_workflow_and_eval_are_seeded_in_order():
     assert created["evals"] == 1
     assert [kind for kind, _ in provider.order] == [
         "targets", "models", "agent_configs", "groups", "agents", "workflows", "evals", "agent_flows"]
+
+
+def test_a_plan_is_seeded_and_reconciled():
+    """``plans`` needs no special-casing — it rides the same seed-then-
+    reconcile path every other kind does, provided KINDS and
+    AGENT_REQUIRED_FIELDS both list it."""
+    from src.apps import seeded_state
+
+    spec = {"plans": [{"slug": "kanban-sweep", "name": "Kanban Sweep",
+                       "purpose": "scan for stale cards",
+                       "follow_up_agent_slug": "kanban-sweeper"}]}
+    provider = FakeStateProvider()
+    rt = FakeRuntime({"runners": FakeLoaded({}, provider)})
+    reg = AgentsRegistry()
+
+    try:
+        created = reg.register(rt, "notion", spec)
+        assert created["plans"] == 1
+        assert provider.store["plans"]["kanban-sweep"]["purpose"] == "scan for stale cards"
+
+        # A later app version corrects the purpose — the field we seeded
+        # and nobody has hand-edited, so the reconcile pass must push it.
+        corrected = {"plans": [{**spec["plans"][0], "purpose": "corrected purpose"}]}
+        reg.register(rt, "notion", corrected)
+        assert provider.store["plans"]["kanban-sweep"]["purpose"] == "corrected purpose"
+    finally:
+        seeded_state.set_provider(None)
 
 
 # --- workspace qualification (narrowed §5.B — identity only) ----------------
