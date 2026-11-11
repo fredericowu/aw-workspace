@@ -829,6 +829,18 @@ class Reconciler:
         self._warned_unresolvable.add(app_id)
         return True
 
+    def _clear_unresolvable(self, app_id: str) -> None:
+        """Drop ``app_id``'s suppression marker on a successful install.
+
+        Without this, an app that was unresolvable, got fixed (or dropped
+        and recreated with a valid repo), installed successfully, and LATER
+        regressed again within the same process lifetime would stay
+        silently suppressed forever by :meth:`_note_unresolvable` — the
+        exact silent-degradation failure mode this whole mechanism exists
+        to avoid, just shifted from "every pass" to "the second occurrence".
+        """
+        self._warned_unresolvable.discard(app_id)
+
     # ---- app dependency resolution -----------------------------------------
 
     @staticmethod
@@ -1772,6 +1784,7 @@ class Reconciler:
                 # level instead of once per installed app in this pool.
                 summary = await self.install(spec, write_cloud=False,
                                              sync_skill_mirrors=False)
+                self._clear_unresolvable(app_id)
                 if summary.get("skipped") == "already-loaded":
                     already_loaded.append(app_id)
                 else:

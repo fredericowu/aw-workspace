@@ -234,6 +234,7 @@ async def run_once(reconciler: "Reconciler", runtime: "AppRuntime") -> dict[str,
         try:
             await reconciler.install(desired_active[app_id], write_cloud=False,
                                      sync_skill_mirrors=False)
+            reconciler._clear_unresolvable(app_id)
             repairs.append({"kind": "app", "app": app_id, "action": "install"})
             log.warning("activation_audit: I1 repaired %s — it was desired and "
                        "not loaded; installed", app_id)
