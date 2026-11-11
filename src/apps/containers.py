@@ -845,22 +845,30 @@ class ContainerSupervisor:
 
     def _engine_arch(self, client) -> str:
         """The container engine's own architecture, normalized to GOARCH
-        spelling, memoized for the life of this supervisor.
+        spelling. A successful detection is memoized for the life of this
+        supervisor — ``client.version()`` is a network round trip and the
+        engine underneath a live process cannot change architecture, so
+        there is no reason to ask twice once it has answered.
 
-        ``client.version()`` is a network round trip and the engine running
-        underneath a live process cannot change architecture, so this is
-        computed at most once. An empty string means "could not be
-        determined" — every caller already treats a falsy arch as "skip the
-        emulation gate", which is also the right behavior when the engine
-        itself can't answer this.
+        Only a SUCCESSFUL detection is memoized. A failure (e.g. the podman
+        socket still coming up during host boot, a brief timeout) returns
+        an empty string for THIS call without caching it, so the next call
+        tries again — caching the failure would permanently disable this
+        card's whole arch-mismatch gate for the rest of the process's life
+        after one transient hiccup on the very first call. Every caller
+        already treats a falsy arch as "skip the emulation gate", which is
+        also the right behavior for a single failed attempt.
         """
-        if self._engine_arch_cache is None:
-            try:
-                info = client.version() or {}
-                self._engine_arch_cache = _normalize_arch(info.get("Arch"))
-            except Exception:  # noqa: BLE001 — unknown engine arch disables the gate, not a crash
-                self._engine_arch_cache = ""
-        return self._engine_arch_cache
+        if self._engine_arch_cache:
+            return self._engine_arch_cache
+        try:
+            info = client.version() or {}
+        except Exception:  # noqa: BLE001 — not cached, see docstring
+            return ""
+        arch = _normalize_arch(info.get("Arch"))
+        if arch:
+            self._engine_arch_cache = arch
+        return arch
 
     def start(self, app_id: str) -> dict:
         c = self._require(app_id)
@@ -929,13 +937,25 @@ class ContainerSupervisor:
                     except Exception as exc3:  # noqa: BLE001
                         amd64_err = exc3
                 if native_err is not None:
-                    detail = f"native pull: {native_err}"
                     if amd64_err is not None:
-                        detail += f"; amd64 pull: {amd64_err}"
+                        # An amd64 fallback was actually attempted (and
+                        # failed) — safe to name it as the cause.
+                        raise ContainerError(
+                            f"image {c.image} has no build for this host "
+                            f"(host architecture {engine_arch}) and the "
+                            f"linux/amd64 fallback could not be pulled — "
+                            f"native pull: {native_err}; amd64 pull: {amd64_err}"
+                        ) from native_err
+                    # No fallback was attempted at all — the host is
+                    # already amd64, or its arch could not be determined.
+                    # Blaming "no build for this host" here would be a
+                    # false architecture diagnosis for what is more likely
+                    # a bad tag, an auth failure, or a genuinely missing
+                    # image — name only what's true: the pull failed and
+                    # nothing is cached.
                     raise ContainerError(
-                        f"image {c.image} has no build for this host (host "
-                        f"architecture {engine_arch or 'unknown'}) and the "
-                        f"linux/amd64 fallback could not be pulled — {detail}"
+                        f"image {c.image} could not be pulled and is not "
+                        f"cached locally — {native_err}"
                     ) from native_err
             else:
                 log.warning(

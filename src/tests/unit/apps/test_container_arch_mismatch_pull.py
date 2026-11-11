@@ -198,8 +198,13 @@ def test_structural_backstop_retries_platform_even_if_the_error_string_drifts(su
 def test_amd64_host_hitting_an_unresolvable_image_gets_no_fallback_attempt(sup, monkeypatch):
     """On an amd64 host the fallback target (linux/amd64) IS the native
     arch, so no retry is attempted at all — the error is still a clear
-    ContainerError, not a bare traceback, but it carries no "amd64 pull"
-    detail since nothing was retried."""
+    ContainerError, not a bare traceback, but it must not claim an
+    architecture mismatch that was never actually diagnosed: nothing here
+    proves this specific image has no amd64 build, only that the pull
+    failed and nothing is cached (it could just as well be a bad tag or an
+    auth failure) — a prior review round flagged the message claiming "no
+    build for this host" / "linux/amd64 fallback could not be pulled" here
+    even though no fallback was ever attempted."""
     client = _FakeClient(arch="x86_64", native_pull_error=_ARCH_MISMATCH)
     _wire(sup, client, monkeypatch)
     sup.register("kb", image="ghcr.io/example/arm-only:latest", port=9000)
@@ -209,6 +214,55 @@ def test_amd64_host_hitting_an_unresolvable_image_gets_no_fallback_attempt(sup, 
         sup.start("kb")
 
     message = str(excinfo.value)
-    assert "amd64" in message
+    assert "ghcr.io/example/arm-only:latest" in message
+    assert "no build for this host" not in message
+    assert "linux/amd64 fallback" not in message
     platform_calls = [c for c in client.pull_calls if c.get("platform") == "linux/amd64"]
     assert platform_calls == []
+
+
+def test_unknown_engine_arch_hitting_an_unresolvable_image_gets_no_fallback_attempt(
+        sup, monkeypatch):
+    """Same honesty requirement as the amd64-host case above, for the other
+    branch that skips the fallback attempt: the engine's arch could not be
+    determined at all (``client.version()`` failing), so the gate that
+    decides whether a platform retry is even relevant never ran."""
+    client = _FakeClient(arch="", native_pull_error=APIError("manifest unknown"))
+    monkeypatch.setattr(client, "version", lambda: (_ for _ in ()).throw(
+        RuntimeError("engine unreachable")))
+    _wire(sup, client, monkeypatch)
+    sup.register("kb", image="ghcr.io/example/missing:latest", port=9000)
+
+    from src.apps.containers import ContainerError
+    with pytest.raises(ContainerError) as excinfo:
+        sup.start("kb")
+
+    message = str(excinfo.value)
+    assert "no build for this host" not in message
+    assert "manifest unknown" in message
+    platform_calls = [c for c in client.pull_calls if c.get("platform") == "linux/amd64"]
+    assert platform_calls == []
+
+
+def test_engine_arch_detection_retries_after_a_transient_failure(sup, monkeypatch):
+    """A review finding on this card: caching a FAILED ``client.version()``
+    call permanently (even as a deliberate "unknown" sentinel) would
+    silently disable the whole arch-mismatch gate for the rest of the
+    process's life after one transient hiccup — e.g. the podman socket
+    still coming up during host boot. The second call must retry, not
+    reuse a cached failure."""
+    client = _FakeClient(arch="aarch64", native_pull_error=_ARCH_MISMATCH)
+    attempts = {"n": 0}
+    real_version = client.version
+
+    def flaky_version():
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("engine socket not ready yet")
+        return real_version()
+
+    monkeypatch.setattr(client, "version", flaky_version)
+    _wire(sup, client, monkeypatch)
+
+    assert sup._engine_arch(client) == ""  # first call: transient failure, not cached
+    assert sup._engine_arch(client) == "arm64"  # second call: retried, and now succeeds
