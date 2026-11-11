@@ -119,16 +119,17 @@ log = logging.getLogger(__name__)
 
 PROVIDER_METHOD = "register_contributed_agents"
 
-#: The eight kinds, in creation order. An agent references a model, a config
+#: The nine kinds, in creation order. An agent references a model, a config
 #: and a group by slug; a workflow's graph references agents by slug, so it
-#: comes after them; an eval's target_slug can point at either an agent or a
-#: workflow, so it comes after both; an agent flow references agents by
-#: slug too, so it comes last. ``targets`` has no dependency on, and no
-#: dependent among, the other seven (a Run points at a Target, not an
-#: Agent), so it is seeded first — as good a slot as any for something with
-#: no ordering constraint.
+#: comes after them; a plan references an agent (follow_up_agent_slug) and a
+#: workflow (follow_up_workflow_slug) by slug, so it comes after both; an
+#: eval's target_slug can point at either an agent or a workflow, so it
+#: comes after both too; an agent flow references agents by slug too, so it
+#: comes last. ``targets`` has no dependency on, and no dependent among, the
+#: other eight (a Run points at a Target, not an Agent), so it is seeded
+#: first — as good a slot as any for something with no ordering constraint.
 KINDS = ("targets", "models", "agent_configs", "groups", "agents",
-         "workflows", "evals", "agent_flows")
+         "workflows", "plans", "evals", "agent_flows")
 
 #: ``<field>_file`` sugar: a path relative to the package dir whose contents
 #: become ``<field>``. Long prompts don't belong inside JSON.
