@@ -112,6 +112,17 @@ def _reconcile_concurrency() -> int:
         return _DEFAULT_RECONCILE_CONCURRENCY
 
 
+class UnresolvableAppError(ValueError):
+    """An app id in desired state has neither a ``repo`` to fetch nor an
+    on-disk ``package_dir`` — raised by :meth:`Reconciler._resolve_package_dir`.
+
+    A distinct type (rather than a bare ``ValueError``) so
+    :meth:`Reconciler._install_missing` can single this condition out from
+    every other install failure and warn about it once per ``app_id``
+    instead of re-logging a full traceback on every reconcile pass forever.
+    """
+
+
 @dataclass
 class AppSpec:
     """Normalized desired-state for one app (from a cloud or local row)."""
@@ -251,6 +262,14 @@ class Reconciler:
         # survives. Created lazily; safe because there is no await between the
         # lookup and the insert.
         self._app_locks: dict[str, asyncio.Lock] = {}
+        # app_ids already warned about via UnresolvableAppError (neither a
+        # repo nor an on-disk package_dir). Per-instance, not persisted —
+        # a process restart re-surfaces the warning once, so a genuinely new
+        # regression is never silently eaten forever. Shared by both call
+        # sites that can hit this condition (_install_missing's install_one,
+        # and activation_audit's I1 repair loop) via _note_unresolvable, so
+        # whichever one discovers it first silences the other too.
+        self._warned_unresolvable: set[str] = set()
         # Serializes the skill-mirror fan-out ONLY — deliberately a separate,
         # cheap, in-process lock rather than reusing _provisioning()'s
         # cross-worker mutex, since the whole point of running the fan-out
@@ -792,8 +811,35 @@ class Reconciler:
             return self._fetch(spec.repo, spec.ref, slug=spec.app_id)
         if spec.package_dir and os.path.isdir(spec.package_dir):
             return spec.package_dir
-        raise ValueError(
+        raise UnresolvableAppError(
             f"app {spec.app_id!r} has neither a repo to fetch nor an on-disk package_dir")
+
+    def _note_unresolvable(self, app_id: str) -> bool:
+        """Record one hit of :class:`UnresolvableAppError` for ``app_id``.
+
+        Returns True the first time this is called for ``app_id`` on this
+        instance — the caller should warn loudly and record an error then.
+        Returns False every time after, for as long as the condition
+        persists — the caller should stay quiet. Shared between
+        :meth:`_install_missing` and ``activation_audit``'s I1 repair loop
+        so whichever discovers the app first silences the other too.
+        """
+        if app_id in self._warned_unresolvable:
+            return False
+        self._warned_unresolvable.add(app_id)
+        return True
+
+    def _clear_unresolvable(self, app_id: str) -> None:
+        """Drop ``app_id``'s suppression marker on a successful install.
+
+        Without this, an app that was unresolvable, got fixed (or dropped
+        and recreated with a valid repo), installed successfully, and LATER
+        regressed again within the same process lifetime would stay
+        silently suppressed forever by :meth:`_note_unresolvable` — the
+        exact silent-degradation failure mode this whole mechanism exists
+        to avoid, just shifted from "every pass" to "the second occurrence".
+        """
+        self._warned_unresolvable.discard(app_id)
 
     # ---- app dependency resolution -----------------------------------------
 
@@ -1490,7 +1536,8 @@ class Reconciler:
 
         # Phases 1+2: BOOT_PRIORITY serially to completion, then the rest
         # through the bounded pool.
-        already_loaded = await self._install_missing(missing, installed, errors, durations)
+        already_loaded, skipped_unresolvable = await self._install_missing(
+            missing, installed, errors, durations)
         # Silent path #2 of design §A.1: an app partitioned as MISSING that
         # turned out already-loaded by the time its own install slot ran (a
         # concurrent peer's dependency resolution won the race). Recorded here
@@ -1668,7 +1715,7 @@ class Reconciler:
                        "resolution won the race)"}
             for app_id in sorted(already_loaded_set)]
         accounted = (set(installed) | set(upgraded) | set(present_unchanged)
-                    | already_loaded_set
+                    | already_loaded_set | set(skipped_unresolvable)
                     | {e["app_id"] for e in errors if e.get("app_id")})
         unaccounted = sorted(set(desired_active) - accounted)
         if unaccounted:
@@ -1687,6 +1734,7 @@ class Reconciler:
                   "installed": installed, "upgraded": upgraded, "removed": removed,
                   "present_unchanged": present_unchanged,
                   "skipped_already_loaded": skipped_already_loaded,
+                  "skipped_unresolvable": sorted(skipped_unresolvable),
                   "errors": errors, "mcp_gateway_reloaded": wanted_reload,
                   "apps_changed_published": wanted_broadcast,
                   "duration_s": duration_s, "concurrency": concurrency,
@@ -1703,13 +1751,18 @@ class Reconciler:
 
     async def _install_missing(self, missing: dict[str, AppSpec],
                                installed: list[str], errors: list[dict[str, str]],
-                               durations: dict[str, float]) -> list[str]:
+                               durations: dict[str, float]) -> tuple[list[str], list[str]]:
         """Install every MISSING app of one pass: BOOT_PRIORITY serially and to
         completion first, then the rest through a bounded pool.
 
-        Returns the app_ids that turned out to be already loaded by the time
-        their own task ran — a concurrent peer pulled them in as ITS dependency
-        (see :meth:`_install_provisioned`'s re-check).
+        Returns ``(already_loaded, skipped_unresolvable)``: ``already_loaded``
+        is the app_ids that turned out to be already loaded by the time their
+        own task ran — a concurrent peer pulled them in as ITS dependency (see
+        :meth:`_install_provisioned`'s re-check). ``skipped_unresolvable`` is
+        app_ids hitting :class:`UnresolvableAppError` for at least a second
+        time (see below) — the caller must still count them as accounted for
+        (design §A.1) even though this pass added nothing to ``errors`` for
+        them.
 
         Why BOOT_PRIORITY stays alone and first: mcp-gateway is the whole
         workspace's MCP surface, every agent session is blind until it is up,
@@ -1722,6 +1775,7 @@ class Reconciler:
         loop's did.
         """
         already_loaded: list[str] = []
+        skipped_unresolvable: list[str] = []
 
         async def install_one(app_id: str, spec: AppSpec) -> None:
             started = time.monotonic()
@@ -1730,10 +1784,22 @@ class Reconciler:
                 # level instead of once per installed app in this pool.
                 summary = await self.install(spec, write_cloud=False,
                                              sync_skill_mirrors=False)
+                self._clear_unresolvable(app_id)
                 if summary.get("skipped") == "already-loaded":
                     already_loaded.append(app_id)
                 else:
                     installed.append(app_id)
+            except UnresolvableAppError as e:
+                # Loud once per app_id (and recorded in errors once, so an
+                # install-status caller sees it at least once), then quiet —
+                # this condition does not change pass to pass, so re-raising
+                # a full traceback on every ~13-minute reconcile forever is
+                # pure noise (measured: 779 occurrences/app over 7 days).
+                if self._note_unresolvable(app_id):
+                    log.warning("apps: reconcile cannot install %s: %s", app_id, e)
+                    errors.append({"app_id": app_id, "action": "install", "error": str(e)})
+                else:
+                    skipped_unresolvable.append(app_id)
             except Exception as e:  # noqa: BLE001 — one bad app must not block the rest
                 log.exception("apps: reconcile failed to install %s", app_id)
                 errors.append({"app_id": app_id, "action": "install", "error": str(e)})
@@ -1754,7 +1820,7 @@ class Reconciler:
             # submission order, same completion order, no tasks, no semaphore.
             for app_id in rest:
                 await install_one(app_id, missing[app_id])
-            return already_loaded
+            return already_loaded, skipped_unresolvable
 
         sem = asyncio.Semaphore(concurrency)
 
@@ -1768,4 +1834,4 @@ class Reconciler:
         # there is nothing here to propagate and nothing to cancel — this is
         # purely "wait for the pool to drain".
         await asyncio.gather(*(guarded(app_id) for app_id in rest))
-        return already_loaded
+        return already_loaded, skipped_unresolvable

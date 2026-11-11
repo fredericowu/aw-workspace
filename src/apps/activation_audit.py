@@ -216,6 +216,8 @@ async def run_once(reconciler: "Reconciler", runtime: "AppRuntime") -> dict[str,
     if reconciler.is_provisioning:
         return {"skipped": "provisioning-in-flight"}
 
+    from src.apps import reconciler as reconciler_mod
+
     repairs: list[dict] = []
     errors: list[dict] = []
     repair_budget = _MAX_REPAIRS_PER_RUN
@@ -232,9 +234,21 @@ async def run_once(reconciler: "Reconciler", runtime: "AppRuntime") -> dict[str,
         try:
             await reconciler.install(desired_active[app_id], write_cloud=False,
                                      sync_skill_mirrors=False)
+            reconciler._clear_unresolvable(app_id)
             repairs.append({"kind": "app", "app": app_id, "action": "install"})
             log.warning("activation_audit: I1 repaired %s — it was desired and "
                        "not loaded; installed", app_id)
+        except reconciler_mod.UnresolvableAppError as e:
+            # Same app, same reason, every ~60s audit tick — reconciler's own
+            # _install_missing may well have already warned about this exact
+            # app_id in the SAME reconcile pass (run_once's other caller).
+            # _note_unresolvable is the shared gate: whichever call site
+            # discovers it first stays loud once, the other (here or there)
+            # goes quiet for as long as the condition persists.
+            if reconciler._note_unresolvable(app_id):
+                errors.append({"kind": "app", "app": app_id, "action": "install",
+                              "error": str(e)})
+                log.warning("activation_audit: I1 cannot repair %s: %s", app_id, e)
         except Exception as e:  # noqa: BLE001 — one bad app must not sink the run
             errors.append({"kind": "app", "app": app_id, "action": "install",
                           "error": str(e)})
