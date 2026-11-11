@@ -127,6 +127,9 @@ def component_snapshot(app: FastAPI) -> list[dict]:
             "running": running,
             "container": status.get("container", container.name),
             "image": getattr(container, "image", None),
+            "image_arch": status.get("image_arch"),
+            "emulated": bool(status.get("emulated")),
+            "emulated_detail": status.get("emulated_detail"),
             "url": status.get("url"),
         })
     rows.extend(_service_snapshot(app))

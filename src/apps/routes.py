@@ -386,6 +386,41 @@ def _knowledge_mirror_problems(runtime) -> list[dict]:
     return out
 
 
+def _emulated_apps(runtime) -> list[dict]:
+    """Running Tier-2 containers whose image architecture does not match the
+    container engine's own — i.e. actually paying the emulation tax right
+    now, per :meth:`ContainerSupervisor.status`'s ``emulated`` flag.
+
+    SET+CLEAR+GATE, same convention as ``_knowledge_mirror_problems``: SET
+    is a running container with ``emulated=True`` this instant — derived
+    live off the container + engine, never a persisted marker, so it cannot
+    go stale the way a stored flag would. CLEAR happens on its own the next
+    time this is called once a native image has been published and the app
+    restarted onto it — nothing here needs to notice the transition, the
+    live comparison just stops matching. Folded into ``ok``: an app running
+    several times slower under emulation, with nothing on the box saying
+    why, is this workspace's named failure mode.
+    """
+    containers = getattr(runtime, "containers", None)
+    if containers is None:
+        return []
+    out: list[dict] = []
+    for app_id, container in containers.registered():
+        try:
+            status = containers.status(app_id)
+        except Exception:  # noqa: BLE001 — one unreadable container must not hide the rest
+            continue
+        if not status.get("emulated"):
+            continue
+        out.append({
+            "app": app_id,
+            "image": getattr(container, "image", None),
+            "image_arch": status.get("image_arch"),
+            "detail": status.get("emulated_detail") or "running emulated",
+        })
+    return out
+
+
 def _config_for_install(app_id: str, data: dict, runtime, reconciler) -> dict:
     """Config to install ``app_id`` with: the caller's if it sent one,
     otherwise whatever is already on record for that app.
@@ -1856,6 +1891,14 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
           of the app's source docs dir. Folded into ``ok``: on 2026-11-08
           every one of the ~10 declared mirrors vanished for ~23h with zero
           signal anywhere — nothing on the box could have told anyone.
+        * ``emulated_apps`` — running Tier-2 containers whose image
+          architecture doesn't match the engine's own (see
+          ``_emulated_apps``) — e.g. an arm64 BYOD host running an
+          amd64-only app image under qemu after the pull fallback in
+          ``ContainerSupervisor.start()``. Folded into ``ok``: auto-falling
+          back to emulation is deliberately NOT silent, per this
+          workspace's named failure mode (a workaround nobody can see is
+          running, several times slower, for no visible reason).
         """
         clis = runtime.commands.system_cli_report()
 
@@ -1942,6 +1985,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         autostart_not_running = await asyncio.to_thread(_autostart_not_running, runtime)
         pending_migrations = await asyncio.to_thread(_app_pending_migrations, runtime)
         knowledge_mirror_problems = await asyncio.to_thread(_knowledge_mirror_problems, runtime)
+        emulated_apps = await asyncio.to_thread(_emulated_apps, runtime)
         # Design §A.2: the audit itself must not rot silently the way the
         # doctor-watch task once did (disabled 2026-09-09, noticed
         # 2026-10-11) — 5x its own ~60s cadence is generous headroom for
@@ -1974,12 +2018,14 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                    and not mcp_status["degraded"] and not autostart_not_running
                    and not pending_migrations
                    and not knowledge_mirror_problems
+                   and not emulated_apps
                    and vault_status.get("reachable") is not False
                    and not remote_host_postgres_backup["stale"]
                    and not activation_audit_stale),
             "app_checks": app_checks,
             "pending_migrations": pending_migrations,
             "knowledge_mirrors": knowledge_mirror_problems,
+            "emulated_apps": emulated_apps,
             "activation_audit": {
                 "last_run_age_s": activation_audit_age_s,
                 "stale": activation_audit_stale,
