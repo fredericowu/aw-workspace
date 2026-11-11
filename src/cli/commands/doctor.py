@@ -48,6 +48,7 @@ def run(args: list[str]) -> int:
     problems += _pending_migrations(report.get("pending_migrations") or [])
     problems += _knowledge_mirrors(report.get("knowledge_mirrors") or [])
     problems += _emulated_apps(report.get("emulated_apps") or [])
+    problems += _activation_audit(report.get("activation_audit") or {})
     _host_power(report.get("host_power") or {})
     problems += _mcp(report.get("mcp") or {})
     problems += _redis(report.get("redis") or {})
@@ -165,6 +166,35 @@ def _knowledge_mirrors(rows: list) -> int:
     for row in rows:
         print(f"  ✗ {row['app']}: {row.get('reason', 'unknown')}")
     return len(rows)
+
+
+def _activation_audit(section: dict) -> int:
+    """The activation audit's own two self-check signals — both already
+    folded into the JSON payload's top-level ``ok``, but (until now) never
+    printed or counted here, so a human/agent running the TEXT form of this
+    very command (the one `AGENTS.md` tells every agent to run first) could
+    see "No silent degradation found." while the JSON `ok` was already
+    False. ``stale``: the audit itself stopped running (design doc §A.2).
+    ``repair_circuits_open``: I1 gave up repairing a required app after
+    repeated failures — see ``repair_circuit_rows`` in
+    ``src/apps/activation_audit.py``."""
+    stale = section.get("stale")
+    circuits = section.get("repair_circuits_open") or []
+    if not stale and not circuits:
+        print()
+        print("Activation audit — running and no repair circuit is open")
+        return 0
+    print()
+    print("Activation audit — problem(s) found")
+    if stale:
+        age = section.get("last_run_age_s")
+        print(f"  ✗ stale — last ran {age:.0f}s ago" if age is not None
+              else "  ✗ stale — has never run")
+    for row in circuits:
+        print(f"  ✗ {row['app']}: I1 repair circuit open after "
+              f"{row.get('consecutive_failures')} consecutive failures — "
+              f"{row.get('last_error', 'unknown')}")
+    return (1 if stale else 0) + len(circuits)
 
 
 def _emulated_apps(rows: list) -> int:
