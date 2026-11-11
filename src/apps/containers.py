@@ -291,6 +291,37 @@ def _registry_host(image: str) -> str:
     return "docker.io"
 
 
+def _normalize_arch(raw: str | None) -> str:
+    """GOARCH-style spelling (``amd64``/``arm64``) for an engine or image
+    architecture string.
+
+    ``docker version``/``docker inspect`` report the kernel's own uname
+    spelling (``x86_64``, ``aarch64``); the OCI platform string — what
+    ``images.pull(platform=...)`` and a manifest list itself use — is
+    GOARCH. Normalizing once here means every caller compares the same
+    spelling instead of each re-deriving its own mapping.
+    """
+    raw = (raw or "").strip().lower()
+    return {"x86_64": "amd64", "aarch64": "arm64"}.get(raw, raw)
+
+
+#: Manifest-list "no build for this platform" wording, from the two engines
+#: BYOD hosts actually run (containers-image/podman, and the Docker Engine).
+#: A maintenance point across podman upgrades — see the structural backstop
+#: in ``ContainerSupervisor.start()``, which does not depend on this staying
+#: accurate: a drifted string degrades to one extra failed pull, not a
+#: broken first start.
+_ARCH_MISMATCH_MARKERS = (
+    "no image found in manifest list",
+    "no matching manifest",
+)
+
+
+def _is_arch_mismatch(err: Exception) -> bool:
+    text = str(err).lower()
+    return any(marker in text for marker in _ARCH_MISMATCH_MARKERS)
+
+
 def _registry_auth(image: str) -> dict | None:
     """Credentials for pulling ``image``, or None to pull anonymously.
 
@@ -560,6 +591,7 @@ class ContainerSupervisor:
         self._pull_client = None  # built lazily, own timeout — see _docker_for_pull
         self._create_client = None  # ditto — see _docker_for_create
         self._containers: dict[str, _Container] = {}
+        self._engine_arch_cache: str | None = None  # memoized — see _engine_arch
 
     @property
     def available(self) -> bool:
@@ -811,6 +843,25 @@ class ContainerSupervisor:
         c.env = dict(env)
         return True
 
+    def _engine_arch(self, client) -> str:
+        """The container engine's own architecture, normalized to GOARCH
+        spelling, memoized for the life of this supervisor.
+
+        ``client.version()`` is a network round trip and the engine running
+        underneath a live process cannot change architecture, so this is
+        computed at most once. An empty string means "could not be
+        determined" — every caller already treats a falsy arch as "skip the
+        emulation gate", which is also the right behavior when the engine
+        itself can't answer this.
+        """
+        if self._engine_arch_cache is None:
+            try:
+                info = client.version() or {}
+                self._engine_arch_cache = _normalize_arch(info.get("Arch"))
+            except Exception:  # noqa: BLE001 — unknown engine arch disables the gate, not a crash
+                self._engine_arch_cache = ""
+        return self._engine_arch_cache
+
     def start(self, app_id: str) -> dict:
         c = self._require(app_id)
         # Not _docker(): every call below is a mutating lifecycle op whose
@@ -833,17 +884,63 @@ class ContainerSupervisor:
         # back to whatever's cached when the registry itself is unreachable
         # (offline/BYOD-friendly), matching the catalog's own stale-is-better-
         # than-broken fallback (see ``src.apps.catalog.get_catalog``).
+        pull_client = self._docker_for_pull()
+        auth = _registry_auth(c.image)
+        engine_arch = self._engine_arch(pull_client)
+        native_err: Exception | None = None
+        amd64_err: Exception | None = None
         try:
             log.info("apps: pulling image %s for %s", c.image, c.name)
-            self._docker_for_pull().images.pull(c.image, auth_config=_registry_auth(c.image))
-        except Exception:  # noqa: BLE001 — registry unreachable, fall back to cache
+            pull_client.images.pull(c.image, auth_config=auth)
+        except Exception as exc:  # noqa: BLE001 — classified below
+            native_err = exc
+            # A manifest-list arch mismatch on a non-amd64 engine means this
+            # image simply has no build for this host — retry under
+            # emulation BEFORE falling back to cache (not after): the native
+            # pull never succeeds on these images, so if the cache fallback
+            # ran first the very first emulated pull would freeze on
+            # whatever got cached that one time, instead of refreshing on
+            # every later restart the way a normal pull does.
+            if engine_arch and engine_arch != "amd64" and _is_arch_mismatch(exc):
+                try:
+                    log.warning(
+                        "apps: %s has no %s build — pulling linux/amd64 under "
+                        "emulation for %s", c.image, engine_arch, c.name)
+                    pull_client.images.pull(c.image, platform="linux/amd64", auth_config=auth)
+                    native_err = None
+                except Exception as exc2:  # noqa: BLE001
+                    amd64_err = exc2
+
+        if native_err is not None:
             try:
                 client.images.get(c.image)
             except ImageNotFound:
-                raise
-            log.warning(
-                "apps: pull failed for %s, starting %s from cached image", c.image, c.name
-            )
+                # Structural backstop: a cache miss on a non-amd64 engine
+                # always gets one platform=linux/amd64 attempt, even if the
+                # error-string classification above never fired — podman's
+                # manifest-list wording is a maintenance point across
+                # versions, and this guarantees first-start correctness
+                # regardless of whether it drifts.
+                if amd64_err is None and engine_arch and engine_arch != "amd64":
+                    try:
+                        pull_client.images.pull(
+                            c.image, platform="linux/amd64", auth_config=auth)
+                        native_err = None
+                    except Exception as exc3:  # noqa: BLE001
+                        amd64_err = exc3
+                if native_err is not None:
+                    detail = f"native pull: {native_err}"
+                    if amd64_err is not None:
+                        detail += f"; amd64 pull: {amd64_err}"
+                    raise ContainerError(
+                        f"image {c.image} has no build for this host (host "
+                        f"architecture {engine_arch or 'unknown'}) and the "
+                        f"linux/amd64 fallback could not be pulled — {detail}"
+                    ) from native_err
+            else:
+                log.warning(
+                    "apps: pull failed for %s, starting %s from cached image", c.image, c.name
+                )
 
         kwargs: dict = {
             "name": c.name,
@@ -1081,6 +1178,7 @@ class ContainerSupervisor:
             running = state == "running"
         except NotFound:
             pass
+        image_arch, emulated, emulated_detail = self._emulation_status(client, c, running)
         return {
             "container": c.name,
             "running": running,
@@ -1088,7 +1186,43 @@ class ContainerSupervisor:
             "image": c.image,
             "port": c.port,
             "url": self.base_url(app_id),
+            "image_arch": image_arch,
+            "emulated": emulated,
+            "emulated_detail": emulated_detail,
         }
+
+    def _emulation_status(
+        self, client, c: _Container, running: bool,
+    ) -> tuple[str, bool, str | None]:
+        """Whether ``c``'s image architecture differs from the engine's own.
+
+        Derived live on every call, never persisted — this workspace's own
+        SET+CLEAR+GATE convention for a degradation signal: a stored
+        "emulated" marker would need its own CLEAR path, and a prior card on
+        this exact convention went permanently red for lacking one. The live
+        comparison below cannot go stale.
+
+        Only checked for a RUNNING container: a stopped/uninstalled app
+        isn't costing anyone emulated CPU right now, and inspecting an image
+        that may not even be pulled yet buys nothing. Any inspect failure
+        (image half-removed, engine unreachable) degrades to "unknown",
+        never a crash — this feeds ``status()``, which must not break just
+        because the arch check couldn't run.
+        """
+        if not running:
+            return "", False, None
+        try:
+            image_obj = client.images.get(c.image)
+            image_arch = _normalize_arch(
+                (getattr(image_obj, "attrs", None) or {}).get("Architecture"))
+            engine_arch = self._engine_arch(client)
+        except Exception:  # noqa: BLE001 — a half-removed image degrades to unknown, not a crash
+            return "", False, None
+        if not image_arch or not engine_arch or image_arch == engine_arch:
+            return image_arch, False, None
+        detail = (f"running emulated: image is {image_arch}, host is {engine_arch} — "
+                  f"restart the app after a native {engine_arch} image publishes")
+        return image_arch, True, detail
 
     def base_url(self, app_id: str) -> str:
         """The URL the reverse-proxy targets to reach this app's container."""

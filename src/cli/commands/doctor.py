@@ -47,6 +47,7 @@ def run(args: list[str]) -> int:
     problems += _autostart_not_running(report.get("autostart_not_running") or [])
     problems += _pending_migrations(report.get("pending_migrations") or [])
     problems += _knowledge_mirrors(report.get("knowledge_mirrors") or [])
+    problems += _emulated_apps(report.get("emulated_apps") or [])
     _host_power(report.get("host_power") or {})
     problems += _mcp(report.get("mcp") or {})
     problems += _redis(report.get("redis") or {})
@@ -163,6 +164,24 @@ def _knowledge_mirrors(rows: list) -> int:
     print(f"Knowledge mirrors — {len(rows)} app(s) with a missing or stale mirror")
     for row in rows:
         print(f"  ✗ {row['app']}: {row.get('reason', 'unknown')}")
+    return len(rows)
+
+
+def _emulated_apps(rows: list) -> int:
+    """Running Tier-2 containers whose image architecture doesn't match the
+    engine's own — see ``_emulated_apps`` in ``src/apps/routes.py``. Counted
+    as a real problem: auto-falling back to an emulated pull is deliberate,
+    but running several times slower with nothing on the box saying why is
+    this workspace's named failure mode."""
+    if not rows:
+        print()
+        print("Emulated apps — every running Tier-2 container matches the host architecture")
+        return 0
+    print()
+    print(f"Emulated apps — {len(rows)} app(s) running under emulation")
+    for row in rows:
+        print(f"  ✗ {row['app']} ({row.get('image', '?')}, {row.get('image_arch', '?')}): "
+              f"{row.get('detail', '')}")
     return len(rows)
 
 
