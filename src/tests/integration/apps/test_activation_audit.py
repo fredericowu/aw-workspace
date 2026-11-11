@@ -37,6 +37,16 @@ def _async(coro):
     return asyncio.run(coro)
 
 
+@pytest.fixture(autouse=True)
+def _reset_i1_repair_state():
+    """``aa._i1_repair_state`` is process-local module state (same shape as
+    ``CommandInstaller._heal_state``) — without this, one test's circuit
+    tripping would leak into the next test's assertions."""
+    aa._i1_repair_state.clear()
+    yield
+    aa._i1_repair_state.clear()
+
+
 async def _drain_background_tasks() -> None:
     """Let any ``asyncio.create_task``-fired escalation actually run. A
     fire-and-forget task scheduled but never awaited is simply cancelled when
@@ -200,6 +210,92 @@ def test_i1_quiet_pass_stays_quiet(tmp_path, monkeypatch, caplog):
     assert result["errors"] == []
     assert result["escalated"] is False
     assert "0 repair(s), 0 error(s)" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# I1's own backoff/circuit-breaker (card 4155bf3b-9510-81fc) — a required
+# app stuck on a persistently-failing repair (e.g. a dependency resolving to
+# a stale cloud `app-installs` pin nothing ever refreshes) must stop being
+# retried at a flat ~60s cadence forever, and must surface as a durable,
+# named doctor problem rather than only a repeating log line.
+# ---------------------------------------------------------------------------
+
+
+def test_i1_persistent_failure_opens_the_circuit_then_stops_retrying(tmp_path, monkeypatch):
+    monkeypatch.setattr(aa, "_I1_MAX_CONSECUTIVE_FAILURES", 3)
+    monkeypatch.setattr(aa, "_I1_BACKOFF_BASE_S", 0.0)
+    monkeypatch.setattr(aa, "_I1_BACKOFF_MAX_S", 0.0)
+    cloud = FakeCloud([{"app_id": "aa-ghost", "repo": str(tmp_path / "nope"),
+                        "ref": "main", "version": "1.0.0", "state": "installed"}])
+    rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    for i in range(3):
+        result = _async(aa.run_once(rc, rt))
+        assert len(result["errors"]) == 1, f"attempt {i} should still be tried"
+        assert result["skipped_backoff"] == []
+
+    open_rows = aa.repair_circuit_rows()
+    assert len(open_rows) == 1
+    assert open_rows[0]["app"] == "aa-ghost"
+    assert open_rows[0]["consecutive_failures"] == 3
+
+    # A 4th tick must not attempt the install again — the circuit is open,
+    # so it is named in skipped_backoff and no new error is recorded.
+    result = _async(aa.run_once(rc, rt))
+    assert result["errors"] == []
+    assert result["skipped_backoff"] == [{"kind": "app", "app": "aa-ghost"}]
+    assert aa.repair_circuit_rows()[0]["consecutive_failures"] == 3, \
+        "a skipped attempt must not itself count as another failure"
+
+
+def test_i1_success_clears_the_failure_count_entirely(tmp_path, monkeypatch):
+    monkeypatch.setattr(aa, "_I1_BACKOFF_BASE_S", 0.0)
+    monkeypatch.setattr(aa, "_I1_BACKOFF_MAX_S", 0.0)
+    repo = _make_app_repo(tmp_path, "aa-widget")
+    cloud = FakeCloud([{"app_id": "aa-widget", "repo": str(tmp_path / "nope"),
+                        "ref": "main", "version": "1.0.0", "state": "installed"}])
+    rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    _async(aa.run_once(rc, rt))  # fails once
+    assert aa._i1_repair_state["aa-widget"]["consecutive_failures"] == 1
+
+    cloud.rows[0]["repo"] = repo  # the same app, now actually installable
+    _async(aa.run_once(rc, rt))
+
+    assert rt.is_loaded("aa-widget")
+    assert "aa-widget" not in aa._i1_repair_state, \
+        "a successful repair must clear the failure count, not just reset to a lower number"
+    assert aa.repair_circuit_rows() == []
+
+
+def test_i1_stale_circuit_clears_once_the_app_loads_through_any_path(tmp_path, monkeypatch):
+    """The same gap PR #29 closed for ``_warned_unresolvable`` via
+    ``_clear_unresolvable``, for this failure shape: an app whose circuit
+    opened and was later fixed through a path OTHER than I1's own retry (a
+    human's explicit top-level reinstall, same as the live mitigation used
+    on card 4155bf3b-9510-81fc) must not keep reporting a permanent
+    "circuit open" degradation on a now-healthy app."""
+    monkeypatch.setattr(aa, "_I1_MAX_CONSECUTIVE_FAILURES", 2)
+    monkeypatch.setattr(aa, "_I1_BACKOFF_BASE_S", 0.0)
+    monkeypatch.setattr(aa, "_I1_BACKOFF_MAX_S", 0.0)
+    cloud = FakeCloud([{"app_id": "aa-widget", "repo": str(tmp_path / "nope"),
+                        "ref": "main", "version": "1.0.0", "state": "installed"}])
+    rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    for _ in range(2):
+        _async(aa.run_once(rc, rt))
+    assert len(aa.repair_circuit_rows()) == 1, "the circuit should be open"
+
+    # Fixed directly, bypassing I1's own retry entirely.
+    repo = _make_app_repo(tmp_path, "aa-widget")
+    _async(rc.install(AppSpec(app_id="aa-widget", repo=repo, ref="main")))
+    assert rt.is_loaded("aa-widget")
+
+    result = _async(aa.run_once(rc, rt))
+
+    assert aa.repair_circuit_rows() == [], \
+        "a stale circuit for a now-healthy app must clear, not persist forever"
+    assert result["apps_missing"] == 0
 
 
 def test_provisioning_in_flight_skips_the_run_entirely(tmp_path, monkeypatch):

@@ -106,6 +106,83 @@ _MAX_REPAIRS_PER_RUN = 5
 #: module docstring's "LOUD escalation" section.
 _ESCALATION_DEBOUNCE_S = 900.0
 
+#: I1's own backoff/circuit-breaker, mirroring ``CommandInstaller.heal``'s
+#: identical shape (``src/apps/commands.py``'s ``HEAL_BACKOFF_BASE_S`` /
+#: ``HEAL_BACKOFF_MAX_S`` / ``HEAL_MAX_CONSECUTIVE_FAILURES``) — same values,
+#: for the same reason: a repair that keeps failing for a REAL cause (a
+#: required dependency resolving to a cloud `app-installs` pin nothing ever
+#: refreshes, confirmed live 2026-11-11 on card 4155bf3b-9510-81fc) must stop
+#: being retried at a flat ~60s cadence forever and say so, instead of
+#: producing an unbounded stream of identical log lines that nothing reads
+#: proactively. Before this, the only signal a stuck I1 repair produced was
+#: the existing LOUD escalation below, debounced to one attempt per 15
+#: minutes workspace-wide and naming no app — it re-runs the degradation-watch
+#: task, it does not itself identify which app is stuck or stay visible
+#: between pings. See :func:`repair_circuit_rows`, read by ``doctor``
+#: (``src/apps/routes.py``), for the persistent half this adds.
+_I1_BACKOFF_BASE_S = 300.0
+_I1_BACKOFF_MAX_S = 3600.0
+_I1_MAX_CONSECUTIVE_FAILURES = 10
+
+#: ``app_id -> {"consecutive_failures", "last_error", "next_attempt_at"}``.
+#: Process-local, like ``CommandInstaller._heal_state`` — a multi-worker
+#: fleet pays this once per worker, which only means each worker grants
+#: itself its own 10 attempts before giving up, not 10 forever workspace-wide.
+_i1_repair_state: dict[str, dict[str, Any]] = {}
+
+
+def _i1_due_for_repair(app_id: str) -> bool:
+    """Whether I1 should attempt another repair of ``app_id`` right now —
+    ``False`` while backing off, or once the circuit has opened."""
+    state = _i1_repair_state.get(app_id)
+    if state is None:
+        return True
+    if state["consecutive_failures"] >= _I1_MAX_CONSECUTIVE_FAILURES:
+        return False  # circuit open — see _record_i1_repair_result
+    next_at = state.get("next_attempt_at")
+    return next_at is None or time.time() >= next_at
+
+
+def _record_i1_repair_result(app_id: str, error: str | None) -> None:
+    """Update ``app_id``'s backoff state after one repair attempt. ``error``
+    is ``None`` on success (clears the state entirely — a fresh problem
+    later starts its own count from zero, same as a successful heal clears
+    ``CommandInstaller``'s own state)."""
+    if error is None:
+        _i1_repair_state.pop(app_id, None)
+        return
+    state = _i1_repair_state.setdefault(
+        app_id, {"consecutive_failures": 0, "last_error": None, "next_attempt_at": None})
+    state["consecutive_failures"] += 1
+    state["last_error"] = error
+    if state["consecutive_failures"] >= _I1_MAX_CONSECUTIVE_FAILURES:
+        # circuit open: _i1_due_for_repair stops offering this app as a
+        # candidate until it next loads successfully through ANY path (see
+        # run_once's stale-state sweep) clears it.
+        state["next_attempt_at"] = None
+        log.error("activation_audit: I1 repair circuit OPEN for %s after %d "
+                  "consecutive failures — giving up until it next loads "
+                  "successfully; last error: %s", app_id,
+                  state["consecutive_failures"], error)
+    else:
+        backoff = min(
+            _I1_BACKOFF_BASE_S * (2 ** (state["consecutive_failures"] - 1)),
+            _I1_BACKOFF_MAX_S)
+        state["next_attempt_at"] = time.time() + backoff
+
+
+def repair_circuit_rows() -> list[dict[str, Any]]:
+    """Every app_id whose I1 repair circuit is open right now — read by
+    ``doctor`` (``src/apps/routes.py``) so a persistently-failing repair is a
+    durable, named problem instead of only a repeating log line between the
+    one escalation ping every 15 minutes."""
+    return [
+        {"app": app_id, "consecutive_failures": state["consecutive_failures"],
+         "last_error": state.get("last_error")}
+        for app_id, state in _i1_repair_state.items()
+        if state["consecutive_failures"] >= _I1_MAX_CONSECUTIVE_FAILURES
+    ]
+
 #: Soft-resolved by NAME (never a hardcoded id — a task id is per-workspace,
 #: created once by a human or a prior card), so an environment missing the
 #: task, or the tasks app entirely, is a one-line WARNING and a no-op rather
@@ -225,7 +302,21 @@ async def run_once(reconciler: "Reconciler", runtime: "AppRuntime") -> dict[str,
     # ---- I1: every desired app is loaded --------------------------------
     desired_active, source = await reconciler._resolve_desired_active()
     apps_missing = [app_id for app_id in desired_active if not runtime.is_loaded(app_id)]
+    skipped_backoff: list[dict] = []
+    # A desired app that IS loaded right now had its problem resolved through
+    # SOME path — I1's own retry succeeding, a human's explicit reinstall, a
+    # manual repair — and the circuit state does not know or care which.
+    # Without this, an app whose circuit opened and was later fixed any other
+    # way would report a PERMANENT "circuit open" degradation forever: the
+    # exact same gap PR #29 closed for `_warned_unresolvable` via
+    # `_clear_unresolvable`, applied here to the same failure shape.
+    for app_id in list(_i1_repair_state):
+        if app_id not in apps_missing:
+            _i1_repair_state.pop(app_id, None)
     for app_id in apps_missing:
+        if not _i1_due_for_repair(app_id):
+            skipped_backoff.append({"kind": "app", "app": app_id})
+            continue
         if repair_budget <= 0:
             errors.append({"kind": "app", "app": app_id,
                           "error": "repair cap reached this run — named, not acted on"})
@@ -235,10 +326,12 @@ async def run_once(reconciler: "Reconciler", runtime: "AppRuntime") -> dict[str,
             await reconciler.install(desired_active[app_id], write_cloud=False,
                                      sync_skill_mirrors=False)
             reconciler._clear_unresolvable(app_id)
+            _record_i1_repair_result(app_id, None)
             repairs.append({"kind": "app", "app": app_id, "action": "install"})
             log.warning("activation_audit: I1 repaired %s — it was desired and "
                        "not loaded; installed", app_id)
         except reconciler_mod.UnresolvableAppError as e:
+            _record_i1_repair_result(app_id, str(e))
             # Same app, same reason, every ~60s audit tick — reconciler's own
             # _install_missing may well have already warned about this exact
             # app_id in the SAME reconcile pass (run_once's other caller).
@@ -250,6 +343,7 @@ async def run_once(reconciler: "Reconciler", runtime: "AppRuntime") -> dict[str,
                               "error": str(e)})
                 log.warning("activation_audit: I1 cannot repair %s: %s", app_id, e)
         except Exception as e:  # noqa: BLE001 — one bad app must not sink the run
+            _record_i1_repair_result(app_id, str(e))
             errors.append({"kind": "app", "app": app_id, "action": "install",
                           "error": str(e)})
             log.exception("activation_audit: I1 repair of %s failed", app_id)
@@ -333,7 +427,7 @@ async def run_once(reconciler: "Reconciler", runtime: "AppRuntime") -> dict[str,
         "source": source,
         "apps_checked": len(desired_active), "apps_missing": len(apps_missing),
         "services_checked": len(service_rows), "repairs": repairs, "errors": errors,
-        "escalated": escalated,
+        "skipped_backoff": skipped_backoff, "escalated": escalated,
     }
     # One line every run, including on zero findings — the staleness of THIS
     # line is what doctor checks for, so it must never be made conditional.

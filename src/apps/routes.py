@@ -44,6 +44,7 @@ from src.apps import config_store
 from src.apps import hostpower
 from src.apps.catalog import get_catalog, is_marketplace_app, list_tags
 from src.apps.activation_audit import last_run_age_s as _activation_audit_last_run_age_s
+from src.apps.activation_audit import repair_circuit_rows as _activation_audit_repair_circuit_rows
 from src.apps.degradations import (degradations,
                                    invalidate_cache as invalidate_degradation_cache)
 from src.apps.install_jobs import InstallJobs
@@ -1994,6 +1995,12 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         activation_audit_age_s = await asyncio.to_thread(_activation_audit_last_run_age_s)
         activation_audit_stale = (activation_audit_age_s is None
                                   or activation_audit_age_s > 300.0)
+        # An I1 repair that gave up on a required app after repeated failures
+        # (src/apps/activation_audit.py's own backoff/circuit-breaker) — the
+        # durable half of that signal: the escalation it also fires debounces
+        # to one ping every 15 minutes and names no app, so this is what lets
+        # a human (or this very check) see WHICH app is stuck between pings.
+        activation_audit_circuits_open = _activation_audit_repair_circuit_rows()
 
         unhealthy = [c for c in clis if not c["healthy"]]
         failing_app_checks = [c for c in app_checks if not c["ok"]]
@@ -2021,7 +2028,8 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                    and not emulated_apps
                    and vault_status.get("reachable") is not False
                    and not remote_host_postgres_backup["stale"]
-                   and not activation_audit_stale),
+                   and not activation_audit_stale
+                   and not activation_audit_circuits_open),
             "app_checks": app_checks,
             "pending_migrations": pending_migrations,
             "knowledge_mirrors": knowledge_mirror_problems,
@@ -2029,6 +2037,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             "activation_audit": {
                 "last_run_age_s": activation_audit_age_s,
                 "stale": activation_audit_stale,
+                "repair_circuits_open": activation_audit_circuits_open,
             },
             "system_clis": {
                 "total": len(clis),
