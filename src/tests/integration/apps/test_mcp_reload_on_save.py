@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import textwrap
 
 from fastapi import FastAPI
@@ -100,6 +101,37 @@ def test_on_config_saved_hook_runs_with_the_updated_config(tmp_path, monkeypatch
 
     loaded = runtime.get("hookapp")
     assert loaded.ctx.saved_configs == [{"enabled": False}]
+
+
+def test_config_save_does_not_leak_into_the_real_cloud_registry_by_default(tmp_path, monkeypatch):
+    """Regression for the 2026-09-18 leak (card 3df5bf3b, re-investigated as
+    4155bf3b): ``register_apps_routes()`` builds ``reconciler.cloud`` as a
+    bare ``CloudRegistry()``, which reads ``AW_BACKEND_URL``/``AW_WORKSPACE``/
+    ``AW_WORKSPACE_HOST_TOKEN`` straight from the process environment. This
+    test's own fixture app id must never reach aw-backend's real
+    ``app_installs`` rows just because this suite happens to run inside a
+    container where a real workspace server already has those vars set for
+    real — which is exactly how hookapp/nohookapp/mcpapp/orderapp/plainapp
+    leaked. ``src/tests/conftest.py``'s ``_no_live_cloud_registry`` autouse
+    fixture blanks the 3 vars for every test by default; this asserts it
+    worked, both directly and via a spy on the HTTP call it would otherwise
+    make."""
+    assert os.environ.get("AW_BACKEND_URL", "") == ""
+    assert os.environ.get("AW_WORKSPACE_HOST_TOKEN", "") == ""
+
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    pkg = _write_app(tmp_path, "cloudleakapp", reload_on_save=False, plugin_src=PLUGIN_NO_HOOK)
+    app, runtime, client = _client()
+    assert app.state.app_reconciler.cloud.configured is False
+
+    put_calls = []
+    monkeypatch.setattr("httpx.put", lambda *a, **k: put_calls.append((a, k)))
+    _async(runtime.load(pkg, granted_permissions=[]))
+
+    res = client.post("/api/apps/cloudleakapp/config", json={"config": {"enabled": False}})
+
+    assert res.status_code == 200
+    assert put_calls == []
 
 
 def test_plugin_without_the_hook_is_not_a_hard_error(tmp_path, monkeypatch):

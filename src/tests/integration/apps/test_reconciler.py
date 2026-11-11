@@ -620,6 +620,40 @@ def test_reconcile_one_bad_app_does_not_block_others(tmp_path, monkeypatch):
     _async(run())
 
 
+def test_reconcile_warns_once_for_an_unresolvable_app_then_goes_quiet(tmp_path, monkeypatch, caplog):
+    """Regression for the reconcile-noise half of card 4155bf3b: a desired
+    app with neither a ``repo`` nor an on-disk ``package_dir`` — exactly the
+    shape of a leaked test-fixture app id (see
+    ``apps-sem-repopackage-dir-falham-...`` card) — must warn loudly ONCE and
+    then go quiet, not re-raise a full traceback plus a fresh ``errors[]``
+    entry on every subsequent reconcile pass forever (measured live: 779
+    log.exception occurrences/app over one 7-day retention window)."""
+    import logging
+
+    repo_ok = _make_app_repo(tmp_path, "good")
+    cloud = FakeCloud([
+        {"app_id": "good", "version": "1.0.0", "repo": repo_ok, "ref": "main",
+         "granted_permissions": ["routes:register"], "config": {}, "state": "installed"},
+        {"app_id": "orphan", "version": "1.0.0", "ref": "main",
+         "granted_permissions": [], "config": {}, "state": "installed"},
+    ])
+    host, rt, rc = _reconciler(tmp_path, monkeypatch, cloud)
+
+    async def run():
+        caplog.set_level(logging.WARNING)
+        result1 = await rc.reconcile()
+        assert any(e["app_id"] == "orphan" for e in result1["errors"])
+        assert any(r.levelname == "WARNING" and "orphan" in r.getMessage()
+                  for r in caplog.records)
+
+        caplog.clear()
+        result2 = await rc.reconcile()
+        assert not any(e["app_id"] == "orphan" for e in result2["errors"])
+        assert not any("orphan" in r.getMessage() for r in caplog.records)
+
+    _async(run())
+
+
 def test_install_triggers_mcp_gateway_reload_when_manifest_opts_in(tmp_path, monkeypatch):
     # An app that self-registers its own mcp.json on activate() (e.g.
     # aw-app-whiteboard) only gets picked up by an ALREADY-RUNNING
