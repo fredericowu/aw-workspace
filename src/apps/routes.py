@@ -2385,6 +2385,14 @@ async def reconcile_on_boot(app: FastAPI) -> None:
         # Cancelling can only lose a rescan start that the tail below performs
         # unconditionally two lines later anyway.
         rescan_starter.cancel()
+    # Deploy reconciliation C2 (card 4165bf3b-9510-81f4): a boot is itself a
+    # fact worth asserting to aw-backend's component inventory (C1) even when
+    # this pass found nothing to install/upgrade — unlike the per-pass report
+    # inside Reconciler.reconcile() (which only fires on an actual change),
+    # every boot re-asserts the full baseline. Best-effort; never raises —
+    # see src/apps/component_report.py's docstring.
+    from src.apps.component_report import report_components_and_trigger_check
+    await report_components_and_trigger_check(app.state.app_runtime)
     # Boot reconcile only (re)installs apps that aren't currently loaded; an
     # already-loaded app's system CLIs are never re-checked otherwise. Start
     # the runtime-owned healer so drift (a CLI removed outside the app's own
