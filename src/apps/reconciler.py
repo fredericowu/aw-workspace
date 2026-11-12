@@ -1360,6 +1360,21 @@ class Reconciler:
                 result["activation_audit"] = audit_result
         except Exception:
             log.exception("apps: activation audit failed after reconcile")
+        # Deploy reconciliation C2 (card 4165bf3b-9510-81f4): feed
+        # aw-backend's component inventory (C1) and nudge the runners app's
+        # /deploy-check pass, but only when this pass actually changed
+        # something — a no-op convergence tick has nothing new to report.
+        # ``reconcile_on_boot`` separately reports unconditionally on every
+        # boot regardless of this condition (a boot is itself a fact worth
+        # asserting). Best-effort: see component_report.py docstring.
+        if result.get("installed") or result.get("upgraded"):
+            try:
+                from src.apps.component_report import (
+                    report_components_and_trigger_check,
+                )
+                await report_components_and_trigger_check(self.runtime)
+            except Exception:
+                log.exception("apps: component self-report after reconcile failed")
         return result
 
     async def _reconcile_provisioned(
