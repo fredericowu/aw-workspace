@@ -2174,6 +2174,7 @@ _INSECURE_FLAGS = {
     "cursor": "--approve-mcps --yolo",
     "codex": "--dangerously-bypass-approvals-and-sandbox",
     "gemini": "--yolo",
+    "antigravity": "--dangerously-skip-permissions",
 }
 
 

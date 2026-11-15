@@ -134,6 +134,9 @@ def test_is_insecure_command_detects_type_specific_flag():
 
     assert _is_insecure_command("claude --session-id x --dangerously-skip-permissions", "claude")
     assert not _is_insecure_command("claude --session-id x", "claude")
+    assert _is_insecure_command("agy --dangerously-skip-permissions", "antigravity")
+    assert _is_insecure_command("agy --conversation conv-123 --dangerously-skip-permissions", "antigravity")
+    assert not _is_insecure_command("agy --conversation conv-123", "antigravity")
     assert _is_insecure_command("copilot --allow-all", "copilot")
     assert not _is_insecure_command(None, "claude")
     assert not _is_insecure_command("claude --session-id x", "terminal")  # no flag mapped
@@ -147,6 +150,10 @@ def test_set_command_insecure_adds_and_removes_flag():
 
     off = _set_command_insecure(on, "claude", False)
     assert off == "claude --session-id x"
+
+    agy_on = _set_command_insecure("agy", "antigravity", True)
+    assert agy_on == "agy --dangerously-skip-permissions"
+    assert _set_command_insecure(agy_on, "antigravity", False) == "agy"
 
     # idempotent — already in the target state is a no-op
     assert _set_command_insecure(on, "claude", True) == on
