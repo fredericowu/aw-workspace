@@ -126,6 +126,7 @@ def _sync() -> int:
         _print_files("MCP (file copies)", result.mcp),
         _print_servers("Codex", result.codex),
         _print_servers("Gemini", result.gemini),
+        _print_servers("Antigravity", result.antigravity),
     ]
     return 0 if not any(codes) else 1
 
@@ -203,4 +204,5 @@ def _status() -> int:
         print(f"  mcp.json → {t}")
     print(f"  mcp      → Codex (~/.codex/config.toml, via the codex CLI)")
     print(f"  mcp      → Gemini ({agent_sync._gemini_settings_path()})")
+    print(f"  mcp      → Antigravity ({agent_sync._antigravity_mcp_config_path()})")
     return 0

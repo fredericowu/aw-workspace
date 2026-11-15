@@ -51,6 +51,8 @@ def _isolated_app_lock_dir(tmp_path_factory, monkeypatch):
     """
     monkeypatch.setenv(fs_lock.LOCK_DIR_ENV,
                        str(tmp_path_factory.mktemp("aw-locks")))
+    monkeypatch.setenv("ANTIGRAVITY_CONFIG_DIR",
+                       str(tmp_path_factory.mktemp("agy-config")))
 
 
 @pytest.fixture(autouse=True)

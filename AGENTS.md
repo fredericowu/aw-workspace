@@ -110,9 +110,10 @@ registered. Edit `.mcp.json` directly, then sync.
 | Cursor | `.cursor/mcp.json` | Byte-for-byte copy. Reload MCP / window after change. |
 | Codex | `~/.codex/config.toml` | Projected via `codex mcp add/remove/list --json`. |
 | Gemini | `.gemini/settings.json` (project scope) | `mcpServers` block written directly — `gemini mcp add` clobbers the whole block. |
+| Antigravity | `~/.gemini/config/mcp_config.json` | `mcpServers` block written directly (`McpServerSpec` `serverUrl` shape). |
 | Copilot | (reads `.claude/skills/` for skills, no project MCP today) | — |
 
-For Codex + Gemini, only entries matching `aw-*` / `playwright*` are managed;
+For Codex, Gemini + Antigravity, only entries matching `aw-*` / `playwright*` are managed;
 user-added MCP servers are preserved across syncs. A CLI that isn't installed
 is reported as a skip, not a failure — a slim BYOD image with only Claude
 Code present is the normal case.

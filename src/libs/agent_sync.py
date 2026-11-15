@@ -11,7 +11,8 @@ agent reads" is one command instead of three subsystems:
   AGENTS.md is the source of truth; the mirrors are generated and gitignored.
 * **``.mcp.json``** → the canonical MCP config (Claude Code reads this path
   natively), fanned out to ``.cursor/mcp.json``, Gemini's
-  ``.gemini/settings.json``, and Codex's ``~/.codex/config.toml``.
+  ``.gemini/settings.json``, Antigravity's ``~/.gemini/config/mcp_config.json``,
+  and Codex's ``~/.codex/config.toml``.
 
 Differences from the monolith's version, and why:
 
@@ -126,6 +127,7 @@ class AgentSyncResult:
     mcp: list[FileSyncResult] = field(default_factory=list)
     codex: list[ServerSyncResult] = field(default_factory=list)
     gemini: list[ServerSyncResult] = field(default_factory=list)
+    antigravity: list[ServerSyncResult] = field(default_factory=list)
 
 
 def _files_identical(a: Path, b: Path) -> bool:
@@ -526,6 +528,87 @@ def sync_gemini_mcp(source: Path | None = None) -> list[ServerSyncResult]:
     return results
 
 
+# --- Antigravity -------------------------------------------------------------
+
+
+def _antigravity_mcp_config_path() -> Path:
+    config_dir = os.environ.get("ANTIGRAVITY_CONFIG_DIR")
+    if config_dir:
+        return Path(config_dir) / "mcp_config.json"
+    return Path.home() / ".gemini" / "config" / "mcp_config.json"
+
+
+def _antigravity_entry(cfg: dict) -> dict:
+    """Translate a ``.mcp.json`` server entry into Antigravity's
+    ``McpServerSpec`` protobuf JSON shape (``serverUrl`` for HTTP, no ``type``
+    field — matches what ``agy mcp add`` writes to
+    ``~/.gemini/config/mcp_config.json``)."""
+    if cfg.get("type") == "http" or cfg.get("url") or cfg.get("serverUrl"):
+        entry: dict = {
+            "disabled": bool(cfg.get("disabled", False)),
+            "serverUrl": str(cfg.get("url") or cfg.get("serverUrl") or ""),
+        }
+        if cfg.get("headers"):
+            entry["headers"] = {str(k): str(v) for k, v in cfg["headers"].items()}
+        return entry
+    entry = {
+        "command": str(cfg.get("command", "")),
+        "disabled": bool(cfg.get("disabled", False)),
+    }
+    if cfg.get("args"):
+        entry["args"] = [str(a) for a in cfg["args"]]
+    if cfg.get("env"):
+        entry["env"] = {str(k): str(v) for k, v in cfg["env"].items()}
+    if cfg.get("cwd"):
+        entry["cwd"] = str(cfg["cwd"])
+    return entry
+
+
+def sync_antigravity_mcp(source: Path | None = None) -> list[ServerSyncResult]:
+    """Write the ``mcpServers`` block of ``~/.gemini/config/mcp_config.json``.
+
+    Antigravity CLI (``agy``) reads its global MCP servers from
+    ``~/.gemini/config/mcp_config.json`` using ``McpServerSpec``'s
+    ``serverUrl`` schema. Writing the file directly avoids a ~30s ``agy mcp
+    add`` boot per server while preserving any unmanaged entries the user
+    configured themselves. Also tolerates the 0-byte ``mcp_config.json`` file
+    ``agy`` creates on first run.
+    """
+    path = _antigravity_mcp_config_path()
+    desired = {
+        n: _antigravity_entry(c)
+        for n, c in _read_servers(source).items()
+        if _is_managed(n)
+    }
+
+    try:
+        raw = path.read_text(encoding="utf-8").strip() if path.exists() else ""
+        data = json.loads(raw) if raw else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        return [ServerSyncResult(name="antigravity", action="skip", success=False, error=str(exc))]
+    if not isinstance(data, dict):
+        data = {}
+
+    current = data.get("mcpServers") if isinstance(data.get("mcpServers"), dict) else {}
+    merged = {n: c for n, c in current.items() if not _is_managed(n)}
+    merged.update(desired)
+
+    results = [ServerSyncResult(name=n, action="add") for n in sorted(desired)]
+    results += [ServerSyncResult(name=n, action="remove")
+                for n in sorted(set(current) - set(desired)) if _is_managed(n)]
+
+    if current == merged:
+        return [ServerSyncResult(name=n, action="noop") for n in sorted(desired)] or results
+
+    data["mcpServers"] = merged
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        return [ServerSyncResult(name="antigravity", action="skip", success=False, error=str(exc))]
+    return results
+
+
 # --- entrypoint --------------------------------------------------------------
 
 
@@ -537,4 +620,5 @@ def sync_all() -> AgentSyncResult:
     result.mcp = sync_mcp()
     result.codex = sync_codex_mcp()
     result.gemini = sync_gemini_mcp()
+    result.antigravity = sync_antigravity_mcp()
     return result

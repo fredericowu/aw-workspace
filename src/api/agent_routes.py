@@ -36,6 +36,7 @@ def _result_payload(result) -> dict:
         "mcp": [r.to_dict() for r in result.mcp],
         "codex": [r.to_dict() for r in result.codex],
         "gemini": [r.to_dict() for r in result.gemini],
+        "antigravity": [r.to_dict() for r in result.antigravity],
     }
 
 

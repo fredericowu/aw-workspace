@@ -478,6 +478,58 @@ def test_gemini_manages_only_aw_prefixed_servers(workspace):
     assert "user-own-thing" not in data["mcpServers"]  # not ours to push
 
 
+def test_antigravity_projects_managed_servers_with_server_url_shape(workspace, monkeypatch):
+    """Antigravity's McpServerSpec protobuf expects ``serverUrl`` (not ``url``
+    or ``type``) in ``~/.gemini/config/mcp_config.json``, and ``agy`` creates
+    an empty 0-byte file on first run that must be tolerated."""
+    config_dir = workspace / "agy-config"
+    config_dir.mkdir(parents=True)
+    mcp_config = config_dir / "mcp_config.json"
+    mcp_config.write_text("")  # 0-byte file created by agy on first boot
+    monkeypatch.setenv("ANTIGRAVITY_CONFIG_DIR", str(config_dir))
+
+    (workspace / ".mcp.json").write_text(json.dumps({"mcpServers": {
+        "aw-gateway": {
+            "type": "http",
+            "url": "http://gw:9200/mcp",
+            "headers": {"Authorization": "Bearer tok"},
+        },
+        "playwright": {
+            "command": "npx",
+            "args": ["@playwright/mcp@latest"],
+            "env": {"DISPLAY": ":0"},
+        },
+        "user-own-thing": {"command": "whatever"},
+    }}))
+
+    results = agent_sync.sync_antigravity_mcp()
+
+    assert [r.to_dict() for r in results] == [
+        {"name": "aw-gateway", "action": "add", "success": True, "error": None},
+        {"name": "playwright", "action": "add", "success": True, "error": None},
+    ]
+    data = json.loads(mcp_config.read_text())
+    assert data["mcpServers"]["aw-gateway"] == {
+        "disabled": False,
+        "serverUrl": "http://gw:9200/mcp",
+        "headers": {"Authorization": "Bearer tok"},
+    }
+    assert data["mcpServers"]["playwright"] == {
+        "command": "npx",
+        "disabled": False,
+        "args": ["@playwright/mcp@latest"],
+        "env": {"DISPLAY": ":0"},
+    }
+    assert "user-own-thing" not in data["mcpServers"]
+
+    # Second sync with no changes reports noop; unmanaged entries are preserved.
+    data["mcpServers"]["my-custom"] = {"serverUrl": "https://example.com/mcp"}
+    mcp_config.write_text(json.dumps(data))
+    resync = agent_sync.sync_antigravity_mcp()
+    assert all(r.action == "noop" for r in resync)
+    assert "my-custom" in json.loads(mcp_config.read_text())["mcpServers"]
+
+
 def test_codex_skips_cleanly_when_the_cli_is_absent(workspace, monkeypatch):
     monkeypatch.setattr(agent_sync.shutil, "which", lambda _: None)
 
@@ -557,4 +609,4 @@ def test_sync_all_runs_every_step(workspace, monkeypatch):
     assert len(result.skills) == 3
     assert len(result.agents_md) == 3
     assert len(result.mcp) == 1
-    assert result.codex and result.gemini
+    assert result.codex and result.gemini and result.antigravity
