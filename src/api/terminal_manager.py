@@ -2168,13 +2168,39 @@ def _stop_reader(session: "TerminalSession", loop=None) -> None:
 # showed "secure" and re-toggling was a no-op. Fixed 2026-08-04 by deriving
 # insecure state FROM the actual command string (source of truth, no separate
 # bookkeeping to drift) instead of a caller-asserted flag.
-_INSECURE_FLAGS = {
+_DEFAULT_INSECURE_FLAGS = {
     "claude": "--dangerously-skip-permissions",
     "copilot": "--allow-all",
     "cursor": "--approve-mcps --yolo",
     "codex": "--dangerously-bypass-approvals-and-sandbox",
     "gemini": "--yolo",
+    "antigravity": "--dangerously-skip-permissions",
 }
+
+_INSECURE_FLAGS = dict(_DEFAULT_INSECURE_FLAGS)
+_CUSTOM_SESSION_ID_EXTRACTOR = None
+
+
+def register_cli_provider(
+    insecure_flags: dict[str, str] | None = None,
+    extract_session_id=None,
+) -> None:
+    """Register CLI-specific insecure flags and session-ID extraction from an
+    in-process app (``aw-app-code-agent-clis``) so CLI flag ownership lives in
+    that app while preserving baseline defaults before app activation."""
+    global _CUSTOM_SESSION_ID_EXTRACTOR
+    if insecure_flags:
+        _INSECURE_FLAGS.update(insecure_flags)
+    if callable(extract_session_id):
+        _CUSTOM_SESSION_ID_EXTRACTOR = extract_session_id
+
+
+def unregister_cli_provider() -> None:
+    """Restore baseline CLI flag mappings when the provider app deactivates."""
+    global _CUSTOM_SESSION_ID_EXTRACTOR
+    _INSECURE_FLAGS.clear()
+    _INSECURE_FLAGS.update(_DEFAULT_INSECURE_FLAGS)
+    _CUSTOM_SESSION_ID_EXTRACTOR = None
 
 
 def _is_insecure_command(command: str | None, session_type: str) -> bool:
@@ -2234,6 +2260,10 @@ def _extract_resume_argument(command: str | None) -> str | None:
 
 def _extract_agent_session_id(command: str | None) -> str | None:
     """Extract an agent conversation id from resume/start command syntax."""
+    if callable(_CUSTOM_SESSION_ID_EXTRACTOR):
+        extracted = _CUSTOM_SESSION_ID_EXTRACTOR(command)
+        if extracted:
+            return extracted
     resume_arg = _extract_resume_argument(command)
     if resume_arg:
         return resume_arg

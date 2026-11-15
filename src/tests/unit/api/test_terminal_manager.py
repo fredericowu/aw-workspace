@@ -135,18 +135,35 @@ def test_is_insecure_command_detects_type_specific_flag():
     assert _is_insecure_command("claude --session-id x --dangerously-skip-permissions", "claude")
     assert not _is_insecure_command("claude --session-id x", "claude")
     assert _is_insecure_command("copilot --allow-all", "copilot")
+    assert _is_insecure_command("agy --conversation c1 --dangerously-skip-permissions", "antigravity")
+    assert not _is_insecure_command("agy --conversation c1", "antigravity")
     assert not _is_insecure_command(None, "claude")
     assert not _is_insecure_command("claude --session-id x", "terminal")  # no flag mapped
 
 
 def test_set_command_insecure_adds_and_removes_flag():
-    from src.api.terminal_manager import _set_command_insecure
+    from src.api.terminal_manager import (
+        _set_command_insecure,
+        register_cli_provider,
+        unregister_cli_provider,
+    )
 
     on = _set_command_insecure("claude --session-id x", "claude", True)
     assert on == "claude --session-id x --dangerously-skip-permissions"
 
     off = _set_command_insecure(on, "claude", False)
     assert off == "claude --session-id x"
+
+    agy_on = _set_command_insecure("agy --conversation c1", "antigravity", True)
+    assert agy_on == "agy --conversation c1 --dangerously-skip-permissions"
+    assert _set_command_insecure(agy_on, "antigravity", False) == "agy --conversation c1"
+
+    # Dynamic provider registration from aw-app-code-agent-clis
+    register_cli_provider(insecure_flags={"custom-cli": "--custom-yolo"})
+    try:
+        assert _set_command_insecure("custom-cli", "custom-cli", True) == "custom-cli --custom-yolo"
+    finally:
+        unregister_cli_provider()
 
     # idempotent — already in the target state is a no-op
     assert _set_command_insecure(on, "claude", True) == on
