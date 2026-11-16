@@ -1,0 +1,15 @@
+name: Security scan
+
+on:
+  schedule:
+    - cron: "33 0 * * 4"
+  workflow_dispatch: {}
+
+jobs:
+  security-scan:
+    uses: fredericowu/aw-shared-workflows/.github/workflows/security-scan-reusable.yml@master
+    with:
+      runs_on: '"ubuntu-latest"'
+    permissions:
+      contents: read
+      security-events: write

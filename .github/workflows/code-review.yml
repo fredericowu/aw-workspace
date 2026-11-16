@@ -1,4 +1,4 @@
-name: Code Review
+name: Devteam Code Review
 
 # Thin caller. The whole two-round PR review -> merge loop lives in
 # fredericowu/aw-shared-workflows — read that file's header for the state
@@ -148,7 +148,7 @@ concurrency:
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.11.2
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@master
     with:
       ci_check_name: unit
     # Declared here as well as in the called workflow: for a reusable
