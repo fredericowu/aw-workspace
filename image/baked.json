@@ -38,8 +38,8 @@
 
   "apps": {
     "essentials": {
-      "why": "vim/telnet/nc/ping ~30s cada, serializados atrás do lock global",
-      "apt": ["vim", "telnet", "netcat-openbsd", "iputils-ping"]
+      "why": "vim/telnet/nc/ping ~30s cada, serializados atrás do lock global; jq/sqlite3 são ~1-2MB cada e agentes de terminal (codex/claude/agy) os usam direto (sqlite3 ausente quebrou uma sessão codex) — o fallback em runtime é install_jq.sh/install_sqlite3.sh da app essentials (aw-app-essentials#8)",
+      "apt": ["vim", "jq", "sqlite3", "telnet", "netcat-openbsd", "iputils-ping"]
     },
     "git": {
       "why": "gh não existe no Debian; o runtime paga apt-get update num repo de terceiro a cada recreate",
