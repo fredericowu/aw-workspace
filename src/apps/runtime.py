@@ -186,8 +186,13 @@ def _default_verify_http(scope: Scope) -> dict | None:
     auth = headers.get(b"authorization", b"").decode()
     if auth.lower().startswith("bearer "):
         token = auth[7:].strip()
-    else:
-        token = _cookie_value(headers.get(b"cookie", b"").decode(), _ID_COOKIE)
+        if token:
+            claims = decode_identity_jwt(token)
+            if claims is not None:
+                return claims
+    # A standalone app can use Authorization for its own session while
+    # the browser's workspace cookie authenticates the proxy request.
+    token = _cookie_value(headers.get(b"cookie", b"").decode(), _ID_COOKIE)
     return decode_identity_jwt(token) if token else None
 
 

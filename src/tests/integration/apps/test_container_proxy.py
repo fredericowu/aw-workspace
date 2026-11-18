@@ -9,12 +9,15 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import pytest
 from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, JSONResponse, Response
-from starlette.routing import Mount, Route
+from starlette.routing import Host, Mount, Route
 from starlette.testclient import TestClient
 
+import src.api.identity as identity
 from src.apps.proxy import ContainerReverseProxy
+from src.apps.runtime import IdentityGuard
 
 
 def test_target_url_building():
@@ -81,6 +84,50 @@ def test_http_forwarding_adds_verified_identity_headers(monkeypatch):
     r = client.get("/api/apps/browser/headers", headers={"x-aw-identity-sub": "spoofed"})
     assert r.status_code == 200
     assert r.json() == {"sub": "verified-user", "email": "user@example.test"}
+
+
+@pytest.mark.parametrize(("bearer", "cookie", "expected_sub"), [
+    ("app-token", "workspace-cookie", "browser-user"),
+    ("app-token", "invalid-cookie", None),
+    ("app-token", None, None),
+    (None, "workspace-cookie", "browser-user"),
+    ("workspace-bearer", None, "api-user"),
+    ("workspace-bearer", "workspace-cookie", "api-user"),
+])
+def test_standalone_proxy_workspace_identity(monkeypatch, bearer, cookie, expected_sub):
+    claims = {
+        "workspace-cookie": {"sub": "browser-user"},
+        "workspace-bearer": {"sub": "api-user"},
+    }
+    monkeypatch.setattr(identity, "decode_identity_jwt", claims.get)
+    forwarded = []
+
+    def upstream(request):
+        forwarded.append((
+            request.headers.get("authorization"),
+            request.headers.get("x-aw-identity-sub"),
+        ))
+        return httpx.Response(200, stream=httpx.ByteStream(b"ok"))
+
+    orig_init = httpx.AsyncClient.__init__
+
+    def patched_init(self, *args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(upstream)
+        orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", patched_init)
+    host = "ollama.app.workspace.example.test"
+    proxy = ContainerReverseProxy("http://upstream")
+    app = Starlette(routes=[Host(host, app=IdentityGuard(proxy))])
+    client = TestClient(app, base_url=f"https://{host}")
+    auth = f"Bearer {bearer}" if bearer else None
+    headers = {"Authorization": auth} if auth else {}
+    if cookie:
+        client.cookies.set("aw_id_jwt", cookie)
+
+    response = client.get("/api/v1/auths/", headers=headers)
+    assert response.status_code == (200 if expected_sub else 401)
+    assert forwarded == ([(auth, expected_sub)] if expected_sub else [])
 
 
 def test_http_forwarding_does_not_alter_accept_encoding(monkeypatch):
