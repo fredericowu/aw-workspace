@@ -45,11 +45,11 @@ def test_an_app_with_no_optional_request_is_skipped():
     assert _unmet_optional_host_power(rt, host_offers=()) == []
 
 
-def test_host_privileged_covers_an_optional_request_too():
-    """Same ceiling resolve_optional() applies at load time: a host that
-    granted `privileged` satisfies any narrower optional request."""
+def test_host_privileged_without_a_gpu_reports_unmet_request():
     rt = _Runtime({"browser": _app("browser", host_power_optional=["gpu"])})
-    assert _unmet_optional_host_power(rt, host_offers=("privileged",)) == []
+    assert _unmet_optional_host_power(rt, host_offers=("privileged",)) == [
+        {"app": "browser", "grant": "gpu"},
+    ]
 
 
 def test_a_slug_that_failed_to_load_does_not_break_the_report():

@@ -149,7 +149,7 @@ class TestResolveOptional:
         assert hostpower.resolve_optional("app", ["gpu"], self.PERMS, self.ENV) == ()
 
     def test_host_offering_it_grants_it(self):
-        env = {hostpower.ENV_VAR: "gpu"}
+        env = {hostpower.ENV_VAR: "gpu", hostpower.GPU_ENV_VAR: "/dev/dri/renderD128"}
         assert hostpower.resolve_optional("app", ["gpu"], self.PERMS, env) == ("gpu",)
 
     def test_missing_capability_still_raises(self):
@@ -163,13 +163,13 @@ class TestResolveOptional:
         assert hostpower.resolve_optional("app", [], [], {}) == ()
         assert hostpower.resolve_optional("app", None, None, None) == ()
 
-    def test_host_privileged_satisfies_an_optional_request_too(self):
+    def test_host_privileged_alone_has_no_probed_gpu(self):
         assert hostpower.resolve_optional(
             "app", ["gpu"], self.PERMS, {hostpower.ENV_VAR: "privileged"}
-        ) == ("gpu",)
+        ) == ()
 
     def test_partial_mix_grants_what_the_host_offers_and_drops_the_rest(self):
-        env = {hostpower.ENV_VAR: "gpu"}
+        env = {hostpower.ENV_VAR: "gpu", hostpower.GPU_ENV_VAR: "/dev/dri/renderD128"}
         perms = ["host:device-gpu", "host:device-kvm"]
         assert hostpower.resolve_optional("app", ["gpu", "kvm"], perms, env) == ("gpu",)
 
@@ -183,11 +183,20 @@ class TestDockerKwargs:
     def test_kvm_passes_the_device_through(self):
         assert hostpower.docker_kwargs(["kvm"]) == {"devices": ["/dev/kvm:/dev/kvm:rwm"]}
 
-    def test_gpu_passes_the_render_node_directory_through(self):
-        """``/dev/dri`` is a DIRECTORY, not a device node — verified live
-        that docker-py + this workspace's podman accept and expand a
-        directory device (podman enumerates every node inside it)."""
-        assert hostpower.docker_kwargs(["gpu"]) == {"devices": ["/dev/dri:/dev/dri:rwm"]}
+    def test_gpu_passes_only_probed_nodes_and_preserves_rootless_groups(self):
+        env = {hostpower.GPU_ENV_VAR: "/dev/dri/renderD128,/dev/kfd,keep-groups"}
+        assert hostpower.docker_kwargs(["gpu"], env) == {
+            "devices": ["/dev/dri/renderD128:/dev/dri/renderD128:rw", "/dev/kfd:/dev/kfd:rw"],
+            "group_add": ["keep-groups"],
+        }
+        assert hostpower.docker_kwargs([], env) == {}
+
+    @pytest.mark.parametrize("devices", ["", "/dev/kfd", "/dev/dri/card0",
+                                         "/dev/dri/renderD128,/dev/sda"])
+    def test_gpu_with_invalid_host_metadata_falls_back(self, devices):
+        env = {hostpower.ENV_VAR: "gpu", hostpower.GPU_ENV_VAR: devices}
+        assert hostpower.resolve_optional("app", ["gpu"], ["host:device-gpu"], env) == ()
+        assert hostpower.docker_kwargs(["gpu"], env) == {}
 
     def test_tun_also_adds_the_capability_the_device_is_useless_without(self):
         """Opening /dev/net/tun without NET_ADMIN succeeds and then fails to

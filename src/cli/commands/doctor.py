@@ -306,7 +306,8 @@ def _host_power(section: dict) -> None:
     print(f"Host power — {section.get('summary', 'unknown')}")
     if not offers:
         print("      no app on this workspace can reach a host device")
-        return
+    for row in section.get("unmet_optional") or []:
+        print(f"  • {row['app']}: optional {row['grant']} unavailable")
     for row in section.get("apps") or []:
         print(f"  • {row['app']}: {', '.join(row['grants'])}")
     unused = section.get("unused") or []
