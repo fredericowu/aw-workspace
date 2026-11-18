@@ -357,9 +357,7 @@ class IdentityGuard:
         return bool(self._auth_required)
 
     def _auth_type_value(self) -> str:
-        """``"scoped"`` or ``"workspace"``. Anything else — including the
-        garbage ``_coerce_config`` (src/apps/routes.py) passes through
-        unvalidated — is treated as ``"workspace"``, i.e. today's behavior."""
+        """Treat legacy values other than ``"scoped"`` as ``"workspace"``."""
         raw = self._auth_type() if callable(self._auth_type) else self._auth_type
         return "scoped" if str(raw) == "scoped" else "workspace"
 

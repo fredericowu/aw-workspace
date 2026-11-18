@@ -11,9 +11,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import textwrap
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -410,3 +412,51 @@ def test_reload_mcp_gateway_retries_a_just_created_container_not_ready_yet(monke
 
 async def _async_noop():
     return None
+
+@pytest.mark.parametrize(("patch", "rule"), [
+    ({"enabled": "false"}, "type"),
+    ({"model": None}, "required"),
+    ({"model": "secret value"}, "pattern"),
+    ({"mode": "unsafe"}, "enum"),
+    ({"workers": 0}, "minimum"),
+    ({"workers": 9}, "maximum"),
+    ({"unknown": 1}, "unknown"),
+    ({"legacy": 2}, "legacy"),
+])
+def test_invalid_config_save_has_no_side_effects(tmp_path, monkeypatch, patch, rule):
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    slug = "validationapp"
+    pkg = _write_app(tmp_path, slug, reload_on_save=False, plugin_src=PLUGIN_RECORDING_SAVES)
+    manifest_path = tmp_path / slug / "aw-app.json"
+    manifest = json.loads(manifest_path.read_text())
+    schema = manifest["config_schema"]
+    schema["required"] = ["model"]
+    schema["properties"].update({
+        "model": {"type": "string", "pattern": "^[a-z]+$"},
+        "mode": {"enum": ["cpu", "gpu"], "default": "cpu"},
+        "workers": {"type": "integer", "minimum": 1, "maximum": 8, "default": 2},
+    })
+    manifest_path.write_text(json.dumps(manifest))
+    app, runtime, client = _client()
+    _async(runtime.load(pkg, granted_permissions=[], config={"model": "llama", "legacy": 1}))
+    loaded = runtime.get(slug)
+    before = dict(loaded.config)
+    stored = []
+    monkeypatch.setattr(routes_mod.config_store, "save", lambda *args: stored.append(args))
+    cloud = []
+    monkeypatch.setattr(app.state.app_reconciler, "cloud", type("CloudSpy", (), {
+        "configured": True,
+        "put_desired": lambda self, *args, **kwargs: cloud.append(args),
+    })())
+
+    res = client.post(f"/api/apps/{slug}/config", json={"config": patch})
+
+    assert res.status_code == 422
+    assert rule in res.json()["error"]
+    assert "secret value" not in res.text
+    assert loaded.config == loaded.ctx.config == before
+    assert loaded.ctx.saved_configs == app.state.app_reconciler.local.saved == stored == cloud == []
+
+    res = client.post(f"/api/apps/{slug}/config", json={"workers": 4, "legacy": 1})
+    assert res.status_code == 200
+    assert res.json()["config"] == {**before, "enabled": True, "mode": "cpu", "workers": 4}

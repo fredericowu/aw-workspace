@@ -16,6 +16,7 @@ cryptography==46.0.6
 # build. src/start/workspace.py reinstalls the venv when this file's hash
 # changes, so a plain restart picks it up too.
 bcrypt==5.0.0
+jsonschema==4.26.0
 httpx[http2]==0.28.1
 # Tier-2 (container) apps: the docker SDK speaks the Docker API to the host's
 # rootless podman socket (AW_CONTAINER_SOCKET). Imported lazily — only apps with

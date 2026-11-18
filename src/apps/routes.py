@@ -38,6 +38,8 @@ import anyio
 import httpx
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
+from jsonschema import Draft7Validator
+from jsonschema.validators import validator_for
 
 from src.api.identity import authorize_ws, require_identity, ws_close_code
 from src.apps import config_store
@@ -463,20 +465,31 @@ def _app_config_payload(loaded) -> dict:
     }
 
 
-def _coerce_config(schema: dict, incoming: dict) -> dict:
-    props = schema.get("properties") or {}
-    config: dict = {}
-    for key, spec in props.items():
-        if key not in incoming:
-            continue
-        value = incoming[key]
-        if isinstance(spec, dict) and spec.get("type") == "boolean":
-            value = bool(value)
-        config[key] = value
-    for key, value in incoming.items():
-        if key not in config:
-            config[key] = value
-    return config
+def _config_validation_error(schema: dict, candidate: dict, previous: dict,
+                             *, app_has_schema: bool) -> str | None:
+    try:
+        json.dumps(candidate, allow_nan=False)
+    except ValueError:
+        return "Config values must be finite JSON values"
+
+    if app_has_schema and "additionalProperties" not in schema:
+        # Preserve unchanged legacy extras so a full-form resave still works.
+        # Explicit additionalProperties policies always take precedence.
+        properties = dict(schema.get("properties") or {})
+        for key in previous.keys() & candidate.keys() - properties.keys():
+            if json.dumps(previous[key], sort_keys=True) == json.dumps(candidate[key], sort_keys=True):
+                properties[key] = {}
+        schema = {**schema, "properties": properties, "additionalProperties": False}
+
+    validator = validator_for(schema, default=Draft7Validator)(schema)
+    error = next(validator.iter_errors(candidate), None)
+    if error is None:
+        return None
+    if error.validator in {"required", "additionalProperties"}:
+        return error.message
+    # jsonschema messages may echo submitted values, including secrets.
+    field = error.json_path
+    return f"{field} does not satisfy the app config schema ({error.validator})"
 
 
 def _merge_config(previous: dict, incoming: dict) -> dict:
@@ -1287,7 +1300,13 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         previous = loaded.manifest.config_with_defaults(loaded.config)
         incoming = data.get("config") if isinstance(data.get("config"), dict) else data
         merged = _merge_config(loaded.config or {}, incoming or {})
-        loaded.config = loaded.manifest.config_with_defaults(_coerce_config(schema, merged))
+        candidate = loaded.manifest.config_with_defaults(merged)
+        error = _config_validation_error(
+            schema, candidate, previous, app_has_schema=bool(loaded.manifest.config_schema),
+        )
+        if error is not None:
+            return JSONResponse({"error": error}, status_code=422)
+        loaded.config = candidate
         # In place, NOT rebound: AppContext copies the dict it is handed, so a
         # plugin that captured ctx.config at activate time holds that exact
         # object and a rebind leaves it reading dead values forever. The
