@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Iterable
 
 log = logging.getLogger(__name__)
@@ -44,6 +45,8 @@ log = logging.getLogger(__name__)
 #: verified it can actually deliver. Absent/empty = this host opted into
 #: nothing, which is the default on every host.
 ENV_VAR = "AW_HOST_POWER"
+GPU_ENV_VAR = "AW_HOST_GPU_DEVICES"
+_RENDER_NODE = re.compile(r"/dev/dri/renderD[0-9]+")
 
 #: Accepted in a host's ``--host-power`` list and in ``runtime.host_power``:
 #: expands to every granular grant, and pointedly NOT to ``privileged``.
@@ -81,16 +84,7 @@ GRANTS: dict[str, dict[str, Any]] = {
     },
     "gpu": {
         "capability": "host:device-gpu",
-        # A DIRECTORY, not a device node: this process's own container does
-        # not see the host's /dev at all (verified live, 2026-09-14 — the
-        # sibling app containers are created by the host's podman, over its
-        # socket, not by anything running inside this container's mount
-        # namespace), so there is no node here to enumerate. podman expands
-        # a directory device into every node it contains — verified live
-        # against this workspace's own container engine before this grant
-        # was added (docker-py's parse_devices does no client-side path
-        # validation at all; the expansion happens server-side).
-        "devices": ("/dev/dri",),
+        "devices": (),  # Runtime selection comes from the host probe.
         "caps": (),
         "desc": "GPU render node passthrough — hardware-accelerated rendering/decode",
     },
@@ -154,6 +148,26 @@ def parse_list(value: str | None) -> tuple[str, ...]:
     return expand(part for part in str(value).replace(" ", "").split(","))
 
 
+def _gpu_devices(env: dict[str, str] | None = None) -> tuple[str, ...]:
+    source = os.environ if env is None else env
+    entries = tuple(dict.fromkeys(source.get(GPU_ENV_VAR, "").split(",")))
+    if not any(_RENDER_NODE.fullmatch(entry) for entry in entries):
+        return ()
+    if any(not _RENDER_NODE.fullmatch(entry) and entry not in ("/dev/kfd", "keep-groups")
+           for entry in entries):
+        log.warning("apps: ignoring malformed %s", GPU_ENV_VAR)
+        return ()
+    return entries
+
+
+def available_grants(grants: Iterable[str]) -> set[str]:
+    """Expand the host's privilege ceiling while keeping GPU device-specific."""
+    available = set(grants)
+    if "privileged" in available:
+        available.update(name for name in GRANULAR if name != "gpu")
+    return available
+
+
 def host_grants(env: dict[str, str] | None = None) -> tuple[str, ...]:
     """What THIS host opted into, from ``AW_HOST_POWER``.
 
@@ -167,7 +181,10 @@ def host_grants(env: dict[str, str] | None = None) -> tuple[str, ...]:
     if not raw:
         return ()
     try:
-        return parse_list(raw)
+        grants = parse_list(raw)
+        if "gpu" in grants and not _gpu_devices(env):
+            return tuple(name for name in grants if name != "gpu")
+        return grants
     except HostPowerError as exc:
         log.warning("apps: ignoring malformed %s=%r (%s)", ENV_VAR, raw, exc)
         return ()
@@ -204,19 +221,7 @@ def resolve(
             f"permission(s): {', '.join(sorted(missing_caps))}"
         )
 
-    available = set(host_grants(env))
-    # A host that granted `privileged` granted every device and capability
-    # there is, so it satisfies any narrower request by definition. Without
-    # this, granting the MOST powerful thing refused an app that asked for
-    # less — "I enabled everything and the app still won't install" (found
-    # live on bare-metal, 2026-08-17).
-    #
-    # The app still only receives what it ASKED for: an app wanting kvm+tun
-    # gets kvm+tun, not --privileged. The host's grant is a ceiling, not a
-    # floor, and there is no reason to hand out more isolation loss than the
-    # manifest declared it needs.
-    if "privileged" in available:
-        available.update(GRANULAR)
+    available = available_grants(host_grants(env))
 
     missing_host = [name for name in wanted if name not in available]
     if missing_host:
@@ -273,11 +278,7 @@ def resolve_optional(
             f"the matching permission(s): {', '.join(sorted(missing_caps))}"
         )
 
-    available = set(host_grants(env))
-    # Same ceiling as resolve(): a host that granted `privileged` covers any
-    # narrower optional request too.
-    if "privileged" in available:
-        available.update(GRANULAR)
+    available = available_grants(host_grants(env))
 
     granted = tuple(name for name in wanted if name in available)
     for name in wanted:
@@ -290,7 +291,9 @@ def resolve_optional(
     return granted
 
 
-def docker_kwargs(grants: Iterable[str]) -> dict[str, Any]:
+def docker_kwargs(
+    grants: Iterable[str], env: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Map granted names onto ``docker`` SDK ``containers.run`` kwargs.
 
     ``privileged`` short-circuits the rest: it already implies every device
@@ -317,6 +320,12 @@ def docker_kwargs(grants: Iterable[str]) -> dict[str, Any]:
                 caps.append(cap)
 
     kwargs: dict[str, Any] = {}
+    if "gpu" in resolved:
+        for device in _gpu_devices(env):
+            if device == "keep-groups":
+                kwargs["group_add"] = ["keep-groups"]
+            else:
+                devices.append(f"{device}:{device}:rw")
     if devices:
         kwargs["devices"] = devices
     if caps:

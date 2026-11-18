@@ -185,11 +185,7 @@ def _unmet_optional_host_power(runtime, host_offers) -> list[dict]:
     optional request is visible at all: not a failure (nothing below folds
     it into ``ok``), just the information ``doctor`` exists to surface.
     """
-    effective_offers = set(host_offers)
-    # Same ceiling resolve_optional() applies at load time: a host that
-    # granted `privileged` covers any narrower optional request too.
-    if "privileged" in effective_offers:
-        effective_offers.update(hostpower.GRANULAR)
+    effective_offers = hostpower.available_grants(host_offers)
 
     out: list[dict] = []
     for slug in runtime.loaded_slugs():
@@ -1971,9 +1967,13 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         host_apps = []
         for slug in runtime.loaded_slugs():
             loaded = runtime.get(slug)
-            if loaded is None or not loaded.manifest.host_power:
+            if loaded is None:
                 continue
-            host_apps.append({"app": slug, "grants": list(loaded.manifest.host_power)})
+            manifest = loaded.manifest
+            optional = hostpower.available_grants(host_offers).intersection(manifest.host_power_optional)
+            grants = sorted(set(manifest.host_power).union(optional))
+            if grants:
+                host_apps.append({"app": slug, "grants": grants})
         unmet_optional = _unmet_optional_host_power(runtime, host_offers)
         claimed = {g for row in host_apps for g in row["grants"]}
         # Not a "problem" (it breaks nothing), but it is the one thing about
