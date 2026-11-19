@@ -7,12 +7,41 @@ import argparse
 import os
 import time
 
+import httpx
+
 from src.cli import local_client
 
 COMMAND = "marketplace"
 DESCRIPTION = "Install or update apps from the marketplace catalog"
 
 _POLL_INTERVAL = 1.0
+
+#: Tries for listing GETs and for the update POST (see ``_update_one``).
+_RETRY_ATTEMPTS = 3
+_RETRY_BACKOFF_S = 2.0
+
+_SERVER_HINT = ("  check the server with: aw-workspace-cli marketplace info  /  "
+                "aw-workspace-cli doctor")
+
+
+def _out(msg: str = "") -> None:
+    """``print`` that flushes. Block-buffered stdout (redirected to a file, or a
+    pipe) left an ``update-all`` log empty for the whole run."""
+    print(msg, flush=True)
+
+
+def _get(path: str, timeout: float = 30.0):
+    """Listing GET with retries; ``None`` (after printing one line) if the
+    server never answered — never a traceback."""
+    try:
+        return local_client.request_with_retry(
+            "GET", path, timeout=timeout,
+            attempts=_RETRY_ATTEMPTS, backoff=_RETRY_BACKOFF_S)
+    except httpx.HTTPError as exc:
+        _out(f"error: the workspace server did not answer GET {path.split('?')[0]} "
+             f"after {_RETRY_ATTEMPTS} tries ({local_client.describe_error(exc)})")
+        _out(_SERVER_HINT)
+        return None
 
 #: Quanto esperar um install terminar, do lado do CLIENTE.
 #:
@@ -89,7 +118,7 @@ def _catalog_entry(app_id: str) -> dict | None:
 def _install(app_id: str, update: bool) -> int:
     entry = _catalog_entry(app_id)
     if entry is None:
-        print(f"error: '{app_id}' is not in the marketplace catalog")
+        _out(f"error: '{app_id}' is not in the marketplace catalog")
         return 1
 
     if update:
@@ -107,25 +136,48 @@ def _install(app_id: str, update: bool) -> int:
         "ref": entry.get("ref") or "HEAD",
         "version": entry.get("version") or "",
     }
-    status, body = local_client.request("POST", "/api/apps/install", payload)
+    # No retry: if the first POST landed, a repeat answers 409 "already
+    # installed", which is indistinguishable from a real conflict.
+    try:
+        status, body = local_client.request("POST", "/api/apps/install", payload)
+    except httpx.HTTPError as exc:
+        return _post_unanswered(app_id, "install", exc)
     if status == 409:
-        print(f"'{app_id}' is already installed — use --update to update it.")
+        _out(f"'{app_id}' is already installed — use --update to update it.")
         return 1
     if status not in (200, 202):
-        print(f"error: install failed ({status}): {body}")
+        _out(f"error: install failed ({status}): {body}")
         return 1
 
     return 0 if _poll_until_done(app_id) else 1
 
 
+def _post_unanswered(app_id: str, verb: str, exc: Exception) -> int:
+    _out(f"error: the workspace server did not answer the {verb} request for "
+         f"'{app_id}' ({local_client.describe_error(exc)}). It may be overloaded; "
+         f"the {verb} may or may not have started.")
+    _out(_SERVER_HINT)
+    return 1
+
+
 def _update_one(app_id: str) -> int:
     """Update a single installed app; returns a process-style exit code."""
-    status, body = local_client.request("POST", f"/api/apps/{app_id}/update")
+    # Bounded retry is safe here: the server answers 202 "installing" for an
+    # update already in flight (``update_app`` in src/apps/routes.py), and one
+    # repeated after completion is a same-version no-op. A POST that never
+    # landed must NOT fall through to polling — install-status could still
+    # report the previous run's stale "installed".
+    try:
+        status, body = local_client.request_with_retry(
+            "POST", f"/api/apps/{app_id}/update",
+            attempts=_RETRY_ATTEMPTS, backoff=_RETRY_BACKOFF_S)
+    except httpx.HTTPError as exc:
+        return _post_unanswered(app_id, "update", exc)
     if status == 404:
-        print(f"'{app_id}' is not installed — run 'aw-workspace-cli marketplace install {app_id}' first.")
+        _out(f"'{app_id}' is not installed — run 'aw-workspace-cli marketplace install {app_id}' first.")
         return 1
     if status not in (200, 202):
-        print(f"error: update failed ({status}): {body}")
+        _out(f"error: update failed ({status}): {body}")
         return 1
     return 0 if _poll_until_done(app_id) else 1
 
@@ -133,9 +185,12 @@ def _update_one(app_id: str) -> int:
 def _installed_apps() -> list[dict] | None:
     """Every installed app's ``/api/apps`` row (slug + running version), or
     ``None`` if the listing call failed."""
-    status, body = local_client.request("GET", "/api/apps")
+    res = _get("/api/apps")
+    if res is None:
+        return None
+    status, body = res
     if status != 200 or not isinstance(body, list):
-        print(f"error: could not list installed apps ({status}): {body}")
+        _out(f"error: could not list installed apps ({status}): {body}")
         return None
     return [a for a in body if isinstance(a, dict) and a.get("slug")]
 
@@ -144,9 +199,12 @@ def _catalog_apps() -> list[dict] | None:
     """The full marketplace catalog listing, or ``None`` on failure.
 
     Always fetched with ``refresh=true`` — see ``_CATALOG_PATH``."""
-    status, body = local_client.request("GET", _CATALOG_PATH, timeout=_CATALOG_TIMEOUT)
+    res = _get(_CATALOG_PATH, timeout=_CATALOG_TIMEOUT)
+    if res is None:
+        return None
+    status, body = res
     if status != 200:
-        print(f"error: could not load the marketplace catalog ({status}): {body}")
+        _out(f"error: could not load the marketplace catalog ({status}): {body}")
         return None
     return (body or {}).get("apps", []) if isinstance(body, dict) else []
 
@@ -187,7 +245,7 @@ def _dependency_order(outdated: dict[str, dict]) -> list[str]:
         ready = sorted(slug for slug, deps in remaining.items() if all(d in placed for d in deps))
         if not ready:
             cycle = ", ".join(sorted(remaining))
-            print(f"warning: cyclic dependency among outdated apps ({cycle}) — updating anyway")
+            _out(f"warning: cyclic dependency among outdated apps ({cycle}) — updating anyway")
             ready = sorted(remaining)
         for slug in ready:
             ordered.append(slug)
@@ -201,7 +259,7 @@ def _update_all() -> int:
     if installed is None:
         return 1
     if not installed:
-        print("no apps installed — nothing to update")
+        _out("no apps installed — nothing to update")
         return 0
 
     catalog = _catalog_apps()
@@ -222,11 +280,11 @@ def _update_all() -> int:
             outdated[slug] = entry
 
     if not outdated:
-        print(f"all {len(installed)} installed app(s) already up to date")
+        _out(f"all {len(installed)} installed app(s) already up to date")
         return 0
 
     order = _dependency_order(outdated)
-    print(f"updating {len(order)} outdated app(s) in dependency order: {', '.join(order)}")
+    _out(f"updating {len(order)} outdated app(s) in dependency order: {', '.join(order)}")
 
     # Sequencial E com parada na primeira que não concluir. Os installers de
     # TODAS as apps serializam num único flock global
@@ -246,17 +304,17 @@ def _update_all() -> int:
         stopped_at = slug
         remaining = order[i + 1:]
         if remaining:
-            print(f"parando aqui — {len(remaining)} app(s) não tentada(s): "
+            _out(f"parando aqui — {len(remaining)} app(s) não tentada(s): "
                   f"{', '.join(remaining)}")
-            print("  os installers de todas as apps compartilham um lock, "
+            _out("  os installers de todas as apps compartilham um lock, "
                   "então enfileirar as próximas agora só deixaria tudo mais "
                   "lento. Rode de novo quando esta terminar.")
         break
 
     if stopped_at is not None:
-        print(f"done — {done} de {len(order)} ok, parou em: {stopped_at}")
+        _out(f"done — {done} de {len(order)} ok, parou em: {stopped_at}")
         return 1
-    print(f"done — all {len(order)} app(s) up to date")
+    _out(f"done — all {len(order)} app(s) up to date")
     return 0
 
 
@@ -265,35 +323,47 @@ def _info() -> int:
     if installed is None:
         return 1
     if not installed:
-        print("no apps installed")
+        _out("no apps installed")
         return 0
 
     for app in sorted(installed, key=lambda a: a["slug"]):
-        print(f"{app['slug']} {app.get('version') or 'unknown'}")
+        _out(f"{app['slug']} {app.get('version') or 'unknown'}")
     return 0
 
 
 def _poll_until_done(app_id: str) -> bool:
-    print(f"{app_id}: installing…")
+    _out(f"{app_id}: installing…")
     deadline = time.monotonic() + _POLL_TIMEOUT
+    flaky = False
     while time.monotonic() < deadline:
-        status, body = local_client.request("GET", f"/api/apps/{app_id}/install-status")
+        try:
+            status, body = local_client.request("GET", f"/api/apps/{app_id}/install-status")
+        except httpx.HTTPError as exc:
+            # Transient: the job lives on the server and keeps running while a
+            # loaded server is slow to answer. Keep waiting until the deadline.
+            if not flaky:
+                _out(f"{app_id}: server slow to answer "
+                     f"({local_client.describe_error(exc)}) — still waiting")
+                flaky = True
+            time.sleep(_POLL_INTERVAL)
+            continue
+        flaky = False
         if status == 200 and isinstance(body, dict):
             state = body.get("status")
             if state == "no-op":
-                print(f"{app_id}: already up to date")
+                _out(f"{app_id}: already up to date")
                 return True
             if state == "installed":
-                print(f"{app_id}: installed")
+                _out(f"{app_id}: installed")
                 return True
             if state == "failed":
-                print(f"{app_id}: failed — {body.get('error')}")
+                _out(f"{app_id}: failed — {body.get('error')}")
                 return False
         time.sleep(_POLL_INTERVAL)
     # NÃO é "falhou". O job vive no servidor e segue rodando depois que
     # paramos de olhar — dizer o contrário fez um update-all inteiro parecer
     # oito falhas quando na verdade era uma fila.
-    print(f"{app_id}: ainda instalando depois de {_POLL_TIMEOUT:.0f}s — o job "
+    _out(f"{app_id}: ainda instalando depois de {_POLL_TIMEOUT:.0f}s — o job "
           f"continua no servidor, parei só de acompanhar.")
-    print(f"  acompanhe com: aw-workspace-cli marketplace info")
+    _out(f"  acompanhe com: aw-workspace-cli marketplace info")
     return False

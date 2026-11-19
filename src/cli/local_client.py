@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import socket
+import time
 from typing import Any
 
 import httpx
@@ -182,3 +183,27 @@ def request(method: str, path: str, json_body: dict | None = None,
     except (json.JSONDecodeError, ValueError):
         body = resp.text
     return resp.status_code, body
+
+
+def describe_error(exc: BaseException) -> str:
+    """One human line for a transport failure — ``httpx`` exceptions often
+    stringify to nothing (a bare ``ReadTimeout`` has an empty message)."""
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+
+
+def request_with_retry(method: str, path: str, json_body: dict | None = None,
+                       timeout: float = 30.0, attempts: int = 3,
+                       backoff: float = 2.0) -> tuple[int, Any]:
+    """``request`` retried on transport errors (timeouts, connection resets)
+    with linear backoff. Only for calls that are safe to repeat — listing
+    GETs, or POSTs the server de-duplicates. Re-raises the last
+    ``httpx.HTTPError`` once ``attempts`` are spent; the caller turns that
+    into a one-line message instead of a traceback."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return request(method, path, json_body, timeout=timeout)
+        except httpx.HTTPError:
+            if attempt == attempts:
+                raise
+            time.sleep(backoff * attempt)
+    raise AssertionError("unreachable")  # pragma: no cover

@@ -160,3 +160,25 @@ def test_request_does_not_retry_when_key_unchanged_after_sync(monkeypatch):
 
     assert calls == ["same-key"]
     assert status == 401
+
+
+def test_request_with_retry_retries_transport_errors_then_raises(monkeypatch):
+    import httpx
+    from src.cli import local_client
+
+    calls = []
+
+    def boom(*a, **k):
+        calls.append(1)
+        raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr(local_client, "request", boom)
+    monkeypatch.setattr(local_client.time, "sleep", lambda s: None)
+    try:
+        local_client.request_with_retry("GET", "/x", attempts=3)
+    except httpx.ReadTimeout:
+        pass
+    else:
+        raise AssertionError("should re-raise after the last attempt")
+    assert len(calls) == 3
+    assert local_client.describe_error(httpx.ReadTimeout("")) == "ReadTimeout"
