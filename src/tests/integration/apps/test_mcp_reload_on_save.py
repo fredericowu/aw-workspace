@@ -559,3 +559,25 @@ def test_root_required_error_is_never_grandfathered():
     assert routes_mod._config_validation_error(
         schema, {"other": True}, {}, app_has_schema=True,
     ) == "'name' is a required property"
+
+
+def test_root_composite_error_is_never_grandfathered():
+    schema = {
+        "properties": {"mode": {}, "other": {}},
+        "anyOf": [{"properties": {"mode": {"const": mode}}} for mode in ("a", "b")],
+    }
+    previous = {"mode": "legacy"}
+    assert routes_mod._config_validation_error(
+        schema, {**previous, "other": True}, previous, app_has_schema=True,
+    ) == "$ does not satisfy the app config schema (anyOf)"
+
+
+def test_unchanged_invalid_values_use_json_schema_equality():
+    schema = {"properties": {"value": {"type": "string"}}}
+    previous = {"value": {"number": 1.0}}
+    assert routes_mod._config_validation_error(
+        schema, {"value": {"number": 1}}, previous, app_has_schema=True,
+    ) is None
+    assert routes_mod._config_validation_error(
+        schema, {"value": {"number": True}}, previous, app_has_schema=True,
+    ) == "$.value does not satisfy the app config schema (type)"

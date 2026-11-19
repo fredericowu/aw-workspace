@@ -481,14 +481,15 @@ def _config_validation_error(schema: dict, candidate: dict, previous: dict,
     previous_violations = None
     for error in validator.iter_errors(candidate):
         if previous_violations is None:
-            previous_violations = {
-                _config_violation_key(leaf)
-                for previous_error in validator.iter_errors(previous)
-                for leaf in _config_error_leaves(previous_error)
-                if leaf.absolute_path
-            }
-        if all(
-            leaf.absolute_path and _config_violation_key(leaf) in previous_violations
+            previous_violations = {}
+            for previous_error in validator.iter_errors(previous):
+                for leaf in _config_error_leaves(previous_error):
+                    previous_violations.setdefault(_config_violation_key(leaf), []).append(leaf.instance)
+        if error.absolute_path and all(
+            any(
+                Draft7Validator({"const": value}).is_valid(leaf.instance)
+                for value in previous_violations.get(_config_violation_key(leaf), ())
+            )
             for leaf in _config_error_leaves(error)
         ):
             continue
@@ -508,12 +509,10 @@ def _config_error_leaves(error):
 
 def _config_violation_key(error) -> tuple:
     # Match the specific schema branch as well as the field and its value.
-    # Serialized values distinguish JSON booleans from numbers and ignore object key order.
     return (
         tuple(error.absolute_path),
         error.validator,
         tuple(error.absolute_schema_path),
-        json.dumps(error.instance, sort_keys=True),
     )
 
 
