@@ -115,7 +115,10 @@ def test_cli_run_exits_nonzero_on_corrupt_and_zero_on_green(monkeypatch, capsys)
     assert run_with(good) == 0
 
 
-def test_dangling_backup_does_not_hide_a_valid_one(home):
+def test_dangling_backup_does_not_hide_a_valid_one(home, monkeypatch):
+    real = os.listdir
+    # deterministic: list the dangling entry BEFORE the valid one
+    monkeypatch.setattr(routes.os, "listdir", lambda p: sorted(real(p)))
     (home / ".claude.json").write_text("{")
     (home / ".claude" / "backups" / ".claude.json.backup.1").symlink_to(home / "gone")
     ok = _backup(home, "2", "{}", 1000)
