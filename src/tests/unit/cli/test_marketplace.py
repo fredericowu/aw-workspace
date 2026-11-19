@@ -330,3 +330,53 @@ def test_plain_listing_get_still_retried_on_5xx(monkeypatch):
 
     assert marketplace_mod._get("/api/apps") == (200, [])
     assert len(calls) == 2
+
+
+def _catalog_returns(monkeypatch, body, installed=None):
+    def fake_request(method, path, json_body=None, timeout=30.0):
+        if path == "/api/apps":
+            return 200, installed if installed is not None else [{"slug": "git", "version": "1"}]
+        return 200, body
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
+
+
+def test_catalog_error_with_no_apps_is_a_failed_lookup(monkeypatch, capsys):
+    _catalog_returns(monkeypatch, {"apps": [], "error": "all sources unreachable"})
+    assert marketplace_mod._catalog_apps() is None
+    assert "all sources unreachable" in capsys.readouterr().out
+
+
+def test_update_all_exits_nonzero_on_catalog_error(monkeypatch, capsys):
+    _catalog_returns(monkeypatch, {"apps": [], "error": "all sources unreachable"})
+    assert marketplace_mod._update_all() == 1
+    out = capsys.readouterr().out
+    assert "all sources unreachable" in out and "up to date" not in out
+
+
+def test_install_exits_nonzero_on_catalog_error(monkeypatch, capsys):
+    _catalog_returns(monkeypatch, {"apps": [], "error": "all sources unreachable"})
+    assert marketplace_mod._install("git", update=False) == 1
+    out = capsys.readouterr().out
+    assert "all sources unreachable" in out and "not in the marketplace catalog" not in out
+
+
+def test_catalog_error_with_apps_is_only_a_warning(monkeypatch, capsys):
+    apps = [{"id": "git", "version": "1"}]
+    _catalog_returns(monkeypatch, {"apps": apps, "error": "refresh failed"})
+    assert marketplace_mod._catalog_apps() == apps
+    assert "warning" in capsys.readouterr().out
+    assert marketplace_mod._update_all() == 0
+
+
+def test_empty_catalog_without_error_is_unchanged(monkeypatch):
+    _catalog_returns(monkeypatch, {"apps": []})
+    assert marketplace_mod._catalog_apps() == []
+    assert marketplace_mod._update_all() == 0
+
+
+def test_stale_flag_without_error_warns(monkeypatch, capsys):
+    apps = [{"id": "git", "version": "1"}]
+    _catalog_returns(monkeypatch, {"apps": apps, "stale": True})
+    assert marketplace_mod._catalog_apps() == apps
+    assert "stale cache" in capsys.readouterr().out

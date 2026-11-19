@@ -205,7 +205,21 @@ def _catalog_apps() -> list[dict] | None:
     if status != 200:
         _out(f"error: could not load the marketplace catalog ({status}): {body}")
         return None
-    return (body or {}).get("apps", []) if isinstance(body, dict) else []
+    if not isinstance(body, dict):
+        return []
+    apps = body.get("apps") or []
+    error = body.get("error")
+    if error:
+        if not apps:
+            # Every catalog source failed and both caches are empty: the server
+            # still answers 200, but "no apps" here is a failed lookup, not an
+            # empty marketplace.
+            _out(f"error: could not load the marketplace catalog: {error}")
+            return None
+        _out(f"warning: marketplace catalog served from a stale cache: {error}")
+    elif body.get("stale"):
+        _out("warning: marketplace catalog served from a stale cache (refresh failed)")
+    return apps
 
 
 def _required_dependency_ids(entry: dict) -> list[str]:
