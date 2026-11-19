@@ -191,19 +191,33 @@ def describe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 
+_TRANSIENT_GATEWAY_STATUSES = (502, 503, 504)
+
+
 def request_with_retry(method: str, path: str, json_body: dict | None = None,
                        timeout: float = 30.0, attempts: int = 3,
-                       backoff: float = 2.0) -> tuple[int, Any]:
+                       backoff: float = 2.0,
+                       retry_on: tuple[type[BaseException], ...] = (httpx.HTTPError,),
+                       ) -> tuple[int, Any]:
     """``request`` retried on transport errors (timeouts, connection resets)
     with linear backoff. Only for calls that are safe to repeat — listing
-    GETs, or POSTs the server de-duplicates. Re-raises the last
-    ``httpx.HTTPError`` once ``attempts`` are spent; the caller turns that
-    into a one-line message instead of a traceback."""
+    GETs, or POSTs whose failure proves the request never arrived (pass
+    ``retry_on=(httpx.ConnectError, httpx.ConnectTimeout)``; a ReadTimeout is
+    ambiguous and may have been accepted). Idempotent GETs also retry a
+    transient gateway status (502/503/504) within the same budget; other
+    methods never do. Re-raises the last error once ``attempts`` are spent;
+    the caller turns that into a one-line message instead of a traceback."""
+    idempotent = method.upper() == "GET"
     for attempt in range(1, attempts + 1):
         try:
-            return request(method, path, json_body, timeout=timeout)
-        except httpx.HTTPError:
+            status, body = request(method, path, json_body, timeout=timeout)
+        except retry_on:
             if attempt == attempts:
                 raise
             time.sleep(backoff * attempt)
+            continue
+        if idempotent and status in _TRANSIENT_GATEWAY_STATUSES and attempt < attempts:
+            time.sleep(backoff * attempt)
+            continue
+        return status, body
     raise AssertionError("unreachable")  # pragma: no cover

@@ -230,12 +230,25 @@ def test_update_post_unanswered_returns_1_without_polling(monkeypatch, fast, cap
 
     def fake_request(method, path, json_body=None, timeout=30.0):
         paths.append((method, path))
-        raise httpx.ConnectTimeout("")
+        raise httpx.ConnectError("")
 
     monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
     assert marketplace_mod._update_one("git") == 1
     assert all(m == "POST" for m, _ in paths)  # never polled a possibly-stale status
-    assert len(paths) == marketplace_mod._RETRY_ATTEMPTS  # update POST is deduped server-side
+    assert len(paths) == marketplace_mod._RETRY_ATTEMPTS  # connect failures prove it never landed
+    assert "did not answer the update request" in capsys.readouterr().out
+
+
+def test_update_post_readtimeout_is_not_retried(monkeypatch, fast, capsys):
+    paths = []
+
+    def fake_request(method, path, json_body=None, timeout=30.0):
+        paths.append((method, path))
+        raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
+    assert marketplace_mod._update_one("git") == 1
+    assert len(paths) == 1  # ambiguous: may have been accepted, retry could double-enqueue
     assert "did not answer the update request" in capsys.readouterr().out
 
 

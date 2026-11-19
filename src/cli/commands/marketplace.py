@@ -162,15 +162,17 @@ def _post_unanswered(app_id: str, verb: str, exc: Exception) -> int:
 
 def _update_one(app_id: str) -> int:
     """Update a single installed app; returns a process-style exit code."""
-    # Bounded retry is safe here: the server answers 202 "installing" for an
-    # update already in flight (``update_app`` in src/apps/routes.py), and one
-    # repeated after completion is a same-version no-op. A POST that never
-    # landed must NOT fall through to polling — install-status could still
-    # report the previous run's stale "installed".
+    # Retry ONLY failures that prove the POST never reached the server
+    # (connect errors). A ReadTimeout is ambiguous: the server may have
+    # accepted it, and a retry can land on another ASGI worker whose job
+    # tracker doesn't know about it, enqueuing a second update. A POST that
+    # never landed must NOT fall through to polling — install-status could
+    # still report the previous run's stale "installed".
     try:
         status, body = local_client.request_with_retry(
             "POST", f"/api/apps/{app_id}/update",
-            attempts=_RETRY_ATTEMPTS, backoff=_RETRY_BACKOFF_S)
+            attempts=_RETRY_ATTEMPTS, backoff=_RETRY_BACKOFF_S,
+            retry_on=(httpx.ConnectError, httpx.ConnectTimeout))
     except httpx.HTTPError as exc:
         return _post_unanswered(app_id, "update", exc)
     if status == 404:

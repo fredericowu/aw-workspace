@@ -182,3 +182,34 @@ def test_request_with_retry_retries_transport_errors_then_raises(monkeypatch):
         raise AssertionError("should re-raise after the last attempt")
     assert len(calls) == 3
     assert local_client.describe_error(httpx.ReadTimeout("")) == "ReadTimeout"
+
+
+def test_request_with_retry_get_retries_transient_gateway_status(monkeypatch):
+    from src.cli import local_client
+
+    answers = iter([(504, "gateway timeout"), (200, {"ok": True})])
+    calls = []
+
+    def fake(method, path, json_body=None, timeout=30.0):
+        calls.append(method)
+        return next(answers)
+
+    monkeypatch.setattr(local_client, "request", fake)
+    monkeypatch.setattr(local_client.time, "sleep", lambda s: None)
+    assert local_client.request_with_retry("GET", "/x") == (200, {"ok": True})
+    assert len(calls) == 2
+
+
+def test_request_with_retry_post_never_retried_on_5xx(monkeypatch):
+    from src.cli import local_client
+
+    calls = []
+
+    def fake(method, path, json_body=None, timeout=30.0):
+        calls.append(method)
+        return 504, "gateway timeout"
+
+    monkeypatch.setattr(local_client, "request", fake)
+    monkeypatch.setattr(local_client.time, "sleep", lambda s: None)
+    assert local_client.request_with_retry("POST", "/x") == (504, "gateway timeout")
+    assert len(calls) == 1
