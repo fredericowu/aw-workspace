@@ -56,7 +56,7 @@ from src.apps import mcp_template
 from src.apps.capabilities import filter_grants
 from src.apps.manifest import load_manifest
 from src.apps.registry_client import CloudRegistry
-from src.apps.runtime import AppRuntime
+from src.apps.runtime import AppRuntime, _public_paths_for
 from src.libs import skills_sync
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -136,6 +136,9 @@ class AppSpec:
     signed: bool = False
     package_dir: str | None = None  # already-on-disk source (skip fetch)
     state: str = "installed"
+    # Paths the registry row currently publishes under routes:public — read
+    # so an upgrade that DROPS them still republishes an empty set.
+    public_paths: list[str] = field(default_factory=list)
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "AppSpec":
@@ -150,6 +153,7 @@ class AppSpec:
             signed=bool(row.get("signed", False)),
             package_dir=row.get("package_dir"),
             state=row.get("state", "installed") or "installed",
+            public_paths=list(row.get("public_paths") or []),
         )
 
 
@@ -1019,6 +1023,35 @@ class Reconciler:
 
     # ---- install / uninstall -----------------------------------------------
 
+    async def _sync_public_paths(self, manifest: Any, loaded: Any,
+                                 previously_published: list[str] | None = None) -> None:
+        """Tell the cloud registry which public paths this load opened.
+
+        Runs on every load regardless of ``write_cloud``: an update applied by
+        :meth:`reconcile` is a ``write_cloud=False`` install, and it is the one
+        that brings a new manifest's paths. Only apps that declare
+        ``routes:public`` or any ``public_paths`` pay the round-trip; the
+        effective set is ``[]`` unless ``routes:public`` was actually granted,
+        so a refused grant clears the edge too. Best-effort — the workspace's
+        own IdentityGuard still refuses anything not opened here.
+
+        Must run AFTER ``put_desired`` on a fresh install (the backend 404s a
+        publish for a row that does not exist yet). An app whose new manifest
+        dropped its paths still publishes ``[]`` when the row had some
+        (``previously_published``), so the edge closes them too.
+        """
+        if not self.cloud.configured:
+            return
+        if (not manifest.public_paths and "routes:public" not in manifest.permissions
+                and not previously_published):
+            return
+        paths = _public_paths_for(loaded) if loaded is not None else []
+        try:
+            await asyncio.to_thread(self.cloud.put_public_paths, manifest.id, paths)
+        except Exception:
+            log.exception("apps: public_paths of %s did not reach the cloud registry",
+                          manifest.id)
+
     async def install(self, spec: AppSpec, *, write_cloud: bool = True,
                       _dependency_stack: tuple[str, ...] = (),
                       sync_skill_mirrors: bool = True) -> dict[str, Any]:
@@ -1217,6 +1250,7 @@ class Reconciler:
             except Exception:
                 log.exception("apps: install of %s did not reach the cloud registry",
                               manifest.id)
+        await self._sync_public_paths(manifest, loaded, spec.public_paths)
 
         # An app that self-registers an mcp.json on activate() (e.g.
         # aw-app-whiteboard) only gets picked up by an ALREADY-RUNNING

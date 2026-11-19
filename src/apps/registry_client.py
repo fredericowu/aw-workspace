@@ -77,6 +77,26 @@ class CloudRegistry:
         resp.raise_for_status()
         return resp.json()
 
+    def put_public_paths(self, app_id: str, public_paths: list[str],
+                         instance_id: str = "") -> dict:
+        """Publish the app's effective ``public_paths`` to its registry row.
+
+        aw-backend's tunnel edge reads them from there — it never derives a
+        public path from the request it is deciding on. A separate verb rather
+        than a field on :meth:`put_desired` because the reconciler's own
+        installs run with ``write_cloud=False`` (so desired state is not
+        rewritten mid-converge), yet the path set of the manifest it just
+        loaded is exactly what the edge must learn. Touches only that column.
+        """
+        if not self.configured:
+            return {}
+        resp = httpx.put(f"{self._base()}/{app_id}/public-paths",
+                         json={"public_paths": list(public_paths),
+                               "instance_id": instance_id},
+                         headers=self._headers(), timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
     def delete_desired(self, app_id: str, instance_id: str = "") -> None:
         """Remove the desired state for one app (the workspace's uninstall flow)."""
         if not self.configured:

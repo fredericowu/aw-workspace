@@ -40,7 +40,7 @@ from src.apps.containers import (WORKSPACE_HOST_ENV, ContainerError, ContainerSu
                                  expand_env, expand_value)
 from src.apps.agents_md import AgentsMdError, AgentsMdRegistry
 from src.apps.journal import ActionJournal
-from src.apps.manifest import Manifest, load_manifest
+from src.apps.manifest import PUBLIC_PATHS_APPROVED_KEY, Manifest, load_manifest
 from src.apps.proxy import ContainerReverseProxy
 from src.apps.secret_store import SecretStore
 from src.apps.services import ServiceSupervisor
@@ -282,6 +282,27 @@ def _local_paths_for(loaded: "LoadedApp") -> list[str]:
     return paths
 
 
+def _public_paths_for(loaded: "LoadedApp") -> list[str]:
+    """Full request paths of ``loaded`` that skip identity auth, or ``[]``.
+
+    The ``routes:local`` sibling for callers that are NOT local: a third-party
+    webhook sender (Shopify) holds no workspace credential at all, and the
+    app's own signature check is the only thing that can judge it. Three
+    conditions, all required, so no single one opens anything:
+
+    * the app was GRANTED ``routes:public`` (declaring it is not enough),
+    * the manifest names the path exactly (``Manifest.public_paths``,
+      validated to sit strictly below the app's own ``/api/apps/<slug>/``), and
+    * the owner approved it for this install — the framework config flag
+      ``public_paths_approved``. Checked per request by the guard (see
+      ``public_paths_approved`` below), not here, so revoking it in the config
+      modal takes effect without a remount.
+    """
+    if "routes:public" not in loaded.granted_permissions:
+        return []
+    return list(loaded.manifest.public_paths)
+
+
 class IdentityGuard:
     """ASGI wrapper enforcing the central identity JWT on an app's sub-app.
 
@@ -347,7 +368,9 @@ class IdentityGuard:
                  local_paths: "list[str] | None" = None,
                  auth_required: "bool | Callable[[], bool]" = True,
                  app_id: str = "",
-                 auth_type: "str | Callable[[], str]" = "workspace") -> None:
+                 auth_type: "str | Callable[[], str]" = "workspace",
+                 public_paths: "list[str] | None" = None,
+                 public_paths_approved: "bool | Callable[[], bool]" = False) -> None:
         self.app = app
         self._verify_http = verify_http or _default_verify_http
         self._verify_ws = verify_ws or _default_verify_ws
@@ -355,6 +378,8 @@ class IdentityGuard:
         self._auth_required = auth_required
         self.app_id = app_id
         self._auth_type = auth_type
+        self._public_paths = frozenset(public_paths or [])
+        self._public_paths_approved = public_paths_approved
 
     def _requires_auth(self) -> bool:
         if callable(self._auth_required):
@@ -382,6 +407,20 @@ class IdentityGuard:
             return "forbidden: workspace key not accepted (auth_type=scoped)"
         return None
 
+    def _public_bypass(self, scope: Scope) -> bool:
+        """True for an HTTP request to one of the app's approved public paths.
+
+        Matched against the FULL path (``scope["path"]``), so only the
+        ``/api/apps/<slug>/...`` mount can match — the per-app subdomain mount
+        sees a prefix-less path and stays gated. Exact match only; HTTP only
+        (the caller wraps this in the ``http`` branch)."""
+        if not self._public_paths:
+            return False
+        if (scope.get("path") or "") not in self._public_paths:
+            return False
+        approved = self._public_paths_approved
+        return bool(approved() if callable(approved) else approved)
+
     def _local_bypass(self, scope: Scope) -> bool:
         if not self._local_paths:
             return False
@@ -397,7 +436,8 @@ class IdentityGuard:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         stype = scope["type"]
         if stype == "http":
-            if self._local_bypass(scope) or _is_presentation_share_link(scope):
+            if (self._local_bypass(scope) or _is_presentation_share_link(scope)
+                    or self._public_bypass(scope)):
                 await self.app(scope, receive, send)
                 return
             if not self._requires_auth():
@@ -1570,6 +1610,12 @@ class AppRuntime:
                        # auth_type was set at mount time and make the flip a
                        # silent no-op until the next restart.
                        auth_type=lambda: str(loaded.config.get("auth_type", "workspace")),
+                       public_paths=_public_paths_for(loaded),
+                       # Live for the same reason as auth_type: the owner's
+                       # approval is a config flag, and revoking it must close
+                       # the paths on save, not on the next restart.
+                       public_paths_approved=lambda: loaded.config.get(
+                           PUBLIC_PATHS_APPROVED_KEY) is True,
                    )
                    if self.guard_identity else drainable)
         mount = Mount(f"/api/apps/{app_id}", app=guarded)
