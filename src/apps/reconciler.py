@@ -56,7 +56,7 @@ from src.apps import mcp_template
 from src.apps.capabilities import filter_grants
 from src.apps.manifest import load_manifest
 from src.apps.registry_client import CloudRegistry
-from src.apps.runtime import AppRuntime
+from src.apps.runtime import AppRuntime, _public_paths_for
 from src.libs import skills_sync
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -1019,6 +1019,28 @@ class Reconciler:
 
     # ---- install / uninstall -----------------------------------------------
 
+    async def _sync_public_paths(self, manifest: Any, loaded: Any) -> None:
+        """Tell the cloud registry which public paths this load opened.
+
+        Runs on every load regardless of ``write_cloud``: an update applied by
+        :meth:`reconcile` is a ``write_cloud=False`` install, and it is the one
+        that brings a new manifest's paths. Only apps that declare
+        ``routes:public`` or any ``public_paths`` pay the round-trip; the
+        effective set is ``[]`` unless ``routes:public`` was actually granted,
+        so a refused grant clears the edge too. Best-effort — the workspace's
+        own IdentityGuard still refuses anything not opened here.
+        """
+        if not self.cloud.configured:
+            return
+        if not manifest.public_paths and "routes:public" not in manifest.permissions:
+            return
+        paths = _public_paths_for(loaded) if loaded is not None else []
+        try:
+            await asyncio.to_thread(self.cloud.put_public_paths, manifest.id, paths)
+        except Exception:
+            log.exception("apps: public_paths of %s did not reach the cloud registry",
+                          manifest.id)
+
     async def install(self, spec: AppSpec, *, write_cloud: bool = True,
                       _dependency_stack: tuple[str, ...] = (),
                       sync_skill_mirrors: bool = True) -> dict[str, Any]:
@@ -1194,6 +1216,7 @@ class Reconciler:
         loaded = self.runtime.get(manifest.id)
         effective = loaded.granted_permissions if loaded else granted_req
         spec.granted_permissions = effective
+        await self._sync_public_paths(manifest, loaded)
 
         # to_thread, same as the cloud/fetch calls around it: LocalMirror talks
         # to Postgres through the SYNCHRONOUS get_session, and reconcile()

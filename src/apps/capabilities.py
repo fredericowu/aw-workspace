@@ -27,6 +27,7 @@ from __future__ import annotations
 CATALOG: dict[str, dict[str, str]] = {
     "routes:register":   {"risk": "low",  "desc": "mount /api/apps/<id>/* routes"},
     "routes:local":      {"risk": "low",  "desc": "declared local_paths bypass identity auth for in-workspace localhost callers"},
+    "routes:public":     {"risk": "low",  "desc": "declared public_paths (exact paths under the app's own prefix) bypass identity auth for ANY caller once the owner sets public_paths_approved — the app's own check (e.g. a webhook HMAC) is the only auth there"},
     "db:own-tables":     {"risk": "low",  "desc": "create/use app-owned workspace tables"},
     "commands:install":  {"risk": "low",  "desc": "install commands/CLIs that survive restart"},
     "service:manage":    {"risk": "low",  "desc": "register a start/stop background service"},

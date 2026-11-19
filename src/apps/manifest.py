@@ -466,6 +466,22 @@ class Manifest:
         return str(self.raw.get("category") or "Apps")
 
     @property
+    def public_paths(self) -> list[str]:
+        """Every ``contributes.routes[].public_paths`` entry, in order.
+
+        Full request paths, validated by :func:`validate_manifest`. Declared is
+        not granted: see ``src.apps.runtime._public_paths_for`` for the
+        capability + owner-approval conditions that actually open one.
+        """
+        out: list[str] = []
+        for route in self.contributes.get("routes", []) or []:
+            if isinstance(route, dict):
+                for path in route.get("public_paths", []) or []:
+                    if path not in out:
+                        out.append(str(path))
+        return out
+
+    @property
     def standalone_app(self) -> bool:
         """Whether this app has a separate process of its own to start/stop/
         restart independently of the aw-workspace process.
@@ -568,6 +584,23 @@ class Manifest:
                 },
             }
             props = {**framework_props, **props}
+        if self.public_paths:
+            props = {
+                PUBLIC_PATHS_APPROVED_KEY: {
+                    "type": "boolean",
+                    "default": False,
+                    "title": "Allow public webhook paths",
+                    "description": (
+                        "Let callers with NO workspace login reach exactly "
+                        "these paths: " + ", ".join(self.public_paths) +
+                        ". The app's own check (e.g. a webhook signature) is "
+                        "then the only auth on them. Every other route of "
+                        "this app stays login-only."
+                    ),
+                    "x-framework": True,
+                },
+                **props,
+            }
         if self.agents_md is not None:
             props = {
                 "agents_md_contribution_enabled": {
@@ -1237,6 +1270,45 @@ def _validate_publish(runtime: dict[str, Any], tier: str,
         raise ManifestError(f"invalid runtime.publish: {exc}") from exc
 
 
+# Framework config key that is the owner's explicit, per-install approval of an
+# app's declared ``public_paths``. Declaring the paths and holding
+# ``routes:public`` is the app ASKING; this flag is the owner SAYING YES. Both
+# aw-workspace's IdentityGuard and aw-backend's tunnel edge read it, the edge
+# from the cloud registry row the config modal already writes to.
+PUBLIC_PATHS_APPROVED_KEY = "public_paths_approved"
+
+# One safe path segment: no dots-only segment, no wildcard/query/fragment
+# characters. Paths are matched EXACTLY (no prefix semantics), so a declared
+# path can never cover more than the one URL it names.
+_PUBLIC_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_\-.~]+$")
+
+
+def _validate_public_path(path: Any, slug: str) -> None:
+    """Refuse a ``public_paths`` entry that is not one exact path under the app.
+
+    The entry is the FULL request path (``/api/apps/<slug>/webhooks``), which
+    is what both enforcement points compare against: IdentityGuard on the
+    workspace and the tunnel edge in aw-backend. It must sit strictly below
+    the app's own mount — the mount root itself would be the whole app, which
+    is what ``config.public`` already is and exactly what this exists to avoid.
+    """
+    prefix = f"/api/apps/{slug}/"
+    if not isinstance(path, str) or not path.startswith(prefix):
+        raise ManifestError(
+            f"public_paths entry {path!r} must be a full path under {prefix!r}"
+        )
+    rest = path[len(prefix):]
+    segments = rest.split("/")
+    if not rest or any(not seg for seg in segments) or any(
+        seg in (".", "..") or not _PUBLIC_PATH_SEGMENT_RE.match(seg)
+        for seg in segments
+    ):
+        raise ManifestError(
+            f"public_paths entry {path!r} must be one exact path (no wildcards, "
+            f"empty segments, '.'/'..', trailing slash or query) below {prefix!r}"
+        )
+
+
 def validate_manifest(data: dict[str, Any]) -> Manifest:
     """Validate a parsed manifest dict against the v1 schema; return a Manifest.
 
@@ -1327,6 +1399,15 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
         raise ManifestError(
             "contributes.routes[].local_paths requires the 'routes:local' permission"
         )
+    for route in routes:
+        if isinstance(route, dict) and "public_paths" in route:
+            for path in route.get("public_paths") or []:
+                _validate_public_path(path, slug)
+            if route.get("public_paths") and "routes:public" not in permissions:
+                raise ManifestError(
+                    "contributes.routes[].public_paths requires the "
+                    "'routes:public' permission"
+                )
 
     for win in contributes.get("windows", []):
         if not isinstance(win, dict) or not win.get("id"):

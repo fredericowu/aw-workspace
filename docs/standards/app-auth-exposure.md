@@ -32,6 +32,39 @@ SigNoz's actual fix is the shape to copy: an `envsubst`-templated
 per `location` block — the UI path left open (SigNoz has its own login),
 everything else gated.
 
+### 1a. The one framework exception: `routes:public` + `public_paths`
+
+For a path that a third party calls with **no workspace credential at all**
+(a Shopify webhook: its only credential is an HMAC header the app itself
+verifies), an app can open exactly that path and nothing else:
+
+```json
+"permissions": ["routes:register", "routes:public"],
+"contributes": {"routes": [{
+  "prefix": "/api/apps/shopify",
+  "public_paths": ["/api/apps/shopify/webhooks"]
+}]}
+```
+
+A path opens only when **all three** hold, checked at both enforcement
+points (aw-workspace's `IdentityGuard`, aw-backend's tunnel edge):
+
+1. `routes:public` is **granted** (declaring it is not enough);
+2. the manifest names the **exact full path** — validated to sit strictly
+   below the app's own `/api/apps/<id>/`, no wildcard, no `..`, no trailing
+   slash, no mount root. Exact match, HTTP only (never a WebSocket), and only
+   on the `api.<ws>` path form — the per-app subdomain stays gated;
+3. the owner set the framework config flag **`public_paths_approved: true`**
+   for that install (it appears in the app's config modal only when the app
+   declares paths, default off). Revoking it closes the paths on save.
+
+The edge never learns the paths from the request: the workspace publishes the
+effective set to the registry row (`PUT /api/workspaces/<ws>/app-installs/<id>/public-paths`)
+on every load, and the edge reads that row plus `config.public_paths_approved`.
+The app's own handler is then the **only** auth on that path — it must verify
+its own signature/token and fail closed. Every other route of the app keeps
+the normal login.
+
 ## 2. Where the decision is resolved — the file chain
 
 Two sessions about an hour apart each burned 12-15 greps hunting for this
