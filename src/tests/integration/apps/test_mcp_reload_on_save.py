@@ -460,3 +460,140 @@ def test_invalid_config_save_has_no_side_effects(tmp_path, monkeypatch, patch, r
     res = client.post(f"/api/apps/{slug}/config", json={"workers": 4, "legacy": 1})
     assert res.status_code == 200
     assert res.json()["config"] == {**before, "enabled": True, "mode": "cpu", "workers": 4}
+
+
+@pytest.mark.parametrize(("managed", "password", "changes", "rule"), [
+    ("", "", {}, None),
+    ("true", "Éclair123!abcd", {}, None),
+    ("true", "Aa1!" + "é" * 35, {}, None),
+    ("true", "ÉÅéâöç1!", {}, None),
+    ("true", "Éclair123!abcd", {"root_account_managed": ""}, None),
+    ("true", "Éclair123!abcd", {"root_password": "Aa1!" + "a" * 68}, None),
+    ("true", "Aa1!" + "a" * 12, {"root_password": "Éclair123!abcd"}, "pattern"),
+    ("true", "Éclair123!abcd", {"root_password": "Éclair234!abcd"}, "pattern"),
+    ("", "", {"root_account_managed": "true"}, "minLength"),
+    ("", "Éclair123!abcd", {"root_account_managed": "true"}, "pattern"),
+    ("true", "Éclair123!abcd", {"root_email": None}, "minLength"),
+    ("true", "Éclair123!abcd", {"root_password": "Aa1!" + "a" * 69}, "maxLength"),
+    ("true", "Éclair123!abcd", {"num_parallel": 0}, "minimum"),
+])
+def test_partial_save_grandfathers_only_unchanged_violations(
+    tmp_path, monkeypatch, managed, password, changes, rule,
+):
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    slug = "validationapp"
+    pkg = _write_app(tmp_path, slug, reload_on_save=False, plugin_src=PLUGIN_RECORDING_SAVES)
+    manifest_path = tmp_path / slug / "aw-app.json"
+    manifest = json.loads(manifest_path.read_text())
+    schema = manifest["config_schema"]
+    schema["properties"].update({
+        "root_account_managed": {"type": "string", "default": ""},
+        "root_email": {"type": "string", "default": ""},
+        "root_password": {"type": "string", "default": "", "x-secret": True},
+        "signoz_api_key": {"type": "string", "default": ""},
+        "num_parallel": {"type": "integer", "minimum": 1, "default": 1},
+    })
+    schema["if"] = {
+        "required": ["root_account_managed"],
+        "properties": {"root_account_managed": {"const": "true"}},
+    }
+    schema["then"] = {
+        "required": ["root_email", "root_password"],
+        "properties": {
+            "root_email": {"minLength": 1},
+            "root_password": {"minLength": 12, "maxLength": 72, "pattern": "^[!-~]+$"},
+        },
+    }
+    manifest_path.write_text(json.dumps(manifest))
+    _, runtime, client = _client()
+    before = {
+        "root_account_managed": managed,
+        "root_email": "root@example.test",
+        "root_password": password,
+    }
+    _async(runtime.load(pkg, granted_permissions=[], config=before))
+    loaded = runtime.get(slug)
+    before = dict(loaded.config)
+    runtime_changes = []
+
+    async def apply_runtime_config(*args):
+        runtime_changes.append(args)
+
+    monkeypatch.setattr(routes_mod, "_apply_runtime_config", apply_runtime_config)
+    patch = {"signoz_api_key": "synthetic-api-key", **changes}
+    result = client.post(f"/api/apps/{slug}/config", json={"config": patch})
+
+    if rule is None:
+        assert result.status_code == 200
+        assert loaded.config["signoz_api_key"] == "synthetic-api-key"
+    else:
+        assert result.status_code == 422
+        field = next(iter(changes))
+        if field == "root_account_managed":
+            field = "root_password"
+        assert result.json() == {
+            "error": f"$.{field} does not satisfy the app config schema ({rule})",
+        }
+        assert loaded.config == loaded.ctx.config == before
+        assert loaded.ctx.saved_configs == runtime_changes == []
+
+
+def test_nested_violations_match_the_schema_branch_and_keep_parent_error():
+    schema = {
+        "properties": {"mode": {}, "value": {}, "other": {}},
+        "if": {"properties": {"mode": {"const": "a"}}},
+        "then": {"properties": {"value": {"anyOf": [{"minimum": 2}, {"minimum": 3}]}}},
+        "else": {"properties": {"value": {"anyOf": [{"minimum": 2}, {"minimum": 3}]}}},
+    }
+    previous = {"mode": "a", "value": 1}
+    assert routes_mod._config_validation_error(
+        schema, {**previous, "other": True}, previous, app_has_schema=True,
+    ) is None
+    assert routes_mod._config_validation_error(
+        schema, {**previous, "mode": "b"}, previous, app_has_schema=True,
+    ) == "$.value does not satisfy the app config schema (anyOf)"
+
+
+def test_root_required_error_is_never_grandfathered():
+    schema = {"required": ["name"], "properties": {"other": {}}}
+    assert routes_mod._config_validation_error(
+        schema, {"other": True}, {}, app_has_schema=True,
+    ) == "'name' is a required property"
+
+
+def test_root_composite_error_is_never_grandfathered():
+    schema = {
+        "properties": {"mode": {}, "other": {}},
+        "anyOf": [{"properties": {"mode": {"const": mode}}} for mode in ("a", "b")],
+    }
+    previous = {"mode": "legacy"}
+    assert routes_mod._config_validation_error(
+        schema, {**previous, "other": True}, previous, app_has_schema=True,
+    ) == "$ does not satisfy the app config schema (anyOf)"
+
+
+def test_unchanged_invalid_values_use_json_schema_equality():
+    schema = {"properties": {"value": {"type": "string"}}}
+    previous = {"value": {"number": 1.0}}
+    assert routes_mod._config_validation_error(
+        schema, {"value": {"number": 1}}, previous, app_has_schema=True,
+    ) is None
+    assert routes_mod._config_validation_error(
+        schema, {"value": {"number": True}}, previous, app_has_schema=True,
+    ) == "$.value does not satisfy the app config schema (type)"
+
+
+def test_non_finite_legacy_value_does_not_crash_validation_of_a_repair():
+    schema = {
+        "properties": {
+            "ratio": {"multipleOf": 0.5},
+            "name": {"type": "string"},
+        },
+    }
+    previous = {"ratio": float("inf"), "name": 123}
+    assert routes_mod._config_validation_error(
+        schema, {**previous, "ratio": 1}, previous, app_has_schema=True,
+    ) == "$.name does not satisfy the app config schema (type)"
+    assert routes_mod._config_validation_error(
+        schema, {"ratio": 1, "name": "example"}, previous, app_has_schema=True,
+    ) is None

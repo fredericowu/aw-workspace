@@ -478,14 +478,47 @@ def _config_validation_error(schema: dict, candidate: dict, previous: dict,
         schema = {**schema, "properties": properties, "additionalProperties": False}
 
     validator = validator_for(schema, default=Draft7Validator)(schema)
-    error = next(validator.iter_errors(candidate), None)
-    if error is None:
-        return None
-    if error.validator in {"required", "additionalProperties"}:
-        return error.message
-    # jsonschema messages may echo submitted values, including secrets.
-    field = error.json_path
-    return f"{field} does not satisfy the app config schema ({error.validator})"
+    previous_violations = None
+    for error in validator.iter_errors(candidate):
+        if previous_violations is None:
+            previous_violations = {}
+            try:
+                for previous_error in validator.iter_errors(previous):
+                    for leaf in _config_error_leaves(previous_error):
+                        previous_violations.setdefault(_config_violation_key(leaf), []).append(leaf.instance)
+            except (ArithmeticError, ValueError):
+                # A legacy non-finite number can crash a schema rule such as
+                # multipleOf. Incomplete evidence cannot grandfather violations.
+                previous_violations.clear()
+        if error.absolute_path and all(
+            any(
+                Draft7Validator({"const": value}).is_valid(leaf.instance)
+                for value in previous_violations.get(_config_violation_key(leaf), ())
+            )
+            for leaf in _config_error_leaves(error)
+        ):
+            continue
+        if error.validator in {"required", "additionalProperties"}:
+            return error.message
+        # jsonschema messages may echo submitted values, including secrets.
+        return f"{error.json_path} does not satisfy the app config schema ({error.validator})"
+    return None
+
+
+def _config_error_leaves(error):
+    if not error.context:
+        yield error
+    for child in error.context:
+        yield from _config_error_leaves(child)
+
+
+def _config_violation_key(error) -> tuple:
+    # Match the specific schema branch as well as the field and its value.
+    return (
+        tuple(error.absolute_path),
+        error.validator,
+        tuple(error.absolute_schema_path),
+    )
 
 
 def _merge_config(previous: dict, incoming: dict) -> dict:
