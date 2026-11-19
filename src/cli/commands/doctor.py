@@ -55,6 +55,7 @@ def run(args: list[str]) -> int:
     problems += _vault(report.get("vault") or {})
     problems += _state_facade(report.get("state_facade") or {})
     problems += _remote_host_postgres_backup(report.get("remote_host_postgres_backup") or {})
+    problems += _claude_config(report.get("claude_config") or {})
 
     print()
     if problems:
@@ -507,4 +508,27 @@ def _remote_host_postgres_backup(section: dict) -> int:
         return 1
     print(f"Backup (aw-remote-host-postgres) — verified {section.get('age_hours', '?')}h ago "
           f"(slot={section.get('slot')})")
+    return 0
+
+
+def _claude_config(section: dict) -> int:
+    """~/.claude.json parse check. Read-only: it names the newest valid
+    backup, it never restores one (a restore would race the live writers)."""
+    print()
+    if not section:
+        print("Claude config (~/.claude.json) — no report from the server")
+        return 0
+    if not section.get("present"):
+        print("Claude config (~/.claude.json) — absent (not an error)")
+        return 0
+    if section.get("corrupt"):
+        print(f"Claude config ({section.get('path', '~/.claude.json')}) — ✗ DOES NOT PARSE")
+        print(f"      {section.get('reason', '')}")
+        backup = section.get("newest_valid_backup")
+        if backup:
+            print(f"      newest valid backup: {backup}")
+        else:
+            print("      no valid backup exists in ~/.claude/backups")
+        return 1
+    print(f"Claude config ({section.get('path', '~/.claude.json')}) — parses")
     return 0
