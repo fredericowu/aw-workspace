@@ -373,3 +373,10 @@ def test_empty_catalog_without_error_is_unchanged(monkeypatch):
     _catalog_returns(monkeypatch, {"apps": []})
     assert marketplace_mod._catalog_apps() == []
     assert marketplace_mod._update_all() == 0
+
+
+def test_stale_flag_without_error_warns(monkeypatch, capsys):
+    apps = [{"id": "git", "version": "1"}]
+    _catalog_returns(monkeypatch, {"apps": apps, "stale": True})
+    assert marketplace_mod._catalog_apps() == apps
+    assert "stale cache" in capsys.readouterr().out

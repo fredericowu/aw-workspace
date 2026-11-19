@@ -217,6 +217,8 @@ def _catalog_apps() -> list[dict] | None:
             _out(f"error: could not load the marketplace catalog: {error}")
             return None
         _out(f"warning: marketplace catalog served from a stale cache: {error}")
+    elif body.get("stale"):
+        _out("warning: marketplace catalog served from a stale cache (refresh failed)")
     return apps
 
 
