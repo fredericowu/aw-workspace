@@ -198,6 +198,7 @@ def request_with_retry(method: str, path: str, json_body: dict | None = None,
                        timeout: float = 30.0, attempts: int = 3,
                        backoff: float = 2.0,
                        retry_on: tuple[type[BaseException], ...] = (httpx.HTTPError,),
+                       retry_status: bool = True,
                        ) -> tuple[int, Any]:
     """``request`` retried on transport errors (timeouts, connection resets)
     with linear backoff. Only for calls that are safe to repeat — listing
@@ -205,7 +206,9 @@ def request_with_retry(method: str, path: str, json_body: dict | None = None,
     ``retry_on=(httpx.ConnectError, httpx.ConnectTimeout)``; a ReadTimeout is
     ambiguous and may have been accepted). Idempotent GETs also retry a
     transient gateway status (502/503/504) within the same budget; other
-    methods never do. Re-raises the last error once ``attempts`` are spent;
+    methods never do — pass ``retry_status=False`` for a GET with a server-side
+    effect (a ``refresh=true`` catalog fetch: a retry could start a second
+    refresh that overwrites the first); transport errors still retry. Re-raises the last error once ``attempts`` are spent;
     the caller turns that into a one-line message instead of a traceback."""
     idempotent = method.upper() == "GET"
     for attempt in range(1, attempts + 1):
@@ -216,7 +219,7 @@ def request_with_retry(method: str, path: str, json_body: dict | None = None,
                 raise
             time.sleep(backoff * attempt)
             continue
-        if idempotent and status in _TRANSIENT_GATEWAY_STATUSES and attempt < attempts:
+        if retry_status and idempotent and status in _TRANSIENT_GATEWAY_STATUSES and attempt < attempts:
             time.sleep(backoff * attempt)
             continue
         return status, body

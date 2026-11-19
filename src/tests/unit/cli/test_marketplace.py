@@ -293,3 +293,40 @@ def test_update_all_still_stops_at_first_incomplete(monkeypatch, fast, capsys):
     monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
     assert marketplace_mod._update_all() == 1
     assert updated == ["/api/apps/a/update"]
+
+
+def test_catalog_refresh_not_retried_on_5xx(monkeypatch):
+    """refresh=true + 504 -> exactly one request: a retry could start a second
+    refresh that overwrites the shared catalog cache."""
+    from src.cli.commands import marketplace as marketplace_mod
+
+    calls = []
+
+    def fake_request(method, path, json_body=None, timeout=30.0):
+        calls.append(path)
+        return 504, "gateway timeout"
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
+    monkeypatch.setattr(marketplace_mod, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(marketplace_mod.local_client.time, "sleep", lambda s: None)
+
+    assert marketplace_mod._catalog_apps() is None
+    assert calls == ["/api/apps/-/catalog?refresh=true"]
+
+
+def test_plain_listing_get_still_retried_on_5xx(monkeypatch):
+    from src.cli.commands import marketplace as marketplace_mod
+
+    answers = iter([(504, "gateway timeout"), (200, [])])
+    calls = []
+
+    def fake_request(method, path, json_body=None, timeout=30.0):
+        calls.append(path)
+        return next(answers)
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
+    monkeypatch.setattr(marketplace_mod, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(marketplace_mod.local_client.time, "sleep", lambda s: None)
+
+    assert marketplace_mod._get("/api/apps") == (200, [])
+    assert len(calls) == 2

@@ -30,13 +30,14 @@ def _out(msg: str = "") -> None:
     print(msg, flush=True)
 
 
-def _get(path: str, timeout: float = 30.0):
+def _get(path: str, timeout: float = 30.0, retry_status: bool = True):
     """Listing GET with retries; ``None`` (after printing one line) if the
     server never answered — never a traceback."""
     try:
         return local_client.request_with_retry(
             "GET", path, timeout=timeout,
-            attempts=_RETRY_ATTEMPTS, backoff=_RETRY_BACKOFF_S)
+            attempts=_RETRY_ATTEMPTS, backoff=_RETRY_BACKOFF_S,
+            retry_status=retry_status)
     except httpx.HTTPError as exc:
         _out(f"error: the workspace server did not answer GET {path.split('?')[0]} "
              f"after {_RETRY_ATTEMPTS} tries ({local_client.describe_error(exc)})")
@@ -197,7 +198,7 @@ def _catalog_apps() -> list[dict] | None:
     """The full marketplace catalog listing, or ``None`` on failure.
 
     Always fetched with ``refresh=true`` — see ``_CATALOG_PATH``."""
-    res = _get(_CATALOG_PATH, timeout=_CATALOG_TIMEOUT)
+    res = _get(_CATALOG_PATH, timeout=_CATALOG_TIMEOUT, retry_status=False)
     if res is None:
         return None
     status, body = res

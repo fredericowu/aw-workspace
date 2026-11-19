@@ -213,3 +213,19 @@ def test_request_with_retry_post_never_retried_on_5xx(monkeypatch):
     monkeypatch.setattr(local_client.time, "sleep", lambda s: None)
     assert local_client.request_with_retry("POST", "/x") == (504, "gateway timeout")
     assert len(calls) == 1
+
+
+def test_request_with_retry_retry_status_false_single_attempt_on_5xx(monkeypatch):
+    from src.cli import local_client
+
+    calls = []
+
+    def fake(method, path, json_body=None, timeout=30.0):
+        calls.append(path)
+        return 504, "gateway timeout"
+
+    monkeypatch.setattr(local_client, "request", fake)
+    monkeypatch.setattr(local_client.time, "sleep", lambda s: None)
+    assert local_client.request_with_retry(
+        "GET", "/x?refresh=true", retry_status=False) == (504, "gateway timeout")
+    assert len(calls) == 1
