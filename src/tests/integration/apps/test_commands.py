@@ -235,6 +235,10 @@ def test_doctor_is_ok_when_nothing_is_degraded(tmp_path, monkeypatch):
     # backup is verified-recent too, not that this test is silently exempt
     # from the one check it would otherwise always fail.
     monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    # tmp HOME: the claude_config check reads $HOME/.claude.json, which on a
+    # live workspace is written in place by running CLIs.
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    (tmp_path / "userhome").mkdir()
     status_dir = tmp_path / "home" / "data" / "backup-status"
     status_dir.mkdir(parents=True)
     import json as _json
@@ -244,6 +248,34 @@ def test_doctor_is_ok_when_nothing_is_degraded(tmp_path, monkeypatch):
                     "verified_at": datetime.now(timezone.utc).isoformat()}, f)
 
     _runtime, client = _doctor_client()
+    assert client.get("/api/apps/-/doctor").json()["ok"] is True
+
+
+def test_doctor_ok_folds_in_an_unparseable_claude_json(tmp_path, monkeypatch):
+    import json as _json
+    from datetime import datetime, timezone
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    uh = tmp_path / "userhome"
+    (uh / ".claude" / "backups").mkdir(parents=True)
+    status_dir = tmp_path / "home" / "data" / "backup-status"
+    status_dir.mkdir(parents=True)
+    (status_dir / "remote-host-postgres.json").write_text(_json.dumps(
+        {"slot": "sunday", "verified_at": datetime.now(timezone.utc).isoformat()}))
+    # isolate from the live workspace's own (independent) degradations
+    monkeypatch.setattr("src.apps.routes._activation_audit_last_run_age_s", lambda: 0.0)
+    _runtime, client = _doctor_client()
+    (uh / ".claude" / "backups" / ".claude.json.backup.1").write_text("{}")
+    (uh / ".claude.json").write_text("{}")
+    assert client.get("/api/apps/-/doctor").json()["ok"] is True
+    # An unparseable ~/.claude.json flips ok (the real ok fold), names the
+    # newest valid backup, and clears once it parses again.
+    (uh / ".claude.json").write_text("{")
+    body = client.get("/api/apps/-/doctor").json()
+    assert body["ok"] is False
+    assert body["claude_config"]["corrupt"] is True
+    assert body["claude_config"]["newest_valid_backup"].endswith(".claude.json.backup.1")
+    (uh / ".claude.json").write_text("{}")
     assert client.get("/api/apps/-/doctor").json()["ok"] is True
 
 

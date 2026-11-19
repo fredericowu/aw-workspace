@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 
 import anyio
@@ -1099,6 +1100,58 @@ def _remote_host_postgres_backup_status() -> dict:
     }
 
 
+def _claude_json_parses(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return isinstance(json.loads(f.read()), dict)
+    except (OSError, ValueError):
+        return False
+
+
+def _claude_config_status(retry_delay_s: float = 0.2) -> dict:
+    """Whether ``$HOME/.claude.json`` parses (read-only; never repairs it).
+
+    Concurrent Claude CLIs rewrite this file in place, so one failed read can
+    just be a torn read of a live writer: it is only reported ``corrupt`` when
+    two reads ``retry_delay_s`` apart BOTH fail to parse. A missing file is not
+    a problem (``present: False``, ``corrupt: False``). Also names the newest
+    ``~/.claude/backups/.claude.json.backup.*`` that parses (or ``None``), so
+    a human knows what to restore from.
+    """
+    home = os.path.expanduser("~")
+    path = os.path.join(home, ".claude.json")
+    if not os.path.exists(path):
+        return {"present": False, "corrupt": False, "path": path,
+                "newest_valid_backup": None, "reason": None}
+    ok = _claude_json_parses(path)
+    if not ok:
+        time.sleep(retry_delay_s)
+        ok = _claude_json_parses(path)
+    backup = None
+    if not ok:
+        bdir = os.path.join(home, ".claude", "backups")
+        stamped = []
+        try:
+            for n in os.listdir(bdir):
+                if n.startswith(".claude.json.backup."):
+                    q = os.path.join(bdir, n)
+                    try:  # one dangling/vanished entry must not hide the rest
+                        stamped.append((os.stat(q).st_mtime, q))
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        stamped.sort(reverse=True)
+        backup = next((q for _, q in stamped if _claude_json_parses(q)), None)
+    return {
+        "present": True, "corrupt": not ok, "path": path,
+        "newest_valid_backup": backup,
+        "reason": None if ok else
+        f"{path} does not parse as JSON (2 reads {retry_delay_s * 1000:.0f}ms apart) — "
+        "new Claude runs die with zero tokens",
+    }
+
+
 def register_apps_routes(app: FastAPI) -> AppRuntime:
     """Wire the plugin runtime + management routes onto ``app``.
 
@@ -2014,6 +2067,8 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         vault_status = await _vault_status()
         state_facade_status = _state_facade_status(runtime)
         remote_host_postgres_backup = _remote_host_postgres_backup_status()
+        # off the event loop: the check sleeps 200ms between its two reads
+        claude_config = await asyncio.to_thread(_claude_config_status)
 
         host_offers = hostpower.host_grants()
         host_apps = []
@@ -2080,6 +2135,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                    and not emulated_apps
                    and vault_status.get("reachable") is not False
                    and not remote_host_postgres_backup["stale"]
+                   and not claude_config["corrupt"]
                    and not activation_audit_stale
                    and not activation_audit_circuits_open),
             "app_checks": app_checks,
@@ -2113,6 +2169,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             "vault": vault_status,
             "state_facade": state_facade_status,
             "remote_host_postgres_backup": remote_host_postgres_backup,
+            "claude_config": claude_config,
         }
 
     @app.get("/api/apps/-/catalog")
