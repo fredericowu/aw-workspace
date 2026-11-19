@@ -585,7 +585,11 @@ class Manifest:
             }
             props = {**framework_props, **props}
         if self.public_paths:
+            # Framework-owned and merged LAST: an app's own schema must never
+            # be able to supply this key's default (e.g. ``true``) — the
+            # owner's approval is the whole point of it.
             props = {
+                **props,
                 PUBLIC_PATHS_APPROVED_KEY: {
                     "type": "boolean",
                     "default": False,
@@ -599,7 +603,6 @@ class Manifest:
                     ),
                     "x-framework": True,
                 },
-                **props,
             }
         if self.agents_md is not None:
             props = {
@@ -1401,7 +1404,11 @@ def validate_manifest(data: dict[str, Any]) -> Manifest:
         )
     for route in routes:
         if isinstance(route, dict) and "public_paths" in route:
-            for path in route.get("public_paths") or []:
+            if not isinstance(route["public_paths"], list):
+                raise ManifestError(
+                    "contributes.routes[].public_paths must be a list of paths"
+                )
+            for path in route["public_paths"]:
                 _validate_public_path(path, slug)
             if route.get("public_paths") and "routes:public" not in permissions:
                 raise ManifestError(

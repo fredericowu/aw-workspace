@@ -136,6 +136,9 @@ class AppSpec:
     signed: bool = False
     package_dir: str | None = None  # already-on-disk source (skip fetch)
     state: str = "installed"
+    # Paths the registry row currently publishes under routes:public — read
+    # so an upgrade that DROPS them still republishes an empty set.
+    public_paths: list[str] = field(default_factory=list)
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "AppSpec":
@@ -150,6 +153,7 @@ class AppSpec:
             signed=bool(row.get("signed", False)),
             package_dir=row.get("package_dir"),
             state=row.get("state", "installed") or "installed",
+            public_paths=list(row.get("public_paths") or []),
         )
 
 
@@ -1019,7 +1023,8 @@ class Reconciler:
 
     # ---- install / uninstall -----------------------------------------------
 
-    async def _sync_public_paths(self, manifest: Any, loaded: Any) -> None:
+    async def _sync_public_paths(self, manifest: Any, loaded: Any,
+                                 previously_published: list[str] | None = None) -> None:
         """Tell the cloud registry which public paths this load opened.
 
         Runs on every load regardless of ``write_cloud``: an update applied by
@@ -1029,10 +1034,16 @@ class Reconciler:
         effective set is ``[]`` unless ``routes:public`` was actually granted,
         so a refused grant clears the edge too. Best-effort — the workspace's
         own IdentityGuard still refuses anything not opened here.
+
+        Must run AFTER ``put_desired`` on a fresh install (the backend 404s a
+        publish for a row that does not exist yet). An app whose new manifest
+        dropped its paths still publishes ``[]`` when the row had some
+        (``previously_published``), so the edge closes them too.
         """
         if not self.cloud.configured:
             return
-        if not manifest.public_paths and "routes:public" not in manifest.permissions:
+        if (not manifest.public_paths and "routes:public" not in manifest.permissions
+                and not previously_published):
             return
         paths = _public_paths_for(loaded) if loaded is not None else []
         try:
@@ -1216,7 +1227,6 @@ class Reconciler:
         loaded = self.runtime.get(manifest.id)
         effective = loaded.granted_permissions if loaded else granted_req
         spec.granted_permissions = effective
-        await self._sync_public_paths(manifest, loaded)
 
         # to_thread, same as the cloud/fetch calls around it: LocalMirror talks
         # to Postgres through the SYNCHRONOUS get_session, and reconcile()
@@ -1240,6 +1250,7 @@ class Reconciler:
             except Exception:
                 log.exception("apps: install of %s did not reach the cloud registry",
                               manifest.id)
+        await self._sync_public_paths(manifest, loaded, spec.public_paths)
 
         # An app that self-registers an mcp.json on activate() (e.g.
         # aw-app-whiteboard) only gets picked up by an ALREADY-RUNNING

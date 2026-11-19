@@ -68,3 +68,19 @@ def test_owner_approval_flag_is_offered_only_when_paths_are_declared():
     without = validate_manifest(_m([]))
     assert PUBLIC_PATHS_APPROVED_KEY not in (
         without.effective_config_schema.get("properties") or {})
+
+
+def test_an_app_schema_cannot_preapprove_its_own_public_paths():
+    data = _m(["/api/apps/shopify/webhooks"])
+    data["config_schema"] = {"type": "object", "properties": {
+        PUBLIC_PATHS_APPROVED_KEY: {"type": "boolean", "default": True}}}
+    m = validate_manifest(data)
+    assert m.effective_config_schema["properties"][PUBLIC_PATHS_APPROVED_KEY]["default"] is False
+    assert m.config_with_defaults({})[PUBLIC_PATHS_APPROVED_KEY] is False
+
+
+@pytest.mark.parametrize("value", [42, "/api/apps/shopify/webhooks",
+                                   {"/api/apps/shopify/webhooks": 1}])
+def test_public_paths_must_be_a_list(value):
+    with pytest.raises(ManifestError, match="public_paths"):
+        validate_manifest(_m(value))

@@ -79,3 +79,36 @@ def test_apps_without_public_paths_make_no_extra_call(tmp_path, monkeypatch):
                  public_paths=None)
     asyncio.run(rc.install(AppSpec(app_id="plain", repo=repo)))
     assert cloud.public_paths == []
+
+
+def test_fresh_install_publishes_after_the_registry_row_exists(tmp_path, monkeypatch):
+    # The backend 404s a publish for a row put_desired has not created yet.
+    calls: list[str] = []
+
+    class OrderCloud(PathsCloud):
+        def put_desired(self, app_id, **kw):
+            calls.append("put_desired")
+            return super().put_desired(app_id, **kw)
+
+        def put_public_paths(self, app_id, public_paths, instance_id=""):
+            calls.append("put_public_paths")
+            return super().put_public_paths(app_id, public_paths, instance_id)
+
+    cloud = OrderCloud()
+    _, _, rc = _reconciler(tmp_path, monkeypatch, cloud)
+    repo = _repo(tmp_path, slug="hooky",
+                 permissions=["routes:register", "routes:public"],
+                 public_paths=["/api/apps/hooky/webhooks"])
+    asyncio.run(rc.install(AppSpec(app_id="hooky", repo=repo)))
+    assert calls == ["put_desired", "put_public_paths"]
+
+
+def test_upgrade_that_drops_public_paths_clears_the_registry(tmp_path, monkeypatch):
+    cloud = PathsCloud()
+    _, _, rc = _reconciler(tmp_path, monkeypatch, cloud)
+    repo = _repo(tmp_path, slug="plain", permissions=["routes:register"],
+                 public_paths=None)
+    spec = AppSpec.from_row({"app_id": "plain", "repo": repo,
+                             "public_paths": ["/api/apps/plain/webhooks"]})
+    asyncio.run(rc.install(spec, write_cloud=False))
+    assert cloud.public_paths == [("plain", [])]
