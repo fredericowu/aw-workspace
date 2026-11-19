@@ -113,3 +113,17 @@ def test_cli_run_exits_nonzero_on_corrupt_and_zero_on_green(monkeypatch, capsys)
     assert "/h/.claude/backups/.claude.json.backup.9" in capsys.readouterr().out
     good = dict(bad, corrupt=False, newest_valid_backup=None)
     assert run_with(good) == 0
+
+
+def test_dangling_backup_does_not_hide_a_valid_one(home):
+    (home / ".claude.json").write_text("{")
+    (home / ".claude" / "backups" / ".claude.json.backup.1").symlink_to(home / "gone")
+    ok = _backup(home, "2", "{}", 1000)
+    out = routes._claude_config_status(retry_delay_s=0)
+    assert out["newest_valid_backup"] == str(ok)
+
+
+def test_check_runs_off_the_event_loop():
+    import inspect
+    src = inspect.getsource(routes)
+    assert "await asyncio.to_thread(_claude_config_status)" in src

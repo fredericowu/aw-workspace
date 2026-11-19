@@ -1130,13 +1130,19 @@ def _claude_config_status(retry_delay_s: float = 0.2) -> dict:
     backup = None
     if not ok:
         bdir = os.path.join(home, ".claude", "backups")
+        stamped = []
         try:
-            cands = [os.path.join(bdir, n) for n in os.listdir(bdir)
-                     if n.startswith(".claude.json.backup.")]
-            cands.sort(key=lambda q: os.stat(q).st_mtime, reverse=True)
+            for n in os.listdir(bdir):
+                if n.startswith(".claude.json.backup."):
+                    q = os.path.join(bdir, n)
+                    try:  # one dangling/vanished entry must not hide the rest
+                        stamped.append((os.stat(q).st_mtime, q))
+                    except OSError:
+                        continue
         except OSError:
-            cands = []
-        backup = next((c for c in cands if _claude_json_parses(c)), None)
+            pass
+        stamped.sort(reverse=True)
+        backup = next((q for _, q in stamped if _claude_json_parses(q)), None)
     return {
         "present": True, "corrupt": not ok, "path": path,
         "newest_valid_backup": backup,
@@ -2061,7 +2067,8 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         vault_status = await _vault_status()
         state_facade_status = _state_facade_status(runtime)
         remote_host_postgres_backup = _remote_host_postgres_backup_status()
-        claude_config = _claude_config_status()
+        # off the event loop: the check sleeps 200ms between its two reads
+        claude_config = await asyncio.to_thread(_claude_config_status)
 
         host_offers = hostpower.host_grants()
         host_apps = []
