@@ -25,7 +25,7 @@ def test_catalog_reads_always_bypass_the_server_ttl_cache(monkeypatch):
     monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
 
     marketplace_mod._catalog_apps()
-    marketplace_mod._catalog_entry("git")
+    marketplace_mod._catalog_apps()
 
     catalog_reads = [p for p in paths if p.startswith("/api/apps/-/catalog")]
     assert len(catalog_reads) == 2
@@ -47,11 +47,11 @@ def test_catalog_read_uses_the_longer_refresh_timeout(monkeypatch):
     assert seen["timeout"] == marketplace_mod._CATALOG_TIMEOUT > 30.0
 
 
-def test_catalog_entry_returns_none_when_the_catalog_fetch_fails(monkeypatch, capsys):
+def test_install_fails_when_the_catalog_fetch_fails(monkeypatch, capsys):
     monkeypatch.setattr(
         marketplace_mod.local_client, "request", lambda *a, **k: (500, "boom")
     )
-    assert marketplace_mod._catalog_entry("git") is None
+    assert marketplace_mod._install("git", update=False) == 1
     assert "could not load the marketplace catalog" in capsys.readouterr().out
 
 
@@ -250,6 +250,16 @@ def test_update_post_readtimeout_is_not_retried(monkeypatch, fast, capsys):
     assert marketplace_mod._update_one("git") == 1
     assert len(paths) == 1  # ambiguous: may have been accepted, retry could double-enqueue
     assert "did not answer the update request" in capsys.readouterr().out
+
+
+def test_install_catalog_timeout_does_not_claim_app_missing(monkeypatch, fast, capsys):
+    def boom(*a, **k):
+        raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", boom)
+    assert marketplace_mod._install("git", update=True) == 1
+    out = capsys.readouterr().out
+    assert "did not answer" in out and "not in the marketplace catalog" not in out
 
 
 def test_install_post_unanswered_is_not_retried(monkeypatch, fast, capsys):

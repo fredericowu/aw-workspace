@@ -108,15 +108,11 @@ def run(args: list[str]) -> int:
     return 1
 
 
-def _catalog_entry(app_id: str) -> dict | None:
-    apps = _catalog_apps()
-    if apps is None:
-        return None
-    return next((a for a in apps if (a.get("id") or a.get("slug")) == app_id), None)
-
-
 def _install(app_id: str, update: bool) -> int:
-    entry = _catalog_entry(app_id)
+    apps = _catalog_apps()
+    if apps is None:  # listing failed (already reported) — not a missing app
+        return 1
+    entry = next((a for a in apps if (a.get("id") or a.get("slug")) == app_id), None)
     if entry is None:
         _out(f"error: '{app_id}' is not in the marketplace catalog")
         return 1
