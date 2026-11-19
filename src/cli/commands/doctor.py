@@ -16,6 +16,8 @@ from __future__ import annotations
 import argparse
 import json
 
+import httpx
+
 from src.cli import local_client
 
 COMMAND = "doctor"
@@ -29,7 +31,14 @@ def run(args: list[str]) -> int:
     parser.add_argument("--json", action="store_true", help="Print the raw payload")
     ns = parser.parse_args(args)
 
-    status, body = local_client.request("GET", "/api/apps/-/doctor")
+    try:
+        status, body = local_client.request_with_retry(
+            "GET", "/api/apps/-/doctor", timeout=60.0)
+    except httpx.HTTPError as exc:
+        print(f"error: the workspace server did not answer "
+              f"({local_client.describe_error(exc)}) — it may be overloaded or down. "
+              f"Try again, or check: aw-workspace-cli status")
+        return 2
     if status != 200:
         print(f"error: could not reach the workspace API ({status}): {body}")
         return 2

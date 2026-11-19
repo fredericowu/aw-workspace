@@ -25,7 +25,7 @@ def test_catalog_reads_always_bypass_the_server_ttl_cache(monkeypatch):
     monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
 
     marketplace_mod._catalog_apps()
-    marketplace_mod._catalog_entry("git")
+    marketplace_mod._catalog_apps()
 
     catalog_reads = [p for p in paths if p.startswith("/api/apps/-/catalog")]
     assert len(catalog_reads) == 2
@@ -47,11 +47,11 @@ def test_catalog_read_uses_the_longer_refresh_timeout(monkeypatch):
     assert seen["timeout"] == marketplace_mod._CATALOG_TIMEOUT > 30.0
 
 
-def test_catalog_entry_returns_none_when_the_catalog_fetch_fails(monkeypatch, capsys):
+def test_install_fails_when_the_catalog_fetch_fails(monkeypatch, capsys):
     monkeypatch.setattr(
         marketplace_mod.local_client, "request", lambda *a, **k: (500, "boom")
     )
-    assert marketplace_mod._catalog_entry("git") is None
+    assert marketplace_mod._install("git", update=False) == 1
     assert "could not load the marketplace catalog" in capsys.readouterr().out
 
 
@@ -150,3 +150,183 @@ def test_info_reports_when_nothing_installed(monkeypatch, capsys):
 
     assert marketplace_mod._info() == 0
     assert "no apps installed" in capsys.readouterr().out
+
+
+# --- transient server slowness (2026-11-19: host load ~14, ReadTimeout) -------
+
+import httpx
+import pytest
+
+
+@pytest.fixture
+def fast(monkeypatch):
+    monkeypatch.setattr(marketplace_mod, "_POLL_INTERVAL", 0)
+    monkeypatch.setattr(marketplace_mod, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(marketplace_mod.local_client.time, "sleep", lambda s: None)
+
+
+def test_poll_survives_readtimeouts_and_completes(monkeypatch, fast, capsys):
+    answers = iter([httpx.ReadTimeout(""), httpx.ReadTimeout(""),
+                    (200, {"status": "installing"}), (200, {"status": "installed"})])
+
+    def fake_request(method, path, json_body=None, timeout=30.0):
+        a = next(answers)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
+    assert marketplace_mod._poll_until_done("git") is True
+    out = capsys.readouterr().out
+    assert out.count("server slow to answer") == 1  # one line per streak, not per poll
+
+
+def test_poll_gives_up_only_at_the_deadline(monkeypatch, fast, capsys):
+    def boom(*a, **k):
+        raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", boom)
+    monkeypatch.setattr(marketplace_mod, "_POLL_TIMEOUT", 0.05)
+    assert marketplace_mod._poll_until_done("git") is False
+    assert "continua no servidor" in capsys.readouterr().out
+
+
+def test_poll_failed_state_unchanged(monkeypatch, fast, capsys):
+    monkeypatch.setattr(marketplace_mod.local_client, "request",
+                        lambda *a, **k: (200, {"status": "failed", "error": "x"}))
+    assert marketplace_mod._poll_until_done("git") is False
+    assert "failed — x" in capsys.readouterr().out
+
+
+def test_listing_get_retries_then_succeeds(monkeypatch, fast):
+    calls = []
+
+    def fake_request(method, path, json_body=None, timeout=30.0):
+        calls.append(path)
+        if len(calls) < 3:
+            raise httpx.ReadTimeout("")
+        return 200, [{"slug": "git", "version": "1"}]
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
+    assert marketplace_mod._installed_apps() == [{"slug": "git", "version": "1"}]
+    assert len(calls) == 3
+
+
+def test_listing_get_persistent_timeout_is_a_clean_failure(monkeypatch, fast, capsys):
+    def boom(*a, **k):
+        raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", boom)
+    assert marketplace_mod._installed_apps() is None
+    assert marketplace_mod._catalog_apps() is None
+    assert marketplace_mod._update_all() == 1
+    assert marketplace_mod._info() == 1
+    out = capsys.readouterr().out
+    assert "did not answer" in out and "ReadTimeout" in out
+
+
+def test_update_post_unanswered_returns_1_without_polling(monkeypatch, fast, capsys):
+    paths = []
+
+    def fake_request(method, path, json_body=None, timeout=30.0):
+        paths.append((method, path))
+        raise httpx.ConnectError("")
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
+    assert marketplace_mod._update_one("git") == 1
+    assert all(m == "POST" for m, _ in paths)  # never polled a possibly-stale status
+    assert len(paths) == marketplace_mod._RETRY_ATTEMPTS  # connect failures prove it never landed
+    assert "did not answer the update request" in capsys.readouterr().out
+
+
+def test_update_post_readtimeout_is_not_retried(monkeypatch, fast, capsys):
+    paths = []
+
+    def fake_request(method, path, json_body=None, timeout=30.0):
+        paths.append((method, path))
+        raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
+    assert marketplace_mod._update_one("git") == 1
+    assert len(paths) == 1  # ambiguous: may have been accepted, retry could double-enqueue
+    assert "did not answer the update request" in capsys.readouterr().out
+
+
+def test_install_catalog_timeout_does_not_claim_app_missing(monkeypatch, fast, capsys):
+    def boom(*a, **k):
+        raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", boom)
+    assert marketplace_mod._install("git", update=True) == 1
+    out = capsys.readouterr().out
+    assert "did not answer" in out and "not in the marketplace catalog" not in out
+
+
+def test_install_post_unanswered_is_not_retried(monkeypatch, fast, capsys):
+    paths = []
+
+    def fake_request(method, path, json_body=None, timeout=30.0):
+        paths.append((method, path))
+        if method == "GET":
+            return 200, {"apps": [{"id": "git", "repo": "r", "version": "2"}]}
+        raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
+    assert marketplace_mod._install("git", update=False) == 1
+    assert paths.count(("POST", "/api/apps/install")) == 1
+    assert "did not answer the install request" in capsys.readouterr().out
+
+
+def test_update_all_still_stops_at_first_incomplete(monkeypatch, fast, capsys):
+    updated = []
+
+    def fake_request(method, path, json_body=None, timeout=30.0):
+        if path == "/api/apps":
+            return 200, [{"slug": "a", "version": "1"}, {"slug": "b", "version": "1"}]
+        if path == marketplace_mod._CATALOG_PATH:
+            return 200, {"apps": [{"id": "a", "version": "2"}, {"id": "b", "version": "2"}]}
+        if path.endswith("/update"):
+            updated.append(path)
+            return 202, {}
+        return 200, {"status": "failed", "error": "nope"}
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
+    assert marketplace_mod._update_all() == 1
+    assert updated == ["/api/apps/a/update"]
+
+
+def test_catalog_refresh_not_retried_on_5xx(monkeypatch):
+    """refresh=true + 504 -> exactly one request: a retry could start a second
+    refresh that overwrites the shared catalog cache."""
+    from src.cli.commands import marketplace as marketplace_mod
+
+    calls = []
+
+    def fake_request(method, path, json_body=None, timeout=30.0):
+        calls.append(path)
+        return 504, "gateway timeout"
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
+    monkeypatch.setattr(marketplace_mod, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(marketplace_mod.local_client.time, "sleep", lambda s: None)
+
+    assert marketplace_mod._catalog_apps() is None
+    assert calls == ["/api/apps/-/catalog?refresh=true"]
+
+
+def test_plain_listing_get_still_retried_on_5xx(monkeypatch):
+    from src.cli.commands import marketplace as marketplace_mod
+
+    answers = iter([(504, "gateway timeout"), (200, [])])
+    calls = []
+
+    def fake_request(method, path, json_body=None, timeout=30.0):
+        calls.append(path)
+        return next(answers)
+
+    monkeypatch.setattr(marketplace_mod.local_client, "request", fake_request)
+    monkeypatch.setattr(marketplace_mod, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(marketplace_mod.local_client.time, "sleep", lambda s: None)
+
+    assert marketplace_mod._get("/api/apps") == (200, [])
+    assert len(calls) == 2

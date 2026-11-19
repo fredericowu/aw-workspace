@@ -1949,7 +1949,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
           workspace's named failure mode (a workaround nobody can see is
           running, several times slower, for no visible reason).
         """
-        clis = runtime.commands.system_cli_report()
+        clis = await asyncio.to_thread(runtime.commands.system_cli_report)
 
         permissions = []
         for slug in runtime.loaded_slugs():
