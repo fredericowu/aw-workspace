@@ -581,3 +581,19 @@ def test_unchanged_invalid_values_use_json_schema_equality():
     assert routes_mod._config_validation_error(
         schema, {"value": {"number": True}}, previous, app_has_schema=True,
     ) == "$.value does not satisfy the app config schema (type)"
+
+
+def test_non_finite_legacy_value_does_not_crash_validation_of_a_repair():
+    schema = {
+        "properties": {
+            "ratio": {"multipleOf": 0.5},
+            "name": {"type": "string"},
+        },
+    }
+    previous = {"ratio": float("inf"), "name": 123}
+    assert routes_mod._config_validation_error(
+        schema, {**previous, "ratio": 1}, previous, app_has_schema=True,
+    ) == "$.name does not satisfy the app config schema (type)"
+    assert routes_mod._config_validation_error(
+        schema, {"ratio": 1, "name": "example"}, previous, app_has_schema=True,
+    ) is None

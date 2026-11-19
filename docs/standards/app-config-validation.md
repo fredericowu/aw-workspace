@@ -11,7 +11,8 @@ match one in the previous effective config at the same field path and
 schema location, with the same rule and JSON value. For rules with nested
 errors, the workspace compares the individual violations. Root-level
 violations still block saves. Editing an invalid value or enabling a rule
-that the previous config did not trigger requires satisfying that rule.
+that the previous config did not trigger requires satisfying that rule. If
+the stored config cannot be validated, submit a valid replacement config.
 
 Explicit `additionalProperties` policies apply as written. An app with a
 config schema and no explicit policy accepts declared properties and

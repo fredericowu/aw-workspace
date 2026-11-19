@@ -482,9 +482,14 @@ def _config_validation_error(schema: dict, candidate: dict, previous: dict,
     for error in validator.iter_errors(candidate):
         if previous_violations is None:
             previous_violations = {}
-            for previous_error in validator.iter_errors(previous):
-                for leaf in _config_error_leaves(previous_error):
-                    previous_violations.setdefault(_config_violation_key(leaf), []).append(leaf.instance)
+            try:
+                for previous_error in validator.iter_errors(previous):
+                    for leaf in _config_error_leaves(previous_error):
+                        previous_violations.setdefault(_config_violation_key(leaf), []).append(leaf.instance)
+            except (ArithmeticError, ValueError):
+                # A legacy non-finite number can crash a schema rule such as
+                # multipleOf. Incomplete evidence cannot grandfather violations.
+                previous_violations.clear()
         if error.absolute_path and all(
             any(
                 Draft7Validator({"const": value}).is_valid(leaf.instance)
