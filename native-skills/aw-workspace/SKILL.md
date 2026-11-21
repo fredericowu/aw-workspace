@@ -383,7 +383,7 @@ itself is deliberately NOT read from `.env` — nothing ever publishes it
 there, and it must stay something only a human hands the CLI explicitly.
 Widening this route to also accept the workspace's own host token was
 considered and **rejected** in the `restart core` design (see the card
-above): cross-repo, aw-backend deploys are manual, and it would widen a
+above): cross-repo, aw-backend ships on merge to master via its own deploy.yml, and it would widen a
 data-plane credential onto control-plane lifecycle routes that also cover
 uninstall/reinstall — the host token stays scoped to `remote-host/exec`.
 
