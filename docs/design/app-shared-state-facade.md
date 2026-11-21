@@ -304,7 +304,7 @@ hand-rolls had:
 
 ## 9. Risks for the Coders (non-obvious breakage)
 
-- **Two-repo mirror, manual deploy.** `capabilities.py` ↔ aw-backend's
+- **Two-repo mirror, deploy on merge.** `capabilities.py` ↔ aw-backend's
   `app_capabilities.py` must stay byte-identical in content; aw-backend's
   `deploy.yml` ships on merge to master and has a history of reverting
   production from a stale run. Verify the mirror is live in the running
