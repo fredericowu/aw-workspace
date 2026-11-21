@@ -883,8 +883,8 @@ until redone. Sequence, one step at a time:
    order" section for the full 1–6 sequence. Confirm
    `https://signoz-mcp.aw.tekflox.com/mcp` answers through the edge (any
    HTTP status is fine as a liveness check; a 401 with no key is correct).
-2. **Deploy aw-backend** with the `forward_auth` support (manual deploy —
-   this repo has no auto-deploy-on-push). Without this live, step 1's
+2. **Deploy aw-backend** with the `forward_auth` support (merging to
+   master deploys it via its own `deploy.yml`). Without this live, step 1's
    hostname is reachable but ungated — an anonymous caller could still get
    `tools/list`.
 3. **Mint or read the viewer key.** `AW_SIGNOZ_ROOT_EMAIL`/

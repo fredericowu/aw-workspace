@@ -25,9 +25,10 @@ whatever image tag is already on GHCR**. It does not build.
 So the order is:
 
 1. Push the code to the service's own repo (e.g. `fredericowu/aw-backend`).
-2. Run **that repo's own** "Deploy `<service>`" workflow — it builds, pushes
-   the new `:latest` to GHCR, and per that repo's pipeline may redeploy on
-   its own:
+2. Get the image built by **that repo's own** pipeline. For aw-backend, a
+   merge to master does this on its own (`deploy.yml` builds, pushes the new
+   `:latest` to GHCR, and redeploys). For a service without auto-deploy, or
+   to redeploy without a merge, run that repo's "Deploy `<service>`" workflow:
    ```bash
    gh workflow run "Deploy aw-backend" -R fredericowu/aw-backend
    gh run watch <run_id> -R fredericowu/aw-backend --exit-status

@@ -122,8 +122,8 @@ do not build a sync mirror speculatively.
 
 **Rollout order (binding, from the `new-capability-rollout-order` lesson +
 capabilities.py:7-8):** (1) core catalog + validator + facade ship and
-restart first; (2) aw-backend mirror updated and deployed (manual deploy —
-it does not ride any hook); (3) only then may any app manifest declare
+restart first; (2) aw-backend mirror updated and deployed (deploys on merge to
+master via its own deploy.yml; it does not ride any hook); (3) only then may any app manifest declare
 `state:own`. An app shipped against a validator that does not know the
 capability is refused the grant, and the refusal is quiet — this ordering is
 what prevents that.
@@ -306,7 +306,7 @@ hand-rolls had:
 
 - **Two-repo mirror, manual deploy.** `capabilities.py` ↔ aw-backend's
   `app_capabilities.py` must stay byte-identical in content; aw-backend's
-  deploy is manual and its `deploy.yml` has a history of reverting
+  `deploy.yml` ships on merge to master and has a history of reverting
   production from a stale run. Verify the mirror is live in the running
   backend container, not just merged.
 - **Tests lie across the container boundary (§1's trap).** A facade test run
