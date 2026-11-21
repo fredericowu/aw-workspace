@@ -8,7 +8,7 @@
 version". Two separate causes live in that gap, they look identical from the
 install side, and only one of them is fixed by waiting.
 
-**The headline:** `raw.githubusercontent.com` serves `tekflox/aw-marketplace`'s
+**The headline:** `raw.githubusercontent.com` serves `fredericowu/aw-marketplace`'s
 `apps.json` from a CDN edge with roughly a **5-minute TTL**. The new version
 is genuinely in the repo; it is not visible at that URL yet. Two independent
 sessions on 2026-09-04 both lost real time to this — one spent ~17 tool
@@ -19,7 +19,7 @@ calls — suspecting the release or the install command.
 ## 1. Don't debug the install path. Ask what the CDN is serving.
 
 ```bash
-curl -s https://raw.githubusercontent.com/tekflox/aw-marketplace/master/apps.json \
+curl -s https://raw.githubusercontent.com/fredericowu/aw-marketplace/master/apps.json \
   | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(a['version'] for a in d['apps'] if a['id']=='<app-slug>'))"
 ```
 
@@ -35,14 +35,14 @@ confirm the release itself actually landed before you start waiting on the
 CDN:
 
 ```bash
-gh api repos/tekflox/aw-marketplace/contents/apps.json   # or a local git log
+gh api repos/fredericowu/aw-marketplace/contents/apps.json   # or a local git log
 ```
 
 ## 2. Poll the catalog, don't re-run `--update` blindly
 
 ```bash
 for i in $(seq 1 20); do
-  v=$(curl -s https://raw.githubusercontent.com/tekflox/aw-marketplace/master/apps.json \
+  v=$(curl -s https://raw.githubusercontent.com/fredericowu/aw-marketplace/master/apps.json \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(a['version'] for a in d['apps'] if a['id']=='<app-slug>'))")
   echo "attempt $i: $v"
   [ "$v" = "<expected-version>" ] && break
@@ -75,7 +75,7 @@ aw-workspace-cli restart <app-slug>
 
 Different cause, identical symptom from the install side. Seen releasing
 `aw-app-kali-linux` v0.13.0: the app's own CI reported build + test + tag
-green, but the step that opens the PR against `tekflox/aw-marketplace` to
+green, but the step that opens the PR against `fredericowu/aw-marketplace` to
 bump the catalog entry **failed silently with a 500**. The new version never
 landed in the marketplace at all, so no amount of polling helps.
 
@@ -83,7 +83,7 @@ The §1 check still catches it — the version string simply never changes, even
 after minutes — but the fix is different:
 
 ```bash
-gh pr list --repo tekflox/aw-marketplace
+gh pr list --repo fredericowu/aw-marketplace
 ```
 
 - PR exists but was not auto-merged → merge it manually, then re-run
