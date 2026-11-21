@@ -58,7 +58,7 @@ def test_successful_update_posts_with_bearer_token(tmp_path, monkeypatch, capsys
         def json(self):
             return {"status": "triggered"}
 
-    def fake_post(url, headers=None, timeout=None):
+    def fake_post(url, headers=None, timeout=None, follow_redirects=False):
         calls.append((url, headers, timeout))
         return _FakeResponse()
 
@@ -90,7 +90,7 @@ def test_read_timeout_outlasts_the_backends_dispatch_plus_verify_window(
         def json(self):
             return {"status": "triggered"}
 
-    def fake_post(url, headers=None, timeout=None):
+    def fake_post(url, headers=None, timeout=None, follow_redirects=False):
         captured["timeout"] = timeout
         return _FakeResponse()
 

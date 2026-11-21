@@ -145,7 +145,7 @@ def validate(body: dict[str, Any], *, source_id: str | None = None) -> dict[str,
 
     sid = str(source_id or body.get("id") or "").strip().lower()
     if not sid:
-        # Derive a stable id from the spec: "tekflox/aw-marketplace@master"
+        # Derive a stable id from the spec: "fredericowu/aw-marketplace@master"
         # -> "tekflox-aw-marketplace".
         base = url.split("@")[0]
         if base.startswith("http"):
