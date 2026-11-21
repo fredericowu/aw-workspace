@@ -24,7 +24,7 @@ and each one changes what the right answer is.
 **0.1 — The pipeline the apps share does not live in `aw-app-template`.**
 The template's entire CI is a 9-line caller
 (`repos/aw-app-template/.github/workflows/release.yml:21`) into
-`tekflox/aw-marketplace/.github/workflows/app-release.yml@master` — a **moving
+`fredericowu/aw-marketplace/.github/workflows/app-release.yml@master` — a **moving
 ref**, deliberately (`app-release.yml:9-10`). Every `aw-app-*` repo calls the
 same file. So the template is where an app's *local* files come from, but
 `app-release.yml` is where the *gate* actually is. Changing the template first
@@ -59,7 +59,7 @@ in common.
 |---|---|---|
 | Repos | `aw-app-*` | `aw-workspace` (this repo), `aw-backend`, `agents-platform-multitenant`, `aw-mcp-gateway`, `aw-console`, `aw-workspace-ui`, `aw-mobile`, `aw-remote-host`, `aw-stack`, `aw-marketplace`, `aw-vault`, `aw-automation` |
 | CI | one shared reusable workflow | one bespoke workflow per repo |
-| Owned by | `tekflox/aw-marketplace` | the repo itself |
+| Owned by | `fredericowu/aw-marketplace` | the repo itself |
 | Test gate | conditional (see 1.2) | varies per repo |
 | Coverage gate | none | none |
 | Lint gate | none | none |
@@ -175,7 +175,7 @@ Redis), so there is no `fail_under` to set yet.
 
 ## 2. Where the gate lives
 
-**Decision: the enforcement lives in `tekflox/aw-marketplace`'s
+**Decision: the enforcement lives in `fredericowu/aw-marketplace`'s
 `app-release.yml` for Tier A, and in each repo's own workflow for Tier B.
 `aw-app-template` carries the *local* files, not the gate.**
 

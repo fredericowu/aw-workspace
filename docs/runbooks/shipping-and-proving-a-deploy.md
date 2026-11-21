@@ -165,16 +165,16 @@ you will not see unless you go look.
 2026-11-07 `fredericowu/aw-workspace`'s `master` carries an **active
 PR-required ruleset with zero bypass actors** — a direct push is rejected
 outright; work in a worktree and open a PR (see `AGENTS.md`). `aw-backend`
-still takes a direct `git push origin master`. `tekflox/aw-marketplace`'s
+still takes a direct `git push origin master`. `fredericowu/aw-marketplace`'s
 `master` is branch-protected behind a `validate-apps-json` check:
 
 ```bash
 git branch -f feat/<short-name> HEAD
 git push -u origin feat/<short-name>
 git reset --hard origin/master      # keep local master clean for the next session
-gh pr create --repo tekflox/aw-marketplace --base master --head feat/<short-name> --title "…" --body "…"
-gh run watch <run_id> --repo tekflox/aw-marketplace --exit-status
-gh pr merge <pr_number> --repo tekflox/aw-marketplace --merge --delete-branch
+gh pr create --repo fredericowu/aw-marketplace --base master --head feat/<short-name> --title "…" --body "…"
+gh run watch <run_id> --repo fredericowu/aw-marketplace --exit-status
+gh pr merge <pr_number> --repo fredericowu/aw-marketplace --merge --delete-branch
 git checkout master && git reset --hard origin/master
 ```
 
