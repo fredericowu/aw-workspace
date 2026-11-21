@@ -38,7 +38,7 @@ _api = catalog_mod._api_url_for
 def test_default_source_uses_legacy_repo_ref(monkeypatch):
     seen = []
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, follow_redirects=False):
         seen.append((url, (headers or {}).get("Accept")))
         return _resp({"apps": [{"id": "git", "name": "Git"}]})
 
@@ -47,11 +47,11 @@ def test_default_source_uses_legacy_repo_ref(monkeypatch):
     result = catalog_mod.get_catalog(force=True)
     # The API is tried first (s-maxage=60) and succeeds, so raw is never hit.
     assert seen == [(
-        "https://api.github.com/repos/tekflox/aw-marketplace/contents/apps.json?ref=master",
+        "https://api.github.com/repos/fredericowu/aw-marketplace/contents/apps.json?ref=master",
         catalog_mod.GITHUB_RAW_MEDIA_TYPE,
     )]
     assert [a["id"] for a in result["apps"]] == ["git"]
-    assert result["apps"][0]["_source"] == "tekflox/aw-marketplace@master"
+    assert result["apps"][0]["_source"] == "fredericowu/aw-marketplace@master"
 
 
 def test_api_url_only_built_for_owner_repo_specs():
@@ -75,7 +75,7 @@ def test_api_failure_falls_back_to_raw(monkeypatch):
     less available than the raw URL alone was."""
     seen = []
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, follow_redirects=False):
         seen.append(url)
         if "api.github.com" in url:
             return httpx.Response(
@@ -89,15 +89,15 @@ def test_api_failure_falls_back_to_raw(monkeypatch):
     assert [a["id"] for a in result["apps"]] == ["git"]
     assert result["failed_sources"] == []
     assert seen == [
-        "https://api.github.com/repos/tekflox/aw-marketplace/contents/apps.json?ref=master",
-        "https://raw.githubusercontent.com/tekflox/aw-marketplace/master/apps.json",
+        "https://api.github.com/repos/fredericowu/aw-marketplace/contents/apps.json?ref=master",
+        "https://raw.githubusercontent.com/fredericowu/aw-marketplace/master/apps.json",
     ]
 
 
 def test_source_fetch_still_raises_when_api_and_raw_both_fail(monkeypatch):
     """The 'test this source' route relies on a bad credential reporting
     itself — the fallback must not swallow a genuine failure."""
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, follow_redirects=False):
         return httpx.Response(404, text="nope", request=httpx.Request("GET", url))
 
     monkeypatch.setattr(catalog_mod.httpx, "get", fake_get)
@@ -112,7 +112,7 @@ def test_per_app_manifests_stay_on_raw(monkeypatch):
     limit in a couple of refreshes."""
     seen = []
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, follow_redirects=False):
         seen.append(url)
         if "contents/apps.json" in url:
             return _resp({"apps": [{"id": "git", "name": "Git", "repo": "acme/git"}]})
@@ -138,7 +138,7 @@ def test_multi_source_merge_and_dedup(monkeypatch):
         },
     }
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, follow_redirects=False):
         return _resp(payloads[url])
 
     monkeypatch.setattr(catalog_mod.httpx, "get", fake_get)
@@ -166,7 +166,7 @@ def test_sources_are_fetched_concurrently_not_serially(monkeypatch):
     }
     barrier = threading.Barrier(3, timeout=3)
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, follow_redirects=False):
         if url.endswith("apps.json"):
             barrier.wait()
             return _resp(payloads[url])
@@ -194,7 +194,7 @@ def test_manifest_fetches_are_concurrent_not_serial(monkeypatch):
     barrier_timeout = 3
     barrier = threading.Barrier(3, timeout=barrier_timeout)
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, follow_redirects=False):
         # Only the per-app manifest fetches (``.../aw-app.json``) should hit
         # the barrier — the catalog fetch itself must resolve immediately
         # (via the API attempt) or its own barrier.wait() would dominate the
@@ -221,7 +221,7 @@ def test_explicit_raw_url_source_used_as_is(monkeypatch):
     monkeypatch.setenv("AW_MARKETPLACE_SOURCES", "https://example.com/custom/apps.json")
     seen_urls = []
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, follow_redirects=False):
         seen_urls.append(url)
         return _resp({"apps": [{"id": "x", "name": "X"}]})
 
@@ -234,7 +234,7 @@ def test_explicit_raw_url_source_used_as_is(monkeypatch):
 def test_one_source_failing_does_not_break_the_others(monkeypatch):
     monkeypatch.setenv("AW_MARKETPLACE_SOURCES", "acme/broken,acme/ok")
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, follow_redirects=False):
         if "broken" in url:
             raise httpx.ConnectError("boom", request=httpx.Request("GET", url))
         return _resp({"apps": [{"id": "ok-app", "name": "OK"}]})
@@ -250,7 +250,7 @@ def test_one_source_failing_does_not_break_the_others(monkeypatch):
 def test_fetch_failure_serves_stale_in_memory_cache(monkeypatch):
     calls = {"n": 0}
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, follow_redirects=False):
         calls["n"] += 1
         if calls["n"] == 1:
             return _resp({"apps": [{"id": "git", "name": "Git"}]})
@@ -268,14 +268,14 @@ def test_fetch_failure_serves_stale_in_memory_cache(monkeypatch):
 
 
 def test_fetch_failure_with_no_memory_cache_serves_disk_cache(monkeypatch):
-    def ok_get(url, headers=None, timeout=None):
+    def ok_get(url, headers=None, timeout=None, follow_redirects=False):
         return _resp({"apps": [{"id": "git", "name": "Git"}]})
 
     monkeypatch.setattr(catalog_mod.httpx, "get", ok_get)
     catalog_mod.get_catalog(force=True)  # populates disk cache
     catalog_mod.clear_cache()  # drop in-memory cache only
 
-    def failing_get(url, headers=None, timeout=None):
+    def failing_get(url, headers=None, timeout=None, follow_redirects=False):
         raise httpx.ConnectError("down", request=httpx.Request("GET", url))
 
     monkeypatch.setattr(catalog_mod.httpx, "get", failing_get)
@@ -286,7 +286,7 @@ def test_fetch_failure_with_no_memory_cache_serves_disk_cache(monkeypatch):
 
 
 def test_total_cold_failure_returns_empty_with_error(monkeypatch):
-    def failing_get(url, headers=None, timeout=None):
+    def failing_get(url, headers=None, timeout=None, follow_redirects=False):
         raise httpx.ConnectError("down", request=httpx.Request("GET", url))
 
     monkeypatch.setattr(catalog_mod.httpx, "get", failing_get)
@@ -300,7 +300,7 @@ def test_token_sent_as_bearer_header_when_configured(monkeypatch):
     monkeypatch.setenv("AW_APP_GIT_TOKEN", "secret-token")
     seen = []
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, follow_redirects=False):
         seen.append((url, headers))
         return _resp({"apps": []})
 
@@ -330,7 +330,7 @@ def test_catalog_entry_enriched_with_publisher_resource_estimate_and_what_you_ge
         },
     }
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, follow_redirects=False):
         if url.endswith("apps.json"):
             return _resp({"apps": [{"id": "git", "name": "Git", "repo": "tekflox/aw-app-git", "ref": "main"}]})
         assert url == "https://raw.githubusercontent.com/tekflox/aw-app-git/main/aw-app.json"
@@ -350,7 +350,7 @@ def test_catalog_entry_enriched_with_publisher_resource_estimate_and_what_you_ge
 
 
 def test_catalog_entry_manifest_fetch_failure_leaves_entry_unenriched(monkeypatch):
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, follow_redirects=False):
         if url.endswith("apps.json"):
             return _resp({"apps": [{"id": "git", "name": "Git", "repo": "tekflox/aw-app-git", "ref": "main"}]})
         raise httpx.ConnectError("down", request=httpx.Request("GET", url))
@@ -366,7 +366,7 @@ def test_catalog_entry_manifest_fetch_failure_leaves_entry_unenriched(monkeypatc
 def test_ttl_cache_avoids_refetch_until_forced(monkeypatch):
     calls = {"n": 0}
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, follow_redirects=False):
         calls["n"] += 1
         return _resp({"apps": [{"id": "git", "name": "Git"}]})
 
@@ -387,14 +387,14 @@ class TestIsMarketplaceApp:
 
     @pytest.fixture(autouse=True)
     def _catalog(self, monkeypatch):
-        def fake_get(url, headers=None, timeout=None):
+        def fake_get(url, headers=None, timeout=None, follow_redirects=False):
             if "aw-marketplace-private" in url:
                 return _resp({"apps": [{"id": "crispal", "repo": "tekflox/aw-app-crispal"}]})
             return _resp({"apps": [{"id": "diff-tool", "repo": "tekflox/aw-app-diff-tool"}]})
 
         monkeypatch.setenv(
             "AW_MARKETPLACE_SOURCES",
-            "tekflox/aw-marketplace@master,tekflox/aw-marketplace-private@master")
+            "fredericowu/aw-marketplace@master,tekflox/aw-marketplace-private@master")
         monkeypatch.setattr(catalog_mod.httpx, "get", fake_get)
         catalog_mod.get_catalog(force=True)
 

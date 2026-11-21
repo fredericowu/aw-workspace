@@ -26,7 +26,7 @@ A comma-separated list of sources. Each entry is either:
 - a full ``http(s)://`` URL — used as-is (the raw URL to the ``apps.json``
   file itself), for a source that doesn't follow the ``owner/repo`` shape.
 
-Default: a single source, ``tekflox/aw-marketplace@master`` (built from the
+Default: a single source, ``fredericowu/aw-marketplace@master`` (built from the
 legacy ``AW_MARKETPLACE_REPO``/``AW_MARKETPLACE_REF`` envs so an unset
 ``AW_MARKETPLACE_SOURCES`` keeps working as before).
 
@@ -72,7 +72,7 @@ log = logging.getLogger(__name__)
 
 # Legacy single-source envs — still used to build the DEFAULT entry of
 # AW_MARKETPLACE_SOURCES when that var is unset.
-MARKETPLACE_REPO = os.environ.get("AW_MARKETPLACE_REPO", "tekflox/aw-marketplace")
+MARKETPLACE_REPO = os.environ.get("AW_MARKETPLACE_REPO", "fredericowu/aw-marketplace")
 MARKETPLACE_REF = os.environ.get("AW_MARKETPLACE_REF", "master")
 CATALOG_PATH = os.environ.get("AW_MARKETPLACE_CATALOG_PATH", "apps.json")
 CACHE_TTL = float(os.environ.get("AW_MARKETPLACE_CACHE_TTL", "300"))  # seconds
@@ -254,7 +254,7 @@ def _get_catalog_text(url: str, source_id: str, timeout: float,
     headers = _auth_headers(url, source_id)
     if accept:
         headers = {**headers, "Accept": accept}
-    resp = httpx.get(url, headers=headers, timeout=timeout)
+    resp = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
     resp.raise_for_status()
     return resp.text
 
@@ -285,7 +285,7 @@ def _fetch_app_manifest(repo: str, ref: str, timeout: float = 10.0,
     """
     url = _manifest_raw_url(repo, ref)
     try:
-        resp = httpx.get(url, headers=_auth_headers(url, source_id), timeout=timeout)
+        resp = httpx.get(url, headers=_auth_headers(url, source_id), timeout=timeout, follow_redirects=True)
         resp.raise_for_status()
         return json.loads(resp.text)
     except Exception as e:  # noqa: BLE001 — one bad manifest shouldn't break the catalog
@@ -549,7 +549,7 @@ def list_tags(repo: str, timeout: float = 10.0) -> list[dict[str, str]]:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
-        resp = httpx.get(url, headers=headers, timeout=timeout)
+        resp = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
         resp.raise_for_status()
         tags = resp.json()
     except Exception as e:  # noqa: BLE001 — best-effort, see docstring
