@@ -384,6 +384,37 @@ def test_receipt_open_permission_error_is_pending_not_a_crash(stubbed_run, monke
     assert stubbed_run["dispatch"] == []
 
 
+def test_receipt_lookup_error_is_pending_not_new_request(stubbed_run, monkeypatch, capsys):
+    real_open = open
+    def deny(file, *a, **k):
+        if str(file).endswith("req-9.json"):
+            raise PermissionError(13, "Permission denied")
+        return real_open(file, *a, **k)
+    monkeypatch.setattr("builtins.open", deny)
+    code = core_restart.run(["--request-id", "req-9", "--json"])
+    obj = _json.loads(capsys.readouterr().out)
+    assert code == 1 and obj["status"] == "dispatch_pending"
+    assert stubbed_run["preflight"] == 0 and stubbed_run["dispatch"] == []
+
+
+def test_transient_receipt_read_error_after_ack_still_persists_dispatched(stubbed_run, monkeypatch, capsys):
+    real_open = open
+    state = {"n": 0}
+    def flaky(file, mode="r", *a, **k):
+        if str(file).endswith("req-10.json") and "r" in mode and "+" not in mode:
+            state["n"] += 1
+            if state["n"] > 1:  # 1st read = initial lookup (absent); later = re-read
+                raise OSError(5, "EIO")
+        return real_open(file, mode, *a, **k)
+    monkeypatch.setattr("builtins.open", flaky)
+    code = core_restart.run(["--request-id", "req-10", "--json"])
+    capsys.readouterr()
+    monkeypatch.setattr("builtins.open", real_open)
+    assert code == 0
+    with open(core_restart._receipt_path("req-10")) as f:
+        assert _json.load(f)["state"] == "dispatched"
+
+
 def test_temp_name_cleanup_failure_does_not_strand_the_dispatch(stubbed_run, monkeypatch, capsys):
     real_unlink = core_restart.os.unlink
     def flaky_unlink(path):
