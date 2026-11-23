@@ -271,7 +271,7 @@ def test_same_request_id_twice_dispatches_once(stubbed_run, capsys):
 
 def test_failed_dispatch_frees_the_request_id_for_retry(stubbed_run, monkeypatch, capsys, tmp_path):
     def boom(*a, **k):
-        raise core_restart.RemoteHostError("link down")
+        raise core_restart.RemoteHostError("bad request", status_code=400)
     monkeypatch.setattr(core_restart, "_dispatch_restart", boom)
     code = core_restart.run(["--request-id", "req-3", "--json"])
     obj = _json.loads(capsys.readouterr().out)
@@ -279,7 +279,7 @@ def test_failed_dispatch_frees_the_request_id_for_retry(stubbed_run, monkeypatch
     assert not _os.path.exists(tmp_path / ".tmp" / "core-restart" / "req-3.json")
 
 
-@pytest.mark.parametrize("bad", ["../x", "a b", "a;rm", "", "x" * 65])
+@pytest.mark.parametrize("bad", ["../x", "a b", "a;rm", "", "x" * 65, "abc\n"])
 def test_invalid_request_id_is_refused_before_anything_runs(stubbed_run, capsys, bad):
     code = core_restart.run(["--request-id", bad, "--json"])
     obj = _json.loads(capsys.readouterr().out)
@@ -314,3 +314,35 @@ def test_json_wait_reports_boot_change(stubbed_run, monkeypatch, capsys):
 def test_without_json_output_is_human_text(stubbed_run, capsys):
     core_restart.run([])
     assert "restart core: dispatched" in capsys.readouterr().out
+
+
+def test_replay_during_inflight_dispatch_is_not_reported_as_dispatched(stubbed_run, monkeypatch, capsys):
+    seen = {}
+    def inflight(backend_url, workspace, token, request_id, container_name):
+        core_restart.run(["--request-id", request_id, "--json"])  # second caller mid-dispatch
+        seen["out"] = _json.loads(capsys.readouterr().out)
+    monkeypatch.setattr(core_restart, "_dispatch_restart", inflight)
+    assert core_restart.run(["--request-id", "req-5", "--json"]) == 0
+    assert seen["out"]["status"] == "dispatch_pending" and seen["out"]["ok"] is False
+    capsys.readouterr()
+    core_restart.run(["--request-id", "req-5", "--json"])
+    assert _json.loads(capsys.readouterr().out)["status"] == "already_dispatched"
+
+
+def test_unacknowledged_dispatch_keeps_receipt_and_baseline(stubbed_run, monkeypatch, capsys, tmp_path):
+    def timeout(*a, **k):
+        raise core_restart.RemoteHostError("HTTP 502", status_code=502)
+    monkeypatch.setattr(core_restart, "_dispatch_restart", timeout)
+    code = core_restart.run(["--request-id", "req-6", "--json"])
+    obj = _json.loads(capsys.readouterr().out)
+    assert code == 1 and obj["status"] == "dispatch_unconfirmed" and obj["boot_id_before"] == "boot-A"
+    assert _os.path.exists(tmp_path / ".tmp" / "core-restart" / "req-6.json")
+    # replay keeps the ORIGINAL baseline, never re-dispatches, never reports success
+    monkeypatch.setattr(core_restart, "_poll_health", lambda: {"boot_id": "boot-B", "git_head": "head1"})
+    core_restart.run(["--request-id", "req-6", "--json"])
+    obj = _json.loads(capsys.readouterr().out)
+    assert obj["status"] == "dispatch_unconfirmed" and obj["ok"] is False
+    code = core_restart.run(["--request-id", "req-6", "--json", "--wait"])
+    obj = _json.loads(capsys.readouterr().out)
+    assert code == 0 and obj["wait"]["boot_id_after"] == "boot-B"
+    assert obj["boot_id_before"] == "boot-A"

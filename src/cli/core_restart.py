@@ -108,7 +108,16 @@ class NotConfigured(RuntimeError):
 
 
 class RemoteHostError(RuntimeError):
-    pass
+    def __init__(self, msg: str = "", status_code: int | None = None):
+        super().__init__(msg)
+        self.status_code = status_code
+
+    @property
+    def rejected(self) -> bool:
+        """True only for a confirmed 4xx refusal from aw-backend: the command
+        was NOT sent. Timeouts, 5xx and transport errors are ambiguous: the
+        host may already have started the restart."""
+        return self.status_code is not None and 400 <= self.status_code < 500
 
 
 def _resolve_config() -> tuple[str, str, str]:
@@ -187,7 +196,8 @@ def _parse(resp: httpx.Response) -> dict:
     if resp.status_code >= 400:
         raise RemoteHostError(
             (isinstance(data, dict) and (data.get("error") or data.get("detail")))
-            or f"HTTP {resp.status_code}"
+            or f"HTTP {resp.status_code}",
+            status_code=resp.status_code,
         )
     return data if isinstance(data, dict) else {}
 
@@ -272,6 +282,9 @@ def _write_receipt(request_id: str, expected_head: str, boot_id_before: str,
         "boot_id_before": boot_id_before,
         "image_digest_before": image_digest,
         "container_name": container_name,
+        # pending -> dispatched (acked) | ambiguous (ack lost). Only
+        # "dispatched" may be reported as already_dispatched.
+        "state": "pending",
     }
     # O_EXCL: the receipt IS the per-request-id idempotency marker (ten
     # workers share this mount); a second creator gets FileExistsError.
@@ -280,6 +293,19 @@ def _write_receipt(request_id: str, expected_head: str, boot_id_before: str,
         json.dump(payload, f, indent=2)
         f.write("\n")
     return path
+
+
+def _set_receipt_state(request_id: str, state: str) -> None:
+    receipt = _read_receipt(request_id)
+    if receipt is None:
+        return
+    receipt["state"] = state
+    path = _receipt_path(request_id)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(receipt, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
 
 
 def _receipt_path(request_id: str) -> str:
@@ -399,7 +425,7 @@ def run(args: list[str]) -> int:
         say(f"error: {msg}")
         return finish(1, status=status, error=msg, **fields)
 
-    if ns.request_id is not None and not REQUEST_ID_RE.match(ns.request_id):
+    if ns.request_id is not None and not REQUEST_ID_RE.fullmatch(ns.request_id):
         return fail("--request-id must match [A-Za-z0-9_-]{1,64}", "invalid_request_id")
 
     request_id = ns.request_id or uuid.uuid4().hex[:12]
@@ -408,8 +434,7 @@ def run(args: list[str]) -> int:
     # dispatched. Never preflight or dispatch again.
     prior = _read_receipt(request_id) if ns.request_id else None
     if prior is not None:
-        return _report_dispatched(ns, say, finish, request_id, prior,
-                                  _receipt_path(request_id), "already_dispatched")
+        return _report_prior(ns, say, finish, request_id, prior)
 
     try:
         backend_url, workspace, token = _resolve_config()
@@ -444,19 +469,27 @@ def run(args: list[str]) -> int:
     except FileExistsError:
         # Lost a race with a concurrent caller using the same id.
         prior = _read_receipt(request_id) or {}
-        return _report_dispatched(ns, say, finish, request_id, prior,
-                                  _receipt_path(request_id), "already_dispatched")
+        return _report_prior(ns, say, finish, request_id, prior)
 
     try:
         _dispatch_restart(backend_url, workspace, token, request_id, container_name)
     except RemoteHostError as e:
-        # Nothing was dispatched: free the id so the caller can retry it.
-        try:
-            os.unlink(receipt_path)
-        except OSError:
-            pass
-        return fail(f"could not dispatch the restart: {e}", "dispatch_failed",
-                    request_id=request_id)
+        if e.rejected:
+            # Confirmed refusal, nothing was sent: free the id for a retry.
+            try:
+                os.unlink(receipt_path)
+            except OSError:
+                pass
+            return fail(f"could not dispatch the restart: {e}", "dispatch_failed",
+                        request_id=request_id)
+        # Ack lost (timeout/5xx/transport): the host may have started the
+        # restart. Keep the receipt and its baseline; never free the id.
+        _set_receipt_state(request_id, "ambiguous")
+        return fail(f"restart dispatch not acknowledged (it may still have run): {e}",
+                    "dispatch_unconfirmed", request_id=request_id,
+                    expected_head=expected_head, boot_id_before=boot_id_before,
+                    receipt=receipt_path)
+    _set_receipt_state(request_id, "dispatched")
 
     receipt = {"expected_head": expected_head, "boot_id_before": boot_id_before,
                "image_digest_before": image_digest}
@@ -469,6 +502,25 @@ def run(args: list[str]) -> int:
     say(f"  poll:            aw-workspace-cli restart core --wait "
         f"# or: curl {local_client.base_url()}/api/health")
     return _finish_dispatched(ns, say, finish, request_id, receipt, receipt_path, "dispatched")
+
+
+def _report_prior(ns, say, finish, request_id: str, receipt: dict) -> int:
+    """Replay of an existing receipt. Only an ACKNOWLEDGED dispatch is
+    ``already_dispatched``; a pending or ambiguous one never reports success."""
+    path = _receipt_path(request_id)
+    state = receipt.get("state", "dispatched")  # pre-state receipts were acked
+    if state == "dispatched":
+        return _report_dispatched(ns, say, finish, request_id, receipt, path,
+                                  "already_dispatched")
+    status = "dispatch_unconfirmed" if state == "ambiguous" else "dispatch_pending"
+    if state == "ambiguous" and ns.wait:
+        # The restart may have happened: observe it against the ORIGINAL baseline.
+        return _finish_dispatched(ns, say, finish, request_id, receipt, path, status)
+    say(f"error: restart for request_id={request_id} is {status}; not dispatching again")
+    return finish(1, status=status, error=f"receipt state is {state!r}",
+                  request_id=request_id,
+                  expected_head=receipt.get("expected_head", ""),
+                  boot_id_before=receipt.get("boot_id_before", ""), receipt=path)
 
 
 def _report_dispatched(ns, say, finish, request_id: str, receipt: dict,
