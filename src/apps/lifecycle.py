@@ -203,8 +203,8 @@ class AppLifecycle:
         convergence latency on the *other* workers, not correctness on this
         one. Never raises into an install/uninstall path.
 
-        Returns True when the message went out over the relay, False when it
-        could not (no Redis, or the publish failed) -- the caller then owes the
+        Returns True when at least one subscriber got it over the relay, False
+        when it could not (no Redis, publish failed, or zero subscribers) -- the caller then owes the
         local worker whatever the relay would have told it (see
         ``Reconciler._trigger_broadcast``'s ``ui_changed`` fallback).
         """
@@ -215,7 +215,10 @@ class AppLifecycle:
             delivered = await self._broadcaster.publish(TOPIC_APPS_CHANGED, payload)
             log.info("apps: published %r (%s) to %s subscriber(s)",
                      TOPIC_APPS_CHANGED, payload, delivered)
-            return True
+            # 0 subscribers (e.g. this worker's own subscription is mid-
+            # reconnect) delivered to nobody, including us: report False so the
+            # caller owes the local worker the nudge.
+            return bool(delivered)
         except Exception:
             log.exception("apps: could not publish %r after %s of %s — other "
                           "workers will not converge until their next restart",

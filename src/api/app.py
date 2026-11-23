@@ -383,7 +383,10 @@ def create_app() -> FastAPI:
         # can be silently dropped (redis_coord's relay has no replay). Never
         # raises — see each start_relay()'s own docstring.
         app.state.notification_mgr.set_revision_provider(app.state.app_runtime.revision)
-        app.state.app_reconciler.on_ui_changed = app.state.notification_mgr.broadcast_ui_changed
+        async def _ui_changed() -> None:
+            app.state.notification_mgr.schedule_ui_changed()
+
+        app.state.app_reconciler.on_ui_changed = _ui_changed
         await app.state.notification_mgr.start_relay()
         await app.state.app_install_jobs.start_relay()
         await app.state.status_hub.start_relay()
@@ -500,7 +503,7 @@ def create_app() -> FastAPI:
             await app.state.app_reconciler.converge_in_process()
             # After converging, so the revision announced is one this worker
             # actually serves.
-            await app.state.notification_mgr.broadcast_ui_changed()
+            app.state.notification_mgr.schedule_ui_changed()
 
         await app.state.app_lifecycle.start(_on_apps_changed)
         # Subscribe this worker to service:cmd/service:reply, so a manual

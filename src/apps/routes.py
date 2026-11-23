@@ -1180,10 +1180,15 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
     app.state.app_lifecycle = lifecycle
 
     @app.get("/api/apps")
-    async def list_apps(identity: dict = Depends(require_identity)):
+    async def list_apps(response: Response, identity: dict = Depends(require_identity)):
         """Installed apps for the SPA's Apps view — includes what the UI needs
         to render each row: icon, whether a config gear applies (``has_config``
-        + ``config_schema``), and the frontend contribution mode (Decision 3b)."""
+        + ``config_schema``), and the frontend contribution mode (Decision 3b).
+
+        ``X-Apps-Revision`` is this worker's contributions revision, so a
+        client holding a pushed revision can tell a lagging worker's list from
+        a converged one (live UI updates)."""
+        response.headers["X-Apps-Revision"] = runtime.revision()
         return [
             {
                 "slug": a.manifest.id,
@@ -1845,7 +1850,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         # Conditional refetch: a polling/reconnecting client sends the ETag it
         # already holds and gets an empty 304 when nothing moved.
         inm = request.headers.get("if-none-match", "")
-        if etag in {t.strip().removeprefix("W/") for t in inm.split(",")}:
+        if inm.strip() == "*" or etag in {t.strip().removeprefix("W/") for t in inm.split(",")}:
             return Response(status_code=304, headers={"ETag": etag})
         return JSONResponse(payload, headers={"ETag": etag, "Cache-Control": "no-cache"})
 
