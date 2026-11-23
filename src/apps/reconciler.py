@@ -523,9 +523,10 @@ class Reconciler:
         # it (no Redis, or the publish failed) nothing would ever tell the
         # browser, so emit locally here: ``lifecycle.publish`` is a silent
         # no-op in exactly that case.
-        if published is False and self.on_ui_changed is not None:
+        ui_changed = getattr(self, "on_ui_changed", None)
+        if published is False and ui_changed is not None:
             try:
-                await self.on_ui_changed()
+                await ui_changed()
             except Exception:  # noqa: BLE001 -- a UI nudge must never fail an install
                 log.exception("apps: local ui_changed fallback raised")
 
