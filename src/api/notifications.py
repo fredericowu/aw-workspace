@@ -41,6 +41,29 @@ class NotificationManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._broadcaster = RedisBroadcaster()
         self._relay_up = False
+        # () -> current contributions revision; wired by the lifespan.
+        self._revision_provider = None
+
+    def set_revision_provider(self, fn) -> None:
+        self._revision_provider = fn
+
+    def current_revision(self) -> str | None:
+        if self._revision_provider is None:
+            return None
+        try:
+            return self._revision_provider()
+        except Exception:
+            log.warning("notifications: revision provider raised", exc_info=True)
+            return None
+
+    async def broadcast_ui_changed(self) -> None:
+        """Tell this worker's open ``/ws/notifications`` sockets the app set
+        moved. Local-only on purpose: every worker calls this itself after it
+        has converged (``_on_apps_changed``), so the announced revision is one
+        THIS worker serves, and relaying it would duplicate the frame N times.
+        The no-Redis path calls it straight from the reconciler."""
+        await self._broadcast(json.dumps(
+            {"type": "ui_changed", "version": 1, "revision": self.current_revision()}))
 
     def set_loop(self, loop):
         self._loop = loop
@@ -278,6 +301,11 @@ class NotificationRoutes:
                 self.manager.mark_delivered(n["id"])
             return rows
 
+        # Connect frame: repeat the revision so a client that missed a
+        # ui_changed while disconnected learns it moved on reconnect.
+        await websocket.send_text(json.dumps(
+            {"type": "ui_changed", "version": 1,
+             "revision": self.manager.current_revision(), "initial": True}))
         pending = await asyncio.to_thread(_drain_pending)
         if pending:
             await websocket.send_text(json.dumps({

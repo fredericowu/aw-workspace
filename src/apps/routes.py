@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 import anyio
 import httpx
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from jsonschema import Draft7Validator
 from jsonschema.validators import validator_for
 
@@ -1838,8 +1838,16 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         return await reconciler.reconcile()
 
     @app.get("/api/apps/-/contributions")
-    async def contributions(identity: dict = Depends(require_identity)):
-        return runtime.contributions()
+    async def contributions(request: Request,
+                            identity: dict = Depends(require_identity)):
+        payload = runtime.contributions()
+        etag = f'"{payload["revision"]}"'
+        # Conditional refetch: a polling/reconnecting client sends the ETag it
+        # already holds and gets an empty 304 when nothing moved.
+        inm = request.headers.get("if-none-match", "")
+        if etag in {t.strip().removeprefix("W/") for t in inm.split(",")}:
+            return Response(status_code=304, headers={"ETag": etag})
+        return JSONResponse(payload, headers={"ETag": etag, "Cache-Control": "no-cache"})
 
     @app.post("/api/apps/{slug}/events")
     async def emit_app_event(

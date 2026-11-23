@@ -15,6 +15,7 @@ Every mount is journaled; uninstall replays the journal in reverse.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import logging
@@ -584,6 +585,31 @@ class _ContainerPlugin(Plugin):
         return None
 
 
+_HASH_CACHE: dict[str, tuple[float, int, str]] = {}
+
+
+def _file_sha256(path: str) -> str:
+    """sha256 of a file, memoised on (mtime, size) so a polling client does
+    not re-read every bundle on each ``/contributions`` request."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ""
+    cached = _HASH_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return cached[2]
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    digest = h.hexdigest()
+    _HASH_CACHE[path] = (st.st_mtime, st.st_size, digest)
+    return digest
+
+
 @dataclass
 class LoadedApp:
     manifest: Manifest
@@ -962,7 +988,33 @@ class AppRuntime:
                     "granted_permissions": app.granted_permissions,
                 })
         return {"windows": windows, "nav": nav, "settings": settings,
-                "frontend": frontend, "event_hooks": event_hooks}
+                "frontend": frontend, "event_hooks": event_hooks,
+                "revision": self.revision()}
+
+    def revision(self) -> str:
+        """Content-hash revision of what :meth:`contributions` serves.
+
+        Derived from each loaded app's (id, version, grants, signed) -- the
+        per-worker projection of the shared ``AppInstall`` mirror -- plus the
+        sha256 of its announced bundle, so a code-only update with an
+        unchanged version still moves it. Pure function of that state: a
+        converged worker pair yields the same string, a lagging worker a
+        different one (which is exactly what the client's retry-until-match
+        needs), and nothing is stored. Sorted, so load order cannot matter.
+        """
+        parts: list[str] = []
+        for app in sorted(self._apps.values(), key=lambda a: a.manifest.id):
+            fe = app.manifest.frontend or {}
+            bundle = fe.get("bundle")
+            bundle_hash = ""
+            if bundle and self._bundle_exists(app, bundle):
+                bundle_hash = _file_sha256(os.path.join(
+                    app.package_dir, "ui", "dist", os.path.basename(str(bundle))))
+            parts.append(json.dumps(
+                [app.manifest.id, app.manifest.version,
+                 sorted(app.granted_permissions), bool(app.signed), bundle_hash],
+                separators=(",", ":")))
+        return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
 
     @staticmethod
     def _bundle_exists(app: LoadedApp, bundle: str) -> bool:
