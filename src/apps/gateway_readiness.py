@@ -29,8 +29,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+from typing import TYPE_CHECKING
 
 from src.apps.containers import ContainerError
+
+if TYPE_CHECKING:  # annotation only; runtime must not import it (no cycle)
+    from src.apps.runtime import AppRuntime
 
 log = logging.getLogger(__name__)
 
