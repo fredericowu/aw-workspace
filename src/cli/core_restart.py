@@ -272,7 +272,7 @@ def _build_restart_script(sentinel: str, log: str, container_name: str) -> str:
 
 
 def _write_receipt(request_id: str, expected_head: str, boot_id_before: str,
-                    image_digest: str, container_name: str) -> str:
+                    image_digest: str, container_name: str) -> tuple[str, dict]:
     path = _receipt_path(request_id)
     payload = {
         "request_id": request_id,
@@ -303,13 +303,13 @@ def _write_receipt(request_id: str, expected_head: str, boot_id_before: str,
         except OSError:
             # Cleanup must preserve the outcome of publishing the receipt.
             pass
-    return path
+    return path, payload
 
 
-def _set_receipt_state(request_id: str, state: str) -> None:
-    receipt = _read_receipt(request_id)
-    if receipt is None:
-        return
+def _set_receipt_state(request_id: str, state: str, base: dict) -> None:
+    # ``base`` is the payload we created: never re-read the pending receipt
+    # to learn it, or one transient read error strands an acked dispatch.
+    receipt = dict(base)
     receipt["state"] = state
     path = _receipt_path(request_id)
     tmp = f"{path}.{os.getpid()}.tmp"
@@ -324,12 +324,16 @@ def _receipt_path(request_id: str) -> str:
 
 
 def _read_receipt(request_id: str) -> dict | None:
+    """None only when the receipt is confirmed absent. Anything present but
+    unreadable (mid-write, EACCES, EIO) is pending, never absent."""
     try:
         with open(_receipt_path(request_id), encoding="utf-8") as f:
             data = json.load(f)
-    except (FileNotFoundError, ValueError):
+    except FileNotFoundError:
         return None
-    return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return {"state": "pending"}
+    return data if isinstance(data, dict) else {"state": "pending"}
 
 
 def _poll_health() -> dict:
@@ -444,8 +448,6 @@ def run(args: list[str]) -> int:
     # Idempotent replay: a receipt for this id means the restart was already
     # dispatched. Never preflight or dispatch again.
     prior = _read_receipt(request_id) if ns.request_id else None
-    if prior is None and ns.request_id and os.path.exists(_receipt_path(request_id)):
-        prior = {"state": "pending"}  # present but unreadable: creator mid-write
     if prior is not None:
         return _report_prior(ns, say, finish, request_id, prior)
 
@@ -476,7 +478,7 @@ def run(args: list[str]) -> int:
                     "container_not_found", request_id=request_id)
 
     try:
-        receipt_path = _write_receipt(
+        receipt_path, receipt_base = _write_receipt(
             request_id, expected_head, boot_id_before, image_digest, container_name,
         )
     except FileExistsError:
@@ -498,12 +500,12 @@ def run(args: list[str]) -> int:
                         request_id=request_id)
         # Ack lost (timeout/5xx/transport): the host may have started the
         # restart. Keep the receipt and its baseline; never free the id.
-        _set_receipt_state(request_id, "ambiguous")
+        _set_receipt_state(request_id, "ambiguous", receipt_base)
         return fail(f"restart dispatch not acknowledged (it may still have run): {e}",
                     "dispatch_unconfirmed", request_id=request_id,
                     expected_head=expected_head, boot_id_before=boot_id_before,
                     receipt=receipt_path)
-    _set_receipt_state(request_id, "dispatched")
+    _set_receipt_state(request_id, "dispatched", receipt_base)
 
     receipt = {"expected_head": expected_head, "boot_id_before": boot_id_before,
                "image_digest_before": image_digest}
