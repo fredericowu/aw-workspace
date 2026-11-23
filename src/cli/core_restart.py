@@ -298,7 +298,11 @@ def _write_receipt(request_id: str, expected_head: str, boot_id_before: str,
     try:
         os.link(tmp, path)
     finally:
-        os.unlink(tmp)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            # Cleanup must preserve the outcome of publishing the receipt.
+            pass
     return path
 
 

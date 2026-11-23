@@ -367,3 +367,16 @@ def test_lost_create_race_with_unreadable_receipt_is_pending(stubbed_run, monkey
     obj = _json.loads(capsys.readouterr().out)
     assert code == 1 and obj["status"] == "dispatch_pending"
     assert stubbed_run["dispatch"] == []
+
+
+def test_temp_name_cleanup_failure_does_not_strand_the_dispatch(stubbed_run, monkeypatch, capsys):
+    real_unlink = core_restart.os.unlink
+    def flaky_unlink(path):
+        if str(path).endswith(".new"):
+            raise OSError("injected")
+        return real_unlink(path)
+    monkeypatch.setattr(core_restart.os, "unlink", flaky_unlink)
+    code = core_restart.run(["--request-id", "req-8", "--json"])
+    obj = _json.loads(capsys.readouterr().out)
+    assert code == 0 and obj["status"] == "dispatched"
+    assert stubbed_run["dispatch"] == ["req-8"]
