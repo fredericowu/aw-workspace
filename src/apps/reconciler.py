@@ -222,6 +222,11 @@ class LocalMirror:
                 session.commit()
 
 
+async def _no_ui_changed() -> None:
+    """Default ``Reconciler.on_ui_changed``: nothing to nudge (unit tests,
+    no notification manager wired)."""
+
+
 class Reconciler:
     """Converges the running app set to the cloud registry's desired state."""
 
@@ -243,7 +248,7 @@ class Reconciler:
         self.lifecycle = lifecycle
         # Local ``ui_changed`` emitter, wired by the lifespan; see
         # ``_trigger_broadcast``.
-        self.on_ui_changed: Callable[[], Awaitable[None]] | None = None
+        self.on_ui_changed: Callable[[], Awaitable[None]] = _no_ui_changed
         # Set while a reconcile() pass is running so the per-app install/
         # uninstall calls inside it COALESCE into one gateway reload at the
         # end instead of firing one HTTP rescan per app — a fresh workspace
@@ -523,10 +528,9 @@ class Reconciler:
         # it (no Redis, or the publish failed) nothing would ever tell the
         # browser, so emit locally here: ``lifecycle.publish`` is a silent
         # no-op in exactly that case.
-        ui_changed = getattr(self, "on_ui_changed", None)
-        if published is False and ui_changed is not None:
+        if published is False:
             try:
-                await ui_changed()
+                await self.on_ui_changed()
             except Exception:  # noqa: BLE001 -- a UI nudge must never fail an install
                 log.exception("apps: local ui_changed fallback raised")
 
