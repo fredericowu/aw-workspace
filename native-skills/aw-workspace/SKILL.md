@@ -341,6 +341,26 @@ So: poll `boot_id`/`git_head` for "did it restart", and `status`/`degraded`
 for "is anything broken" — any script asserting `status == "ok"` will now
 alarm on a degraded workspace, which is the point.
 
+### Agents: prefer `update_workspace` over a hand `restart core`
+
+When the Agents Platform runners app is installed and the graceful-restart
+feature is enabled, an agent should call the MCP tool
+**`update_workspace(workspace?, restart_only=false, reason)`** instead of
+`aw-workspace-cli restart core` or an update by hand. It takes a restart
+lock (1 hour max), drains in-flight runs for up to 30 minutes (no abort),
+turns new fires into scheduled wake-ups that replay after release, verifies
+health, and wakes the requester with a report on success or failure. Check
+it with `workspace_restart_status(lock_id)`; release early with
+`cancel_workspace_restart(lock_id)`. Restarting your OWN workspace from
+inside a run ends that run; you are woken afterwards.
+
+A hand `restart core` is for when the feature is off (`update_workspace`
+answers 503 "not enabled"), or the workspace is already down with nothing
+to drain. A 503 from status/cancel is an outage, not "feature off": do not
+restart by hand, re-read the status once the service recovers. Failure
+outcomes and what to do for each are in the `aw-workspace-restart` skill
+(contributed by the agents-platform-runners app).
+
 ### Before you `restart` anything, or `kill -9` a service
 
 Read **`docs/standards/core-restart-blast-radius.md`**. Two things in it
