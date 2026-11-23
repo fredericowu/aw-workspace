@@ -6,7 +6,7 @@ the aw-remote-host link this workspace already has (the same link
 This is deliberately NOT ``aw-workspace-cli update workspace``
 (``src/cli/commands/update.py``): that action pulls ``:latest`` and syncs
 the image's baked repo over the host source tree, and stays gated behind a
-central-identity JWT only a human can mint. This command only restarts the
+central-identity JWT a human supplies. This command only restarts the
 container process so it picks up code that a ``git push`` already put on
 the host's bind-mounted checkout — the code is already there the moment it
 lands (``/opt/aw-workspace`` is a host bind mount), only the running
@@ -14,6 +14,10 @@ process is stale. That needs no new privilege: anything that can read
 ``<AW_WORKSPACE_HOME>/.env`` can already run arbitrary shell on the linked
 host via ``remote-hosts exec``. This packages that existing capability into
 one idempotent, observable verb instead of a hand-rolled shell one-liner.
+
+Flags: ``--request-id X`` (idempotency key; replay => ``already_dispatched``,
+no second restart) and ``--json`` (exactly one JSON object on stdout; see
+:func:`run`). With ``--json`` every human line is suppressed.
 
 Why this can't just POST to itself and wait: the process serving that
 response is the one about to die. There is no response to wait for, so
@@ -26,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 import uuid
 
@@ -103,7 +108,16 @@ class NotConfigured(RuntimeError):
 
 
 class RemoteHostError(RuntimeError):
-    pass
+    def __init__(self, msg: str = "", status_code: int | None = None):
+        super().__init__(msg)
+        self.status_code = status_code
+
+    @property
+    def rejected(self) -> bool:
+        """True only for a confirmed 4xx refusal from aw-backend: the command
+        was NOT sent. Timeouts, 5xx and transport errors are ambiguous: the
+        host may already have started the restart."""
+        return self.status_code is not None and 400 <= self.status_code < 500
 
 
 def _resolve_config() -> tuple[str, str, str]:
@@ -182,7 +196,8 @@ def _parse(resp: httpx.Response) -> dict:
     if resp.status_code >= 400:
         raise RemoteHostError(
             (isinstance(data, dict) and (data.get("error") or data.get("detail")))
-            or f"HTTP {resp.status_code}"
+            or f"HTTP {resp.status_code}",
+            status_code=resp.status_code,
         )
     return data if isinstance(data, dict) else {}
 
@@ -258,7 +273,7 @@ def _build_restart_script(sentinel: str, log: str, container_name: str) -> str:
 
 def _write_receipt(request_id: str, expected_head: str, boot_id_before: str,
                     image_digest: str, container_name: str) -> str:
-    path = os.path.join(_receipts_dir(), f"{request_id}.json")
+    path = _receipt_path(request_id)
     payload = {
         "request_id": request_id,
         "requested_at": int(time.time()),
@@ -267,11 +282,43 @@ def _write_receipt(request_id: str, expected_head: str, boot_id_before: str,
         "boot_id_before": boot_id_before,
         "image_digest_before": image_digest,
         "container_name": container_name,
+        # pending -> dispatched (acked) | ambiguous (ack lost). Only
+        # "dispatched" may be reported as already_dispatched.
+        "state": "pending",
     }
-    with open(path, "w", encoding="utf-8") as f:
+    # O_EXCL: the receipt IS the per-request-id idempotency marker (ten
+    # workers share this mount); a second creator gets FileExistsError.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
         f.write("\n")
     return path
+
+
+def _set_receipt_state(request_id: str, state: str) -> None:
+    receipt = _read_receipt(request_id)
+    if receipt is None:
+        return
+    receipt["state"] = state
+    path = _receipt_path(request_id)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(receipt, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def _receipt_path(request_id: str) -> str:
+    return os.path.join(_receipts_dir(), f"{request_id}.json")
+
+
+def _read_receipt(request_id: str) -> dict | None:
+    try:
+        with open(_receipt_path(request_id), encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _poll_health() -> dict:
@@ -281,7 +328,8 @@ def _poll_health() -> dict:
     return body
 
 
-def _wait_for_restart(expected_head: str, boot_id_before: str, deadline_s: float) -> int:
+def _wait_for_restart(expected_head: str, boot_id_before: str, deadline_s: float,
+                      quiet: bool = False, result: dict | None = None) -> int:
     """Poll ``/api/health`` until ``boot_id`` changes and ``git_head``
     matches. Disposable: all durable state is the receipt plus
     ``/api/health`` itself, so killing this loop loses nothing but the exit
@@ -292,6 +340,15 @@ def _wait_for_restart(expected_head: str, boot_id_before: str, deadline_s: float
     see that constant's docstring for why a single mismatched poll isn't
     trustworthy on its own.
     """
+    def _say(msg: str) -> None:
+        if not quiet:
+            print(msg)
+
+    def _set(code: int, state: str, boot_after: str) -> None:
+        if result is not None:
+            result.update(exit_code=code, state=state, boot_id_after=boot_after,
+                          git_head_after=last_health.get("git_head", ""))
+
     deadline = time.monotonic() + deadline_s
     last_health: dict = {}
     mismatch_polls_remaining: int | None = None
@@ -300,27 +357,34 @@ def _wait_for_restart(expected_head: str, boot_id_before: str, deadline_s: float
         new_boot_id = last_health.get("boot_id", "")
         if new_boot_id and new_boot_id != boot_id_before:
             if last_health.get("git_head") == expected_head:
-                print(f"restart core: succeeded — boot_id {boot_id_before!r} -> "
+                _say(f"restart core: succeeded — boot_id {boot_id_before!r} -> "
                       f"{new_boot_id!r}, git_head {expected_head!r}")
+                _set(0, "succeeded", new_boot_id)
                 return 0
             if mismatch_polls_remaining is None:
                 mismatch_polls_remaining = HEAD_MISMATCH_GRACE_POLLS
-                print(f"restart core: boot_id changed but git_head is "
+                _say(f"restart core: boot_id changed but git_head is "
                       f"{last_health.get('git_head')!r}, expected {expected_head!r} — "
                       f"tolerating a transient mismatch, rechecking...")
             if mismatch_polls_remaining <= 0:
-                print(f"restart core: came back on the WRONG code — expected "
+                _say(f"restart core: came back on the WRONG code — expected "
                       f"git_head {expected_head!r}, got {last_health.get('git_head')!r}")
+                _set(2, "wrong_code", new_boot_id)
                 return 2
             mismatch_polls_remaining -= 1
         time.sleep(POLL_INTERVAL_S)
     if mismatch_polls_remaining is not None:
-        print(f"restart core: came back on the WRONG code — expected "
+        _say(f"restart core: came back on the WRONG code — expected "
               f"git_head {expected_head!r}, got {last_health.get('git_head')!r}")
+        _set(2, "wrong_code", last_health.get("boot_id", ""))
         return 2
-    print(f"restart core: the restart never happened — boot_id is still "
+    _say(f"restart core: the restart never happened — boot_id is still "
           f"{boot_id_before!r} after {deadline_s:.0f}s")
+    _set(1, "never_restarted", last_health.get("boot_id", ""))
     return 1
+
+
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -332,17 +396,50 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="Block and poll /api/health until the restart is confirmed")
     parser.add_argument("--timeout", type=float, default=DEFAULT_WAIT_DEADLINE_S,
                          help=f"--wait deadline in seconds (default {DEFAULT_WAIT_DEADLINE_S:.0f})")
+    parser.add_argument("--request-id", default=None,
+                         help="Caller-chosen idempotency key ([A-Za-z0-9_-], max 64). A second "
+                              "call with the same id never restarts again: it reports "
+                              "status=already_dispatched from the stored receipt")
+    parser.add_argument("--json", action="store_true", dest="as_json",
+                         help="Print exactly one JSON object on stdout and nothing else")
     return parser
 
 
 def run(args: list[str]) -> int:
     ns = _build_parser().parse_args(args)
+    as_json = ns.as_json
+
+    def say(msg: str) -> None:
+        if not as_json:
+            print(msg)
+
+    def finish(code: int, **fields) -> int:
+        """``--json``: the single stdout object. ``ok`` is true iff exit 0."""
+        if as_json:
+            out = {"ok": code == 0, "exit_code": code}
+            out.update(fields)
+            print(json.dumps(out, sort_keys=True))
+        return code
+
+    def fail(msg: str, status: str, **fields) -> int:
+        say(f"error: {msg}")
+        return finish(1, status=status, error=msg, **fields)
+
+    if ns.request_id is not None and not REQUEST_ID_RE.fullmatch(ns.request_id):
+        return fail("--request-id must match [A-Za-z0-9_-]{1,64}", "invalid_request_id")
+
+    request_id = ns.request_id or uuid.uuid4().hex[:12]
+
+    # Idempotent replay: a receipt for this id means the restart was already
+    # dispatched. Never preflight or dispatch again.
+    prior = _read_receipt(request_id) if ns.request_id else None
+    if prior is not None:
+        return _report_prior(ns, say, finish, request_id, prior)
 
     try:
         backend_url, workspace, token = _resolve_config()
     except NotConfigured as e:
-        print(f"error: {e}")
-        return 1
+        return fail(str(e), "not_configured", request_id=request_id)
 
     container_name = _env(CONTAINER_NAME_ENV, DEFAULT_CONTAINER_NAME)
     image_ref = _env(IMAGE_REF_ENV, DEFAULT_IMAGE_REF)
@@ -356,36 +453,99 @@ def run(args: list[str]) -> int:
             backend_url, workspace, token, container_name, image_ref,
         )
     except RemoteHostError as e:
-        print(f"error: could not verify the target container on the linked host: {e}")
-        return 1
+        return fail(f"could not verify the target container on the linked host: {e}",
+                    "preflight_failed", request_id=request_id)
 
     if not exists:
-        print(f"error: no container named {container_name!r} on the linked host — "
-              f"refusing to restart the wrong one. Known containers: "
-              f"{', '.join(known_names) or '(none)'}")
-        return 1
+        return fail(f"no container named {container_name!r} on the linked host — "
+                    f"refusing to restart the wrong one. Known containers: "
+                    f"{', '.join(known_names) or '(none)'}",
+                    "container_not_found", request_id=request_id)
 
-    request_id = uuid.uuid4().hex[:12]
-    receipt_path = _write_receipt(
-        request_id, expected_head, boot_id_before, image_digest, container_name,
-    )
+    try:
+        receipt_path = _write_receipt(
+            request_id, expected_head, boot_id_before, image_digest, container_name,
+        )
+    except FileExistsError:
+        # Lost a race with a concurrent caller using the same id.
+        prior = _read_receipt(request_id) or {}
+        return _report_prior(ns, say, finish, request_id, prior)
 
     try:
         _dispatch_restart(backend_url, workspace, token, request_id, container_name)
     except RemoteHostError as e:
-        print(f"error: could not dispatch the restart: {e}")
-        return 1
+        if e.rejected:
+            # Confirmed refusal, nothing was sent: free the id for a retry.
+            try:
+                os.unlink(receipt_path)
+            except OSError:
+                pass
+            return fail(f"could not dispatch the restart: {e}", "dispatch_failed",
+                        request_id=request_id)
+        # Ack lost (timeout/5xx/transport): the host may have started the
+        # restart. Keep the receipt and its baseline; never free the id.
+        _set_receipt_state(request_id, "ambiguous")
+        return fail(f"restart dispatch not acknowledged (it may still have run): {e}",
+                    "dispatch_unconfirmed", request_id=request_id,
+                    expected_head=expected_head, boot_id_before=boot_id_before,
+                    receipt=receipt_path)
+    _set_receipt_state(request_id, "dispatched")
 
-    print(f"restart core: dispatched (request_id={request_id})")
-    print(f"  expected_head:   {expected_head}")
-    print(f"  boot_id_before:  {boot_id_before!r}")
-    print(f"  image_digest:    {image_digest or '(unavailable)'}")
-    print(f"  receipt:         {receipt_path}")
-    print("  WARNING: this kills every live terminal/PTY in the workspace container.")
-    print(f"  poll:            aw-workspace-cli restart core --wait "
-          f"# or: curl {local_client.base_url()}/api/health")
+    receipt = {"expected_head": expected_head, "boot_id_before": boot_id_before,
+               "image_digest_before": image_digest}
+    say(f"restart core: dispatched (request_id={request_id})")
+    say(f"  expected_head:   {expected_head}")
+    say(f"  boot_id_before:  {boot_id_before!r}")
+    say(f"  image_digest:    {image_digest or '(unavailable)'}")
+    say(f"  receipt:         {receipt_path}")
+    say("  WARNING: this kills every live terminal/PTY in the workspace container.")
+    say(f"  poll:            aw-workspace-cli restart core --wait "
+        f"# or: curl {local_client.base_url()}/api/health")
+    return _finish_dispatched(ns, say, finish, request_id, receipt, receipt_path, "dispatched")
 
+
+def _report_prior(ns, say, finish, request_id: str, receipt: dict) -> int:
+    """Replay of an existing receipt. Only an ACKNOWLEDGED dispatch is
+    ``already_dispatched``; a pending or ambiguous one never reports success."""
+    path = _receipt_path(request_id)
+    state = receipt.get("state", "dispatched")  # pre-state receipts were acked
+    if state == "dispatched":
+        return _report_dispatched(ns, say, finish, request_id, receipt, path,
+                                  "already_dispatched")
+    status = "dispatch_unconfirmed" if state == "ambiguous" else "dispatch_pending"
+    if state == "ambiguous" and ns.wait:
+        # The restart may have happened: observe it against the ORIGINAL baseline.
+        return _finish_dispatched(ns, say, finish, request_id, receipt, path, status)
+    say(f"error: restart for request_id={request_id} is {status}; not dispatching again")
+    return finish(1, status=status, error=f"receipt state is {state!r}",
+                  request_id=request_id,
+                  expected_head=receipt.get("expected_head", ""),
+                  boot_id_before=receipt.get("boot_id_before", ""), receipt=path)
+
+
+def _report_dispatched(ns, say, finish, request_id: str, receipt: dict,
+                       receipt_path: str, status: str) -> int:
+    say(f"restart core: already dispatched for request_id={request_id} — not restarting again")
+    return _finish_dispatched(ns, say, finish, request_id, receipt, receipt_path, status)
+
+
+def _finish_dispatched(ns, say, finish, request_id: str, receipt: dict,
+                       receipt_path: str, status: str) -> int:
+    fields = {
+        "status": status,
+        "request_id": request_id,
+        "expected_head": receipt.get("expected_head", ""),
+        "boot_id_before": receipt.get("boot_id_before", ""),
+        "image_digest_before": receipt.get("image_digest_before", ""),
+        "receipt": receipt_path,
+    }
     if not ns.wait:
-        return 0
+        return finish(0, **fields)
 
-    return _wait_for_restart(expected_head, boot_id_before, ns.timeout)
+    waited: dict = {}
+    code = _wait_for_restart(fields["expected_head"], fields["boot_id_before"],
+                             ns.timeout, quiet=ns.as_json, result=waited)
+    fields["wait"] = waited
+    if waited.get("state"):
+        fields["status"] = waited["state"]
+    return finish(code, **fields)

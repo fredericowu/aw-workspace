@@ -11,15 +11,26 @@ against) to POST a restart to, and even if there were, a process cannot
 usefully POST its own restart and wait on the response — the response can
 never arrive. See ``src/cli/core_restart.py``.
 
-Card 3d15bf3b-9510-816a-bff8-fc6698619fa4's Architect design also
-considered — and explicitly REJECTED — a second path here: an aw-backend
-``POST /api/workspaces/{slug}/restart`` route authorized by this
-workspace's own host token. Cross-repo (aw-backend deploys are manual, so
-a route change there isn't live the moment this lands), and it would widen
-a data-plane credential onto control-plane lifecycle routes that also
-cover uninstall/reinstall — for no gain, since the exec channel `core`
-already uses grants strictly more power. Do not re-add it here; see the
-card's REJECTED section for the full reasoning.
+``restart core`` flags: ``--wait`` / ``--timeout`` block on ``/api/health``;
+``--request-id X`` makes the call idempotent per X (a replay reports
+``already_dispatched`` from ``.tmp/core-restart/X.json`` and never restarts
+twice); ``--json`` prints exactly one JSON object on stdout.
+
+History, so nobody re-litigates it. Card 3d15bf3b-9510-816a-bff8-fc6698619fa4
+rejected routing ``restart core`` through an aw-backend
+``POST /api/workspaces/{slug}/restart`` authorised by this workspace's host
+token: that would widen a data-plane credential onto lifecycle routes that
+also cover uninstall/reinstall, for no gain over the exec channel this
+command already uses. That still holds for ``restart core``. It does NOT mean
+"no agent path to a workspace update exists": card 4215bf3b (graceful
+restart/update) adds an agent-facing path that never uses the host token. The
+Agents Platform (AP-MT) holds the lock and calls the runners app, which runs
+this command for a restart-only request; for a full update AP-MT calls a
+dedicated aw-backend ``agent-lifecycle`` route (service secret + workspace
+identity JWT, tenant match checked server-side, restart-class actions only).
+aw-backend and AP-MT deploys are now automatic on merge, so a route change
+there goes live without a manual step (only ``aw-app-*`` repos need an
+install).
 """
 from __future__ import annotations
 
