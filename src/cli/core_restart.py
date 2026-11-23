@@ -286,12 +286,19 @@ def _write_receipt(request_id: str, expected_head: str, boot_id_before: str,
         # "dispatched" may be reported as already_dispatched.
         "state": "pending",
     }
-    # O_EXCL: the receipt IS the per-request-id idempotency marker (ten
-    # workers share this mount); a second creator gets FileExistsError.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
+    # The receipt IS the per-request-id idempotency marker (ten workers share
+    # this mount). Write it to a private temp file, then publish with
+    # os.link(): exclusive (FileExistsError for a second creator) AND atomic,
+    # so a concurrent reader never sees an empty/partial receipt and mistakes
+    # it for an acknowledged dispatch.
+    tmp = f"{path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.new"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
         f.write("\n")
+    try:
+        os.link(tmp, path)
+    finally:
+        os.unlink(tmp)
     return path
 
 
@@ -433,6 +440,8 @@ def run(args: list[str]) -> int:
     # Idempotent replay: a receipt for this id means the restart was already
     # dispatched. Never preflight or dispatch again.
     prior = _read_receipt(request_id) if ns.request_id else None
+    if prior is None and ns.request_id and os.path.exists(_receipt_path(request_id)):
+        prior = {"state": "pending"}  # present but unreadable: creator mid-write
     if prior is not None:
         return _report_prior(ns, say, finish, request_id, prior)
 
@@ -468,7 +477,8 @@ def run(args: list[str]) -> int:
         )
     except FileExistsError:
         # Lost a race with a concurrent caller using the same id.
-        prior = _read_receipt(request_id) or {}
+        # An unreadable receipt is never an acknowledged dispatch.
+        prior = _read_receipt(request_id) or {"state": "pending"}
         return _report_prior(ns, say, finish, request_id, prior)
 
     try:
