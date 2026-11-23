@@ -46,7 +46,7 @@ import re
 import shutil
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from src.apps import config_store
 from src.apps import fetch as fetch_mod
@@ -222,6 +222,11 @@ class LocalMirror:
                 session.commit()
 
 
+async def _no_ui_changed() -> None:
+    """Default ``Reconciler.on_ui_changed``: nothing to nudge (unit tests,
+    no notification manager wired)."""
+
+
 class Reconciler:
     """Converges the running app set to the cloud registry's desired state."""
 
@@ -241,6 +246,9 @@ class Reconciler:
         # before — no broadcast, no shared lock, which is right for a single
         # process). Wired for real in src/apps/routes.py.
         self.lifecycle = lifecycle
+        # Local ``ui_changed`` emitter, wired by the lifespan; see
+        # ``_trigger_broadcast``.
+        self.on_ui_changed: Callable[[], Awaitable[None]] = _no_ui_changed
         # Set while a reconcile() pass is running so the per-app install/
         # uninstall calls inside it COALESCE into one gateway reload at the
         # end instead of firing one HTTP rescan per app — a fresh workspace
@@ -512,8 +520,19 @@ class Reconciler:
         if self._pending_broadcast is not None:
             self._pending_broadcast = True
             return
+        published = True
         if self.lifecycle is not None:
-            await self.lifecycle.publish(reason, app_id)
+            published = await self.lifecycle.publish(reason, app_id)
+        # With the relay up, this worker hears its own publish and
+        # ``_on_apps_changed`` emits ``ui_changed`` after converging. Without
+        # it (no Redis, or the publish failed) nothing would ever tell the
+        # browser, so emit locally here: ``lifecycle.publish`` is a silent
+        # no-op in exactly that case.
+        if published is False:
+            try:
+                await self.on_ui_changed()
+            except Exception:  # noqa: BLE001 -- a UI nudge must never fail an install
+                log.exception("apps: local ui_changed fallback raised")
 
     async def attach(self, app_id: str, rows: dict[str, dict[str, Any]] | None = None,
                      _stack: tuple[str, ...] = ()) -> None:

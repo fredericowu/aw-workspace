@@ -15,6 +15,7 @@ Every mount is journaled; uninstall replays the journal in reverse.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import logging
@@ -584,6 +585,34 @@ class _ContainerPlugin(Plugin):
         return None
 
 
+_HASH_CACHE: dict[str, tuple[tuple, str]] = {}
+
+
+def _file_sha256(path: str) -> str:
+    """sha256 of a file, memoised on (inode, size, mtime_ns, ctime_ns) so a
+    polling client does not re-read every bundle on each ``/contributions``
+    request. ctime cannot be restored by an overwrite, so a same-size,
+    same-mtime replacement still invalidates the entry."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ""
+    key = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    cached = _HASH_CACHE.get(path)
+    if cached and cached[0] == key:
+        return cached[1]
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    digest = h.hexdigest()
+    _HASH_CACHE[path] = (key, digest)
+    return digest
+
+
 @dataclass
 class LoadedApp:
     manifest: Manifest
@@ -961,8 +990,46 @@ class AppRuntime:
                     "signed": app.signed,
                     "granted_permissions": app.granted_permissions,
                 })
-        return {"windows": windows, "nav": nav, "settings": settings,
+        body = {"windows": windows, "nav": nav, "settings": settings,
                 "frontend": frontend, "event_hooks": event_hooks}
+        body["revision"] = self._revision_of(body)
+        return body
+
+    def revision(self) -> str:
+        """Content-hash revision of what :meth:`contributions` serves."""
+        return self.contributions()["revision"]
+
+    def _revision_of(self, body: dict[str, Any]) -> str:
+        """Hash of the RESOLVED contribution payload plus each loaded app's
+        (id, version, grants, signed) and announced-bundle sha256.
+
+        Hashing the resolved payload (not just the manifest facts) means a
+        change that alters what the SPA would render -- a config value
+        expanded into a declarative window's ``spec_data``, say -- moves the
+        revision too. The bundle digest covers a code-only update whose
+        version did not change. Pure function of loaded state: converged
+        workers agree, a lagging worker differs (the client retries on that),
+        nothing is stored. List order is normalised so load order cannot
+        matter.
+        """
+        canon: dict[str, Any] = {}
+        for key, val in body.items():
+            canon[key] = sorted(json.dumps(v, sort_keys=True, default=str) for v in val) \
+                if isinstance(val, list) else val
+        apps: list[str] = []
+        for app in sorted(self._apps.values(), key=lambda a: a.manifest.id):
+            fe = app.manifest.frontend or {}
+            bundle = fe.get("bundle")
+            bundle_hash = ""
+            if bundle and self._bundle_exists(app, bundle):
+                bundle_hash = _file_sha256(os.path.join(
+                    app.package_dir, "ui", "dist", os.path.basename(str(bundle))))
+            apps.append(json.dumps(
+                [app.manifest.id, app.manifest.version,
+                 sorted(app.granted_permissions), bool(app.signed), bundle_hash]))
+        digest = hashlib.sha256(json.dumps(
+            [canon, apps], sort_keys=True, default=str).encode()).hexdigest()
+        return digest[:16]
 
     @staticmethod
     def _bundle_exists(app: LoadedApp, bundle: str) -> bool:

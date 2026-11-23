@@ -170,9 +170,10 @@ def test_ws_notifications_rejects_missing_token(ctx):
 def test_ws_notifications_delivers_broadcast(ctx):
     client, token = ctx
     # No pending notifications yet on a fresh schema, so the server sends no
-    # ninja_init frame on connect (see notification_stream: `if pending: ...`)
-    # — go straight to triggering a live broadcast.
+    # ninja_init frame on connect (see notification_stream: `if pending: ...`).
+    # It does always send the live-UI connect frame (`ui_changed`, initial).
     with client.websocket_connect(f"/ws/notifications?token={token}") as ws:
+        assert ws.receive_json()["type"] == "ui_changed"
         client.cookies.set("aw_id_jwt", token)
         client.post("/api/notify", json={"message": "live update"})
 

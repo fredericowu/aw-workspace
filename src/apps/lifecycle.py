@@ -195,25 +195,35 @@ class AppLifecycle:
                  TOPIC_APPS_CHANGED, payload)
         await self._handler(payload)
 
-    async def publish(self, reason: str, app_id: str | None = None) -> None:
+    async def publish(self, reason: str, app_id: str | None = None) -> bool:
         """Tell every worker (this one included) that the shared state moved.
 
         Fire-and-forget by contract: the caller has already finished the
         provisioning half and persisted it, so a failed publish costs
         convergence latency on the *other* workers, not correctness on this
         one. Never raises into an install/uninstall path.
+
+        Returns True when at least one subscriber got it over the relay, False
+        when it could not (no Redis, publish failed, or zero subscribers) -- the caller then owes the
+        local worker whatever the relay would have told it (see
+        ``Reconciler._trigger_broadcast``'s ``ui_changed`` fallback).
         """
         if self._broadcaster is None:
-            return
+            return False
         payload = {"reason": reason, "app_id": app_id, "pid": os.getpid()}
         try:
             delivered = await self._broadcaster.publish(TOPIC_APPS_CHANGED, payload)
             log.info("apps: published %r (%s) to %s subscriber(s)",
                      TOPIC_APPS_CHANGED, payload, delivered)
+            # 0 subscribers (e.g. this worker's own subscription is mid-
+            # reconnect) delivered to nobody, including us: report False so the
+            # caller owes the local worker the nudge.
+            return bool(delivered)
         except Exception:
             log.exception("apps: could not publish %r after %s of %s — other "
                           "workers will not converge until their next restart",
                           TOPIC_APPS_CHANGED, reason, app_id)
+            return False
 
     def broadcast_health(self) -> dict:
         """Can THIS worker still hear ``apps:changed``? Sync and syscall-free.
