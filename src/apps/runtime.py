@@ -992,8 +992,41 @@ class AppRuntime:
                 })
         body = {"windows": windows, "nav": nav, "settings": settings,
                 "frontend": frontend, "event_hooks": event_hooks}
+        # Per-app revisions (live-UI phase 2): additive. The shell diffs these
+        # to learn WHICH app changed. Set before the whole-payload revision so
+        # that hash covers it (it moves whenever any app rev does anyway).
+        body["app_revs"] = self._app_revs(body)
         body["revision"] = self._revision_of(body)
         return body
+
+    def _bundle_hash(self, app: LoadedApp) -> str:
+        fe = app.manifest.frontend or {}
+        bundle = fe.get("bundle")
+        if bundle and self._bundle_exists(app, bundle):
+            return _file_sha256(os.path.join(
+                app.package_dir, "ui", "dist", os.path.basename(str(bundle))))
+        return ""
+
+    def _app_revs(self, body: dict[str, Any]) -> dict[str, str]:
+        """``{slug: rev}`` -- a content hash of ONE app's slice of the resolved
+        payload (its windows/nav/settings/frontend/event_hooks entries) plus its
+        version, grants, signed flag and announced-bundle sha256. A pure
+        function of that app's own state: installing, updating or uninstalling
+        another app never moves it, and entry order cannot matter.
+        """
+        revs: dict[str, str] = {}
+        for app in self._apps.values():
+            slug = app.manifest.id
+            slice_ = {
+                key: sorted(json.dumps(e, sort_keys=True, default=str)
+                            for e in body.get(key, []) if e.get("app") == slug)
+                for key in ("windows", "nav", "settings", "frontend", "event_hooks")
+            }
+            facts = [app.manifest.version, sorted(app.granted_permissions),
+                     bool(app.signed), self._bundle_hash(app)]
+            revs[slug] = hashlib.sha256(json.dumps(
+                [slice_, facts], sort_keys=True, default=str).encode()).hexdigest()[:16]
+        return revs
 
     def revision(self) -> str:
         """Content-hash revision of what :meth:`contributions` serves."""
@@ -1018,12 +1051,7 @@ class AppRuntime:
                 if isinstance(val, list) else val
         apps: list[str] = []
         for app in sorted(self._apps.values(), key=lambda a: a.manifest.id):
-            fe = app.manifest.frontend or {}
-            bundle = fe.get("bundle")
-            bundle_hash = ""
-            if bundle and self._bundle_exists(app, bundle):
-                bundle_hash = _file_sha256(os.path.join(
-                    app.package_dir, "ui", "dist", os.path.basename(str(bundle))))
+            bundle_hash = self._bundle_hash(app)
             apps.append(json.dumps(
                 [app.manifest.id, app.manifest.version,
                  sorted(app.granted_permissions), bool(app.signed), bundle_hash]))
