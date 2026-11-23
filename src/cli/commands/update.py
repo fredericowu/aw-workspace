@@ -12,23 +12,26 @@ auth login`` handing a CLI a token that only a human can mint.
 
 ``AW_BACKEND_URL``/``AW_WORKSPACE`` resolve through the same ``.env``
 fallback ``core_restart.py`` uses (env first, then
-``<AW_WORKSPACE_HOME>/.env``) — those two are readable from a sibling
-agent-runner container exactly like the host token is, so the ONLY thing
-this command should ever fail on is the actual gate: the missing
-central-identity JWT no agent can mint. If what you actually want is "I
-pushed a core fix, make it live", that's ``aw-workspace-cli restart core``,
-not this — this command rewrites the host source tree from the image and
-needs a human to authorize it.
+``<AW_WORKSPACE_HOME>/.env``). The gate this command fails on is the missing
+central-identity JWT: it is supplied explicitly by a human, as with
+``gh auth login``. If what you actually want is "I pushed a core fix, make
+it live", that is ``aw-workspace-cli restart core``, not this: this command
+rewrites the host source tree from the image.
 
-See card 3d15bf3b-9510-816a-bff8-fc6698619fa4 and its Architect design:
-routing this through aw-backend with the workspace's own host token
-accepted as an alternative credential (widening it from the exec channel
-onto control-plane lifecycle routes that also cover uninstall/reinstall)
-was considered and explicitly REJECTED there — cross-repo (aw-backend
-deploys are manual, so a route change there isn't live the moment this
-lands), and it buys nothing today since the exec channel already grants
-strictly more power. The host token stays scoped to
-``remote-host/exec`` only; this command keeps the human JWT gate.
+This CLI is the human path only. It is NOT the only way an update happens:
+the Agents Platform's graceful workspace update (card 4215bf3b) triggers the
+same aw-backend driver update through a separate
+``POST /api/workspaces/{slug}/agent-lifecycle`` route, authorised by the
+AP-MT service secret plus the workspace identity JWT (tenant match verified
+by aw-backend from its own DB), never by this command's central-identity
+JWT and never by the host token. An agent that needs an update calls the
+platform's ``update_workspace`` tool rather than this command. Note the
+workspace identity JWT is minted automatically (24h TTL) and held by the
+runners app, so "a token no agent can mint" is not a safe assumption; do not
+rely on this gate as the only protection of the update route.
+
+See card 3d15bf3b-9510-816a-bff8-fc6698619fa4 for why the host token stays
+scoped to ``remote-host/exec`` only.
 """
 from __future__ import annotations
 
