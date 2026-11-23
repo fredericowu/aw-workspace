@@ -250,3 +250,53 @@ def test_revision_that_moves_during_connect_is_still_delivered(monkeypatch):
         first, second = ws.receive_json(), ws.receive_json()
     assert first["revision"] == "old" and first["initial"] is True
     assert second == {"type": "ui_changed", "version": 1, "revision": "new"}
+
+
+def test_app_revs_are_per_app_and_isolated(tmp_path, monkeypatch):
+    """Live-UI phase 2: ``app_revs`` moves only for the app that changed."""
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    a, b = _pkg(tmp_path, "uirevaa"), _pkg(tmp_path, "uirevbb")
+    _, rt, client = _client()
+    asyncio.run(rt.load(a, granted_permissions=["ui:code"]))
+    before = rt.contributions()["app_revs"]
+    assert set(before) == {"uirevaa"}
+    # installing another app adds its key, never moves an existing one
+    asyncio.run(rt.load(b, granted_permissions=["ui:code"]))
+    both = rt.contributions()["app_revs"]
+    assert set(both) == {"uirevaa", "uirevbb"}
+    assert both["uirevaa"] == before["uirevaa"]
+    # code-only update of B moves B's rev, not A's, and the whole revision
+    with open(os.path.join(b, "ui", "dist", "uirevbb.js"), "w") as fh:
+        fh.write("export default { changed: 1 };\n")
+    after = rt.contributions()["app_revs"]
+    assert after["uirevbb"] != both["uirevbb"]
+    assert after["uirevaa"] == both["uirevaa"]
+    # grants move only that app's rev
+    rt._apps["uirevaa"].granted_permissions = ["ui:code", "routes:register"]
+    granted = rt.contributions()["app_revs"]
+    assert granted["uirevaa"] != after["uirevaa"]
+    assert granted["uirevbb"] == after["uirevbb"]
+    # served over HTTP, identical to the in-process value
+    assert client.get("/api/apps/-/contributions").json()["app_revs"] == granted
+
+
+def test_app_revs_independent_of_load_order_across_workers(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    a, b = _pkg(tmp_path, "uirevaa"), _pkg(tmp_path, "uirevbb")
+    _, rt1, _ = _client()
+    _, rt2, _ = _client()
+    asyncio.run(rt1.load(a, granted_permissions=["ui:code"]))
+    asyncio.run(rt1.load(b, granted_permissions=["ui:code"]))
+    asyncio.run(rt2.load(b, granted_permissions=["ui:code"]))
+    asyncio.run(rt2.load(a, granted_permissions=["ui:code"]))
+    assert rt1.contributions()["app_revs"] == rt2.contributions()["app_revs"]
+
+
+def test_uninstall_drops_the_app_rev_and_moves_revision(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path / "home"))
+    _, rt, _ = _client()
+    asyncio.run(rt.load(_pkg(tmp_path, "uirevaa"), granted_permissions=["ui:code"]))
+    r1 = rt.revision()
+    rt._apps.pop("uirevaa")
+    assert rt.contributions()["app_revs"] == {}
+    assert rt.revision() != r1
