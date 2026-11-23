@@ -346,3 +346,37 @@ def test_unacknowledged_dispatch_keeps_receipt_and_baseline(stubbed_run, monkeyp
     obj = _json.loads(capsys.readouterr().out)
     assert code == 0 and obj["wait"]["boot_id_after"] == "boot-B"
     assert obj["boot_id_before"] == "boot-A"
+
+
+def test_empty_receipt_from_a_creator_mid_write_is_pending_not_dispatched(stubbed_run, capsys):
+    # Competing caller created the receipt but has not written it yet.
+    open(core_restart._receipt_path("req-6"), "w").close()
+    code = core_restart.run(["--request-id", "req-6", "--json"])
+    obj = _json.loads(capsys.readouterr().out)
+    assert code == 1 and obj["ok"] is False and obj["status"] == "dispatch_pending"
+    assert stubbed_run["preflight"] == 0 and stubbed_run["dispatch"] == []
+
+
+def test_lost_create_race_with_unreadable_receipt_is_pending(stubbed_run, monkeypatch, capsys):
+    real_link = core_restart.os.link
+    def racing_link(src, dst):
+        open(dst, "w").close()  # competing caller wins, receipt still empty
+        return real_link(src, dst)  # raises FileExistsError
+    monkeypatch.setattr(core_restart.os, "link", racing_link)
+    code = core_restart.run(["--request-id", "req-7", "--json"])
+    obj = _json.loads(capsys.readouterr().out)
+    assert code == 1 and obj["status"] == "dispatch_pending"
+    assert stubbed_run["dispatch"] == []
+
+
+def test_temp_name_cleanup_failure_does_not_strand_the_dispatch(stubbed_run, monkeypatch, capsys):
+    real_unlink = core_restart.os.unlink
+    def flaky_unlink(path):
+        if str(path).endswith(".new"):
+            raise OSError("injected")
+        return real_unlink(path)
+    monkeypatch.setattr(core_restart.os, "unlink", flaky_unlink)
+    code = core_restart.run(["--request-id", "req-8", "--json"])
+    obj = _json.loads(capsys.readouterr().out)
+    assert code == 0 and obj["status"] == "dispatched"
+    assert stubbed_run["dispatch"] == ["req-8"]
