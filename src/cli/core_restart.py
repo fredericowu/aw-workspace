@@ -327,7 +327,7 @@ def _read_receipt(request_id: str) -> dict | None:
     try:
         with open(_receipt_path(request_id), encoding="utf-8") as f:
             data = json.load(f)
-    except (FileNotFoundError, ValueError):
+    except (OSError, ValueError):  # absent or unreadable; caller checks exists()
         return None
     return data if isinstance(data, dict) else None
 

@@ -369,6 +369,21 @@ def test_lost_create_race_with_unreadable_receipt_is_pending(stubbed_run, monkey
     assert stubbed_run["dispatch"] == []
 
 
+def test_receipt_open_permission_error_is_pending_not_a_crash(stubbed_run, monkeypatch, capsys):
+    path = core_restart._receipt_path("req-8")
+    open(path, "w").close()
+    real_open = open
+    def deny(file, *a, **k):
+        if str(file) == path:
+            raise PermissionError(13, "Permission denied")
+        return real_open(file, *a, **k)
+    monkeypatch.setattr("builtins.open", deny)
+    code = core_restart.run(["--request-id", "req-8", "--json"])
+    obj = _json.loads(capsys.readouterr().out)
+    assert code == 1 and obj["status"] == "dispatch_pending"
+    assert stubbed_run["dispatch"] == []
+
+
 def test_temp_name_cleanup_failure_does_not_strand_the_dispatch(stubbed_run, monkeypatch, capsys):
     real_unlink = core_restart.os.unlink
     def flaky_unlink(path):
