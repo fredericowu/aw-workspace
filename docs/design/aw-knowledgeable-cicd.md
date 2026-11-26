@@ -304,19 +304,44 @@ shape answers both structurally:
   `DETACH DELETE`: one misconfigured env var from writing to the production
   graph.
 
-**Shape:** the `pytest` job runs in a `python:3.11-slim` **job container**
-(matching the Dockerfile) with Neo4j as a sibling service on the per-job
-Docker network, reached as `bolt://neo4j:7687`. No host port is published.
+**Shape:** the `pytest` job has **no job-level container**. Host steps only
+check out, launch the test container, and force-remove it. The container is a
+`python:3.11-slim` (matching the Dockerfile) started with `docker run` on the
+per-job network of the `services:` Neo4j (`${{ job.container.network }}`, which
+is populated for a services-only job; the step refuses any name that is not a
+`github_network_*`), reached as `bolt://neo4j:7687`. No host port is published.
 Inside the container 127.0.0.1 is its own loopback, the container is not on
 `aw-stack-net` and cannot read the host `.env`, so "cannot reach the
-production graph" stays structural. The embedding model lives in a named
-volume (`onnx-models-baai-bge-m3-v1`, name carries model and version). The
-container runs as root on the bind-mounted workspace, so a final `if: always()`
-step chowns the workspace back to the runner user; a runner killed mid-job
-skips it, giving a loud EACCES on the next host checkout, which the next
-pytest container job clears. Rules recorded in `test.yml`'s header: never add
-`ports:`, never move the pytest steps onto the host, never attach the job to
-`aw-stack-net`, self-hosted only while the repo is private.
+production graph" stays structural. It mounts the workspace and the embedding
+volume (`onnx-models-baai-bge-m3-v1`, name carries model and version) and
+nothing else. pip and pytest never run on the host.
+
+*Why not a job container:* the runner adds `-v /var/run/docker.sock` to every
+job container on its own, and steps run as root. Production `aw-neo4j` lives on
+that daemon, so a job container was a root-capable path to it. The mount cannot
+be removed (duplicate mount point through `container.options`).
+
+*Guard:* the test container's first command fails the job if
+`/var/run/docker.sock` exists in it (any file type) and prints a line when it
+is absent. It is kept permanently as a regression guard. This protects against
+*accidental* reach, not hostile code: the step that launches the container runs
+on the host as the runner user, which can talk to the 666 host socket, so
+anyone who can edit the workflow can still reach it (see the trust restriction
+below).
+
+*Ownership and cleanup:* the container runs as the runner's own uid:gid with
+`HOME` and the venv outside the workspace, so every file it writes is owned by
+the runner user and no chown step exists. The model volume's older root-owned
+files are handed to the runner user by a throwaway container (volume mount
+only), and a one-time repair step does the same for a workspace left root-owned
+by the previous shape. The container is named `kn-pytest-<run_id>-<attempt>`,
+started with `--rm`, and force-removed by an `if: always()` step so a cancelled
+run (`cancel-in-progress` is on) cannot leave one alive to block the runner's
+network removal. Rules recorded in `test.yml`'s header: never add `ports:`,
+never move pip/pytest onto the host, never attach to `aw-stack-net`, never
+mount the socket into the test container, self-hosted only while the repo is
+private. Verified on the PR: probe passes, two green runs, a deliberate cancel
+left no container, network or non-runner-owned file, and a green run followed.
 
 **Trust restriction (required):** the frontend job (`npm ci` + vitest) and the
 review jobs run PR code directly on the production host as the runner user; the
@@ -345,6 +370,14 @@ deploy this card is supposed to create.
   but steps still run on the host, where the default `NEO4J_URI` is
   production's address and the tests delete data, and it publishes a
   known-password Neo4j on a random port of a public host.
+- **Running as a non-root user inside the job container.** Does not help: the
+  host socket is mode 666, so any uid can connect to it.
+- **Masking the socket through `container.options`.** The runner's own mount
+  of the same path makes it a duplicate mount point, and root in the container
+  cannot unmount or delete it.
+- **Runner container hooks, rootless Docker, or docker-in-docker.** Each is a
+  new piece of host infrastructure to change the runner's behaviour for one
+  repo, where launching the container from a step needs none.
 - **Staying on GitHub-hosted runners** (the 2026-09-27 decision). Does not
   address the quota the owner raised, and a spent quota blocks every deploy.
 - **Duplicating the pytest steps inside `deploy.yml`.** Two copies drift; the
