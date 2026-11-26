@@ -272,7 +272,7 @@ Rules:
 
 **One suite, in one file, called by the deploy — `test.yml` becomes
 `workflow_call`-able and loses its `push` trigger; `deploy.yml` gates on
-`uses: ./.github/workflows/test.yml`. The test job stays on `ubuntu-latest`.**
+`uses: ./.github/workflows/test.yml`. The `pytest` job runs on `[self-hosted, aw-baremetal]` inside a job container; the frontend tests run directly on that runner (superseded 2026-11-26, see below).**
 
 The `uses:` form is AP-MT's (`deploy.yml:47-48`) and the reason is in its own
 comment: *"Reused from test.yml rather than copied, so 'what CI runs' and
@@ -282,32 +282,53 @@ it is not duplicated and no second suite is invented.
 
 **Divergence from AP-MT, deliberate:** AP-MT's `test.yml` keeps its own `push`
 trigger *and* is called from `deploy.yml`, so a push runs the suite twice. Its
-runner is free. aw-knowledgeable's test job runs on billable GitHub-hosted
-minutes in a private repo, so `push` comes off `test.yml` and the deploy owns
-the push path. `pull_request` and `workflow_dispatch` stay.
+runner is free. aw-knowledgeable's repo has a single runner, so a push
+would run the suite twice on it (originally: billable GitHub-hosted minutes),
+so `push` comes off `test.yml` and the deploy owns the push path. `pull_request` and `workflow_dispatch` stay.
 
-**Why the tests stay on `ubuntu-latest` — and why this is a considered
-exception to the `aw-*` self-hosted policy** (KB
-`aw-repos-github-actions-self-hosted-policy.md`):
+**Update 2026-11-26: this supersedes the 2026-09-27 exception that kept the
+tests on `ubuntu-latest`.** Two reasons: the owner asked for the repo's
+workflows to move to the runners (Telegram, run 4c7969c9), and the hosted
+minutes quota was at 1,804/2,000 (resets 2026-12-01), pytest being the bulk of
+the ~370 hosted minutes a month. Once the quota runs out the hosted test gate
+fails and blocks every deploy. aw-knowledgeable PR #12 moves it.
 
-- `test.yml:23-35` runs Neo4j as a `services:` container publishing `7687:7687`.
-  On a self-hosted runner, job steps execute on the host, so a service
-  container is only reachable through a **host** port — and the bare metal
-  already has aw-stack's production `aw-neo4j` on `127.0.0.1:7687`. The
-  collision is not hypothetical; it is the exact caveat
-  `tekflox-aw-baremetal-four-org-runners-20260730.md` closes with, and with up
-  to 5 runners on that host, remapping to some other fixed port just moves the
-  collision between concurrent runs.
-- Stronger reason: a test suite that runs on the bare metal is one
-  misconfigured env var away from writing to the **production graph**. Off-host
-  is a structural guarantee that it cannot.
+The two original objections still hold for **host-run** steps, and the new
+shape answers both structurally:
 
-So: `test` on `ubuntu-latest` with its throwaway Neo4j; `deploy` on
-`[self-hosted, aw-baremetal]`. Keep `test.yml`'s existing header comment
-explaining the GitHub-hosted choice and extend it with the port-collision
-reason, since the original ("no self-hosted runner registered yet") stops
-being true the moment §1a lands and would otherwise read as an invitation to
-move it.
+- A `services:` Neo4j publishing `7687:7687` collides with production
+  `aw-neo4j` on `127.0.0.1:7687` (the caveat
+  `tekflox-aw-baremetal-four-org-runners-20260730.md` closes with).
+- Host-run steps default `NEO4J_URI` (`backend/tests/conftest.py`) to
+  `bolt://127.0.0.1:7687`, production's address, and these tests
+  `DETACH DELETE`: one misconfigured env var from writing to the production
+  graph.
+
+**Shape:** the `pytest` job runs in a `python:3.11-slim` **job container**
+(matching the Dockerfile) with Neo4j as a sibling service on the per-job
+Docker network, reached as `bolt://neo4j:7687`. No host port is published.
+Inside the container 127.0.0.1 is its own loopback, the container is not on
+`aw-stack-net` and cannot read the host `.env`, so "cannot reach the
+production graph" stays structural. The embedding model lives in a named
+volume (`onnx-models-baai-bge-m3-v1`, name carries model and version). The
+container runs as root on the bind-mounted workspace, so a final `if: always()`
+step chowns the workspace back to the runner user; a runner killed mid-job
+skips it, giving a loud EACCES on the next host checkout, which the next
+pytest container job clears. Rules recorded in `test.yml`'s header: never add
+`ports:`, never move the pytest steps onto the host, never attach the job to
+`aw-stack-net`, self-hosted only while the repo is private.
+
+**Trust restriction (required):** the frontend job (`npm ci` + vitest) and the
+review jobs run PR code directly on the production host as the runner user; the
+pytest container does not protect that path. A self-hosted runner is therefore
+acceptable only while the repo is private **and** every PR author who can
+trigger a run is trusted (the owner and the agents acting as the owner). Never
+open the repo to outside contributors, or enable runs from untrusted forks,
+while it uses this runner; if that ever changes, route untrusted PRs to an
+isolated or GitHub-hosted runner first. See GitHub's hardening guidance for
+self-hosted runners. (Repo is private as of 2026-11-26; the fork-PR approval
+setting does not exist for private repos, so this rule is not enforced by
+GitHub and rests on keeping access closed.)
 
 Leave the suite's content alone. 35 tests across
 `test_tenant_isolation.py` (6), `test_service_identity.py` (5),
@@ -319,6 +340,13 @@ deploy this card is supposed to create.
 
 ### Rejected
 
+- **Host-run pytest steps with a random published Neo4j port**
+  (`ports: - 7687` + `job.services.neo4j.ports['7687']`). Fixes the collision
+  but steps still run on the host, where the default `NEO4J_URI` is
+  production's address and the tests delete data, and it publishes a
+  known-password Neo4j on a random port of a public host.
+- **Staying on GitHub-hosted runners** (the 2026-09-27 decision). Does not
+  address the quota the owner raised, and a spent quota blocks every deploy.
 - **Duplicating the pytest steps inside `deploy.yml`.** Two copies drift; the
   AP-MT comment exists because someone considered this.
 - **Re-running the suite on the host after the container is up** (a smoke/E2E
