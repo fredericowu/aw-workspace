@@ -272,7 +272,7 @@ Rules:
 
 **One suite, in one file, called by the deploy — `test.yml` becomes
 `workflow_call`-able and loses its `push` trigger; `deploy.yml` gates on
-`uses: ./.github/workflows/test.yml`. The test job runs on `[self-hosted, aw-baremetal]`, inside a job container (superseded 2026-11-26, see below).**
+`uses: ./.github/workflows/test.yml`. The `pytest` job runs on `[self-hosted, aw-baremetal]` inside a job container; the frontend tests run directly on that runner (superseded 2026-11-26, see below).**
 
 The `uses:` form is AP-MT's (`deploy.yml:47-48`) and the reason is in its own
 comment: *"Reused from test.yml rather than copied, so 'what CI runs' and
@@ -317,6 +317,18 @@ skips it, giving a loud EACCES on the next host checkout, which the next
 pytest container job clears. Rules recorded in `test.yml`'s header: never add
 `ports:`, never move the pytest steps onto the host, never attach the job to
 `aw-stack-net`, self-hosted only while the repo is private.
+
+**Trust restriction (required):** the frontend job (`npm ci` + vitest) and the
+review jobs run PR code directly on the production host as the runner user; the
+pytest container does not protect that path. A self-hosted runner is therefore
+acceptable only while the repo is private **and** every PR author who can
+trigger a run is trusted (the owner and the agents acting as the owner). Never
+open the repo to outside contributors, or enable runs from untrusted forks,
+while it uses this runner; if that ever changes, route untrusted PRs to an
+isolated or GitHub-hosted runner first. See GitHub's hardening guidance for
+self-hosted runners. (Repo is private as of 2026-11-26; the fork-PR approval
+setting does not exist for private repos, so this rule is not enforced by
+GitHub and rests on keeping access closed.)
 
 Leave the suite's content alone. 35 tests across
 `test_tenant_isolation.py` (6), `test_service_identity.py` (5),
