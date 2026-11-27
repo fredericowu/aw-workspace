@@ -28,6 +28,7 @@ from src.api.db import create_all_tables, get_session, get_workspace_schema
 from src.api.components import register_component_routes
 from src.api.agent_routes import register_agent_routes, sync_on_boot
 from src.api.folders import register_folder_routes
+from src.api.about import register_about_routes
 from src.api.guest_users import register_guest_user_routes
 from src.api.marketplace import reconcile_sources_on_boot, register_marketplace_routes
 from src.api.identity import _extract_token, decode_identity_jwt, require_identity
@@ -852,6 +853,9 @@ def create_app() -> FastAPI:
     # aw-backend copy of this feature never answered it. See
     # src/api/guest_users.py — admin CRUD only, no guest login yet.
     register_guest_user_routes(app)
+
+    # Settings > About: read-only version + machine facts. See src/api/about.py.
+    register_about_routes(app)
 
     # Settings NEW > General > VPNs: stored VPN config profiles (upload, edit,
     # delete, Nord import). Phase 1 stores and validates; NOTHING dials — the
