@@ -823,3 +823,21 @@ def test_check_system_cli_kills_the_process_tree_on_a_hanging_verify(tmp_path, m
     assert pidfile.exists()
     child_pid = int(pidfile.read_text().strip())
     _assert_pid_dies(child_pid)
+
+
+def test_boot_status_endpoint_reads_the_progress_file(tmp_path, monkeypatch):
+    import asyncio
+    from src.apps.boot_progress import BootProgress
+    monkeypatch.setenv("AW_APPS_LOCK_DIR", str(tmp_path))
+    monkeypatch.setenv("AW_WORKSPACE_BOOT_ID", "b1")
+    _runtime, client = _doctor_client()
+    assert client.get("/api/apps/-/boot-status").json()["phase"] == "idle"
+
+    async def go():
+        p = BootProgress("b1")
+        await p.begin(14, 5)
+        await p.app_started("x")
+    asyncio.run(go())
+    body = client.get("/api/apps/-/boot-status").json()
+    assert (body["phase"], body["total"], body["loaded"], body["in_flight"]) == \
+        ("reconciling", 14, 5, ["x"])

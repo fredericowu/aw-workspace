@@ -80,6 +80,23 @@ class NotificationManager:
 
         await asyncio.gather(*(_send(ws) for ws in listeners))
 
+    async def broadcast_boot_progress(self, snapshot: dict) -> None:
+        """Local ``boot_progress`` frame. The boot leader is the only emitter
+        and the file (``GET /api/apps/-/boot-status``) is the cross-worker
+        source of truth, so this is a best-effort live nudge to the sockets
+        on the leader's own worker; other workers' clients poll the file."""
+        msg = json.dumps({"type": "boot_progress", "version": 1, **{
+            k: snapshot.get(k) for k in
+            ("boot_id", "phase", "total", "loaded", "in_flight")}})
+
+        async def _send(ws):
+            try:
+                await asyncio.wait_for(ws.send_text(msg), _UI_SEND_TIMEOUT_S)
+            except Exception:
+                self._listeners.discard(ws)
+
+        await asyncio.gather(*(_send(ws) for ws in list(self._listeners)))
+
     def schedule_ui_changed(self) -> None:
         """Fire-and-forget :meth:`broadcast_ui_changed`, so the apps:changed
         relay handler (which the Redis relay awaits serially) never waits on a

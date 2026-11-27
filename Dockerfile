@@ -192,6 +192,11 @@ EXPOSE 9030
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
     CMD curl -fsS http://localhost:9030/api/health || exit 1
 
+# Installer stamps (src/apps/commands.py) live in the container's writable
+# layer so a recreated container reinstalls; the runtime user must own the dir.
+RUN mkdir -p /var/lib/aw-workspace/installer-stamps \
+    && chown -R ubuntu:ubuntu /var/lib/aw-workspace
+
 # Default user for PID 1 AND for `docker/podman exec` (no `-u` flag needed to
 # log in as ubuntu) — every child process (PTY terminal sessions, etc.)
 # inherits it. Must come last: everything above needs root (apt-get, chown).

@@ -71,6 +71,8 @@ its manifest instead of being the silent default for everything.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import shutil
@@ -97,6 +99,28 @@ INSTALLER_LOCK_NAME = "system-cli-installers"
 #: lock. One holder can legitimately run for the full timeout, so anything
 #: less would make a normal queue of two look like a failure.
 INSTALLER_LOCK_MARGIN_S = 120.0
+
+
+#: Installer stamps: "this script, at this app version, already ran OK here".
+#: They attest that CLIs exist on the core container's WRITABLE LAYER
+#: (``/usr/local/bin`` and friends), so they must live in that layer too — a
+#: stamp under ``AW_WORKSPACE_HOME`` or ``$HOME`` (bind mounts) would outlive a
+#: container recreate and claim CLIs the fresh layer does not have.
+STAMP_DIR_ENV = "AW_INSTALLER_STAMP_DIR"
+DEFAULT_STAMP_DIR = "/var/lib/aw-workspace/installer-stamps"
+STAMP_TTL_ENV = "AW_INSTALLER_STAMP_TTL_S"
+DEFAULT_STAMP_TTL_S = 7 * 24 * 3600.0
+
+
+def stamp_dir() -> str:
+    return os.environ.get(STAMP_DIR_ENV) or DEFAULT_STAMP_DIR
+
+
+def _stamp_ttl() -> float:
+    try:
+        return float(os.environ.get(STAMP_TTL_ENV, DEFAULT_STAMP_TTL_S))
+    except ValueError:
+        return DEFAULT_STAMP_TTL_S
 
 
 class CommandError(RuntimeError):
@@ -150,8 +174,84 @@ class CommandInstaller:
 
     # ---- system CLIs (installer scripts) --------------------------------
 
-    def run_installer(self, package_dir: str, script: str) -> str:
-        return self._run(package_dir, script, what="installer")
+    def run_installer(self, package_dir: str, script: str, *,
+                      app_id: str | None = None,
+                      version: str | None = None) -> str:
+        """Run an installer. With ``app_id`` + ``version``, a successful run
+        writes the installer stamp (see :meth:`installer_stamp_hit`)."""
+        out = self._run(package_dir, script, what="installer")
+        if app_id is not None and version is not None:
+            self._write_stamp(app_id, package_dir, script, version)
+        return out
+
+    # ---- installer stamps ------------------------------------------------
+
+    def _stamp_key(self, package_dir: str, script: str, version: str) -> str:
+        """sha256 over the script bytes, the app version and the env values an
+        installer actually keys off (``AW_BIN_DIR``, ``HOME``, ``AW_INSTALL*`` /
+        ``AW_APP_*`` vars, e.g. an app's configured tool versions). Not the whole environment: that carries per-boot noise and
+        would make every boot a miss."""
+        env = self._installer_env()
+        relevant = {k: v for k, v in env.items()
+                    if k in ("AW_BIN_DIR", "HOME") or k.startswith(("AW_INSTALL", "AW_APP_"))}
+        # The stamp dir/TTL knobs configure the stamp, not the installer.
+        relevant.pop(STAMP_DIR_ENV, None)
+        relevant.pop(STAMP_TTL_ENV, None)
+        h = hashlib.sha256()
+        with open(_resolve(package_dir, script), "rb") as f:
+            h.update(f.read())
+        h.update(b"\0" + version.encode() + b"\0")
+        h.update(json.dumps(relevant, sort_keys=True).encode())
+        return h.hexdigest()
+
+    @staticmethod
+    def _stamp_path(app_id: str, script: str) -> str:
+        tag = hashlib.sha256(script.encode()).hexdigest()[:12]
+        return os.path.join(stamp_dir(), f"{app_id}--{tag}.json")
+
+    def installer_stamp_hit(self, app_id: str, package_dir: str, script: str,
+                            version: str) -> bool:
+        """True when a live stamp says this exact installer already succeeded
+        here. Any doubt (no dir, unreadable, key mismatch, expired) is a miss."""
+        try:
+            with open(self._stamp_path(app_id, script), encoding="utf-8") as f:
+                stamp = json.load(f)
+            if time.time() - float(stamp["written_at"]) > _stamp_ttl():
+                return False
+            return stamp["key"] == self._stamp_key(package_dir, script, version)
+        except Exception:  # noqa: BLE001 — never block an install on a stamp
+            return False
+
+    def _write_stamp(self, app_id: str, package_dir: str, script: str,
+                     version: str) -> None:
+        path = self._stamp_path(app_id, script)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"key": self._stamp_key(package_dir, script, version),
+                           "written_at": time.time(), "version": version}, f)
+            os.replace(tmp, path)
+        except Exception:  # noqa: BLE001 — no stamp just means no skip next boot
+            log.warning("apps: could not write installer stamp for %s (%s)",
+                        app_id, script, exc_info=True)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def clear_stamps(self, app_id: str) -> None:
+        """Delete every stamp of one app (the healer found a CLI unhealthy)."""
+        try:
+            names = os.listdir(stamp_dir())
+        except OSError:
+            return
+        for name in names:
+            if name.startswith(f"{app_id}--"):
+                try:
+                    os.unlink(os.path.join(stamp_dir(), name))
+                except OSError:
+                    pass
 
     def run_revert(self, package_dir: str, script: str) -> str:
         return self._run(package_dir, script, what="revert")
@@ -202,6 +302,7 @@ class CommandInstaller:
 
         if not explicit:
             if shutil.which(name) is None:
+                self.clear_stamps(app_id)
                 return False, "not on PATH"
             if verify is False:
                 return True, ""
@@ -211,8 +312,10 @@ class CommandInstaller:
             proc = self._run_subprocess(["bash", "-c", command], cwd=None,
                                          timeout=self.VERIFY_TIMEOUT)
         except subprocess.TimeoutExpired:
+            self.clear_stamps(app_id)
             return False, f"verify timed out after {self.VERIFY_TIMEOUT:.0f}s: {command}"
         except Exception as exc:  # noqa: BLE001 — a broken verify must not crash the healer
+            self.clear_stamps(app_id)
             return False, f"verify could not run ({exc}): {command}"
         if proc.returncode != 0:
             detail = (proc.stderr.strip() or proc.stdout.strip() or "").splitlines()
@@ -330,6 +433,7 @@ class CommandInstaller:
             self._healing.add(key)
         try:
             package_dir, installer = self._system_clis[key]
+            self.clear_stamps(app_id)
             return self.run_installer(package_dir, installer)
         finally:
             with self._heal_guard:

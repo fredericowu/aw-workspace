@@ -249,6 +249,9 @@ class Reconciler:
         # Local ``ui_changed`` emitter, wired by the lifespan; see
         # ``_trigger_broadcast``.
         self.on_ui_changed: Callable[[], Awaitable[None]] = _no_ui_changed
+        # Set by reconcile_on_boot for the boot pass only (src/apps/boot_progress.py);
+        # None for every other pass, which publishes no progress.
+        self.progress = None
         # Set while a reconcile() pass is running so the per-app install/
         # uninstall calls inside it COALESCE into one gateway reload at the
         # end instead of firing one HTTP rescan per app — a fresh workspace
@@ -1602,6 +1605,9 @@ class Reconciler:
         for app_id, spec in desired_active.items():
             (present if self.runtime.is_loaded(app_id) else missing)[app_id] = spec
 
+        if self.progress is not None:
+            await self.progress.begin(len(desired_active), len(present))
+
         # Phases 1+2: BOOT_PRIORITY serially to completion, then the rest
         # through the bounded pool.
         already_loaded, skipped_unresolvable = await self._install_missing(
@@ -1847,6 +1853,9 @@ class Reconciler:
 
         async def install_one(app_id: str, spec: AppSpec) -> None:
             started = time.monotonic()
+            ok = False
+            if self.progress is not None:
+                await self.progress.app_started(app_id)
             try:
                 # sync_skill_mirrors=False: fanned out once at the reconcile()
                 # level instead of once per installed app in this pool.
@@ -1857,6 +1866,7 @@ class Reconciler:
                     already_loaded.append(app_id)
                 else:
                     installed.append(app_id)
+                ok = True
             except UnresolvableAppError as e:
                 # Loud once per app_id (and recorded in errors once, so an
                 # install-status caller sees it at least once), then quiet —
@@ -1873,6 +1883,8 @@ class Reconciler:
                 errors.append({"app_id": app_id, "action": "install", "error": str(e)})
             finally:
                 durations[app_id] = round(time.monotonic() - started, 1)
+                if self.progress is not None:
+                    await self.progress.app_finished(app_id, ok)
 
         # `missing` is already sorted BOOT_PRIORITY-first, so this just splits
         # that order in two without re-deriving it.

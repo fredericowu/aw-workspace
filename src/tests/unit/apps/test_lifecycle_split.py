@@ -92,7 +92,7 @@ class _Effects:
 
         monkeypatch.setattr(runtime, "_register_repos", _repos)
         monkeypatch.setattr(runtime.commands, "run_installer",
-                            lambda pkg, script: self._bump("installer") or "")
+                            lambda pkg, script, **kw: self._bump("installer") or "")
         monkeypatch.setattr(runtime.commands, "run_revert",
                             lambda pkg, script: self._bump("revert") or "")
         monkeypatch.setattr(runtime.commands, "install_shim",

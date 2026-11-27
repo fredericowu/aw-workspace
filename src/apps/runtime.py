@@ -1616,6 +1616,9 @@ class AppRuntime:
             # ten-concurrent-pip-installs problem.
             if provision:
                 await asyncio.to_thread(self.commands.run_revert, loaded.package_dir, entry.target)
+                # The CLIs this app's stamps attested are gone now: a reinstall
+                # of the same version must run the installer again.
+                await asyncio.to_thread(self.commands.clear_stamps, entry.app_id)
         elif kind == "db:table":
             # Deliberately NOT dropped (2026-08-04 decision — see db_tables.py's
             # module docstring): reconcile()'s upgrade path is uninstall+install
