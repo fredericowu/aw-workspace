@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import stat
 import tarfile
 import tempfile
 import time
@@ -146,7 +147,8 @@ def _force_rmtree(path: str) -> None:
     """``rmtree`` that also deletes trees holding read-only / non-searchable dirs."""
     def _open_up(d: str) -> None:
         try:
-            os.chmod(d, 0o700)
+            if stat.S_ISDIR(os.lstat(d).st_mode):  # never chmod through a symlink
+                os.chmod(d, 0o700)
         except OSError:
             pass
 
@@ -177,7 +179,8 @@ def sweep_stale_fetch_dirs(parent: str, *, max_age_s: float = STALE_FETCH_DIR_AG
             continue
         path = os.path.join(parent, name)
         try:
-            if now - os.lstat(path).st_mtime < max_age_s or not os.path.isdir(path):
+            st = os.lstat(path)
+            if now - st.st_mtime < max_age_s or not stat.S_ISDIR(st.st_mode):
                 continue
             _force_rmtree(path)
             removed.append(path)
@@ -248,6 +251,9 @@ def fetch_app_repo(repo: str, ref: str = "HEAD", *, slug: str,
                     with open(archive_path, "wb") as f:
                         for chunk in resp.iter_bytes():
                             f.write(chunk)
+                            # heartbeat: file writes don't bump the dir's mtime, and the
+                            # sweep ages staging dirs by it
+                            os.utime(tmp_dir)
                 break
             except httpx.TransportError as e:
                 if attempt == _DOWNLOAD_ATTEMPTS:
@@ -259,8 +265,10 @@ def fetch_app_repo(repo: str, ref: str = "HEAD", *, slug: str,
             except httpx.HTTPError as e:
                 raise FetchError(f"download of {url} failed: {e}") from e
 
-        extract_dir = os.path.join(tmp_dir, "extracted")
         for attempt in range(1, _EXTRACT_ATTEMPTS + 1):
+            # own path per attempt: a failed attempt's partial tree never has to
+            # be removed before the next one starts
+            extract_dir = os.path.join(tmp_dir, "extracted" if attempt == 1 else f"extracted-{attempt}")
             try:
                 with tarfile.open(archive_path, "r:gz") as tf:
                     _safe_extract(tf, extract_dir)
@@ -277,8 +285,10 @@ def fetch_app_repo(repo: str, ref: str = "HEAD", *, slug: str,
                             url, attempt, _EXTRACT_ATTEMPTS, e, diag)
                 if attempt == _EXTRACT_ATTEMPTS:
                     raise FetchError(f"extraction of {url} failed: {e} [{diag}]") from e
-                if os.path.lexists(extract_dir):
+                try:
                     _force_rmtree(extract_dir)
+                except OSError as cleanup_err:  # best effort; TemporaryDirectory retries at exit
+                    log.warning("apps: could not remove partial extraction %s: %s", extract_dir, cleanup_err)
                 time.sleep(0.2)
 
         dest_old = dest + ".old"

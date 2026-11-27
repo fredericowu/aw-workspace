@@ -440,3 +440,58 @@ def test_persistent_eacces_is_a_fetch_error_with_modes(tmp_path, monkeypatch):
         fetch_mod.fetch_app_repo("acme/widget", "main", slug="widget")
     assert "Permission denied" in str(ei.value)
     assert not (tmp_path / "apps" / "widget").exists()
+
+
+def test_sweep_and_cleanup_never_chmod_through_symlinks(tmp_path):
+    apps = tmp_path / "apps"
+    installed = apps / "widget"
+    installed.mkdir(parents=True)
+    os.chmod(installed, 0o755)
+    link_root = apps / ".widget.fetch-link0001"
+    link_root.symlink_to(installed)
+    os.utime(link_root, (1, 1), follow_symlinks=False)
+    stale = apps / ".widget.fetch-dead0002"
+    (stale / "inner").mkdir(parents=True)
+    (stale / "inner" / "to-installed").symlink_to(installed)
+    os.utime(stale, (1, 1))
+
+    fetch_mod.sweep_stale_fetch_dirs(str(apps))
+
+    assert (installed.stat().st_mode & 0o777) == 0o755
+    assert not stale.exists()
+
+
+def test_download_heartbeats_staging_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path / "apps"))
+    _patch_httpx_stream(monkeypatch, _make_tarball("acme-widget-abc", DEFAULT_FILES), {})
+    touched = []
+    real = os.utime
+    monkeypatch.setattr(fetch_mod.os, "utime", lambda p, *a, **k: (touched.append(str(p)), real(p, *a, **k))[1])
+
+    fetch_mod.fetch_app_repo("acme/widget", "main", slug="widget")
+
+    assert any(".widget.fetch-" in t for t in touched)
+
+
+def test_cleanup_failure_does_not_mask_retry_or_final_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path / "apps"))
+    _patch_httpx_stream(monkeypatch, _make_tarball("acme-widget-abc", DEFAULT_FILES), {})
+    calls = {"n": 0}
+    real = fetch_mod._safe_extract
+
+    def flaky(tf, dest):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(13, "Permission denied", os.path.join(dest, "a"))
+        return real(tf, dest)
+
+    def bad_cleanup(path):
+        raise OSError("cannot remove")
+
+    monkeypatch.setattr(fetch_mod, "_safe_extract", flaky)
+    monkeypatch.setattr(fetch_mod, "_force_rmtree", bad_cleanup)
+    monkeypatch.setattr(fetch_mod.time, "sleep", lambda s: None)
+
+    fetch_mod.fetch_app_repo("acme/widget", "main", slug="widget")
+    assert calls["n"] == 2
+    assert (tmp_path / "apps" / "widget" / "aw-app.json").exists()
