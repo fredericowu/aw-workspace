@@ -1735,6 +1735,13 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             gate = "leader" if lease.is_leader else "standby"
         return {"leader": runtime.watchdog.is_leader, "gate": gate, "tasks": runtime.watchdog.snapshot()}
 
+    @app.get("/api/apps/-/boot-status")
+    async def boot_status(identity: dict = Depends(require_identity)):
+        """Boot-reconcile progress ("setting up apps n/m"), read from the
+        leader's progress file so any worker answers the same thing."""
+        from src.apps.boot_progress import read_progress
+        return await asyncio.to_thread(read_progress)
+
     @app.get("/api/apps/-/doctor")
     async def doctor(identity: dict = Depends(require_identity)):
         """Everything that can be SILENTLY degraded, in one place.
@@ -2238,6 +2245,14 @@ async def reconcile_on_boot(app: FastAPI) -> None:
     network path can't run forever either.
     """
     reconciler: Reconciler = app.state.app_reconciler
+    from src.apps.boot_progress import BootProgress
+    from src.api import boot_info
+    mgr = getattr(app.state, "notification_mgr", None)
+    progress = BootProgress(
+        boot_info.boot_id(),
+        on_change=(mgr.broadcast_boot_progress if mgr is not None else None))
+    reconciler.progress = progress
+    boot_ok = False
     # Armed BEFORE the pass, not after it: mcp-gateway now installs first
     # (BOOT_PRIORITY in src/apps/reconciler.py), so it is up within the first
     # seconds of a pass that runs for minutes. This lets the 60s rescan
@@ -2248,6 +2263,7 @@ async def reconcile_on_boot(app: FastAPI) -> None:
             reconciler.reconcile(sync_skill_mirrors=False),
             timeout=_BOOT_RECONCILE_TIMEOUT)
         log.info("apps: boot reconcile — %s", result)
+        boot_ok = not result.get("errors")
     except asyncio.TimeoutError:
         log.error(
             "apps: boot reconcile exceeded %ss — giving up for THIS BOOT; "
@@ -2265,6 +2281,8 @@ async def reconcile_on_boot(app: FastAPI) -> None:
         # Cancelling can only lose a rescan start that the tail below performs
         # unconditionally two lines later anyway.
         rescan_starter.cancel()
+        reconciler.progress = None
+        await progress.finish(boot_ok)
     # Deploy reconciliation C2 (card 4165bf3b-9510-81f4): a boot is itself a
     # fact worth asserting to aw-backend's component inventory (C1) even when
     # this pass found nothing to install/upgrade — unlike the per-pass report

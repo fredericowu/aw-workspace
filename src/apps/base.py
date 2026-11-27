@@ -309,8 +309,18 @@ class CommandsFacade(_Facade):
         # W1's lease must know about this CLI to be able to heal it.
         output = ""
         if self._ctx.provision:
-            output = self._ctx._runtime.commands.run_installer(
-                self._ctx.package_dir, installer)
+            cmds = self._ctx._runtime.commands
+            # A live stamp (same script bytes + app version + installer env,
+            # inside its TTL) says this installer already succeeded on this
+            # container layer: skip the ~seconds-to-minute rerun. The healer
+            # deletes the stamp the moment it finds the CLI unhealthy.
+            if cmds.installer_stamp_hit(self._ctx.app_id, self._ctx.package_dir,
+                                        installer, self._ctx.version):
+                output = "skipped: installer stamp is current"
+            else:
+                output = cmds.run_installer(
+                    self._ctx.package_dir, installer,
+                    app_id=self._ctx.app_id, version=self._ctx.version)
         self._ctx._runtime.commands.record_system_cli(
             self._ctx.app_id, name, self._ctx.package_dir, installer, verify=verify)
         self._ctx._runtime.journal.record(
