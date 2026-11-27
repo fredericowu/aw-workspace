@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 
 from fastapi import Depends, FastAPI
@@ -19,14 +20,18 @@ from src.libs import sysfacts
 
 _TTL = 5.0
 _cache: dict = {"at": 0.0, "value": None}
+_lock = threading.Lock()
 
 
 def _facts() -> dict:
-    now = time.monotonic()
-    if _cache["value"] is None or now - _cache["at"] > _TTL:
-        _cache["value"] = sysfacts.collect()
-        _cache["at"] = now
-    return _cache["value"]
+    # Concurrent callers share one refresh: the lock serializes them and the
+    # re-check inside means only the first one runs the collector (nvidia-smi
+    # can hold a thread for seconds). The TTL starts when the refresh finishes.
+    with _lock:
+        if _cache["value"] is None or time.monotonic() - _cache["at"] > _TTL:
+            _cache["value"] = sysfacts.collect()
+            _cache["at"] = time.monotonic()
+        return _cache["value"]
 
 
 def register_about_routes(app: FastAPI) -> None:

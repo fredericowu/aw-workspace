@@ -39,9 +39,42 @@ def _read(path: str) -> str | None:
         return None
 
 
-def cpu_limit(cgroup_root: str = "/sys/fs/cgroup") -> dict:
+def _proc_cgroups(proc_root: str) -> dict[str, str]:
+    """This process's cgroup path per controller from ``/proc/self/cgroup``
+    (v2 unified entry under key ``""``). Under Docker's host cgroup namespace
+    the process sits in a child of the hierarchy mounted at /sys/fs/cgroup, so
+    limits live there, not at the mount root."""
+    out: dict[str, str] = {}
+    for line in (_read(f"{proc_root}/self/cgroup") or "").splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        path = parts[2].strip()
+        if not path.startswith("/"):
+            continue
+        if parts[1] == "":
+            out[""] = path
+        for ctrl in parts[1].split(","):
+            if ctrl:
+                out[ctrl] = path
+    return out
+
+
+def _cg_read(cgroup_root: str, proc_root: str, ctrl: str, name: str) -> str | None:
+    """Read ``name`` from the process's own cgroup dir first, then the mount
+    root (private cgroup namespace, or a /proc that can't be resolved)."""
+    path = _proc_cgroups(proc_root).get(ctrl, "").rstrip("/")
+    base = f"{cgroup_root}/{ctrl}" if ctrl else cgroup_root
+    if path:
+        raw = _read(f"{base}{path}/{name}")
+        if raw is not None:
+            return raw
+    return _read(f"{base}/{name}")
+
+
+def cpu_limit(cgroup_root: str = "/sys/fs/cgroup", proc_root: str = "/proc") -> dict:
     scope, unit = "container", "cores"
-    raw = _read(f"{cgroup_root}/cpu.max")
+    raw = _cg_read(cgroup_root, proc_root, "", "cpu.max")
     if raw is not None:
         src = "cgroup v2 cpu.max"
         parts = raw.split()
@@ -52,8 +85,8 @@ def cpu_limit(cgroup_root: str = "/sys/fs/cgroup") -> dict:
             return fact("ok", round(quota / period, 3), unit, scope, src)
         except (ValueError, IndexError, ZeroDivisionError):
             return fact("unknown", None, unit, scope, src, reason=f"unparseable cpu.max {raw!r}")
-    q = _read(f"{cgroup_root}/cpu/cpu.cfs_quota_us")
-    p = _read(f"{cgroup_root}/cpu/cpu.cfs_period_us")
+    q = _cg_read(cgroup_root, proc_root, "cpu", "cpu.cfs_quota_us")
+    p = _cg_read(cgroup_root, proc_root, "cpu", "cpu.cfs_period_us")
     src = "cgroup v1 cpu.cfs_quota_us"
     if q is None:
         return fact("unknown", None, unit, scope, "cgroup", reason="no cgroup cpu limit file readable")
@@ -65,10 +98,11 @@ def cpu_limit(cgroup_root: str = "/sys/fs/cgroup") -> dict:
         return fact("unknown", None, unit, scope, src, reason=f"unparseable quota {q!r}")
 
 
-def _mem_pair(cgroup_root: str, v2: str, v1: str, label: str, scope: str, v1_sentinel: bool) -> dict:
-    raw, src = _read(f"{cgroup_root}/{v2}"), f"cgroup v2 {v2}"
+def _mem_pair(cgroup_root: str, proc_root: str, v2: str, v1: str, label: str, scope: str,
+              v1_sentinel: bool) -> dict:
+    raw, src = _cg_read(cgroup_root, proc_root, "", v2), f"cgroup v2 {v2}"
     if raw is None:
-        raw, src = _read(f"{cgroup_root}/memory/{v1}"), f"cgroup v1 {v1}"
+        raw, src = _cg_read(cgroup_root, proc_root, "memory", v1), f"cgroup v1 {v1}"
     if raw is None:
         return fact("unknown", None, "bytes", scope, "cgroup", reason=f"{label}: no cgroup file readable")
     if raw == "max":
@@ -82,9 +116,9 @@ def _mem_pair(cgroup_root: str, v2: str, v1: str, label: str, scope: str, v1_sen
     return fact("ok", n, "bytes", scope, src)
 
 
-def container_memory(cgroup_root: str = "/sys/fs/cgroup") -> tuple[dict, dict]:
-    limit = _mem_pair(cgroup_root, "memory.max", "memory.limit_in_bytes", "memory limit", "container", True)
-    used = _mem_pair(cgroup_root, "memory.current", "memory.usage_in_bytes", "memory used", "container", False)
+def container_memory(cgroup_root: str = "/sys/fs/cgroup", proc_root: str = "/proc") -> tuple[dict, dict]:
+    limit = _mem_pair(cgroup_root, proc_root, "memory.max", "memory.limit_in_bytes", "memory limit", "container", True)
+    used = _mem_pair(cgroup_root, proc_root, "memory.current", "memory.usage_in_bytes", "memory used", "container", False)
     return limit, used
 
 
@@ -139,6 +173,14 @@ def storage(paths: list[tuple[str, str]]) -> list[dict]:
     return out
 
 
+def _mib(raw: str) -> int | None:
+    """nvidia-smi prints ``N/A`` (or ``[N/A]``) for unsupported fields."""
+    try:
+        return int(raw) * 1048576
+    except ValueError:
+        return None
+
+
 def gpu(dev_root: str = "/dev") -> dict:
     scope = "container"
     nvidia = os.path.exists(f"{dev_root}/nvidiactl")
@@ -154,9 +196,9 @@ def gpu(dev_root: str = "/dev") -> dict:
                 capture_output=True, text=True, timeout=2, check=True)
             devices = []
             for line in res.stdout.strip().splitlines():
-                name, total, used = [p.strip() for p in line.split(",")]
-                devices.append({"name": name, "memory_total": int(total) * 1048576,
-                                "memory_used": int(used) * 1048576})
+                name, total, used = [p.strip() for p in line.rsplit(",", 2)]
+                devices.append({"name": name, "memory_total": _mib(total),
+                                "memory_used": _mib(used)})
             if devices:
                 return fact("ok", devices, "bytes", scope, "nvidia-smi")
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
@@ -169,14 +211,14 @@ def gpu(dev_root: str = "/dev") -> dict:
 def collect(*, cgroup_root: str = "/sys/fs/cgroup", proc_root: str = "/proc",
             dev_root: str = "/dev", env: dict | None = None) -> dict:
     env = os.environ if env is None else env
-    mem_limit, mem_used = container_memory(cgroup_root)
+    mem_limit, mem_used = container_memory(cgroup_root, proc_root)
     paths = []
     for role, key in (("workspace", "AW_WORKSPACE_CONTAINER_DIR"), ("state", "AW_WORKSPACE_HOME")):
         if env.get(key):
             paths.append((role, env[key]))
     paths.append(("container_root", "/"))
     return {
-        "container": {"cpu_limit": cpu_limit(cgroup_root), "memory_limit": mem_limit,
+        "container": {"cpu_limit": cpu_limit(cgroup_root, proc_root), "memory_limit": mem_limit,
                       "memory_used": mem_used},
         "machine": {"cpus": machine_cpus(), "memory": machine_memory(proc_root)},
         "storage": storage(paths),
