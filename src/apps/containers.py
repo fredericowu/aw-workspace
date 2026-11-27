@@ -350,21 +350,31 @@ def versioned_image(image: str, version: str | None) -> str | None:
 
 
 def _is_tag_not_found(err: Exception) -> bool:
-    """A registry that answered 'no such tag' — distinct from a registry that did not answer."""
-    from docker.errors import NotFound
+    """A registry that answered 'no such tag' — distinct from a registry that did not answer.
+
+    docker-py discards streamed pull errors and then inspects the local image, so an outage plus a
+    cache miss surfaces as ImageNotFound: that proves nothing about the registry and is NOT a 404.
+    """
+    from docker.errors import ImageNotFound, NotFound
+    if isinstance(err, ImageNotFound):
+        return False
     if isinstance(err, NotFound) or getattr(err, "status_code", None) == 404:
         return True
     return any(m in str(err).lower() for m in _NOT_FOUND_MARKERS)
 
 
 def _pull_ref(pull_client, ref: str, auth, engine_arch: str) -> None:
-    """Pull ``ref``; on a non-amd64 engine retry once under amd64 emulation on an arch mismatch."""
+    """Pull ``ref``; on a non-amd64 engine retry once under amd64 emulation after any failure that
+    is not a confirmed missing tag (error wording for an arch mismatch varies across engines)."""
     try:
         pull_client.images.pull(ref, auth_config=auth)
     except Exception as exc:  # noqa: BLE001
-        if engine_arch and engine_arch != "amd64" and _is_arch_mismatch(exc):
-            pull_client.images.pull(ref, platform="linux/amd64", auth_config=auth)
-            return
+        if engine_arch and engine_arch != "amd64" and (_is_arch_mismatch(exc) or not _is_tag_not_found(exc)):
+            try:
+                pull_client.images.pull(ref, platform="linux/amd64", auth_config=auth)
+                return
+            except Exception:  # noqa: BLE001
+                pass
         raise
 
 

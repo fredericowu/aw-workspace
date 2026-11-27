@@ -20,7 +20,6 @@ class _Client(_FakeClient):
         super().__init__(arch="x86_64", cached_image=_FakeImageObj("amd64"))
         self.errors = errors or {}
         self.cached = set(cached)
-        orig_pull = self.images.pull
 
         def pull(image, **kw):
             self.pull_calls.append({"image": image, **kw})
@@ -34,12 +33,6 @@ class _Client(_FakeClient):
 
         self.images.pull = pull
         self.images.get = get
-        del orig_pull
-
-    def ran(self):
-        return self.runs and self.containers._created and self._ran_image
-
-    _ran_image = None
 
 
 @pytest.fixture
@@ -117,6 +110,29 @@ def test_arch_mismatch_retries_versioned_ref_under_amd64(monkeypatch):
         calls.append((image, kw.get("platform")))
         if image == VERSIONED and not kw.get("platform"):
             raise mismatch
+
+    client.images.pull = pull
+    assert _start(sup, client, monkeypatch) == [VERSIONED]
+    assert (VERSIONED, "linux/amd64") in calls
+
+
+def test_image_not_found_after_a_pull_is_not_a_confirmed_missing_tag(sup, monkeypatch):
+    """docker-py swallows a streamed outage then raises ImageNotFound from its local lookup."""
+    client = _Client(errors={VERSIONED: ImageNotFound("no such image")}, cached={VERSIONED})
+    assert _start(sup, client, monkeypatch) == [VERSIONED]
+    assert sup._containers["kali"].image_fallback is None
+
+
+def test_unrecognised_native_error_still_tries_amd64_for_the_versioned_ref(monkeypatch):
+    sup = ContainerSupervisor(socket="/dev/null")
+    client = _Client()
+    client._arch = "aarch64"
+    calls = []
+
+    def pull(image, **kw):
+        calls.append((image, kw.get("platform")))
+        if image == VERSIONED and not kw.get("platform"):
+            raise APIError("some new wording nobody has classified")
 
     client.images.pull = pull
     assert _start(sup, client, monkeypatch) == [VERSIONED]

@@ -404,11 +404,17 @@ def _image_fallback_apps(runtime) -> list[dict]:
     containers = getattr(runtime, "containers", None)
     if containers is None:
         return []
-    return [
-        {"app": app_id, "image": c.running_image or c.image, "detail": c.image_fallback}
-        for app_id, c in containers.registered()
-        if getattr(c, "image_fallback", None)
-    ]
+    out: list[dict] = []
+    for app_id, c in containers.registered():
+        if not getattr(c, "image_fallback", None):
+            continue
+        try:
+            if not containers.status(app_id).get("running"):
+                continue
+        except Exception:  # noqa: BLE001 — one unreadable container must not hide the rest
+            continue
+        out.append({"app": app_id, "image": c.running_image or c.image, "detail": c.image_fallback})
+    return out
 
 
 def _config_for_install(app_id: str, data: dict, runtime, reconciler) -> dict:
