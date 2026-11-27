@@ -364,3 +364,134 @@ def test_path_traversal_is_rejected(tmp_path, monkeypatch, malicious_name):
 
     assert not (tmp_path / "apps" / "widget").exists()
     assert not (tmp_path.parent / "etc" / "passwd").exists()
+
+
+# --- stale staging-dir sweep + transient EACCES during extraction (card 4245bf3b) ---
+
+
+def test_sweep_removes_only_old_fetch_dirs(tmp_path):
+    apps = tmp_path / "apps"
+    old = apps / ".widget.fetch-dead0001" / "extracted" / "sub"
+    old.mkdir(parents=True)
+    (old / "f.txt").write_text("x")
+    os.chmod(old, 0o500)  # read-only leftover must still be removable
+    fresh = apps / ".widget.fetch-live0002"
+    fresh.mkdir()
+    keep = apps / "widget"
+    keep.mkdir()
+    for d in (apps / ".widget.fetch-dead0001",):
+        os.utime(d, (1, 1))
+
+    removed = fetch_mod.sweep_stale_fetch_dirs(str(apps))
+
+    assert removed == [str(apps / ".widget.fetch-dead0001")]
+    assert not (apps / ".widget.fetch-dead0001").exists()
+    assert fresh.exists() and keep.exists()
+
+
+def test_fetch_sweeps_stale_dirs_before_extracting(tmp_path, monkeypatch):
+    apps = tmp_path / "apps"
+    stale = apps / ".widget.fetch-dead0001"
+    stale.mkdir(parents=True)
+    os.utime(stale, (1, 1))
+    monkeypatch.setenv("AW_APPS_ROOT", str(apps))
+    _patch_httpx_stream(monkeypatch, _make_tarball("acme-widget-abc", DEFAULT_FILES), {})
+
+    fetch_mod.fetch_app_repo("acme/widget", "main", slug="widget")
+
+    assert not stale.exists()
+    assert (apps / "widget" / "aw-app.json").exists()
+
+
+def test_transient_eacces_during_extract_is_retried(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path / "apps"))
+    _patch_httpx_stream(monkeypatch, _make_tarball("acme-widget-abc", DEFAULT_FILES), {})
+    real, calls = fetch_mod._safe_extract, {"n": 0}
+
+    def flaky(tf, dest):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            os.makedirs(dest, exist_ok=True)
+            os.chmod(dest, 0o000)  # the half-made, non-searchable dir
+            raise PermissionError(13, "Permission denied", os.path.join(dest, "x", "aw-app.json"))
+        return real(tf, dest)
+
+    monkeypatch.setattr(fetch_mod, "_safe_extract", flaky)
+    monkeypatch.setattr(fetch_mod.time, "sleep", lambda s: None)
+
+    dest = fetch_mod.fetch_app_repo("acme/widget", "main", slug="widget")
+
+    assert calls["n"] == 2
+    assert (tmp_path / "apps" / "widget" / "aw-app.json").exists()
+    assert not [n for n in os.listdir(tmp_path / "apps") if ".fetch-" in n]
+
+
+def test_persistent_eacces_is_a_fetch_error_with_modes(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path / "apps"))
+    _patch_httpx_stream(monkeypatch, _make_tarball("acme-widget-abc", DEFAULT_FILES), {})
+
+    def always(tf, dest):
+        raise PermissionError(13, "Permission denied", os.path.join(dest, "a.json"))
+
+    monkeypatch.setattr(fetch_mod, "_safe_extract", always)
+    monkeypatch.setattr(fetch_mod.time, "sleep", lambda s: None)
+
+    with pytest.raises(fetch_mod.FetchError, match=r"uid=\d+ umask=") as ei:
+        fetch_mod.fetch_app_repo("acme/widget", "main", slug="widget")
+    assert "Permission denied" in str(ei.value)
+    assert not (tmp_path / "apps" / "widget").exists()
+
+
+def test_sweep_and_cleanup_never_chmod_through_symlinks(tmp_path):
+    apps = tmp_path / "apps"
+    installed = apps / "widget"
+    installed.mkdir(parents=True)
+    os.chmod(installed, 0o755)
+    link_root = apps / ".widget.fetch-link0001"
+    link_root.symlink_to(installed)
+    os.utime(link_root, (1, 1), follow_symlinks=False)
+    stale = apps / ".widget.fetch-dead0002"
+    (stale / "inner").mkdir(parents=True)
+    (stale / "inner" / "to-installed").symlink_to(installed)
+    os.utime(stale, (1, 1))
+
+    fetch_mod.sweep_stale_fetch_dirs(str(apps))
+
+    assert (installed.stat().st_mode & 0o777) == 0o755
+    assert not stale.exists()
+
+
+def test_download_heartbeats_staging_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path / "apps"))
+    _patch_httpx_stream(monkeypatch, _make_tarball("acme-widget-abc", DEFAULT_FILES), {})
+    touched = []
+    real = os.utime
+    monkeypatch.setattr(fetch_mod.os, "utime", lambda p, *a, **k: (touched.append(str(p)), real(p, *a, **k))[1])
+
+    fetch_mod.fetch_app_repo("acme/widget", "main", slug="widget")
+
+    assert any(".widget.fetch-" in t for t in touched)
+
+
+def test_cleanup_failure_does_not_mask_retry_or_final_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("AW_APPS_ROOT", str(tmp_path / "apps"))
+    _patch_httpx_stream(monkeypatch, _make_tarball("acme-widget-abc", DEFAULT_FILES), {})
+    calls = {"n": 0}
+    real = fetch_mod._safe_extract
+
+    def flaky(tf, dest):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError(13, "Permission denied", os.path.join(dest, "a"))
+        return real(tf, dest)
+
+    def bad_cleanup(path):
+        raise OSError("cannot remove")
+
+    monkeypatch.setattr(fetch_mod, "_safe_extract", flaky)
+    monkeypatch.setattr(fetch_mod, "_force_rmtree", bad_cleanup)
+    monkeypatch.setattr(fetch_mod.time, "sleep", lambda s: None)
+
+    fetch_mod.fetch_app_repo("acme/widget", "main", slug="widget")
+    assert calls["n"] == 2
+    assert (tmp_path / "apps" / "widget" / "aw-app.json").exists()

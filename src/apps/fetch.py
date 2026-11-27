@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import stat
 import tarfile
 import tempfile
 import time
@@ -134,6 +135,86 @@ def _download_headers(repo: str, url: str, token: str | None) -> dict[str, str]:
 
 
 _DOWNLOAD_ATTEMPTS = 3
+_EXTRACT_ATTEMPTS = 2
+
+#: A ``.<slug>.fetch-*`` staging dir older than this belongs to a fetch that
+#: was killed (container restart, OOM) before ``TemporaryDirectory`` could
+#: clean up; no live fetch runs for anywhere near this long.
+STALE_FETCH_DIR_AGE_S = 3600
+
+
+def _force_rmtree(path: str) -> None:
+    """``rmtree`` that also deletes trees holding read-only / non-searchable dirs."""
+    def _open_up(d: str) -> None:
+        try:
+            if stat.S_ISDIR(os.lstat(d).st_mode):  # never chmod through a symlink
+                os.chmod(d, 0o700)
+        except OSError:
+            pass
+
+    _open_up(path)
+    for root, dirs, _files in os.walk(path, topdown=True):
+        for d in dirs:  # top-down: make each child listable before os.walk descends
+            _open_up(os.path.join(root, d))
+    shutil.rmtree(path, ignore_errors=True)
+    if os.path.lexists(path):
+        raise OSError(f"could not remove {path}")
+
+
+def sweep_stale_fetch_dirs(parent: str, *, max_age_s: float = STALE_FETCH_DIR_AGE_S,
+                           now: float | None = None) -> list[str]:
+    """Delete leftover ``.<slug>.fetch-*`` staging dirs under ``parent``.
+
+    Only dirs older than ``max_age_s`` are touched, so a fetch running right
+    now in another thread/process is never swept. Returns the removed paths.
+    """
+    now = time.time() if now is None else now
+    removed: list[str] = []
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return removed
+    for name in names:
+        if not (name.startswith(".") and ".fetch-" in name):
+            continue
+        path = os.path.join(parent, name)
+        try:
+            st = os.lstat(path)
+            if now - st.st_mtime < max_age_s or not stat.S_ISDIR(st.st_mode):
+                continue
+            _force_rmtree(path)
+            removed.append(path)
+        except OSError as e:
+            log.warning("apps: could not sweep stale fetch dir %s: %s", path, e)
+    if removed:
+        log.info("apps: swept %d stale fetch dir(s) under %s", len(removed), parent)
+    return removed
+
+
+def _describe_path_modes(path: str) -> str:
+    """``mode`` of each existing component of ``path`` (diagnostic for EACCES)."""
+    parts, cur, out = path.strip(os.sep).split(os.sep), os.sep, []
+    for part in parts:
+        cur = os.path.join(cur, part)
+        try:
+            out.append(f"{part}={os.lstat(cur).st_mode & 0o7777:o}")
+        except OSError as e:
+            out.append(f"{part}=!{e.errno}")
+            break
+    return f"uid={os.getuid()} umask={_current_umask()} " + " ".join(out[-5:])
+
+
+def _current_umask() -> str:
+    # Read, never set: os.umask() can only read by writing, and a transient
+    # process-wide write is exactly the kind of thing this diagnostic hunts.
+    try:
+        with open("/proc/self/status", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("Umask:"):
+                    return line.split()[1]
+    except OSError:
+        pass
+    return "?"
 
 
 def fetch_app_repo(repo: str, ref: str = "HEAD", *, slug: str,
@@ -159,6 +240,8 @@ def fetch_app_repo(repo: str, ref: str = "HEAD", *, slug: str,
     parent = os.path.dirname(dest) or "."
     os.makedirs(parent, exist_ok=True)
 
+    sweep_stale_fetch_dirs(parent)
+
     with tempfile.TemporaryDirectory(dir=parent, prefix=f".{slug}.fetch-") as tmp_dir:
         archive_path = os.path.join(tmp_dir, "repo.tar.gz")
         for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
@@ -168,6 +251,9 @@ def fetch_app_repo(repo: str, ref: str = "HEAD", *, slug: str,
                     with open(archive_path, "wb") as f:
                         for chunk in resp.iter_bytes():
                             f.write(chunk)
+                            # heartbeat: file writes don't bump the dir's mtime, and the
+                            # sweep ages staging dirs by it
+                            os.utime(tmp_dir)
                 break
             except httpx.TransportError as e:
                 if attempt == _DOWNLOAD_ATTEMPTS:
@@ -179,12 +265,31 @@ def fetch_app_repo(repo: str, ref: str = "HEAD", *, slug: str,
             except httpx.HTTPError as e:
                 raise FetchError(f"download of {url} failed: {e}") from e
 
-        extract_dir = os.path.join(tmp_dir, "extracted")
-        try:
-            with tarfile.open(archive_path, "r:gz") as tf:
-                _safe_extract(tf, extract_dir)
-        except tarfile.TarError as e:
-            raise FetchError(f"extraction of {url} failed: {e}") from e
+        for attempt in range(1, _EXTRACT_ATTEMPTS + 1):
+            # own path per attempt: a failed attempt's partial tree never has to
+            # be removed before the next one starts
+            extract_dir = os.path.join(tmp_dir, "extracted" if attempt == 1 else f"extracted-{attempt}")
+            try:
+                with tarfile.open(archive_path, "r:gz") as tf:
+                    _safe_extract(tf, extract_dir)
+                break
+            except tarfile.TarError as e:
+                raise FetchError(f"extraction of {url} failed: {e}") from e
+            except PermissionError as e:
+                # Seen on the aw-desktop (virtiofs) workspace 2026-11-26: EACCES
+                # from tarfile's path check on a dir this same process had just
+                # created. Not reproducible on demand, so record the modes that
+                # were actually on disk and retry once in a fresh dir.
+                diag = _describe_path_modes(e.filename or extract_dir)
+                log.warning("apps: extraction of %s hit EACCES (attempt %d/%d): %s [%s]",
+                            url, attempt, _EXTRACT_ATTEMPTS, e, diag)
+                if attempt == _EXTRACT_ATTEMPTS:
+                    raise FetchError(f"extraction of {url} failed: {e} [{diag}]") from e
+                try:
+                    _force_rmtree(extract_dir)
+                except OSError as cleanup_err:  # best effort; TemporaryDirectory retries at exit
+                    log.warning("apps: could not remove partial extraction %s: %s", extract_dir, cleanup_err)
+                time.sleep(0.2)
 
         dest_old = dest + ".old"
         if os.path.exists(dest_old):
