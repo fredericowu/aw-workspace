@@ -179,7 +179,12 @@ def test_the_poll_loop_survives_a_raised_attempt(lock_dir, monkeypatch):
                 return real(path)
 
             monkeypatch.setattr(fs_lock, "try_acquire", _flaky)
-            await asyncio.sleep(0.15)
+            # Wait for the condition, not a fixed 0.15s: each raised attempt
+            # logs a traceback (log.exception), which on a loaded CI runner
+            # can starve the loop to 1 call in 150ms (flaked on master).
+            deadline = asyncio.get_running_loop().time() + 5
+            while calls["n"] <= 3 and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.02)
             assert standby._task is not None and not standby._task.done(), (
                 "the poll loop died on a raised attempt")
             assert standby.is_leader is False
