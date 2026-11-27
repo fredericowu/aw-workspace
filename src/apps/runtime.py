@@ -1856,7 +1856,8 @@ class AppRuntime:
             slug, image, port, run_flags=run_flags, resources=resources, env=env,
             volumes=volumes, host_power=host_power,
             publish=rt.get("publish") or [],
-            emit_app_events="notifications:send" in granted)
+            emit_app_events="notifications:send" in granted,
+            version=str(manifest.version or "") or None)
         self.journal.record(slug, "container:register", image,
                             {"port": port, "run_flags": run_flags, "resources": resources,
                              "host_power": list(host_power),

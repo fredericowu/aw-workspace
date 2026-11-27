@@ -322,6 +322,52 @@ def _is_arch_mismatch(err: Exception) -> bool:
     return any(marker in text for marker in _ARCH_MISMATCH_MARKERS)
 
 
+#: Kill switch for versioned app images. Default on; "0"/"false"/"off" restores
+#: the old behaviour of running exactly the image the manifest names.
+VERSIONED_IMAGES_ENV = "AW_APP_VERSIONED_IMAGES"
+
+_NOT_FOUND_MARKERS = ("manifest unknown", "name unknown", "not found", "no such image", "404")
+
+
+def _versioned_images_enabled() -> bool:
+    return os.environ.get(VERSIONED_IMAGES_ENV, "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def versioned_image(image: str, version: str | None) -> str | None:
+    """``repo:v<version>`` when ``image`` names a mutable ``latest`` (or no tag) and the
+    installed manifest version is known; None when the declared image is already pinned.
+
+    The installed version selects the artifact: a mutable tag is never resolved at runtime,
+    so an app container cannot run a build newer than the manifest that describes it.
+    """
+    if not version or not image or "@" in image:
+        return None
+    last = image.rsplit("/", 1)[-1]
+    repo, sep, tag = image.rpartition(":") if ":" in last else (image, "", "")
+    if sep and tag != "latest":
+        return None
+    return f"{repo}:{version if version.startswith('v') else 'v' + version}"
+
+
+def _is_tag_not_found(err: Exception) -> bool:
+    """A registry that answered 'no such tag' — distinct from a registry that did not answer."""
+    from docker.errors import NotFound
+    if isinstance(err, NotFound) or getattr(err, "status_code", None) == 404:
+        return True
+    return any(m in str(err).lower() for m in _NOT_FOUND_MARKERS)
+
+
+def _pull_ref(pull_client, ref: str, auth, engine_arch: str) -> None:
+    """Pull ``ref``; on a non-amd64 engine retry once under amd64 emulation on an arch mismatch."""
+    try:
+        pull_client.images.pull(ref, auth_config=auth)
+    except Exception as exc:  # noqa: BLE001
+        if engine_arch and engine_arch != "amd64" and _is_arch_mismatch(exc):
+            pull_client.images.pull(ref, platform="linux/amd64", auth_config=auth)
+            return
+        raise
+
+
 def _registry_auth(image: str) -> dict | None:
     """Credentials for pulling ``image``, or None to pull anonymously.
 
@@ -494,9 +540,15 @@ class _Container:
                  container_name: str | None = None,
                  host_power: tuple[str, ...] | None = None,
                  publish: list[dict] | None = None,
-                 emit_app_events: bool = False) -> None:
+                 emit_app_events: bool = False,
+                 version: str | None = None) -> None:
         self.app_id = app_id
         self.image = image
+        #: Installed manifest version; selects ``repo:v<version>`` when ``image`` is ``latest``.
+        self.version = version
+        #: Image actually run by the last start(), and why it is not the versioned one (else None).
+        self.running_image: str | None = None
+        self.image_fallback: str | None = None
         # 0 for a sidecar with nothing to expose — a database is dialled by
         # its siblings on the podman network, never reverse-proxied.
         self.port = int(port or 0)
@@ -754,7 +806,8 @@ class ContainerSupervisor:
                  container_name: str | None = None,
                  host_power: tuple[str, ...] | None = None,
                  publish: list[dict] | None = None,
-                 emit_app_events: bool = False) -> None:
+                 emit_app_events: bool = False,
+                 version: str | None = None) -> None:
         if app_id in self._containers:
             raise ContainerError(f"container already registered for {app_id!r}")
         if not image:
@@ -772,7 +825,7 @@ class ContainerSupervisor:
         host_power = hostpower.expand(host_power)
         _publish_ports(publish)
         c = _Container(app_id, image, port, run_flags, resources, env, self._network,
-                       volumes, container_name, host_power, publish, emit_app_events)
+                       volumes, container_name, host_power, publish, emit_app_events, version)
         self._containers[app_id] = c
         log.info("apps: registered container %s (image=%s port=%s network=%s)",
                  c.name, image, port, self._network)
@@ -870,6 +923,33 @@ class ContainerSupervisor:
             self._engine_arch_cache = arch
         return arch
 
+    def _resolve_image(self, c: "_Container", client, pull_client, auth, engine_arch: str) -> tuple[str, bool]:
+        """(image to run for ``c``, already pulled?): ``repo:v<installed version>`` when the manifest names ``latest``.
+
+        Tag absent on the registry -> the declared image, recorded in ``c.image_fallback`` (doctor
+        reports it). Registry unreachable -> a cached versioned image if present, else today's
+        behaviour (the declared image and its own cache fallback).
+        """
+        c.image_fallback = None
+        want = versioned_image(c.image, c.version) if _versioned_images_enabled() else None
+        if want is None or ":" in c.app_id:  # sidecars are third-party images
+            return c.image, False
+        try:
+            log.info("apps: pulling versioned image %s for %s", want, c.name)
+            _pull_ref(pull_client, want, auth, engine_arch)
+            return want, True
+        except Exception as exc:  # noqa: BLE001 — classified below
+            if _is_tag_not_found(exc):
+                c.image_fallback = f"{want} not published; running declared image {c.image}"
+                log.warning("apps: %s: %s", c.name, c.image_fallback)
+                return c.image, False
+            try:
+                client.images.get(want)
+                log.warning("apps: registry unreachable for %s, using cached %s", c.name, want)
+                return want, False
+            except Exception:  # noqa: BLE001
+                return c.image, False
+
     def start(self, app_id: str) -> dict:
         c = self._require(app_id)
         # Not _docker(): every call below is a mutating lifecycle op whose
@@ -895,11 +975,13 @@ class ContainerSupervisor:
         pull_client = self._docker_for_pull()
         auth = _registry_auth(c.image)
         engine_arch = self._engine_arch(pull_client)
+        ref, pre_pulled = self._resolve_image(c, client, pull_client, auth, engine_arch)
         native_err: Exception | None = None
         amd64_err: Exception | None = None
         try:
-            log.info("apps: pulling image %s for %s", c.image, c.name)
-            pull_client.images.pull(c.image, auth_config=auth)
+            if not pre_pulled:  # the versioned ref was already pulled by _resolve_image
+                log.info("apps: pulling image %s for %s", ref, c.name)
+                pull_client.images.pull(ref, auth_config=auth)
         except Exception as exc:  # noqa: BLE001 — classified below
             native_err = exc
             # A manifest-list arch mismatch on a non-amd64 engine means this
@@ -913,15 +995,15 @@ class ContainerSupervisor:
                 try:
                     log.warning(
                         "apps: %s has no %s build — pulling linux/amd64 under "
-                        "emulation for %s", c.image, engine_arch, c.name)
-                    pull_client.images.pull(c.image, platform="linux/amd64", auth_config=auth)
+                        "emulation for %s", ref, engine_arch, c.name)
+                    pull_client.images.pull(ref, platform="linux/amd64", auth_config=auth)
                     native_err = None
                 except Exception as exc2:  # noqa: BLE001
                     amd64_err = exc2
 
         if native_err is not None:
             try:
-                client.images.get(c.image)
+                client.images.get(ref)
             except ImageNotFound:
                 # Structural backstop: a cache miss on a non-amd64 engine
                 # always gets one platform=linux/amd64 attempt, even if the
@@ -932,7 +1014,7 @@ class ContainerSupervisor:
                 if amd64_err is None and engine_arch and engine_arch != "amd64":
                     try:
                         pull_client.images.pull(
-                            c.image, platform="linux/amd64", auth_config=auth)
+                            ref, platform="linux/amd64", auth_config=auth)
                         native_err = None
                     except Exception as exc3:  # noqa: BLE001
                         amd64_err = exc3
@@ -941,7 +1023,7 @@ class ContainerSupervisor:
                         # An amd64 fallback was actually attempted (and
                         # failed) — safe to name it as the cause.
                         raise ContainerError(
-                            f"image {c.image} has no build for this host "
+                            f"image {ref} has no build for this host "
                             f"(host architecture {engine_arch}) and the "
                             f"linux/amd64 fallback could not be pulled — "
                             f"native pull: {native_err}; amd64 pull: {amd64_err}"
@@ -954,12 +1036,12 @@ class ContainerSupervisor:
                     # image — name only what's true: the pull failed and
                     # nothing is cached.
                     raise ContainerError(
-                        f"image {c.image} could not be pulled and is not "
+                        f"image {ref} could not be pulled and is not "
                         f"cached locally — {native_err}"
                     ) from native_err
             else:
                 log.warning(
-                    "apps: pull failed for %s, starting %s from cached image", c.image, c.name
+                    "apps: pull failed for %s, starting %s from cached image", ref, c.name
                 )
 
         kwargs: dict = {
@@ -1067,7 +1149,8 @@ class ContainerSupervisor:
             # No shared network → publish the port so the proxy host can reach it.
             kwargs["ports"] = {f"{c.port}/tcp": c.port}
 
-        container = client.containers.run(c.image, **kwargs)
+        c.running_image = ref
+        container = client.containers.run(ref, **kwargs)
         c.container_id = getattr(container, "id", None)
         log.info("apps: started container %s id=%s", c.name, c.container_id)
         return self.status(app_id)

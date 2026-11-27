@@ -57,6 +57,7 @@ def run(args: list[str]) -> int:
     problems += _pending_migrations(report.get("pending_migrations") or [])
     problems += _knowledge_mirrors(report.get("knowledge_mirrors") or [])
     problems += _emulated_apps(report.get("emulated_apps") or [])
+    problems += _image_fallback_apps(report.get("image_fallback_apps") or [])
     problems += _activation_audit(report.get("activation_audit") or {})
     _host_power(report.get("host_power") or {})
     problems += _mcp(report.get("mcp") or {})
@@ -222,6 +223,17 @@ def _emulated_apps(rows: list) -> int:
     for row in rows:
         print(f"  ✗ {row['app']} ({row.get('image', '?')}, {row.get('image_arch', '?')}): "
               f"{row.get('detail', '')}")
+    return len(rows)
+
+
+def _image_fallback_apps(rows: list) -> int:
+    """Apps running their declared mutable image because ``repo:v<version>`` was never published."""
+    if not rows:
+        return 0
+    print()
+    print(f"Image fallback — {len(rows)} app(s) not running their versioned image")
+    for row in rows:
+        print(f"  ✗ {row['app']} ({row.get('image', '?')}): {row.get('detail', '')}")
     return len(rows)
 
 

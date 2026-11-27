@@ -396,6 +396,21 @@ def _emulated_apps(runtime) -> list[dict]:
     return out
 
 
+def _image_fallback_apps(runtime) -> list[dict]:
+    """Tier-2 apps whose ``repo:v<version>`` image was not published, so they run the declared
+    (mutable) image instead — the app/image skew the versioned-image rule exists to remove.
+    Live off the supervisor's last start(), never a stored marker: it clears on the next start
+    once the tag exists."""
+    containers = getattr(runtime, "containers", None)
+    if containers is None:
+        return []
+    return [
+        {"app": app_id, "image": c.running_image or c.image, "detail": c.image_fallback}
+        for app_id, c in containers.registered()
+        if getattr(c, "image_fallback", None)
+    ]
+
+
 def _config_for_install(app_id: str, data: dict, runtime, reconciler) -> dict:
     """Config to install ``app_id`` with: the caller's if it sent one,
     otherwise whatever is already on record for that app.
@@ -1865,6 +1880,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
         pending_migrations = await asyncio.to_thread(_app_pending_migrations, runtime)
         knowledge_mirror_problems = await asyncio.to_thread(_knowledge_mirror_problems, runtime)
         emulated_apps = await asyncio.to_thread(_emulated_apps, runtime)
+        image_fallback_apps = _image_fallback_apps(runtime)
         # Design §A.2: the audit itself must not rot silently the way the
         # doctor-watch task once did (disabled 2026-09-09, noticed
         # 2026-10-11) — 5x its own ~60s cadence is generous headroom for
@@ -1904,6 +1920,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
                    and not pending_migrations
                    and not knowledge_mirror_problems
                    and not emulated_apps
+                   and not image_fallback_apps
                    and vault_status.get("reachable") is not False
                    and not remote_host_postgres_backup["stale"]
                    and not claude_config["corrupt"]
@@ -1913,6 +1930,7 @@ def register_apps_routes(app: FastAPI) -> AppRuntime:
             "pending_migrations": pending_migrations,
             "knowledge_mirrors": knowledge_mirror_problems,
             "emulated_apps": emulated_apps,
+            "image_fallback_apps": image_fallback_apps,
             "activation_audit": {
                 "last_run_age_s": activation_audit_age_s,
                 "stale": activation_audit_stale,
