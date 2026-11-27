@@ -95,3 +95,15 @@ def test_default_stamp_dir_is_in_the_container_layer(monkeypatch, tmp_path):
     for forbidden in (paths.workspace_home(), os.environ["HOME"],
                       "/opt/aw-workspace/.aw-workspace"):
         assert not d.startswith(os.path.abspath(forbidden) + os.sep)
+
+
+def test_app_config_env_and_revert_invalidate(pkg, monkeypatch):
+    c = CommandInstaller(lock_dir=str(pkg / "locks"))
+    monkeypatch.setenv("AW_APP_TERRAFORM_VERSION", "1.9.8")
+    assert _install(c, pkg) == "ran"
+    assert _install(c, pkg) == "skipped"
+    monkeypatch.setenv("AW_APP_TERRAFORM_VERSION", "1.10.0")
+    assert _install(c, pkg) == "ran"
+    assert _install(c, pkg) == "skipped"
+    c.clear_stamps("app")  # what runtime._revert_entry does on uninstall
+    assert _install(c, pkg) == "ran"

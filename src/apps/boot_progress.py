@@ -21,6 +21,7 @@ import threading
 import time
 from typing import Any, Awaitable, Callable, Optional
 
+from src.api import boot_info
 from src.apps import fs_lock
 
 log = logging.getLogger(__name__)
@@ -38,7 +39,10 @@ def read_progress(lock_dir: str | None = None) -> dict[str, Any]:
     try:
         with open(progress_path(lock_dir), encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict) and data.get("phase"):
+        # The file survives restarts in the host-mounted lock dir: a snapshot
+        # from another boot is stale, not "the current pass".
+        if (isinstance(data, dict) and data.get("phase")
+                and data.get("boot_id") == boot_info.boot_id()):
             return data
     except (OSError, ValueError):
         pass
@@ -65,9 +69,9 @@ class BootProgress:
             return {**self._state, "in_flight": list(self._state["in_flight"])}
 
     def _write(self) -> None:
-        path = progress_path(self._lock_dir)
-        tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
         try:
+            path = progress_path(self._lock_dir)
+            tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
             with self._lock:
                 self._state["updated_at"] = time.time()
                 payload = json.dumps(self._state)
@@ -98,12 +102,13 @@ class BootProgress:
                 self._state["in_flight"].append(app_id)
         await self._publish()
 
-    async def app_finished(self, app_id: str) -> None:
+    async def app_finished(self, app_id: str, ok: bool = True) -> None:
         with self._lock:
             if app_id in self._state["in_flight"]:
                 self._state["in_flight"].remove(app_id)
-            self._state["loaded"] = min(self._state["total"] or 10**9,
-                                        self._state["loaded"] + 1)
+            if ok:
+                self._state["loaded"] = min(self._state["total"] or 10**9,
+                                            self._state["loaded"] + 1)
         await self._publish()
 
     async def finish(self, ok: bool) -> None:

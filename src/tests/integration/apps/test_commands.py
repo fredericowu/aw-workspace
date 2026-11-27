@@ -829,6 +829,7 @@ def test_boot_status_endpoint_reads_the_progress_file(tmp_path, monkeypatch):
     import asyncio
     from src.apps.boot_progress import BootProgress
     monkeypatch.setenv("AW_APPS_LOCK_DIR", str(tmp_path))
+    monkeypatch.setenv("AW_WORKSPACE_BOOT_ID", "b1")
     _runtime, client = _doctor_client()
     assert client.get("/api/apps/-/boot-status").json()["phase"] == "idle"
 

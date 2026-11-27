@@ -188,12 +188,12 @@ class CommandInstaller:
 
     def _stamp_key(self, package_dir: str, script: str, version: str) -> str:
         """sha256 over the script bytes, the app version and the env values an
-        installer actually keys off (``AW_BIN_DIR``, ``HOME``, ``AW_INSTALL*``
-        vars). Not the whole environment: that carries per-boot noise and
+        installer actually keys off (``AW_BIN_DIR``, ``HOME``, ``AW_INSTALL*`` /
+        ``AW_APP_*`` vars, e.g. an app's configured tool versions). Not the whole environment: that carries per-boot noise and
         would make every boot a miss."""
         env = self._installer_env()
         relevant = {k: v for k, v in env.items()
-                    if k in ("AW_BIN_DIR", "HOME") or k.startswith("AW_INSTALL")}
+                    if k in ("AW_BIN_DIR", "HOME") or k.startswith(("AW_INSTALL", "AW_APP_"))}
         # The stamp dir/TTL knobs configure the stamp, not the installer.
         relevant.pop(STAMP_DIR_ENV, None)
         relevant.pop(STAMP_TTL_ENV, None)

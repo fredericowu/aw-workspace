@@ -1853,6 +1853,7 @@ class Reconciler:
 
         async def install_one(app_id: str, spec: AppSpec) -> None:
             started = time.monotonic()
+            ok = False
             if self.progress is not None:
                 await self.progress.app_started(app_id)
             try:
@@ -1865,6 +1866,7 @@ class Reconciler:
                     already_loaded.append(app_id)
                 else:
                     installed.append(app_id)
+                ok = True
             except UnresolvableAppError as e:
                 # Loud once per app_id (and recorded in errors once, so an
                 # install-status caller sees it at least once), then quiet —
@@ -1882,7 +1884,7 @@ class Reconciler:
             finally:
                 durations[app_id] = round(time.monotonic() - started, 1)
                 if self.progress is not None:
-                    await self.progress.app_finished(app_id)
+                    await self.progress.app_finished(app_id, ok)
 
         # `missing` is already sorted BOOT_PRIORITY-first, so this just splits
         # that order in two without re-deriving it.
